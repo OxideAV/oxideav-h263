@@ -17,6 +17,9 @@
 //!   estimator on the previous reconstructed frame, COD flag, MCBPC inter +
 //!   CBPY XOR + MVD VLC + inter AC encode.
 //! * Source formats 1..=5: sub-QCIF, QCIF, CIF, 4CIF, 16CIF.
+//! * **Annex J — Deblocking filter**: available out-of-band as an encoder /
+//!   decoder option (no PLUSPTYPE/OPPTYPE bitstream signalling — both sides
+//!   must agree explicitly; default off). See [`deblock::deblock_picture`].
 //! * Reuses VLC tables and IDCT/dequantisation from `oxideav-mpeg4video`
 //!   (the MPEG-4 Part 2 VLCs are identical to the H.263 baseline ones).
 //!
@@ -24,9 +27,8 @@
 //! * PB-frames mode (§G).
 //! * Annex D (Unrestricted MV), Annex E (SAC), Annex F (Advanced Prediction
 //!   — 4MV/OBMC), Annex G (PB-frames), Annex I (Advanced Intra Coding),
-//!   Annex J (Deblocking filter), Annex K (Slice Structured Mode), Annex N
-//!   (RPS), Annex P (Reference Picture Resampling), Annex T (Modified
-//!   Quantization).
+//!   Annex K (Slice Structured Mode), Annex N (RPS), Annex P (Reference
+//!   Picture Resampling), Annex T (Modified Quantization).
 //! * H.263+/PLUSPTYPE custom picture format extensions.
 //! * CPM continuous-presence multipoint mode.
 //! * B-pictures of any flavour.
@@ -40,6 +42,7 @@
 pub mod bitwriter;
 pub mod block;
 pub mod dct;
+pub mod deblock;
 pub mod decoder;
 pub mod enc_tables;
 pub mod encoder;

@@ -39,6 +39,13 @@ pub struct H263Decoder {
     /// for the next P-picture. Cleared on I-pictures (before the I is
     /// decoded) and refreshed after every successful decode.
     reference: Option<IPicture>,
+    /// When `true`, apply the Annex J deblocking filter to every decoded
+    /// picture (both the output and the MC reference). Default `false` —
+    /// this crate does NOT parse the DF bit from PLUSPTYPE/OPPTYPE (the
+    /// H.263+ extended header is out of scope for v1), so the caller must
+    /// mirror the encoder's configuration explicitly via
+    /// [`Self::set_enable_annex_j`].
+    enable_annex_j: bool,
 }
 
 impl H263Decoder {
@@ -51,7 +58,20 @@ impl H263Decoder {
             pending_tb: TimeBase::new(1, 90_000),
             eof: false,
             reference: None,
+            enable_annex_j: false,
         }
+    }
+
+    /// Enable or disable the Annex J deblocking filter. Must be set before
+    /// the first packet is submitted; mid-stream changes would desync the
+    /// reconstruction from the encoder.
+    pub fn set_enable_annex_j(&mut self, enable: bool) {
+        self.enable_annex_j = enable;
+    }
+
+    /// Returns whether Annex J deblocking is currently enabled.
+    pub fn enable_annex_j(&self) -> bool {
+        self.enable_annex_j
     }
 
     /// Walk the buffer for picture start codes and process each picture
@@ -109,7 +129,8 @@ impl H263Decoder {
         let hdr = parse_picture_header(&mut br)?;
         match hdr.coding_type {
             PictureCodingType::Intra => {
-                let pic = decode_i_picture(&mut br, &hdr, bytes)?;
+                let mut pic = decode_i_picture(&mut br, &hdr, bytes)?;
+                self.maybe_deblock(&mut pic, hdr.pquant);
                 let frame = pic_to_video_frame(&pic, self.pending_pts, self.pending_tb);
                 self.reference = Some(pic);
                 self.ready_frames.push_back(frame);
@@ -127,13 +148,28 @@ impl H263Decoder {
                         "h263 P-picture: dimension change without I-picture",
                     ));
                 }
-                let pic = decode_p_picture(&mut br, &hdr, bytes, reference)?;
+                let mut pic = decode_p_picture(&mut br, &hdr, bytes, reference)?;
+                self.maybe_deblock(&mut pic, hdr.pquant);
                 let frame = pic_to_video_frame(&pic, self.pending_pts, self.pending_tb);
                 self.reference = Some(pic);
                 self.ready_frames.push_back(frame);
                 Ok(())
             }
         }
+    }
+
+    /// Apply the Annex J deblocking filter to `pic` iff the caller opted in
+    /// via [`Self::set_enable_annex_j`]. Uses the picture-header PQUANT as
+    /// a uniform per-MB quantiser (matches the encoder, which holds the
+    /// quantiser constant for the whole picture).
+    fn maybe_deblock(&self, pic: &mut IPicture, pquant: u8) {
+        if !self.enable_annex_j {
+            return;
+        }
+        let mb_w = pic.mb_width;
+        let mb_h = pic.mb_height;
+        let qp = vec![pquant; mb_w * mb_h];
+        crate::deblock::deblock_picture(pic, &qp);
     }
 }
 

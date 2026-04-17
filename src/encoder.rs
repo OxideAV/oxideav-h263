@@ -62,53 +62,13 @@ pub const DEFAULT_GOP_SIZE: u32 = 12;
 
 /// Encoder factory used by [`crate::register_encoder`].
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    let width = params
-        .width
-        .ok_or_else(|| Error::invalid("h263 encoder: missing width"))?;
-    let height = params
-        .height
-        .ok_or_else(|| Error::invalid("h263 encoder: missing height"))?;
-    let source_format = SourceFormat::for_dimensions(width, height).ok_or_else(|| {
-        Error::unsupported(format!(
-            "h263 encoder: dimensions {width}x{height} are not one of the standard \
-             source formats (sub-QCIF/QCIF/CIF/4CIF/16CIF)"
-        ))
-    })?;
-    let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
-    if pix != PixelFormat::Yuv420P {
-        return Err(Error::unsupported(format!(
-            "h263 encoder: only Yuv420P supported (got {:?})",
-            pix
-        )));
-    }
-
-    let frame_rate = params.frame_rate.unwrap_or(Rational::new(30, 1));
-    let mut output_params = params.clone();
-    output_params.media_type = MediaType::Video;
-    output_params.codec_id = CodecId::new(super::CODEC_ID_STR);
-    output_params.width = Some(width);
-    output_params.height = Some(height);
-    output_params.pixel_format = Some(PixelFormat::Yuv420P);
-    output_params.frame_rate = Some(frame_rate);
-    let time_base = TimeBase::new(frame_rate.den, frame_rate.num);
-
-    Ok(Box::new(H263Encoder {
-        output_params,
-        width,
-        height,
-        source_format,
-        pquant: DEFAULT_PQUANT,
-        gop_size: DEFAULT_GOP_SIZE,
-        since_keyframe: 0,
-        reference: None,
-        time_base,
-        pending: VecDeque::new(),
-        eof: false,
-        next_tr: 0,
-    }))
+    Ok(Box::new(H263Encoder::from_params(params)?))
 }
 
-struct H263Encoder {
+/// Public H.263 baseline encoder. Construct via [`make_encoder`] and the
+/// codec registry; post-construction tweaks (Annex J, GOP, …) can be applied
+/// by downcasting to this type.
+pub struct H263Encoder {
     output_params: CodecParameters,
     width: u32,
     height: u32,
@@ -126,6 +86,80 @@ struct H263Encoder {
     pending: VecDeque<Packet>,
     eof: bool,
     next_tr: u8,
+    /// When `true`, apply the H.263 Annex J deblocking filter to every
+    /// reconstructed picture before it is stored as the motion-compensation
+    /// reference for the next P-picture. The bitstream itself is unchanged
+    /// (we do NOT signal the DF bit via PLUSPTYPE/OPPTYPE — that header
+    /// extension is out of scope for the current crate); the matching
+    /// decoder must be configured with the same flag via
+    /// [`crate::decoder::H263Decoder::set_enable_annex_j`].
+    enable_annex_j: bool,
+}
+
+impl H263Encoder {
+    /// Construct an encoder from `CodecParameters`. Same validation as the
+    /// factory [`make_encoder`], returning the concrete type so callers can
+    /// use [`Self::set_enable_annex_j`] and any future knobs without going
+    /// through trait-object downcasts.
+    pub fn from_params(params: &CodecParameters) -> Result<Self> {
+        let width = params
+            .width
+            .ok_or_else(|| Error::invalid("h263 encoder: missing width"))?;
+        let height = params
+            .height
+            .ok_or_else(|| Error::invalid("h263 encoder: missing height"))?;
+        let source_format = SourceFormat::for_dimensions(width, height).ok_or_else(|| {
+            Error::unsupported(format!(
+                "h263 encoder: dimensions {width}x{height} are not one of the standard \
+                 source formats (sub-QCIF/QCIF/CIF/4CIF/16CIF)"
+            ))
+        })?;
+        let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
+        if pix != PixelFormat::Yuv420P {
+            return Err(Error::unsupported(format!(
+                "h263 encoder: only Yuv420P supported (got {:?})",
+                pix
+            )));
+        }
+
+        let frame_rate = params.frame_rate.unwrap_or(Rational::new(30, 1));
+        let mut output_params = params.clone();
+        output_params.media_type = MediaType::Video;
+        output_params.codec_id = CodecId::new(super::CODEC_ID_STR);
+        output_params.width = Some(width);
+        output_params.height = Some(height);
+        output_params.pixel_format = Some(PixelFormat::Yuv420P);
+        output_params.frame_rate = Some(frame_rate);
+        let time_base = TimeBase::new(frame_rate.den, frame_rate.num);
+
+        Ok(Self {
+            output_params,
+            width,
+            height,
+            source_format,
+            pquant: DEFAULT_PQUANT,
+            gop_size: DEFAULT_GOP_SIZE,
+            since_keyframe: 0,
+            reference: None,
+            time_base,
+            pending: VecDeque::new(),
+            eof: false,
+            next_tr: 0,
+            enable_annex_j: false,
+        })
+    }
+
+    /// Enable or disable the Annex J deblocking filter. Must be set before
+    /// the first frame is submitted; changing it mid-stream would desync
+    /// reconstruction from any decoder running the same flag.
+    pub fn set_enable_annex_j(&mut self, enable: bool) {
+        self.enable_annex_j = enable;
+    }
+
+    /// Returns whether Annex J deblocking is currently enabled.
+    pub fn enable_annex_j(&self) -> bool {
+        self.enable_annex_j
+    }
 }
 
 impl Encoder for H263Encoder {
@@ -164,7 +198,7 @@ impl Encoder for H263Encoder {
             || self.gop_size <= 1
             || self.since_keyframe + 1 >= self.gop_size;
 
-        let (data, recon, is_key) = if force_i {
+        let (data, mut recon, is_key) = if force_i {
             let (bytes, pic) = encode_i_picture_with_recon(
                 self.width,
                 self.height,
@@ -187,6 +221,17 @@ impl Encoder for H263Encoder {
             )?;
             (bytes, pic, false)
         };
+
+        // Annex J — optional in-loop deblocking filter. Applied after
+        // reconstruction so that the filtered picture is what becomes the MC
+        // reference for the next P-frame. The decoder must mirror this
+        // (via `H263Decoder::set_enable_annex_j`) for round-trip equivalence.
+        if self.enable_annex_j {
+            let mb_w = self.width.div_ceil(16) as usize;
+            let mb_h = self.height.div_ceil(16) as usize;
+            let qp = vec![self.pquant; mb_w * mb_h];
+            crate::deblock::deblock_picture(&mut recon, &qp);
+        }
 
         self.reference = Some(recon);
         if is_key {
