@@ -21,9 +21,11 @@
 //!
 //! Out of scope (returns `Error::Unsupported`):
 //! * Annex D (UMV), Annex E (SAC), Annex F (Advanced Prediction — 4MV/OBMC),
-//!   Annex G (PB-frames), Annex I (Advanced Intra Coding), Annex J
-//!   (deblocking), Annex T (Modified Quantization).
-//! * H.263+ PLUSPTYPE custom picture format extensions.
+//!   Annex G (PB-frames), Annex I (Advanced Intra Coding), Annex T
+//!   (Modified Quantization).
+//! * H.263+ PLUSPTYPE custom picture format / custom PCF / DF-bit signalling
+//!   (Annex J deblocking is applied out-of-band; the bitstream itself is
+//!   still baseline).
 //! * CPM continuous-presence multipoint mode.
 //! * B-pictures of any flavour.
 //!
@@ -89,9 +91,10 @@ pub struct H263Encoder {
     /// When `true`, apply the H.263 Annex J deblocking filter to every
     /// reconstructed picture before it is stored as the motion-compensation
     /// reference for the next P-picture. The bitstream itself is unchanged
-    /// (we do NOT signal the DF bit via PLUSPTYPE/OPPTYPE — that header
-    /// extension is out of scope for the current crate); the matching
-    /// decoder must be configured with the same flag via
+    /// (the encoder never emits a PLUSPTYPE block — our decoder parses
+    /// PLUSPTYPE/OPPTYPE on input, but the encoder always produces a
+    /// baseline PTYPE header); the matching decoder must be configured
+    /// with the same flag via
     /// [`crate::decoder::H263Decoder::set_enable_annex_j`].
     enable_annex_j: bool,
 }

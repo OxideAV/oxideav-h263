@@ -17,21 +17,31 @@
 //!   estimator on the previous reconstructed frame, COD flag, MCBPC inter +
 //!   CBPY XOR + MVD VLC + inter AC encode.
 //! * Source formats 1..=5: sub-QCIF, QCIF, CIF, 4CIF, 16CIF.
-//! * **Annex J — Deblocking filter**: available out-of-band as an encoder /
-//!   decoder option (no PLUSPTYPE/OPPTYPE bitstream signalling — both sides
-//!   must agree explicitly; default off). See [`deblock::deblock_picture`].
+//! * **Annex J — Deblocking filter**: applied on both the encoder (before
+//!   the reconstruction is cached as the motion-compensation reference) and
+//!   the decoder (to the emitted frame + reference). Opt-in via
+//!   [`encoder::H263Encoder::set_enable_annex_j`] /
+//!   [`decoder::H263Decoder::set_enable_annex_j`], or auto-enabled on the
+//!   decoder side when a PLUSPTYPE-carrying stream asserts the `DF` bit in
+//!   its OPPTYPE. See [`deblock::deblock_picture`].
+//! * **PLUSPTYPE parse** (H.263+, ITU-T Rec. H.263 01/2005 Annex U): the
+//!   decoder recognises extended picture headers carrying source-format
+//!   code `111`, reads UFEP / MPPTYPE / OPPTYPE + CPFMT, and either returns
+//!   a normal `PictureHeader` (when the stream sticks to baseline features
+//!   on a standard source size + optional DF) or an `Error::Unsupported`
+//!   naming the specific annex the stream requires.
 //! * Reuses VLC tables and IDCT/dequantisation from `oxideav-mpeg4video`
 //!   (the MPEG-4 Part 2 VLCs are identical to the H.263 baseline ones).
 //!
 //! Out of scope (returns `Error::Unsupported`):
-//! * PB-frames mode (§G).
+//! * PB-frames mode (§G) and every B-picture flavour.
 //! * Annex D (Unrestricted MV), Annex E (SAC), Annex F (Advanced Prediction
 //!   — 4MV/OBMC), Annex G (PB-frames), Annex I (Advanced Intra Coding),
 //!   Annex K (Slice Structured Mode), Annex N (RPS), Annex P (Reference
 //!   Picture Resampling), Annex T (Modified Quantization).
-//! * H.263+/PLUSPTYPE custom picture format extensions.
+//! * H.263+ custom picture clock frequency / custom picture sizes that don't
+//!   match one of the standard source formats (sub-QCIF/QCIF/CIF/4CIF/16CIF).
 //! * CPM continuous-presence multipoint mode.
-//! * B-pictures of any flavour.
 //!
 //! No runtime dependencies beyond `oxideav-core`, `oxideav-codec`, and
 //! `oxideav-mpeg4video` (whose VLC tables we share).

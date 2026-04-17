@@ -3,9 +3,11 @@
 //! Parses one coded picture from each compressed packet, produces one
 //! `VideoFrame` per picture (I-picture or P-picture). The previous decoded
 //! frame is retained as the motion-compensation reference for the next
-//! P-picture; an I-picture clears it. Streams with optional annexes (Annex
-//! D/E/F/G/T/…) are rejected at the picture-header layer; see
-//! `picture::parse_picture_header`.
+//! P-picture; an I-picture clears it. Both baseline PTYPE headers and
+//! H.263+ PLUSPTYPE headers are recognised — streams that assert any
+//! still-unimplemented annex (Annex D/E/F/G/I/K/N/P/Q/R/S/T or PB-frames)
+//! are rejected at the picture-header layer with a diagnostic naming the
+//! specific annex; see `picture::parse_picture_header`.
 
 use std::collections::VecDeque;
 
@@ -40,11 +42,14 @@ pub struct H263Decoder {
     /// decoded) and refreshed after every successful decode.
     reference: Option<IPicture>,
     /// When `true`, apply the Annex J deblocking filter to every decoded
-    /// picture (both the output and the MC reference). Default `false` —
-    /// this crate does NOT parse the DF bit from PLUSPTYPE/OPPTYPE (the
-    /// H.263+ extended header is out of scope for v1), so the caller must
-    /// mirror the encoder's configuration explicitly via
-    /// [`Self::set_enable_annex_j`].
+    /// picture (both the output and the MC reference). Default `false`.
+    /// When the picture header itself carries a PLUSPTYPE block with the DF
+    /// bit set (H.263+), deblocking is also applied for that picture even
+    /// if this flag is left off — see [`maybe_deblock`]. For baseline
+    /// streams that don't carry a DF bit at all, callers must opt in via
+    /// [`Self::set_enable_annex_j`] (and match whatever the encoder did).
+    ///
+    /// [`maybe_deblock`]: Self::maybe_deblock
     enable_annex_j: bool,
 }
 
@@ -130,7 +135,7 @@ impl H263Decoder {
         match hdr.coding_type {
             PictureCodingType::Intra => {
                 let mut pic = decode_i_picture(&mut br, &hdr, bytes)?;
-                self.maybe_deblock(&mut pic, hdr.pquant);
+                self.maybe_deblock(&mut pic, &hdr);
                 let frame = pic_to_video_frame(&pic, self.pending_pts, self.pending_tb);
                 self.reference = Some(pic);
                 self.ready_frames.push_back(frame);
@@ -149,7 +154,7 @@ impl H263Decoder {
                     ));
                 }
                 let mut pic = decode_p_picture(&mut br, &hdr, bytes, reference)?;
-                self.maybe_deblock(&mut pic, hdr.pquant);
+                self.maybe_deblock(&mut pic, &hdr);
                 let frame = pic_to_video_frame(&pic, self.pending_pts, self.pending_tb);
                 self.reference = Some(pic);
                 self.ready_frames.push_back(frame);
@@ -159,16 +164,18 @@ impl H263Decoder {
     }
 
     /// Apply the Annex J deblocking filter to `pic` iff the caller opted in
-    /// via [`Self::set_enable_annex_j`]. Uses the picture-header PQUANT as
-    /// a uniform per-MB quantiser (matches the encoder, which holds the
-    /// quantiser constant for the whole picture).
-    fn maybe_deblock(&self, pic: &mut IPicture, pquant: u8) {
-        if !self.enable_annex_j {
+    /// via [`Self::set_enable_annex_j`] OR the picture header signalled the
+    /// DF bit inside a PLUSPTYPE (H.263+) block. Uses the picture-header
+    /// PQUANT as a uniform per-MB quantiser (matches the encoder, which
+    /// holds the quantiser constant for the whole picture).
+    fn maybe_deblock(&self, pic: &mut IPicture, hdr: &PictureHeader) {
+        let enable = self.enable_annex_j || hdr.deblocking_filter;
+        if !enable {
             return;
         }
         let mb_w = pic.mb_width;
         let mb_h = pic.mb_height;
-        let qp = vec![pquant; mb_w * mb_h];
+        let qp = vec![hdr.pquant; mb_w * mb_h];
         crate::deblock::deblock_picture(pic, &qp);
     }
 }

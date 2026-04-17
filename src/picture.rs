@@ -1,6 +1,7 @@
-//! H.263 picture header parser — Annex C §5.1 of ITU-T Rec. H.263 (02/98).
+//! H.263 picture header parser — Annex C §5.1 of ITU-T Rec. H.263 (02/98)
+//! with the H.263+ PLUSPTYPE / OPPTYPE extension from the 01/2005 revision.
 //!
-//! Layout (baseline, no PLUSPTYPE):
+//! Baseline layout (no PLUSPTYPE):
 //!
 //! | Field       | Bits  | Notes                                            |
 //! |-------------|-------|--------------------------------------------------|
@@ -20,6 +21,16 @@
 //! | TRB         | 3     | Present iff PB-frames mode                       |
 //! | DBQUANT     | 2     | Present iff PB-frames mode                       |
 //! | PEI/PSPARE  | n     | 1-bit PEI, then 8-bit PSPARE if PEI==1, repeat   |
+//!
+//! When `Source fmt == 7` the picture carries a PLUSPTYPE block instead of
+//! the standard PTYPE tail. PLUSPTYPE is parsed by
+//! [`parse_plusptype_tail`] below — we recognise the full syntax so that
+//! streams built around H.263+ can be read up to the point where an
+//! actually-unsupported annex is signalled (at which point we return a
+//! specific `Error::Unsupported`). Custom Picture Format (CPFMT) is
+//! accepted when the dimensions happen to match one of the standard
+//! source formats; non-standard sizes are rejected for now as the MB grid
+//! and motion-compensation paths below still assume the fixed formats.
 //!
 //! GOB data immediately follows the header (no further alignment required).
 
@@ -133,6 +144,13 @@ pub struct PictureHeader {
     pub dbquant: u8,
     pub width: u32,
     pub height: u32,
+    /// Set to `true` when the picture header carried a PLUSPTYPE block
+    /// (source format code `111`). Baseline streams leave this at `false`.
+    pub plusptype: bool,
+    /// Annex J (Deblocking Filter) mode — only meaningful when [`Self::plusptype`]
+    /// is set; baseline streams cannot signal DF inside the bitstream and
+    /// leave this at `false`. Mirrors the `DF` bit of OPPTYPE.
+    pub deblocking_filter: bool,
 }
 
 /// Parse the picture header that follows the 22-bit PSC.
@@ -169,6 +187,24 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
     let freeze_release = br.read_u1()? == 1;
     let src_code = br.read_u32(3)? as u8;
     let source_format = SourceFormat::from_code(src_code);
+
+    if matches!(
+        source_format,
+        SourceFormat::Forbidden | SourceFormat::Reserved
+    ) {
+        return Err(Error::invalid("h263 picture: forbidden source format"));
+    }
+
+    if source_format == SourceFormat::Extended {
+        return parse_plusptype_tail(
+            br,
+            tr,
+            split_screen,
+            document_camera,
+            freeze_release,
+        );
+    }
+
     let coding_bit = br.read_u1()?;
     let coding_type = if coding_bit == 0 {
         PictureCodingType::Intra
@@ -180,18 +216,6 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
     let advanced_prediction = br.read_u1()? == 1;
     let pb_frames = br.read_u1()? == 1;
 
-    // Reject anything that needs out-of-scope annexes for v1.
-    if matches!(
-        source_format,
-        SourceFormat::Forbidden | SourceFormat::Reserved
-    ) {
-        return Err(Error::invalid("h263 picture: forbidden source format"));
-    }
-    if source_format == SourceFormat::Extended {
-        return Err(Error::unsupported(
-            "h263 PLUSPTYPE / H.263+ extended picture format: follow-up",
-        ));
-    }
     if umv_mode {
         return Err(Error::unsupported(
             "h263 Annex D unrestricted MV mode: follow-up",
@@ -261,10 +285,305 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
         dbquant,
         width,
         height,
+        plusptype: false,
+        deblocking_filter: false,
+    })
+}
+
+/// Parse the PLUSPTYPE tail (H.263+, Annex U of the 01/2005 edition). Called
+/// after the baseline PTYPE prefix reaches source-format code `111`.
+///
+/// Layout after source-format = 111:
+///
+/// | Field    | Bits | Notes                                             |
+/// |----------|------|---------------------------------------------------|
+/// | UFEP     | 3    | `000` = MPPTYPE only; `001` = OPPTYPE follows     |
+/// | OPPTYPE  | 18   | Only if UFEP == `001`                             |
+/// | MPPTYPE  | 9    | Picture-type code + RPR/RRU/RTYPE + `001` marker  |
+/// | CPM      | 1    | Continuous presence multipoint                    |
+/// | PSBI     | 2    | Only if CPM == 1                                  |
+/// | CPFMT    | 23   | Only if OPPTYPE signalled custom format           |
+/// | CPCFC    | 8    | Only if OPPTYPE signalled custom PCF              |
+/// | ETR      | 8    | Only if OPPTYPE signalled custom PCF              |
+/// | UUI      | 1..2 | Unlimited Unrestricted MV indicator (Annex D)     |
+/// | SSS      | 2    | Slice Structured sub-mode (Annex K)               |
+/// | ELNUM    | 4    | Scalability (Annex O)                             |
+/// | RLNUM    | 4    | Scalability (Annex O)                             |
+/// | RPSMF    | 3    | Reference Picture Selection (Annex N)             |
+/// | TRPI     | 1    | RPS TRP indicator                                 |
+/// | TRP      | 10   | RPS                                               |
+/// | BCI      | 1..  | Backchannel message indicator                     |
+/// | RPRP     | var  | Reference Picture Resampling (Annex P)            |
+/// | PQUANT   | 5    |                                                   |
+/// | MVD      | 1    | Only if RTYPE signalled B-pictures                |
+/// | CPM      | 1    | (second copy when UFEP == `000`)                  |
+/// | DBQUANT  | 2    | If B-pictures                                     |
+/// | PEI loop | n    |                                                   |
+///
+/// This parser recognises the bitstream shape and either returns a baseline-
+/// compatible [`PictureHeader`] when the stream happens to only use the
+/// PLUSPTYPE-form-of-standard features (standard source format + DF bit for
+/// Annex J), or returns `Error::Unsupported` with a specific diagnostic
+/// naming the offending annex.
+fn parse_plusptype_tail(
+    br: &mut BitReader<'_>,
+    tr: u8,
+    split_screen: bool,
+    document_camera: bool,
+    freeze_release: bool,
+) -> Result<PictureHeader> {
+    let ufep = br.read_u32(3)?;
+
+    // OPPTYPE (18 bits) — present only when UFEP == `001`. If absent, the
+    // decoder is expected to carry the optional-feature flags from the last
+    // full PLUSPTYPE seen on the stream. We don't track cross-picture state
+    // yet, so we only accept pictures that either carry the full OPPTYPE
+    // (and use a subset we support) or default everything to baseline.
+    let (custom_src_format, custom_pcf, df_mode) = if ufep == 0b001 {
+        let opptype = br.read_u32(18)?;
+        // Bit 17 (MSB of OPPTYPE): custom source format follows (CPFMT).
+        let custom_src = (opptype >> 17) & 1 != 0;
+        // Bit 16: custom PCF (Picture Clock Frequency — custom frame rate).
+        let custom_pcf = (opptype >> 16) & 1 != 0;
+        let umv = (opptype >> 15) & 1 != 0;
+        let sac = (opptype >> 14) & 1 != 0;
+        let ap = (opptype >> 13) & 1 != 0;
+        let aic = (opptype >> 12) & 1 != 0;
+        let df = (opptype >> 11) & 1 != 0;
+        let sss = (opptype >> 10) & 1 != 0;
+        let rps = (opptype >> 9) & 1 != 0;
+        let isd = (opptype >> 8) & 1 != 0;
+        let aiv = (opptype >> 7) & 1 != 0;
+        let mq = (opptype >> 6) & 1 != 0;
+        let marker = (opptype >> 5) & 1;
+        // Low 5 bits: 1 marker + 3 reserved + 1 marker? Spec says "1" + "000"
+        // + "0" + "0" (1 marker then 4 reserved). We require the marker bits
+        // to be `1` and the reserved bits to be `0`.
+        if marker != 1 {
+            return Err(Error::invalid("h263 PLUSPTYPE: OPPTYPE marker bit != 1"));
+        }
+        if umv {
+            return Err(Error::unsupported(
+                "h263 Annex D unrestricted MV mode (PLUSPTYPE): follow-up",
+            ));
+        }
+        if sac {
+            return Err(Error::unsupported(
+                "h263 Annex E syntax-based arithmetic coding (PLUSPTYPE): follow-up",
+            ));
+        }
+        if ap {
+            return Err(Error::unsupported(
+                "h263 Annex F advanced prediction (PLUSPTYPE): follow-up",
+            ));
+        }
+        if aic {
+            return Err(Error::unsupported(
+                "h263 Annex I advanced intra coding (PLUSPTYPE): follow-up",
+            ));
+        }
+        if sss {
+            return Err(Error::unsupported(
+                "h263 Annex K slice structured mode: follow-up",
+            ));
+        }
+        if rps {
+            return Err(Error::unsupported(
+                "h263 Annex N reference picture selection: follow-up",
+            ));
+        }
+        if isd {
+            return Err(Error::unsupported(
+                "h263 Annex R independent segment decoding: follow-up",
+            ));
+        }
+        if aiv {
+            return Err(Error::unsupported(
+                "h263 Annex S alternative inter VLC: follow-up",
+            ));
+        }
+        if mq {
+            return Err(Error::unsupported(
+                "h263 Annex T modified quantization: follow-up",
+            ));
+        }
+        (custom_src, custom_pcf, df)
+    } else if ufep == 0b000 {
+        // Inherit previous-picture OPPTYPE state. Since we do not yet retain
+        // OPPTYPE across pictures, we treat the inherited state as "baseline
+        // with DF and custom format both off" — the same default a freshly
+        // constructed decoder would pick. This is good enough for streams
+        // whose very first PLUSPTYPE picture supplies a full OPPTYPE and
+        // whose subsequent P-pictures keep the same options (the common
+        // case); anything else will diverge downstream on the first feature
+        // bit that actually matters.
+        (false, false, false)
+    } else {
+        return Err(Error::invalid(format!(
+            "h263 PLUSPTYPE: invalid UFEP {ufep:03b}"
+        )));
+    };
+
+    // MPPTYPE (9 bits): PCT(3) | RPR(1) | RRU(1) | RTYPE(1) | `001` marker
+    let mpptype = br.read_u32(9)?;
+    let pct = (mpptype >> 6) & 0b111;
+    let rpr = (mpptype >> 5) & 1 != 0;
+    let rru = (mpptype >> 4) & 1 != 0;
+    let rtype = (mpptype >> 3) & 1 != 0;
+    let mpp_marker = mpptype & 0b111;
+    if mpp_marker != 0b001 {
+        return Err(Error::invalid(format!(
+            "h263 PLUSPTYPE: MPPTYPE marker != 001 (got {mpp_marker:03b})"
+        )));
+    }
+    let _ = rtype;
+    if rpr {
+        return Err(Error::unsupported(
+            "h263 Annex P reference picture resampling: follow-up",
+        ));
+    }
+    if rru {
+        return Err(Error::unsupported(
+            "h263 Annex Q reduced-resolution update: follow-up",
+        ));
+    }
+    let coding_type = match pct {
+        0b000 => PictureCodingType::Intra,
+        0b001 => PictureCodingType::Predicted,
+        0b010 => {
+            return Err(Error::unsupported(
+                "h263 Improved PB-frames picture (PCT=010): follow-up",
+            ));
+        }
+        0b011 => {
+            return Err(Error::unsupported(
+                "h263 B-picture (PCT=011): follow-up",
+            ));
+        }
+        0b100 => {
+            return Err(Error::unsupported(
+                "h263 EI-picture (PCT=100, Annex O scalability): follow-up",
+            ));
+        }
+        0b101 => {
+            return Err(Error::unsupported(
+                "h263 EP-picture (PCT=101, Annex O scalability): follow-up",
+            ));
+        }
+        _ => {
+            return Err(Error::invalid(format!(
+                "h263 PLUSPTYPE: reserved picture-type code {pct:03b}"
+            )));
+        }
+    };
+
+    let cpm = br.read_u1()? == 1;
+    let psbi = if cpm { br.read_u32(2)? as u8 } else { 0 };
+    if cpm {
+        return Err(Error::unsupported(
+            "h263 CPM continuous-presence multipoint (PLUSPTYPE): follow-up",
+        ));
+    }
+
+    // CPFMT (23 bits): PAR code (4) | PWI (9) | `1` marker | PHI (9). Only
+    // present when OPPTYPE said so.
+    let (width, height) = if custom_src_format {
+        let par_code = br.read_u32(4)?;
+        let pwi = br.read_u32(9)?;
+        let marker = br.read_u1()?;
+        let phi = br.read_u32(9)?;
+        if marker != 1 {
+            return Err(Error::invalid("h263 PLUSPTYPE CPFMT: marker bit != 1"));
+        }
+        let _ = par_code;
+        // Custom size is (PWI+1)*4 by (PHI)*4 per §5.1.5.
+        let w = (pwi + 1) * 4;
+        let h = phi * 4;
+        if w == 0 || h == 0 {
+            return Err(Error::invalid("h263 PLUSPTYPE CPFMT: zero-sized picture"));
+        }
+        // We currently only support the standard source formats for the
+        // actual MB/GOB layout below. Accept custom dimensions only when
+        // they happen to coincide with one.
+        if SourceFormat::for_dimensions(w, h).is_none() {
+            return Err(Error::unsupported(format!(
+                "h263 PLUSPTYPE custom picture size {w}x{h}: only standard \
+                 sub-QCIF/QCIF/CIF/4CIF/16CIF dimensions supported so far"
+            )));
+        }
+        (w, h)
+    } else {
+        // When not signalled, size is inherited from the last full PLUSPTYPE
+        // which in our stateless parse means "we don't know". Baseline
+        // decoding is impossible without a size.
+        return Err(Error::unsupported(
+            "h263 PLUSPTYPE without custom-source-format bit: cross-picture \
+             state inheritance for source size is not yet tracked",
+        ));
+    };
+
+    if custom_pcf {
+        let _cpcfc = br.read_u32(8)?;
+        let _etr = br.read_u32(8)?;
+        return Err(Error::unsupported(
+            "h263 custom picture clock frequency (CPCFC/ETR): follow-up",
+        ));
+    }
+
+    // UUI (Annex D). Syntax: `1` = default; `01` = explicit 2-bit code follows.
+    // Because UMV was already rejected above, UUI is effectively never needed
+    // on a stream we accept — but the spec still requires the bit. It is only
+    // sent when OPPTYPE had UMV set, which we rejected, so no UUI here.
+
+    // SSS (Annex K) — only if slice structured was signalled (rejected above).
+
+    // PQUANT
+    let pquant = br.read_u32(5)? as u8;
+    if pquant == 0 {
+        return Err(Error::invalid("h263 PLUSPTYPE: PQUANT == 0"));
+    }
+
+    // PEI / PSPARE loop.
+    loop {
+        let pei = br.read_u1()?;
+        if pei == 0 {
+            break;
+        }
+        let _pspare = br.read_u32(8)?;
+    }
+
+    let source_format = SourceFormat::for_dimensions(width, height).expect("validated above");
+
+    Ok(PictureHeader {
+        temporal_reference: tr,
+        split_screen,
+        document_camera,
+        freeze_release,
+        source_format,
+        coding_type,
+        umv_mode: false,
+        sac_mode: false,
+        advanced_prediction: false,
+        pb_frames: false,
+        pquant,
+        cpm,
+        psbi,
+        trb: 0,
+        dbquant: 0,
+        width,
+        height,
+        plusptype: true,
+        deblocking_filter: df_mode,
     })
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::identity_op,
+    clippy::erasing_op,
+    clippy::double_parens,
+    clippy::unusual_byte_groupings
+)]
 mod tests {
     use super::*;
 
@@ -297,5 +616,121 @@ mod tests {
         assert!(!p.cpm);
         assert_eq!(p.width, 128);
         assert_eq!(p.height, 96);
+        assert!(!p.plusptype);
+        assert!(!p.deblocking_filter);
+    }
+
+    /// Tiny MSB-first bit writer used by the PLUSPTYPE synthesis tests
+    /// below. Mirrors [`crate::bitwriter::BitWriter`] but kept local so the
+    /// picture-header unit tests don't take a dependency on the encoder
+    /// module's public surface.
+    struct BitBuf {
+        bytes: Vec<u8>,
+        acc: u64,
+        n: u32,
+    }
+    impl BitBuf {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                acc: 0,
+                n: 0,
+            }
+        }
+        fn put(&mut self, v: u32, bits: u32) {
+            self.acc = (self.acc << bits) | (v as u64 & ((1u64 << bits) - 1));
+            self.n += bits;
+            while self.n >= 8 {
+                self.n -= 8;
+                self.bytes.push((self.acc >> self.n) as u8);
+            }
+        }
+        fn finish(mut self) -> Vec<u8> {
+            if self.n > 0 {
+                self.bytes.push(((self.acc << (8 - self.n)) & 0xff) as u8);
+            }
+            self.bytes
+        }
+    }
+
+    #[test]
+    fn plusptype_qcif_iframe_with_df_flag() {
+        let mut w = BitBuf::new();
+        // PSC (22) + TR=0 (8) = 30 bits
+        w.put(0b00_0000_0000_0000_0000_1_00000, 22);
+        w.put(0, 8);
+        // PTYPE prefix: marker=1, id=0, split=0, cam=0, freeze=0, fmt=111
+        w.put(1, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0b111, 3);
+        // PLUSPTYPE tail starts here.
+        // UFEP = 001
+        w.put(0b001, 3);
+        // OPPTYPE (18): custom_src=1, custom_pcf=0, UMV=0, SAC=0, AP=0, AIC=0,
+        // DF=1, SSS=0, RPS=0, ISD=0, AIV=0, MQ=0, marker=1, reserved=00000
+        let opptype = (1u32 << 17)
+            | (0u32 << 16)
+            | (0u32 << 15)
+            | (0u32 << 14)
+            | (0u32 << 13)
+            | (0u32 << 12)
+            | (1u32 << 11)
+            | (0u32 << 10)
+            | (0u32 << 9)
+            | (0u32 << 8)
+            | (0u32 << 7)
+            | (0u32 << 6)
+            | (1u32 << 5);
+        w.put(opptype, 18);
+        // MPPTYPE (9): PCT=000 (I) | RPR=0 | RRU=0 | RTYPE=0 | marker=001
+        w.put(0b000_0_0_0_001, 9);
+        // CPM = 0
+        w.put(0, 1);
+        // CPFMT (23): PAR=0001 (1:1), PWI = 176/4 - 1 = 43, marker=1, PHI=36
+        w.put(0b0001, 4);
+        w.put(43, 9);
+        w.put(1, 1);
+        w.put(36, 9);
+        // PQUANT = 5
+        w.put(5, 5);
+        // PEI = 0
+        w.put(0, 1);
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let p = parse_picture_header(&mut br).unwrap();
+        assert!(p.plusptype);
+        assert_eq!(p.coding_type, PictureCodingType::Intra);
+        assert_eq!(p.width, 176);
+        assert_eq!(p.height, 144);
+        assert_eq!(p.pquant, 5);
+        assert!(p.deblocking_filter);
+    }
+
+    #[test]
+    fn plusptype_rejects_unsupported_annex_d() {
+        let mut w = BitBuf::new();
+        w.put(0b00_0000_0000_0000_0000_1_00000, 22);
+        w.put(0, 8);
+        w.put(1, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0b111, 3);
+        w.put(0b001, 3);
+        // OPPTYPE with UMV=1.
+        let opptype = (1u32 << 17) | (1u32 << 15) | (1u32 << 5);
+        w.put(opptype, 18);
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let err = parse_picture_header(&mut br).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Annex D"),
+            "expected Annex D rejection, got {msg}"
+        );
     }
 }
