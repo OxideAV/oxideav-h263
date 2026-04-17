@@ -1,19 +1,19 @@
 [package]
 name = "oxideav-h263"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
+version = "0.0.3"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-h263"
+authors = ["Mark Karpeles"]
 description = "Pure-Rust ITU-T H.263 baseline video decoder for oxideav"
 
 readme = "README.md"
-homepage.workspace = true
+homepage = "https://github.com/OxideAV/oxideav-h263"
 keywords = ["multimedia", "video", "h263", "codec", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]
-oxideav-core = { workspace = true }
-oxideav-codec = { workspace = true }
-oxideav-mpeg4video = { workspace = true }
+oxideav-core = "0.0"
+oxideav-codec = "0.0"
+oxideav-mpeg4video = "0.0"
