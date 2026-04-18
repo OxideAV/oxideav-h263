@@ -4,7 +4,7 @@
 //! `oxideav-mpeg4video`: bits are packed MSB-first within each byte. After all
 //! data is written, `finish()` zero-pads the trailing partial byte.
 //!
-//! Lifted verbatim from `oxideav-mpeg1video::bitwriter` — duplicated rather
+//! Lifted verbatim from `oxideav-mpeg12video::bitwriter` — duplicated rather
 //! than depended on so the H.263 crate does not cross-depend on MPEG-1.
 
 pub struct BitWriter {
