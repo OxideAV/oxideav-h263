@@ -62,7 +62,7 @@ pub mod motion;
 pub mod picture;
 pub mod start_code;
 
-use oxideav_codec::CodecRegistry;
+use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 
 /// The canonical oxideav codec id for ITU-T H.263 baseline video.
@@ -73,24 +73,29 @@ pub const CODEC_ID_STR: &str = "h263";
 
 /// Register the H.263 decoder + I-picture encoder with a codec registry.
 pub fn register(reg: &mut CodecRegistry) {
-    let dec_caps = CodecCapabilities::video("h263_sw")
+    let caps = CodecCapabilities::video("h263_sw")
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(1408, 1152);
-    let cid = CodecId::new(CODEC_ID_STR);
-    reg.register_decoder_impl(cid.clone(), dec_caps, decoder::make_decoder);
-    let enc_caps = CodecCapabilities::video("h263_sw")
-        .with_lossy(true)
-        .with_intra_only(false)
-        .with_max_size(1408, 1152);
-    reg.register_encoder_impl(cid.clone(), enc_caps, encoder::make_encoder);
-
     // AVI FourCC claims — H.263 baseline + the vendor-prefixed variants
     // from ITU-T Annex X encoders (VivoActive, UB Video, Intel, etc.).
     // All unambiguous.
-    for fcc in &[
-        b"H263", b"U263", b"M263", b"ILVR", b"VX1K", b"VIV1", b"X263", b"T263", b"S263", b"L263",
-    ] {
-        reg.claim_tag(cid.clone(), CodecTag::fourcc(fcc), 10, None);
-    }
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(decoder::make_decoder)
+            .encoder(encoder::make_encoder)
+            .tags([
+                CodecTag::fourcc(b"H263"),
+                CodecTag::fourcc(b"U263"),
+                CodecTag::fourcc(b"M263"),
+                CodecTag::fourcc(b"ILVR"),
+                CodecTag::fourcc(b"VX1K"),
+                CodecTag::fourcc(b"VIV1"),
+                CodecTag::fourcc(b"X263"),
+                CodecTag::fourcc(b"T263"),
+                CodecTag::fourcc(b"S263"),
+                CodecTag::fourcc(b"L263"),
+            ]),
+    );
 }
