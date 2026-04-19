@@ -63,7 +63,7 @@ pub mod picture;
 pub mod start_code;
 
 use oxideav_codec::CodecRegistry;
-use oxideav_core::{CodecCapabilities, CodecId};
+use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 
 /// The canonical oxideav codec id for ITU-T H.263 baseline video.
 ///
@@ -77,10 +77,20 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(1408, 1152);
-    reg.register_decoder_impl(CodecId::new(CODEC_ID_STR), dec_caps, decoder::make_decoder);
+    let cid = CodecId::new(CODEC_ID_STR);
+    reg.register_decoder_impl(cid.clone(), dec_caps, decoder::make_decoder);
     let enc_caps = CodecCapabilities::video("h263_sw")
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(1408, 1152);
-    reg.register_encoder_impl(CodecId::new(CODEC_ID_STR), enc_caps, encoder::make_encoder);
+    reg.register_encoder_impl(cid.clone(), enc_caps, encoder::make_encoder);
+
+    // AVI FourCC claims — H.263 baseline + the vendor-prefixed variants
+    // from ITU-T Annex X encoders (VivoActive, UB Video, Intel, etc.).
+    // All unambiguous.
+    for fcc in &[
+        b"H263", b"U263", b"M263", b"ILVR", b"VX1K", b"VIV1", b"X263", b"T263", b"S263", b"L263",
+    ] {
+        reg.claim_tag(cid.clone(), CodecTag::fourcc(fcc), 10, None);
+    }
 }
