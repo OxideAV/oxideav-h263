@@ -12,8 +12,8 @@ framework but usable standalone.
 
 ```toml
 [dependencies]
-oxideav-core = "0.0"
-oxideav-codec = "0.0"
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
 oxideav-h263 = "0.0"
 ```
 
