@@ -27,8 +27,8 @@
 //!      residual; add to the half-pel motion-compensated predictor then clip.
 //!    * Intra-in-P: same path as I-pictures (INTRADC + AC).
 
+use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
-use oxideav_mpeg4video::bitreader::BitReader;
 use oxideav_mpeg4video::tables::{cbpy, mcbpc, vlc};
 
 use crate::block::{decode_ac, decode_intradc, idct_and_clip};

@@ -43,7 +43,6 @@ use oxideav_core::{
 };
 use oxideav_mpeg4video::headers::vol::ZIGZAG;
 
-use crate::bitwriter::BitWriter;
 use crate::dct::fdct8x8;
 use crate::enc_tables::{write_cbpy, write_mcbpc_inter, write_mcbpc_intra, write_tcoef, PMbKind};
 use crate::interp::{predict_block, sad_block};
@@ -53,6 +52,7 @@ use crate::motion::{
     MV_RANGE_MIN_HALF,
 };
 use crate::picture::SourceFormat;
+use oxideav_core::bits::BitWriter;
 
 /// Default fixed quantiser (PQUANT) — `5` matches the
 /// `ffmpeg -qscale:v 5` baseline used to validate the existing decoder.

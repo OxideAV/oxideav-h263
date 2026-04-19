@@ -18,8 +18,8 @@
 //!   `|F''| = q * (2 * |level| + 1)`, with bit-0 cleared when `q` is even.
 //! INTRADC bypasses dequantisation — it's already in the correct domain.
 
+use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
-use oxideav_mpeg4video::bitreader::BitReader;
 use oxideav_mpeg4video::headers::vol::ZIGZAG;
 use oxideav_mpeg4video::tables::{
     tcoef::{inter_table, TcoefSym},

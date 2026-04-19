@@ -14,7 +14,7 @@
 //! sourced from FFmpeg's `ff_inter_vlc` / `ff_inter_run` / `ff_inter_level`
 //! arrays — so the encoded stream is bit-exact with what the decoder expects.
 
-use crate::bitwriter::BitWriter;
+use oxideav_core::bits::BitWriter;
 
 // Mirror of `oxideav_mpeg4video::tables::tcoef::INTER_LAST0_*` /
 // `INTER_LAST1_*`. Kept private — encoder-only consumers shouldn't need to
@@ -293,7 +293,7 @@ pub fn write_cbpy(bw: &mut BitWriter, cbpy: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_mpeg4video::bitreader::BitReader;
+    use oxideav_core::bits::BitReader;
     use oxideav_mpeg4video::tables::{
         cbpy as dec_cbpy, mcbpc as dec_mcbpc, tcoef as dec_tcoef, vlc,
     };

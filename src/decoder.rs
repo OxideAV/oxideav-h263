@@ -12,12 +12,12 @@
 use std::collections::VecDeque;
 
 use oxideav_codec::Decoder;
+use oxideav_core::bits::BitReader;
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Rational, Result, TimeBase,
     VideoFrame,
 };
-use oxideav_mpeg4video::bitreader::BitReader;
 
 use crate::gob::parse_gob_header;
 use crate::mb::{decode_intra_mb, decode_p_mb, IPicture};

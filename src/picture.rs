@@ -34,8 +34,8 @@
 //!
 //! GOB data immediately follows the header (no further alignment required).
 
+use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
-use oxideav_mpeg4video::bitreader::BitReader;
 
 /// H.263 source-format codes (PTYPE bits 6-8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,13 +196,7 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
     }
 
     if source_format == SourceFormat::Extended {
-        return parse_plusptype_tail(
-            br,
-            tr,
-            split_screen,
-            document_camera,
-            freeze_release,
-        );
+        return parse_plusptype_tail(br, tr, split_screen, document_camera, freeze_release);
     }
 
     let coding_bit = br.read_u1()?;
@@ -456,9 +450,7 @@ fn parse_plusptype_tail(
             ));
         }
         0b011 => {
-            return Err(Error::unsupported(
-                "h263 B-picture (PCT=011): follow-up",
-            ));
+            return Err(Error::unsupported("h263 B-picture (PCT=011): follow-up"));
         }
         0b100 => {
             return Err(Error::unsupported(

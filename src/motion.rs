@@ -22,11 +22,11 @@
 //! Cross-checked against libavcodec's `h263dec.c` MV parsing + `h263.c`
 //! median predictor.
 
+use oxideav_core::bits::BitReader;
 use oxideav_core::Result;
-use oxideav_mpeg4video::bitreader::BitReader;
 use oxideav_mpeg4video::tables::{mv as mv_tab, vlc};
 
-use crate::bitwriter::BitWriter;
+use oxideav_core::bits::BitWriter;
 
 /// Valid half-pel MV range for baseline H.263 (f_code == 1): each component
 /// lies in `[-32, +31]` half-pel units, i.e. `[-16, +15.5]` luma pels.

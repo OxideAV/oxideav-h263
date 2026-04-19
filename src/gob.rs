@@ -15,8 +15,8 @@
 //! the encoder may emit only the start codes it needs (typically none for
 //! short clips).
 
+use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
-use oxideav_mpeg4video::bitreader::BitReader;
 
 /// Parsed GOB header.
 #[derive(Clone, Debug)]
