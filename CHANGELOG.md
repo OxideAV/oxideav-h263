@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-h263/compare/v0.0.4...v0.0.5) - 2026-04-24
+
+### Other
+
+- Annex F — 4MV + OBMC encoder emission
+- Annex D PLUSPTYPE — Table D.3 MVD VLC + UUI range + Annex K detect
+- Annex E core — SAC arithmetic coder + every §E.8 cumul-freq model
+- Annex F — Advanced Prediction mode (4MV + OBMC decode)
+- Annex D — Unrestricted Motion Vectors (baseline PTYPE decode)
+
 ### Added
 
 - Annex F (Advanced Prediction — 4MV + OBMC) **encoder emission**, opt-in
