@@ -57,14 +57,25 @@
 //! * Reuses VLC tables and IDCT/dequantisation from `oxideav-mpeg4video`
 //!   (the MPEG-4 Part 2 VLCs are identical to the H.263 baseline ones).
 //!
+//! * **Annex E — Syntax-based Arithmetic Coding (core)**: the §E.2 / §E.3
+//!   arithmetic encoder + decoder and every §E.8 cumulative-frequency model
+//!   live in [`sac`]. The §E.5 PSC_FIFO emulation-prevention (14-zero
+//!   stuffing) is handled by [`sac::PscFifoWriter`] / [`sac::PscFifoReader`].
+//!   Round-trip unit tests walk every symbol of every model. End-to-end
+//!   integration with the picture / MB / block decoder is the next step;
+//!   until that wiring is in place, SAC-signalled streams are rejected at
+//!   the picture-header layer.
+//!
 //! Out of scope (returns `Error::Unsupported`):
 //! * PB-frames mode (§G) and every B-picture flavour.
 //! * Annex D in its PLUSPTYPE form (Table D.3 MVD VLC + UUI range selection).
-//! * Annex E (SAC), Annex G (PB-frames), Annex I (Advanced Intra Coding),
-//!   Annex K (Slice Structured Mode), Annex N (RPS), Annex P (Reference
-//!   Picture Resampling), Annex T (Modified Quantization). Annex F
-//!   encode-side (4MV / OBMC emission) is also out of scope — the encoder
-//!   still emits baseline-PTYPE 1-MV-per-MB streams.
+//! * Annex E wiring (VLC→SAC swap at the MB layer); the arithmetic coder
+//!   is implemented in [`sac`], but SAC-active streams are not yet driven.
+//! * Annex G (PB-frames), Annex I (Advanced Intra Coding), Annex K (Slice
+//!   Structured Mode), Annex N (RPS), Annex P (Reference Picture
+//!   Resampling), Annex T (Modified Quantization). Annex F encode-side
+//!   (4MV / OBMC emission) is also out of scope — the encoder still emits
+//!   baseline-PTYPE 1-MV-per-MB streams.
 //! * H.263+ custom picture clock frequency / custom picture sizes that don't
 //!   match one of the standard source formats (sub-QCIF/QCIF/CIF/4CIF/16CIF).
 //! * CPM continuous-presence multipoint mode.
@@ -86,6 +97,7 @@ pub mod interp;
 pub mod mb;
 pub mod motion;
 pub mod picture;
+pub mod sac;
 pub mod start_code;
 
 use oxideav_codec::{CodecInfo, CodecRegistry};

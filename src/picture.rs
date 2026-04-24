@@ -211,8 +211,14 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
     let pb_frames = br.read_u1()? == 1;
 
     if sac_mode {
+        // Annex E arithmetic coder + every §E.8 probability model are
+        // implemented in `crate::sac`, but the wiring that replaces VLC
+        // decodes at the MB / block layer with SAC calls is not yet in
+        // place. Reject the stream with a diagnostic that points at the
+        // actual integration gap rather than leaving callers guessing.
         return Err(Error::unsupported(
-            "h263 Annex E syntax-based arithmetic coding: follow-up",
+            "h263 Annex E syntax-based arithmetic coding: MB-layer wiring \
+             pending (arithmetic coder lives in crate::sac)",
         ));
     }
     // Annex F (Advanced Prediction — 4MV + OBMC) is accepted on baseline
@@ -385,7 +391,8 @@ fn parse_plusptype_tail(
         }
         if sac {
             return Err(Error::unsupported(
-                "h263 Annex E syntax-based arithmetic coding (PLUSPTYPE): follow-up",
+                "h263 Annex E syntax-based arithmetic coding (PLUSPTYPE): \
+                 MB-layer wiring pending (arithmetic coder lives in crate::sac)",
             ));
         }
         // Annex F AP in PLUSPTYPE — accepted, same 4MV/OBMC path as the
