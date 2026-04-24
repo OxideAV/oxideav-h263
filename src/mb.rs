@@ -34,12 +34,61 @@ use oxideav_mpeg4video::tables::{cbpy, mcbpc, vlc};
 use crate::block::{decode_ac, decode_intradc, idct_and_clip};
 use crate::interp::predict_block;
 use crate::motion::{
-    chroma_mv_4mv, decode_mv_component_umv, luma_to_chroma_mv, predict_mv_block_with_gob_mask,
-    predict_mv_with_gob_mask, MbMotion, MvGrid, OBMC_H0, OBMC_H1, OBMC_H2,
+    chroma_mv_4mv, consume_mvd_pair_sce_bit, decode_mv_component_umv, luma_to_chroma_mv,
+    predict_mv_block_with_gob_mask, predict_mv_with_gob_mask, MbMotion, MvGrid, OBMC_H0, OBMC_H1,
+    OBMC_H2,
 };
 
 /// Signed `dquant` adjustment — Table 12/H.263. 2-bit code indexes `[-1, -2, 1, 2]`.
 const DQUANT_DELTA: [i32; 4] = [-1, -2, 1, 2];
+
+/// Per-picture MV-decode mode, plumbed from the picture-header UMV flags to
+/// the MB decoder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UmvMode {
+    /// UMV off — Table 14 VLC, range folded into `[-32, +31]` halfpel.
+    #[default]
+    Off,
+    /// UMV on, baseline PTYPE form (no PLUSPTYPE): Table 14 VLC + §D.2
+    /// sign-of-predictor reconstruction. See
+    /// [`crate::motion::decode_mv_component_umv`].
+    BaselinePtype,
+    /// UMV on, PLUSPTYPE form: Table D.3 VLC + direct reconstruction
+    /// (`predictor + differential`) + MVD-pair SCE stuffing bit after
+    /// `(+1,+1)` halfpel pairs.
+    ///
+    /// `h_limit` / `v_limit` are the per-axis UMV range for UUI="1"
+    /// (Tables D.1 / D.2 of H.263) or `None` for UUI="01" (range
+    /// unlimited except by picture size, which we do not enforce here).
+    PlusPtype {
+        h_limit: Option<(i32, i32)>,
+        v_limit: Option<(i32, i32)>,
+    },
+}
+
+impl UmvMode {
+    /// Convert a decoded [`crate::picture::PictureHeader`] into the
+    /// MV-decode mode used by `decode_p_mb` / `decode_p_mb_pass1`.
+    pub fn from_header(hdr: &crate::picture::PictureHeader) -> Self {
+        if !hdr.umv_mode {
+            return UmvMode::Off;
+        }
+        if !hdr.plusptype {
+            return UmvMode::BaselinePtype;
+        }
+        if hdr.uui_unlimited {
+            UmvMode::PlusPtype {
+                h_limit: None,
+                v_limit: None,
+            }
+        } else {
+            UmvMode::PlusPtype {
+                h_limit: Some(crate::motion::uui_limit_range_halfpel(hdr.width)),
+                v_limit: Some(crate::motion::uui_limit_range_halfpel(hdr.height)),
+            }
+        }
+    }
+}
 
 /// Reconstructed I-picture: three pel planes (Y, Cb, Cr), MB-aligned, stride
 /// equal to MB-aligned width.
@@ -264,7 +313,7 @@ pub fn decode_p_mb_pass1(
     quant_in: u32,
     pic: &mut IPicture,
     mv_grid: &mut MvGrid,
-    umv: bool,
+    umv: UmvMode,
     advanced_prediction: bool,
     gob_top_row: bool,
 ) -> Result<(u32, PMbInfo)> {
@@ -325,8 +374,7 @@ pub fn decode_p_mb_pass1(
         mv_grid.set(mb_x, mb_y, MbMotion::mv4([(0, 0); 4]));
         for b in 0..4 {
             let (px, py) = predict_mv_block_with_gob_mask(mv_grid, mb_x, mb_y, b, gob_top_row);
-            let mvx = decode_mv_component_umv(br, px, umv)?;
-            let mvy = decode_mv_component_umv(br, py, umv)?;
+            let (mvx, mvy) = decode_mv_pair(br, px, py, umv)?;
             mvs[b] = (mvx, mvy);
             // Update partial mvs4 so subsequent block predictors see it.
             let mut cur = mv_grid.get(mb_x, mb_y);
@@ -337,8 +385,7 @@ pub fn decode_p_mb_pass1(
         mv_grid.set(mb_x, mb_y, MbMotion::mv4(mvs));
     } else {
         let (px, py) = predict_mv_with_gob_mask(mv_grid, mb_x, mb_y, gob_top_row);
-        let mvx = decode_mv_component_umv(br, px, umv)?;
-        let mvy = decode_mv_component_umv(br, py, umv)?;
+        let (mvx, mvy) = decode_mv_pair(br, px, py, umv)?;
         mv_grid.set(mb_x, mb_y, MbMotion::mv1((mvx, mvy), true, false));
     }
 
@@ -472,7 +519,10 @@ pub fn apply_p_mb_reconstruction(
     let (cmx, cmy) = if advanced_prediction && motion.four_mv {
         chroma_mv_4mv(&motion.mvs4)
     } else {
-        (luma_to_chroma_mv(motion.mv.0), luma_to_chroma_mv(motion.mv.1))
+        (
+            luma_to_chroma_mv(motion.mv.0),
+            luma_to_chroma_mv(motion.mv.1),
+        )
     };
 
     let ref_c_h = reference.cb.len() / reference.c_stride;
@@ -564,8 +614,7 @@ fn obmc_luma_block(
     // using the top-neighbour MV and bottom-neighbour MV respectively and
     // pick per row in the weighted sum.
     let mv_top = obmc_remote_mv_vertical(mv_grid, mb_x, mb_y, block_idx, mv0, VerticalSide::Top);
-    let mv_bot =
-        obmc_remote_mv_vertical(mv_grid, mb_x, mb_y, block_idx, mv0, VerticalSide::Bottom);
+    let mv_bot = obmc_remote_mv_vertical(mv_grid, mb_x, mb_y, block_idx, mv0, VerticalSide::Bottom);
     let mut r_top_pred = [0u8; 64];
     let mut r_bot_pred = [0u8; 64];
     predict_block(
@@ -847,12 +896,59 @@ pub fn decode_p_mb(
     pic: &mut IPicture,
     reference: &IPicture,
     mv_grid: &mut MvGrid,
-    umv: bool,
+    umv: UmvMode,
 ) -> Result<u32> {
     let (quant, info) =
         decode_p_mb_pass1(br, mb_x, mb_y, quant_in, pic, mv_grid, umv, false, false)?;
     apply_p_mb_reconstruction(mb_x, mb_y, pic, reference, mv_grid, &info, false);
     Ok(quant)
+}
+
+/// Decode a pair `(mvx, mvy)` for a single MVD codeword, dispatching over
+/// [`UmvMode`]. Under PLUSPTYPE+UMV, the MVD-pair start-code-emulation
+/// stuffing bit (§D.2 last paragraph) is consumed after both components
+/// have been decoded and the differentials happen to be `(+1, +1)` halfpel
+/// (i.e. six consecutive zero bits in the code stream).
+fn decode_mv_pair(br: &mut BitReader<'_>, px: i32, py: i32, umv: UmvMode) -> Result<(i32, i32)> {
+    match umv {
+        UmvMode::Off => {
+            let mvx = decode_mv_component_umv(br, px, false)?;
+            let mvy = decode_mv_component_umv(br, py, false)?;
+            Ok((mvx, mvy))
+        }
+        UmvMode::BaselinePtype => {
+            let mvx = decode_mv_component_umv(br, px, true)?;
+            let mvy = decode_mv_component_umv(br, py, true)?;
+            Ok((mvx, mvy))
+        }
+        UmvMode::PlusPtype { h_limit, v_limit } => {
+            // Table D.3 differentials are decoded directly (no wrap); the
+            // reconstructed vector is `predictor + diff`. We re-read the
+            // per-component differential to pass the same value into the
+            // SCE stuffing check below — component helper returns the
+            // reconstructed MV but not the diff, so inline the decode.
+            let diff_x = crate::motion::decode_mvd_table_d3(br)?;
+            let diff_y = crate::motion::decode_mvd_table_d3(br)?;
+            consume_mvd_pair_sce_bit(br, diff_x, diff_y)?;
+            let mvx = px + diff_x;
+            let mvy = py + diff_y;
+            if let Some((lo, hi)) = h_limit {
+                if mvx < lo || mvx > hi {
+                    return Err(Error::invalid(format!(
+                        "h263 Annex D PLUSPTYPE: horizontal MV {mvx} halfpel out of range [{lo}, {hi}]"
+                    )));
+                }
+            }
+            if let Some((lo, hi)) = v_limit {
+                if mvy < lo || mvy > hi {
+                    return Err(Error::invalid(format!(
+                        "h263 Annex D PLUSPTYPE: vertical MV {mvy} halfpel out of range [{lo}, {hi}]"
+                    )));
+                }
+            }
+            Ok((mvx, mvy))
+        }
+    }
 }
 
 /// Intra block decode when the MB is an embedded intra inside a P-picture.
@@ -883,4 +979,3 @@ fn decode_one_intra_block_in_p(
     write_block_to_picture(pic, block_idx, mb_x, mb_y, &out);
     Ok(())
 }
-

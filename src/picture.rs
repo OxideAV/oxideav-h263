@@ -151,6 +151,10 @@ pub struct PictureHeader {
     /// is set; baseline streams cannot signal DF inside the bitstream and
     /// leave this at `false`. Mirrors the `DF` bit of OPPTYPE.
     pub deblocking_filter: bool,
+    /// UUI = "01" — unlimited range (§5.1.9). Only meaningful when UMV is on
+    /// in a PLUSPTYPE header. `false` means "UUI = 1" (range limited per
+    /// Tables D.1/D.2) or UMV off.
+    pub uui_unlimited: bool,
 }
 
 /// Parse the picture header that follows the 22-bit PSC.
@@ -281,6 +285,7 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
         height,
         plusptype: false,
         deblocking_filter: false,
+        uui_unlimited: false,
     })
 }
 
@@ -353,108 +358,109 @@ fn parse_plusptype_tail(
     //   Bit 14:   MQ  (Annex T modified quantization).
     //   Bit 15:   Marker, must be "1".
     //   Bits 16-18: Reserved, must be "000".
-    let (opptype_src_format, custom_src_format, custom_pcf, umv_mode, df_mode, ap_mode) = if ufep
-        == 0b001
-    {
-        let opptype = br.read_u32(18)?;
-        // MSB-first helpers: `bit(k)` returns the k-th spec bit
-        // (1-indexed, where 1 is the MSB of the 18-bit field).
-        let bit = |k: u32| -> u32 { (opptype >> (18 - k)) & 1 };
-        let src_fmt_code = (opptype >> (18 - 3)) & 0b111;
-        let custom_pcf = bit(4) != 0;
-        let umv = bit(5) != 0;
-        let sac = bit(6) != 0;
-        let ap = bit(7) != 0;
-        let aic = bit(8) != 0;
-        let df = bit(9) != 0;
-        let sss = bit(10) != 0;
-        let rps = bit(11) != 0;
-        let isd = bit(12) != 0;
-        let aiv = bit(13) != 0;
-        let mq = bit(14) != 0;
-        let marker = bit(15);
-        // Reserved bits 16..=18 must all be zero.
-        let reserved = (opptype & 0b111) as u8;
-        if marker != 1 {
-            return Err(Error::invalid("h263 PLUSPTYPE: OPPTYPE marker bit != 1"));
-        }
-        if reserved != 0 {
-            return Err(Error::invalid(format!(
-                "h263 PLUSPTYPE: OPPTYPE reserved bits != 000 (got {reserved:03b})"
-            )));
-        }
-        let custom_src = src_fmt_code == 0b110;
-        if src_fmt_code == 0b000 || src_fmt_code == 0b111 {
-            return Err(Error::invalid(format!(
-                "h263 PLUSPTYPE: reserved OPPTYPE source format {src_fmt_code:03b}"
-            )));
-        }
-        if sac {
-            return Err(Error::unsupported(
-                "h263 Annex E syntax-based arithmetic coding (PLUSPTYPE): \
+    let (opptype_src_format, custom_src_format, custom_pcf, umv_mode, df_mode, ap_mode) =
+        if ufep == 0b001 {
+            let opptype = br.read_u32(18)?;
+            // MSB-first helpers: `bit(k)` returns the k-th spec bit
+            // (1-indexed, where 1 is the MSB of the 18-bit field).
+            let bit = |k: u32| -> u32 { (opptype >> (18 - k)) & 1 };
+            let src_fmt_code = (opptype >> (18 - 3)) & 0b111;
+            let custom_pcf = bit(4) != 0;
+            let umv = bit(5) != 0;
+            let sac = bit(6) != 0;
+            let ap = bit(7) != 0;
+            let aic = bit(8) != 0;
+            let df = bit(9) != 0;
+            let sss = bit(10) != 0;
+            let rps = bit(11) != 0;
+            let isd = bit(12) != 0;
+            let aiv = bit(13) != 0;
+            let mq = bit(14) != 0;
+            let marker = bit(15);
+            // Reserved bits 16..=18 must all be zero.
+            let reserved = (opptype & 0b111) as u8;
+            if marker != 1 {
+                return Err(Error::invalid("h263 PLUSPTYPE: OPPTYPE marker bit != 1"));
+            }
+            if reserved != 0 {
+                return Err(Error::invalid(format!(
+                    "h263 PLUSPTYPE: OPPTYPE reserved bits != 000 (got {reserved:03b})"
+                )));
+            }
+            let custom_src = src_fmt_code == 0b110;
+            if src_fmt_code == 0b000 || src_fmt_code == 0b111 {
+                return Err(Error::invalid(format!(
+                    "h263 PLUSPTYPE: reserved OPPTYPE source format {src_fmt_code:03b}"
+                )));
+            }
+            if sac {
+                return Err(Error::unsupported(
+                    "h263 Annex E syntax-based arithmetic coding (PLUSPTYPE): \
                  MB-layer wiring pending (arithmetic coder lives in crate::sac)",
-            ));
-        }
-        // Annex F AP in PLUSPTYPE — accepted, same 4MV/OBMC path as the
-        // baseline PTYPE form. `advanced_prediction` is reflected back to
-        // the caller via the returned `PictureHeader`.
-        if aic {
-            return Err(Error::unsupported(
-                "h263 Annex I advanced intra coding (PLUSPTYPE): follow-up",
-            ));
-        }
-        if sss {
-            return Err(Error::unsupported(
-                "h263 Annex K slice structured mode: follow-up",
-            ));
-        }
-        if rps {
-            return Err(Error::unsupported(
-                "h263 Annex N reference picture selection: follow-up",
-            ));
-        }
-        if isd {
-            return Err(Error::unsupported(
-                "h263 Annex R independent segment decoding: follow-up",
-            ));
-        }
-        if aiv {
-            return Err(Error::unsupported(
-                "h263 Annex S alternative inter VLC: follow-up",
-            ));
-        }
-        if mq {
-            return Err(Error::unsupported(
-                "h263 Annex T modified quantization: follow-up",
-            ));
-        }
-        if umv {
-            // PLUSPTYPE + UMV requires Table D.3 (§D.2) instead of Table 14
-            // for the MV differential VLC. That table is not yet
-            // implemented — reject these streams with a specific
-            // diagnostic so callers can fall back.
-            return Err(Error::unsupported(
-                "h263 Annex D unrestricted MV mode in PLUSPTYPE form (Table D.3): follow-up",
-            ));
-        }
-        (src_fmt_code as u8, custom_src, custom_pcf, umv, df, ap)
-    } else if ufep == 0b000 {
-        // Inherit previous-picture OPPTYPE state. Since we do not yet retain
-        // OPPTYPE across pictures, we treat the inherited state as "baseline
-        // with DF and custom format both off" — the same default a freshly
-        // constructed decoder would pick. This is good enough for streams
-        // whose very first PLUSPTYPE picture supplies a full OPPTYPE and
-        // whose subsequent P-pictures keep the same options (the common
-        // case); anything else will diverge downstream on the first feature
-        // bit that actually matters. `opptype_src_format = 0` signals
-        // "no OPPTYPE, dimensions must be inferable from later CPFMT (which
-        // in turn will not be present for UFEP==000)".
-        (0, false, false, false, false, false)
-    } else {
-        return Err(Error::invalid(format!(
-            "h263 PLUSPTYPE: invalid UFEP {ufep:03b}"
-        )));
-    };
+                ));
+            }
+            // Annex F AP in PLUSPTYPE — accepted, same 4MV/OBMC path as the
+            // baseline PTYPE form. `advanced_prediction` is reflected back to
+            // the caller via the returned `PictureHeader`.
+            if aic {
+                return Err(Error::unsupported(
+                    "h263 Annex I advanced intra coding (PLUSPTYPE): follow-up",
+                ));
+            }
+            // Annex K (Slice Structured mode) is detected here with a specific
+            // diagnostic. ffmpeg's `h263p -umv 1` bundles this with Annex D+UMV,
+            // so decoders that want to reach the MVD VLC layer need to bail out
+            // at the picture header rather than silently misread slice headers
+            // as GOB headers.
+            if sss {
+                return Err(Error::unsupported(
+                    "h263 Annex K slice structured mode: follow-up (bit 10 of OPPTYPE; \
+                 slice headers replace GOB headers per §K.2)",
+                ));
+            }
+            if rps {
+                return Err(Error::unsupported(
+                    "h263 Annex N reference picture selection: follow-up",
+                ));
+            }
+            if isd {
+                return Err(Error::unsupported(
+                    "h263 Annex R independent segment decoding: follow-up",
+                ));
+            }
+            if aiv {
+                return Err(Error::unsupported(
+                    "h263 Annex S alternative inter VLC: follow-up",
+                ));
+            }
+            if mq {
+                return Err(Error::unsupported(
+                    "h263 Annex T modified quantization: follow-up",
+                ));
+            }
+            // PLUSPTYPE + UMV: Table D.3 MVD VLC + UUI + direct `predictor +
+            // differential` reconstruction (no sign-of-predictor cascade). Both
+            // encode and decode paths are in `crate::motion`; wired into
+            // `decode_p_mb` / `decode_p_mb_pass1` below via the `umv_plusptype`
+            // flag on `PictureHeader`.
+            (src_fmt_code as u8, custom_src, custom_pcf, umv, df, ap)
+        } else if ufep == 0b000 {
+            // Inherit previous-picture OPPTYPE state. Since we do not yet retain
+            // OPPTYPE across pictures, we treat the inherited state as "baseline
+            // with DF and custom format both off" — the same default a freshly
+            // constructed decoder would pick. This is good enough for streams
+            // whose very first PLUSPTYPE picture supplies a full OPPTYPE and
+            // whose subsequent P-pictures keep the same options (the common
+            // case); anything else will diverge downstream on the first feature
+            // bit that actually matters. `opptype_src_format = 0` signals
+            // "no OPPTYPE, dimensions must be inferable from later CPFMT (which
+            // in turn will not be present for UFEP==000)".
+            (0, false, false, false, false, false)
+        } else {
+            return Err(Error::invalid(format!(
+                "h263 PLUSPTYPE: invalid UFEP {ufep:03b}"
+            )));
+        };
 
     // MPPTYPE (9 bits): PCT(3) | RPR(1) | RRU(1) | RTYPE(1) | `001` marker
     let mpptype = br.read_u32(9)?;
@@ -573,12 +579,14 @@ fn parse_plusptype_tail(
 
     // UUI (Annex D) — variable-length, 1 or 2 bits, only present when OPPTYPE
     // had UMV set. "1" → range limited per Tables D.1/D.2. "01" → range
-    // unlimited except by picture size (§5.1.9). UMV in the PLUSPTYPE path
-    // is rejected above because it requires Table D.3 for the MVD VLC, so
-    // the body below never actually triggers on an accepted stream — but
-    // we keep the parse shape correct so that the pattern remains useful
-    // once Table D.3 lands.
-    let _uui_unlimited = if umv_mode {
+    // unlimited except by picture size (§5.1.9). Table D.3 is used for the
+    // MVD VLC regardless of UUI setting (see `motion::decode_mvd_table_d3`).
+    //
+    // UUI is present only when `ufep == 001` per §5.1.9; inherited otherwise.
+    // In the UFEP=000 branch above we reject with an Unsupported diagnostic,
+    // so by the time we get here `ufep == 001` is guaranteed when `umv_mode`
+    // is true.
+    let uui_unlimited = if umv_mode {
         let first = br.read_u1()?;
         if first == 1 {
             false
@@ -632,6 +640,7 @@ fn parse_plusptype_tail(
         height,
         plusptype: true,
         deblocking_filter: df_mode,
+        uui_unlimited,
     })
 }
 
@@ -744,7 +753,7 @@ mod tests {
             | b(13, aiv as u32)
             | b(14, mq as u32)
             | b(15, 1) // marker
-            // bits 16-18 = reserved 0.
+                       // bits 16-18 = reserved 0.
     }
 
     #[test]
@@ -788,11 +797,13 @@ mod tests {
         assert!(p.deblocking_filter);
     }
 
-    /// PLUSPTYPE path currently rejects UMV with a specific diagnostic
-    /// pointing to Table D.3 (Annex D in PLUSPTYPE form requires that
-    /// alternative VLC, which isn't implemented yet).
+    /// PLUSPTYPE + UMV is now accepted — Table D.3 VLC is implemented in
+    /// `motion::decode_mvd_table_d3`. The header parse must complete and
+    /// consume the UUI prefix (default `1` → limited range per Tables
+    /// D.1/D.2). I-picture body is ignored by the test; we only validate
+    /// the header fields.
     #[test]
-    fn plusptype_umv_rejected_with_table_d3_diagnostic() {
+    fn plusptype_umv_accepted_with_table_d3() {
         let mut w = BitBuf::new();
         w.put(0b00_0000_0000_0000_0000_1_00000, 22);
         w.put(0, 8);
@@ -808,11 +819,82 @@ mod tests {
             0b010, false, true, false, false, false, false, false, false, false, false, false,
         );
         w.put(opptype, 18);
+        // MPPTYPE: PCT=000 (I) | RPR=0 | RRU=0 | RTYPE=0 | marker=001
+        w.put(0b000_0_0_0_001, 9);
+        // CPM = 0
+        w.put(0, 1);
+        // UUI = "1" → limited range.
+        w.put(1, 1);
+        // PQUANT = 5
+        w.put(5, 5);
+        // PEI = 0
+        w.put(0, 1);
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let p = parse_picture_header(&mut br).expect("PLUSPTYPE+UMV must parse");
+        assert!(p.plusptype);
+        assert!(p.umv_mode);
+        assert!(!p.uui_unlimited);
+        assert_eq!(p.source_format, SourceFormat::Qcif);
+    }
+
+    /// PLUSPTYPE + UMV with UUI = "01" → unlimited range flag latches.
+    #[test]
+    fn plusptype_umv_uui_unlimited_latches() {
+        let mut w = BitBuf::new();
+        w.put(0b00_0000_0000_0000_0000_1_00000, 22);
+        w.put(0, 8);
+        w.put(1, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0b111, 3);
+        w.put(0b001, 3);
+        let opptype = pack_opptype(
+            0b010, false, true, false, false, false, false, false, false, false, false, false,
+        );
+        w.put(opptype, 18);
+        w.put(0b000_0_0_0_001, 9); // MPPTYPE I
+        w.put(0, 1); // CPM
+                     // UUI = "01"
+        w.put(0, 1);
+        w.put(1, 1);
+        w.put(5, 5); // PQUANT
+        w.put(0, 1); // PEI
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let p = parse_picture_header(&mut br).expect("PLUSPTYPE+UMV must parse");
+        assert!(p.plusptype);
+        assert!(p.umv_mode);
+        assert!(p.uui_unlimited);
+    }
+
+    /// Annex K (slice structured) in PLUSPTYPE must still surface a specific
+    /// diagnostic naming the annex — the slice layer syntax replaces GOB
+    /// headers with SSC start codes, and we don't yet track that.
+    #[test]
+    fn plusptype_slice_structured_rejected() {
+        let mut w = BitBuf::new();
+        w.put(0b00_0000_0000_0000_0000_1_00000, 22);
+        w.put(0, 8);
+        w.put(1, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0b111, 3);
+        w.put(0b001, 3);
+        // OPPTYPE: src_fmt=010 (QCIF), SSS=1 (bit 10 of OPPTYPE).
+        let opptype = pack_opptype(
+            0b010, false, false, false, false, false, false, true, false, false, false, false,
+        );
+        w.put(opptype, 18);
         let data = w.finish();
         let mut br = BitReader::new(&data);
         let err = parse_picture_header(&mut br).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("Table D.3"), "got {msg}");
+        assert!(msg.contains("Annex K"), "got {msg}");
     }
 
     /// Baseline PTYPE (no PLUSPTYPE) with UMV enabled should now parse — the

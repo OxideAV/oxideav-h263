@@ -119,8 +119,6 @@ fn compare_with_and_without_obmc() {
         } else {
             10.0 * (255.0 * 255.0 / mse).log10()
         };
-        eprintln!(
-            "no-OBMC frame {i:2}: Y-only psnr={psnr:.2} dB, max={max_diff}, sum={sum_diff}"
-        );
+        eprintln!("no-OBMC frame {i:2}: Y-only psnr={psnr:.2} dB, max={max_diff}, sum={sum_diff}");
     }
 }

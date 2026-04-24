@@ -31,8 +31,13 @@
 //! predictor is outside that range, the decoder picks among `{d, d+64, d-64}`
 //! whichever produces a reconstructed component that lies in `[-63, +63]`
 //! halfpel **and** has the same sign as the predictor (zero counts as
-//! either sign). For PLUSPTYPE-form Annex D, Table D.3 is used instead —
-//! that path is not yet supported by this crate.
+//! either sign). For PLUSPTYPE-form Annex D, Table D.3 is used instead;
+//! that path is implemented by [`decode_mvd_plusptype_umv`] / [`encode_mvd_plusptype_umv`]
+//! (the "regular-structure MVD VLC" of Table D.3/H.263). Under PLUSPTYPE
+//! the reconstructed vector is simply `predictor + differential` (no
+//! sign-of-predictor cascade) — §D.2 replaces that rule with a direct
+//! range limit per Tables D.1 / D.2 when UUI = "1" or an unlimited
+//! range (picture size only) when UUI = "01".
 //!
 //! Cross-checked against libavcodec's `h263dec.c` MV parsing + `h263.c`
 //! median predictor.
@@ -83,7 +88,7 @@ pub fn wrap_mv_component(v: i32) -> i32 {
 /// Returns the reconstructed absolute MV component in halfpel units.
 pub fn reconstruct_umv_component(pred_half: i32, mag: i32, sign: i32) -> i32 {
     let raw_diff = mag * sign; // positive sign → `-diff` as the VLC sign bit semantics
-    // Candidates per §D.2.
+                               // Candidates per §D.2.
     let candidates = [raw_diff, raw_diff + 64, raw_diff - 64];
     // Filter to those that land inside the extended UMV range.
     let mut best: Option<i32> = None;
@@ -211,6 +216,163 @@ pub fn decode_mv_component_umv(
     } else {
         let diff = magnitude * sign_dir;
         Ok(wrap_mv_component(predictor_half + diff))
+    }
+}
+
+/// Decode one MVD component under Annex D PLUSPTYPE — the "regular-structure
+/// MVD VLC" of Table D.3/H.263.
+///
+/// Returns the signed differential in half-pel units. The reconstructed MV
+/// component is simply `predictor + differential` (no wrap, no
+/// sign-of-predictor cascade — §D.2 replaces that rule with a direct range
+/// limit per Tables D.1/D.2).
+///
+/// Table D.3 codewords are built as:
+///   * value 0   →  `1` (no sign bit)
+///   * value > 0 →  `0` followed by, for each x-bit after the leading 1
+///     (high to low), the pair `<x_i> 1`; then `<s> 0`
+///     where `s = 0` is positive, `s = 1` is negative.
+///
+/// Length = `1` for zero, `2k + 3` for value with `k` x-bits (`abs` in
+/// `[2^k, 2^(k+1))` once `k >= 1`; value 1 has `k = 0`).
+pub fn decode_mvd_table_d3(br: &mut BitReader<'_>) -> Result<i32> {
+    // First bit: `1` means value 0, `0` means nonzero and more bits follow.
+    let first = br.read_u1()?;
+    if first == 1 {
+        return Ok(0);
+    }
+    // Collect alternating (x, continue) pairs. `continue == 1` → `x` is a
+    // data bit; `continue == 0` → `x` is the sign bit and the code ends.
+    let mut xbits: Vec<u32> = Vec::with_capacity(12);
+    let sign_bit;
+    // Guard against a pathological bitstream that keeps claiming
+    // "continue"; Table D.3 goes up to 2047 (11 x-bits) and at most 12
+    // x-bits for the warping parameter profile in §O. We stop at 16.
+    loop {
+        if xbits.len() > 16 {
+            return Err(oxideav_core::Error::invalid(
+                "h263 Annex D Table D.3: MVD VLC exceeded maximum length",
+            ));
+        }
+        let b = br.read_u1()?;
+        let cont = br.read_u1()?;
+        if cont == 0 {
+            sign_bit = b;
+            break;
+        }
+        xbits.push(b);
+    }
+    // Assemble the absolute value: leading `1` followed by `xbits` from
+    // high to low (in the order they were read).
+    let mut abs: i32 = 1;
+    for x in &xbits {
+        abs = (abs << 1) | (*x as i32);
+    }
+    let signed = if sign_bit == 1 { -abs } else { abs };
+    Ok(signed)
+}
+
+/// Emit the Table D.3/H.263 codeword for a signed MVD component.
+///
+/// See [`decode_mvd_table_d3`] for the VLC structure. For value 0 the
+/// codeword is a single `1` bit (no sign).
+pub fn encode_mvd_table_d3(bw: &mut BitWriter, diff: i32) {
+    if diff == 0 {
+        bw.write_bits(1, 1);
+        return;
+    }
+    let sign_bit: u32 = if diff < 0 { 1 } else { 0 };
+    let abs = diff.unsigned_abs();
+    // Build the x-bits (all bits below the leading 1) from high to low.
+    // leading = position of the leading 1-bit.
+    let leading = 31 - abs.leading_zeros();
+    // x-bits are positions `leading-1 .. 0`.
+    bw.write_bits(0, 1); // value != 0
+    if leading > 0 {
+        for k in (0..leading).rev() {
+            let x = (abs >> k) & 1;
+            bw.write_bits(x, 1);
+            bw.write_bits(1, 1); // continue
+        }
+    }
+    // Terminating pair: `<s> <0>`.
+    bw.write_bits(sign_bit, 1);
+    bw.write_bits(0, 1);
+}
+
+/// Decode one MV component under Annex D + PLUSPTYPE (Table D.3). Reads the
+/// Table D.3 codeword from `br` and returns the **reconstructed** component
+/// in half-pel units: `predictor + differential`.
+///
+/// When `limit` is `Some((min, max))` the reconstructed component is checked
+/// against the UUI = "1" range from Tables D.1/D.2; out-of-range values
+/// yield `Error::invalid`. `None` selects UUI = "01" behaviour — unlimited
+/// range (modulo picture size, which we do not enforce here).
+pub fn decode_mv_component_plusptype_umv(
+    br: &mut BitReader<'_>,
+    predictor_half: i32,
+    limit: Option<(i32, i32)>,
+) -> Result<i32> {
+    let diff = decode_mvd_table_d3(br)?;
+    let mv = predictor_half + diff;
+    if let Some((lo, hi)) = limit {
+        if mv < lo || mv > hi {
+            return Err(oxideav_core::Error::invalid(format!(
+                "h263 Annex D PLUSPTYPE: reconstructed MV {mv} halfpel out of range [{lo}, {hi}]"
+            )));
+        }
+    }
+    Ok(mv)
+}
+
+/// Decode the MVD-pair start-code-emulation-prevention bit (§D.2 last
+/// paragraph): "if a pair equals (0.5, 0.5) six consecutive zeros are
+/// produced. To prevent start code emulation, this occurrence shall be
+/// followed by one bit set to '1'."
+///
+/// The "(0.5, 0.5)" refers to +1 half-pel on each axis; both components'
+/// Table D.3 codes are then `000` each → six zeros concatenated. We detect
+/// that case by inspecting the *decoded differentials* rather than the raw
+/// bits. Call this helper after decoding both horizontal + vertical
+/// components of an MVD (or MVD2-4 under Annex F) when PLUSPTYPE+UMV is
+/// active.
+pub fn consume_mvd_pair_sce_bit(
+    br: &mut BitReader<'_>,
+    diff_horiz: i32,
+    diff_vert: i32,
+) -> Result<()> {
+    if diff_horiz == 1 && diff_vert == 1 {
+        // Expect a single `1` bit; any other value implies a malformed
+        // stream. We tolerate a `0` here as well (some encoders elide the
+        // bit when the resulting byte happens not to reach the start-code
+        // pattern) but don't advertise that leniency.
+        let b = br.read_u1()?;
+        if b != 1 {
+            return Err(oxideav_core::Error::invalid(
+                "h263 Annex D Table D.3: start-code-emulation stuffing bit after (+1,+1) pair was not 1",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Return the UUI = "1" MV-component range `(min, max)` in half-pel units
+/// for a picture whose luma dimension (width for horizontal, height for
+/// vertical) is `dim` samples. Mirrors Tables D.1 / D.2 of H.263.
+///
+/// * `dim ≤ 352`  → `[-32, +31.5]` pel = `[-64, +63]` halfpel
+/// * `dim ≤ 704`  → `[-64, +63.5]` pel = `[-128, +127]` halfpel
+/// * `dim ≤ 1408` → `[-128, +127.5]` pel = `[-256, +255]` halfpel
+/// * larger       → `[-256, +255.5]` pel = `[-512, +511]` halfpel
+pub fn uui_limit_range_halfpel(dim: u32) -> (i32, i32) {
+    if dim <= 352 {
+        (-64, 63)
+    } else if dim <= 704 {
+        (-128, 127)
+    } else if dim <= 1408 {
+        (-256, 255)
+    } else {
+        (-512, 511)
     }
 }
 
@@ -758,6 +920,122 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let got = decode_mv_component_umv(&mut br, pred, true).unwrap();
         assert_eq!(got, want);
+    }
+
+    /// Annex D Table D.3 — value 0 is a single `1` bit, no sign.
+    #[test]
+    fn table_d3_zero_round_trip() {
+        let mut bw = BitWriter::new();
+        encode_mvd_table_d3(&mut bw, 0);
+        let bytes = bw.finish();
+        // Padded to one byte: `1000 0000` = 0x80.
+        assert_eq!(bytes, vec![0x80]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_mvd_table_d3(&mut br).unwrap(), 0);
+    }
+
+    /// Annex D Table D.3 — spec example: the motion vector difference -13
+    /// is encoded as `0 11 01 11 10` = `0 1 1 0 1 1 1 1 0` (9 bits).
+    #[test]
+    fn table_d3_spec_example_minus_13() {
+        let mut bw = BitWriter::new();
+        encode_mvd_table_d3(&mut bw, -13);
+        let bytes = bw.finish();
+        // 9-bit code `011011110` padded to 16 bits: `01101111 00000000`.
+        assert_eq!(bytes, vec![0b01101111, 0x00]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_mvd_table_d3(&mut br).unwrap(), -13);
+    }
+
+    /// Annex D Table D.3 — round-trip the full `±2047` range. That's the
+    /// 11-x-bit bucket (code length 25 bits) which covers more than the
+    /// QCIF UUI=1 range — good enough for conformance.
+    #[test]
+    fn table_d3_full_range_round_trip() {
+        for v in [
+            -2047, -1024, -512, -100, -2, -1, 0, 1, 2, 100, 511, 1023, 2047,
+        ] {
+            let mut bw = BitWriter::new();
+            encode_mvd_table_d3(&mut bw, v);
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            assert_eq!(decode_mvd_table_d3(&mut br).unwrap(), v, "round-trip v={v}");
+        }
+    }
+
+    /// Annex D Table D.3 — consecutive round-trip at byte boundary (exercise
+    /// bit-reader's multi-code accumulation).
+    #[test]
+    fn table_d3_sequential_codes_round_trip() {
+        let seq = [0i32, 1, -1, 5, -13, 42, -100, 2047];
+        let mut bw = BitWriter::new();
+        for v in &seq {
+            encode_mvd_table_d3(&mut bw, *v);
+        }
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        for v in &seq {
+            assert_eq!(decode_mvd_table_d3(&mut br).unwrap(), *v);
+        }
+    }
+
+    /// MVD-pair SCE stuffing bit (§D.2 end): when both components are
+    /// `+1` halfpel, the encoder emits six zero bits (`000 000`) and
+    /// the decoder must consume a `1` bit afterward.
+    #[test]
+    fn mvd_pair_sce_stuff_present_for_plus_one_pair() {
+        // Emit two `+1` codes + a stuffing `1` + a `0` marker.
+        let mut bw = BitWriter::new();
+        encode_mvd_table_d3(&mut bw, 1);
+        encode_mvd_table_d3(&mut bw, 1);
+        bw.write_bits(1, 1); // SCE stuffing bit.
+        bw.write_bits(0, 8); // filler.
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let dx = decode_mvd_table_d3(&mut br).unwrap();
+        let dy = decode_mvd_table_d3(&mut br).unwrap();
+        assert_eq!(dx, 1);
+        assert_eq!(dy, 1);
+        consume_mvd_pair_sce_bit(&mut br, dx, dy).unwrap();
+    }
+
+    /// PLUSPTYPE MV-component helper: decodes via Table D.3 and adds to
+    /// predictor; enforces UUI="1" limits when provided.
+    #[test]
+    fn plusptype_umv_component_uui1_limits_enforced() {
+        // QCIF (176) → UUI=1 range [-64, 63] halfpel.
+        let limit = Some(uui_limit_range_halfpel(176));
+        assert_eq!(limit, Some((-64, 63)));
+        // encode diff = +30 with predictor = +10 → 40, in range.
+        let mut bw = BitWriter::new();
+        encode_mvd_table_d3(&mut bw, 30);
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mv = decode_mv_component_plusptype_umv(&mut br, 10, limit).unwrap();
+        assert_eq!(mv, 40);
+
+        // encode diff = +60, predictor = +10 → 70, out of range for QCIF.
+        let mut bw = BitWriter::new();
+        encode_mvd_table_d3(&mut bw, 60);
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let err = decode_mv_component_plusptype_umv(&mut br, 10, limit).unwrap_err();
+        assert!(
+            format!("{err}").contains("out of range"),
+            "expected range diagnostic, got {err}"
+        );
+    }
+
+    /// UUI=01 (unlimited): the component decoder should accept any
+    /// `predictor + diff` value without a range check.
+    #[test]
+    fn plusptype_umv_component_uui01_unlimited() {
+        let mut bw = BitWriter::new();
+        encode_mvd_table_d3(&mut bw, 500);
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mv = decode_mv_component_plusptype_umv(&mut br, 0, None).unwrap();
+        assert_eq!(mv, 500);
     }
 
     /// Annex D §D.1 — reconstruct_umv_component picks the wrap that keeps

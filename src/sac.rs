@@ -102,8 +102,7 @@ impl SacEncoder {
         // with C integer division truncating toward zero. Since length <=
         // 65536 and cumul_freq[*] <= 16383, the product fits in 31 bits.
         let new_high = self.low + ((length as u64 * cumul_freq[index] as u64) / total) as u32 - 1;
-        let new_low =
-            self.low + ((length as u64 * cumul_freq[index + 1] as u64) / total) as u32;
+        let new_low = self.low + ((length as u64 * cumul_freq[index + 1] as u64) / total) as u32;
         self.high = new_high;
         self.low = new_low;
 
@@ -225,8 +224,7 @@ impl SacDecoder {
         }
 
         // Interval update: same division as the encoder.
-        self.high =
-            self.low + ((length as u64 * cumul_freq[index - 1] as u64) / total) as u32 - 1;
+        self.high = self.low + ((length as u64 * cumul_freq[index - 1] as u64) / total) as u32 - 1;
         self.low += ((length as u64 * cumul_freq[index] as u64) / total) as u32;
 
         loop {
@@ -575,8 +573,8 @@ pub mod models {
     pub const RUN_INTRA: &[u32] = &[
         16383, 10884, 8242, 7124, 5173, 4745, 4246, 3984, 3034, 2749, 2607, 2298, 966, 681, 396,
         349, 302, 255, 254, 253, 206, 159, 158, 157, 156, 155, 154, 153, 106, 35, 34, 33, 32, 31,
-        30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7,
-        6, 5, 4, 3, 2, 1, 0,
+        30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8,
+        7, 6, 5, 4, 3, 2, 1, 0,
     ];
 
     /// LEVEL for INTER escape tail (`cumf_LEVEL`). 254 entries (-127..=127,
@@ -643,7 +641,10 @@ mod tests {
                 "{name}: last entry must be 0 (sentinel)"
             );
             for i in 1..c.len() {
-                assert!(c[i - 1] > c[i], "{name}: not strictly decreasing at index {i}");
+                assert!(
+                    c[i - 1] > c[i],
+                    "{name}: not strictly decreasing at index {i}"
+                );
             }
         }
         check("COD", models::COD);

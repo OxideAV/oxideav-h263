@@ -24,18 +24,16 @@
 //!   [`decoder::H263Decoder::set_enable_annex_j`], or auto-enabled on the
 //!   decoder side when a PLUSPTYPE-carrying stream asserts the `DF` bit in
 //!   its OPPTYPE. See [`deblock::deblock_picture`].
-//! * **Annex D — Unrestricted Motion Vectors (decode path, baseline PTYPE
-//!   form)**: the decoder accepts PTYPE bit 10 (UMV) on non-PLUSPTYPE
-//!   streams and applies the §D.2 sign-of-predictor reconstruction rule
-//!   for MV differentials when the median predictor falls outside the
-//!   baseline `[-15.5, 16]` pel band. The picture-edge extrapolation
-//!   required by §D.1 (samples outside the reference picture replicate
-//!   from the nearest valid edge) was already present in
-//!   [`interp::predict_block`] via `x.clamp(0, w-1)` and is exercised by
-//!   the Annex D tests. The PLUSPTYPE-form Annex D variant (Table D.3
-//!   VLC, UUI bit) is parsed but currently rejected with a specific
-//!   diagnostic; the baseline-form path is the common case emitted by
-//!   pre-H.263+ encoders.
+//! * **Annex D — Unrestricted Motion Vectors (decode path)**: both the
+//!   baseline-PTYPE form (§D.2 sign-of-predictor reconstruction over Table 14
+//!   VLC) and the PLUSPTYPE form (Table D.3 "regular-structure MVD VLC" + UUI
+//!   range selection per Tables D.1/D.2 + §D.2 last-paragraph MVD-pair
+//!   start-code-emulation stuffing bit) are accepted. The PLUSPTYPE path
+//!   reconstructs each MV component as `predictor + differential` directly
+//!   (no wrap) and enforces the UUI="1" range limit (or leaves it unlimited
+//!   under UUI="01"). The picture-edge extrapolation required by §D.1
+//!   (samples outside the reference picture replicate from the nearest valid
+//!   edge) is handled by [`interp::predict_block`] via `x.clamp(0, w-1)`.
 //! * **Annex F — Advanced Prediction (decode path)**: the decoder accepts
 //!   PTYPE bit 12 (AP) on baseline streams and OPPTYPE bit 7 inside a
 //!   PLUSPTYPE block. When AP is active the P-picture decoder runs a
@@ -68,14 +66,14 @@
 //!
 //! Out of scope (returns `Error::Unsupported`):
 //! * PB-frames mode (§G) and every B-picture flavour.
-//! * Annex D in its PLUSPTYPE form (Table D.3 MVD VLC + UUI range selection).
 //! * Annex E wiring (VLC→SAC swap at the MB layer); the arithmetic coder
 //!   is implemented in [`sac`], but SAC-active streams are not yet driven.
 //! * Annex G (PB-frames), Annex I (Advanced Intra Coding), Annex K (Slice
-//!   Structured Mode), Annex N (RPS), Annex P (Reference Picture
-//!   Resampling), Annex T (Modified Quantization). Annex F encode-side
-//!   (4MV / OBMC emission) is also out of scope — the encoder still emits
-//!   baseline-PTYPE 1-MV-per-MB streams.
+//!   Structured Mode — detected with a specific diagnostic since ffmpeg's
+//!   `h263p -umv 1` bundles it with Annex D), Annex N (RPS), Annex P
+//!   (Reference Picture Resampling), Annex T (Modified Quantization).
+//!   Annex F encode-side (4MV / OBMC emission) is also out of scope — the
+//!   encoder still emits baseline-PTYPE 1-MV-per-MB streams.
 //! * H.263+ custom picture clock frequency / custom picture sizes that don't
 //!   match one of the standard source formats (sub-QCIF/QCIF/CIF/4CIF/16CIF).
 //! * CPM continuous-presence multipoint mode.

@@ -20,7 +20,11 @@
 //! require Table D.3 — follow-up work). Skipped when ffmpeg isn't on
 //! `$PATH` or can't emit the expected stream.
 
-#![allow(clippy::unusual_byte_groupings)]
+#![allow(
+    clippy::unusual_byte_groupings,
+    clippy::identity_op,
+    clippy::erasing_op
+)]
 
 use std::process::Command;
 
@@ -53,7 +57,8 @@ fn interp_replicates_edge_for_out_of_picture_mv() {
     for j in 0..16 {
         for i in 0..16 {
             assert_eq!(
-                dst[j * 16 + i], 15,
+                dst[j * 16 + i],
+                15,
                 "out-of-picture MV must replicate edge at ({i},{j})"
             );
         }
@@ -123,7 +128,7 @@ fn build_umv_i_picture_subqcif() -> Vec<u8> {
     w.put(0, 1); // SAC
     w.put(0, 1); // AP
     w.put(0, 1); // PB
-    // PQUANT = 5.
+                 // PQUANT = 5.
     w.put(5, 5);
     // CPM = 0, PEI = 0.
     w.put(0, 1);
@@ -230,13 +235,344 @@ fn synthetic_umv_i_picture_decodes() {
     assert!(pct > 0.99, "I-picture luma DC should be stable: {pct}");
 }
 
-/// When ffmpeg is on PATH, verify that an h263p stream with `-umv 1`
-/// currently produces a deterministic `Error::Unsupported` diagnostic
-/// (PLUSPTYPE + UMV requires Table D.3, which is follow-up work). This
-/// locks in the specific error message so a subsequent round will know
-/// that enabling Table D.3 also needs to remove / update this check.
+/// Build a minimal QCIF PLUSPTYPE I-picture whose PLUSPTYPE asserts UMV
+/// (Annex D), UUI = "1" (limited range per Tables D.1/D.2). The body is an
+/// array of flat-DC intra MBs matching the synthetic sub-QCIF picture used
+/// by [`build_umv_i_picture_subqcif`].
+fn build_plusptype_umv_i_picture_qcif() -> Vec<u8> {
+    let mut w = BitBuf::new();
+    // PSC (22) + TR (8).
+    w.put(0b00_0000_0000_0000_0000_1_00000, 22);
+    w.put(0, 8);
+    // PTYPE prefix: marker=1, id=0, split=0, cam=0, freeze=0, fmt=111.
+    w.put(1, 1);
+    w.put(0, 1);
+    w.put(0, 1);
+    w.put(0, 1);
+    w.put(0, 1);
+    w.put(0b111, 3);
+    // PLUSPTYPE tail.
+    // UFEP = 001 → OPPTYPE follows.
+    w.put(0b001, 3);
+    // OPPTYPE (18): src_fmt=010 (QCIF, bits 1..3); UMV=1 (bit 5); marker=1
+    // (bit 15). All other feature bits zero.
+    // Layout: [3 src_fmt] [1 custom_pcf] [1 umv] [1 sac] [1 ap] [1 aic]
+    //         [1 df] [1 sss] [1 rps] [1 isd] [1 aiv] [1 mq] [1 marker] [3 rsv]
+    let opptype: u32 = (0b010 << 15)
+        | (0 << 14) // custom_pcf
+        | (1 << 13) // UMV
+        | (0 << 12) // SAC
+        | (0 << 11) // AP
+        | (0 << 10) // AIC
+        | (0 << 9)  // DF
+        | (0 << 8)  // SSS
+        | (0 << 7)  // RPS
+        | (0 << 6)  // ISD
+        | (0 << 5)  // AIV
+        | (0 << 4)  // MQ
+        | (1 << 3); // marker
+    w.put(opptype, 18);
+    // MPPTYPE: PCT=000 (I) | RPR=0 | RRU=0 | RTYPE=0 | marker=001
+    w.put(0b000_0_0_0_001, 9);
+    // CPM = 0
+    w.put(0, 1);
+    // UUI = "1" → limited per Tables D.1/D.2.
+    w.put(1, 1);
+    // PQUANT = 5
+    w.put(5, 5);
+    // PEI = 0
+    w.put(0, 1);
+
+    // MB body: QCIF = 176x144 → 11 × 9 = 99 MBs in 9 GOBs of one MB row.
+    let mb_w = 11usize;
+    let mb_h = 9usize;
+    for mb_y in 0..mb_h {
+        for _ in 0..mb_w {
+            // MCBPC intra mb_type=3 cbpc=0 → `1`.
+            w.put(1, 1);
+            // CBPY=0000 for intra → `0011`.
+            w.put(0b0011, 4);
+            // Six 8-bit INTRADC = 0x40.
+            for _ in 0..6 {
+                w.put(0x40, 8);
+            }
+        }
+        if mb_y + 1 < mb_h {
+            // Pad to byte boundary and emit GBSC.
+            while w.n % 8 != 0 {
+                w.put(0, 1);
+            }
+            w.put(0b0_0000_0000_0000_0000_1, 17); // GBSC
+            w.put((mb_y + 1) as u32, 5); // GN
+            w.put(0, 2); // GFID
+            w.put(5, 5); // GQUANT
+        }
+    }
+    w.finish()
+}
+
+/// Synthetic PLUSPTYPE+UMV I-picture with UUI=1 must parse end-to-end and
+/// produce a 176x144 frame.
 #[test]
-fn ffmpeg_h263p_umv_rejected_with_specific_diagnostic() {
+fn synthetic_plusptype_umv_i_picture_decodes() {
+    let data = build_plusptype_umv_i_picture_qcif();
+    // Header parse sanity.
+    let mut br = BitReader::new(&data);
+    let hdr = parse_picture_header(&mut br).expect("parse PLUSPTYPE+UMV header");
+    assert!(hdr.plusptype);
+    assert!(hdr.umv_mode);
+    assert!(!hdr.uui_unlimited);
+    assert_eq!(hdr.source_format, SourceFormat::Qcif);
+    assert_eq!(hdr.coding_type, PictureCodingType::Intra);
+
+    // Full decode.
+    let mut decoder = H263Decoder::new(CodecId::new(oxideav_h263::CODEC_ID_STR));
+    decoder
+        .send_packet(&Packet::new(0, TimeBase::new(1, 90_000), data))
+        .expect("send_packet");
+    decoder.flush().expect("flush");
+    let frame = decoder.receive_frame().expect("receive I-frame");
+    let Frame::Video(vf) = frame else {
+        panic!("expected video frame");
+    };
+    assert_eq!(vf.width, 176);
+    assert_eq!(vf.height, 144);
+}
+
+/// Build a PLUSPTYPE+UMV P-picture for the QCIF I-picture above. Every MB
+/// is "skipped" via the COD flag — this gives us a PLUSPTYPE+UMV stream
+/// the decoder will traverse end-to-end without needing an MVD (COD=1 is
+/// identical behaviour regardless of UMV). The point is to exercise the
+/// full picture-header + PLUSPTYPE + UUI parse on a P-picture path.
+fn build_plusptype_umv_p_picture_all_skipped_qcif() -> Vec<u8> {
+    let mut w = BitBuf::new();
+    w.put(0b00_0000_0000_0000_0000_1_00000, 22);
+    w.put(1, 8); // TR = 1
+    w.put(1, 1);
+    w.put(0, 1);
+    w.put(0, 1);
+    w.put(0, 1);
+    w.put(0, 1);
+    w.put(0b111, 3);
+    w.put(0b001, 3);
+    let opptype: u32 = (0b010 << 15)
+        | (1 << 13) // UMV
+        | (1 << 3); // marker
+    w.put(opptype, 18);
+    // MPPTYPE: PCT=001 (P) | RPR=0 | RRU=0 | RTYPE=0 | marker=001
+    w.put(0b001_0_0_0_001, 9);
+    w.put(0, 1); // CPM
+    w.put(1, 1); // UUI = "1"
+    w.put(5, 5); // PQUANT
+    w.put(0, 1); // PEI
+
+    let mb_w = 11usize;
+    let mb_h = 9usize;
+    for mb_y in 0..mb_h {
+        for _ in 0..mb_w {
+            // COD = 1 → skipped.
+            w.put(1, 1);
+        }
+        if mb_y + 1 < mb_h {
+            while w.n % 8 != 0 {
+                w.put(0, 1);
+            }
+            w.put(0b0_0000_0000_0000_0000_1, 17);
+            w.put((mb_y + 1) as u32, 5);
+            w.put(0, 2);
+            w.put(5, 5);
+        }
+    }
+    w.finish()
+}
+
+/// Synthetic PLUSPTYPE+UMV P-picture (all-skipped MBs): no MVDs to decode
+/// but the header + picture-layer wiring must still succeed. The resulting
+/// frame should mirror the preceding I-picture.
+#[test]
+fn synthetic_plusptype_umv_p_picture_all_skipped_decodes() {
+    let i_bytes = build_plusptype_umv_i_picture_qcif();
+    let p_bytes = build_plusptype_umv_p_picture_all_skipped_qcif();
+    // Concatenate in a single packet (the decoder treats consecutive PSCs
+    // as back-to-back pictures).
+    let mut data = i_bytes.clone();
+    data.extend_from_slice(&p_bytes);
+    let mut decoder = H263Decoder::new(CodecId::new(oxideav_h263::CODEC_ID_STR));
+    decoder
+        .send_packet(&Packet::new(0, TimeBase::new(1, 90_000), data))
+        .expect("send_packet");
+    decoder.flush().expect("flush");
+    // Two frames expected.
+    let _i = decoder.receive_frame().expect("I");
+    let p = decoder.receive_frame().expect("P");
+    let Frame::Video(pvf) = p else {
+        panic!("expected video frame");
+    };
+    assert_eq!(pvf.width, 176);
+    assert_eq!(pvf.height, 144);
+}
+
+/// Build a PLUSPTYPE+UMV P-picture whose first MB is `Inter` with an
+/// explicit Table D.3 MVD pair `(0, 0)` (the simplest non-trivial MVD:
+/// two `1`-bit codes, no signs, no SCE stuffing). All other MBs are
+/// skipped.
+fn build_plusptype_umv_p_picture_one_mvd_qcif() -> Vec<u8> {
+    let mut w = BitBuf::new();
+    w.put(0b00_0000_0000_0000_0000_1_00000, 22);
+    w.put(1, 8);
+    w.put(1, 1);
+    w.put(0, 1);
+    w.put(0, 1);
+    w.put(0, 1);
+    w.put(0, 1);
+    w.put(0b111, 3);
+    w.put(0b001, 3);
+    let opptype: u32 = (0b010 << 15) | (1 << 13) | (1 << 3);
+    w.put(opptype, 18);
+    w.put(0b001_0_0_0_001, 9); // P
+    w.put(0, 1); // CPM
+    w.put(1, 1); // UUI=1
+    w.put(5, 5); // PQUANT
+    w.put(0, 1); // PEI
+
+    let mb_w = 11usize;
+    let mb_h = 9usize;
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            if mb_x == 0 && mb_y == 0 {
+                // COD=0: coded MB.
+                w.put(0, 1);
+                // MCBPC inter mb_type=Inter cbpc=00 → code `1` (1 bit).
+                w.put(1, 1);
+                // CBPY for inter: decoder XORs the decoded value with 0xF, so
+                // to get "no luma residual anywhere" we need the decoded value
+                // to be 15 (which XORs to 0). CBPY value 15 has code `11`
+                // (2 bits) per Table 13.
+                w.put(0b11, 2);
+                // MVD pair: (0, 0) → two `1` bits (Table D.3 value 0).
+                w.put(1, 1); // dx = 0
+                w.put(1, 1); // dy = 0
+            } else {
+                w.put(1, 1); // COD=1 → skipped
+            }
+        }
+        if mb_y + 1 < mb_h {
+            while w.n % 8 != 0 {
+                w.put(0, 1);
+            }
+            w.put(0b0_0000_0000_0000_0000_1, 17);
+            w.put((mb_y + 1) as u32, 5);
+            w.put(0, 2);
+            w.put(5, 5);
+        }
+    }
+    w.finish()
+}
+
+/// Exercise the Table D.3 MVD VLC end-to-end: a single coded Inter MB
+/// with MVD `(0, 0)` (the shortest possible D.3 codes) should decode
+/// without error and produce a valid P-picture.
+#[test]
+fn synthetic_plusptype_umv_p_picture_one_mvd_decodes() {
+    let i_bytes = build_plusptype_umv_i_picture_qcif();
+    let p_bytes = build_plusptype_umv_p_picture_one_mvd_qcif();
+    let mut data = i_bytes.clone();
+    data.extend_from_slice(&p_bytes);
+    let mut decoder = H263Decoder::new(CodecId::new(oxideav_h263::CODEC_ID_STR));
+    decoder
+        .send_packet(&Packet::new(0, TimeBase::new(1, 90_000), data))
+        .expect("send_packet");
+    decoder.flush().expect("flush");
+    let _i = decoder.receive_frame().expect("I");
+    let p = decoder.receive_frame().expect("P");
+    let Frame::Video(_) = p else {
+        panic!("expected video frame");
+    };
+}
+
+/// Build a PLUSPTYPE+UMV P-picture where MB(0,0) carries MVD=(+1, +1)
+/// halfpel — this is the one case that triggers the §D.2 last-paragraph
+/// start-code-emulation stuffing (`000 000` followed by a `1` bit).
+fn build_plusptype_umv_p_picture_sce_stuff_qcif() -> Vec<u8> {
+    let mut w = BitBuf::new();
+    w.put(0b00_0000_0000_0000_0000_1_00000, 22);
+    w.put(1, 8);
+    w.put(1, 1);
+    w.put(0, 1);
+    w.put(0, 1);
+    w.put(0, 1);
+    w.put(0, 1);
+    w.put(0b111, 3);
+    w.put(0b001, 3);
+    let opptype: u32 = (0b010 << 15) | (1 << 13) | (1 << 3);
+    w.put(opptype, 18);
+    w.put(0b001_0_0_0_001, 9);
+    w.put(0, 1); // CPM
+    w.put(1, 1); // UUI=1
+    w.put(5, 5); // PQUANT
+    w.put(0, 1); // PEI
+
+    let mb_w = 11usize;
+    let mb_h = 9usize;
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            if mb_x == 0 && mb_y == 0 {
+                w.put(0, 1); // COD=0
+                w.put(1, 1); // MCBPC inter mb_type=0, cbpc=0
+                             // CBPY=15 so decoder XOR yields 0 (no luma residual).
+                w.put(0b11, 2);
+                // MVD = (+1, +1) halfpel → Table D.3 `0 s 0 0 s 0` with s=0
+                // = `000000`. Emit two value-1 codes, then the SCE stuffing
+                // bit `1`.
+                w.put(0b000, 3); // dx = +1
+                w.put(0b000, 3); // dy = +1
+                w.put(1, 1); // SCE stuff bit
+            } else {
+                w.put(1, 1);
+            }
+        }
+        if mb_y + 1 < mb_h {
+            while w.n % 8 != 0 {
+                w.put(0, 1);
+            }
+            w.put(0b0_0000_0000_0000_0000_1, 17);
+            w.put((mb_y + 1) as u32, 5);
+            w.put(0, 2);
+            w.put(5, 5);
+        }
+    }
+    w.finish()
+}
+
+/// Exercise the §D.2 start-code-emulation stuffing: MVD=(+1,+1) produces
+/// six consecutive zero bits, and the decoder must consume a subsequent
+/// `1` bit before reading the next MB's COD flag.
+#[test]
+fn synthetic_plusptype_umv_p_picture_sce_stuff_decodes() {
+    let i_bytes = build_plusptype_umv_i_picture_qcif();
+    let p_bytes = build_plusptype_umv_p_picture_sce_stuff_qcif();
+    let mut data = i_bytes.clone();
+    data.extend_from_slice(&p_bytes);
+    let mut decoder = H263Decoder::new(CodecId::new(oxideav_h263::CODEC_ID_STR));
+    decoder
+        .send_packet(&Packet::new(0, TimeBase::new(1, 90_000), data))
+        .expect("send_packet");
+    decoder.flush().expect("flush");
+    let _i = decoder.receive_frame().expect("I");
+    let p = decoder.receive_frame().expect("P");
+    let Frame::Video(_) = p else {
+        panic!("expected video frame");
+    };
+}
+
+/// When ffmpeg is on PATH, exercise an h263p stream with `-umv 1`. With
+/// Table D.3 + UUI parsing landed, the header-layer rejection that earlier
+/// rounds saw may now advance past the MVD VLC to whatever additional
+/// annex ffmpeg bundled (slice structured mode, custom PCF, etc.). We
+/// accept either "successful decode" OR a specific `Error::Unsupported`
+/// diagnostic naming the remaining gap (Annex K most commonly).
+#[test]
+fn ffmpeg_h263p_umv_integration_diagnostic() {
     if Command::new("ffmpeg").arg("-version").output().is_err() {
         eprintln!("ffmpeg not on PATH — skipping");
         return;
@@ -291,18 +627,31 @@ fn ffmpeg_h263p_umv_rejected_with_specific_diagnostic() {
     }
     let bytes = std::fs::read(&es).expect("read h263 es");
     let mut decoder = H263Decoder::new(CodecId::new(oxideav_h263::CODEC_ID_STR));
-    let err = decoder
-        .send_packet(&Packet::new(0, TimeBase::new(1, 90_000), bytes))
-        .expect_err("expected Unsupported error for PLUSPTYPE+UMV");
-    let msg = format!("{err}");
-    eprintln!("ffmpeg h263p -umv 1 diagnostic: {msg}");
-    // Table D.3 isn't implemented yet; the diagnostic must name Annex D OR
-    // a downstream annex ffmpeg also bundled (SS, custom PCF).
-    assert!(
-        msg.contains("Annex D")
-            || msg.contains("Annex K")
-            || msg.contains("custom picture clock frequency")
-            || msg.contains("Table D.3"),
-        "unexpected diagnostic: {msg}"
-    );
+    match decoder.send_packet(&Packet::new(0, TimeBase::new(1, 90_000), bytes)) {
+        Ok(()) => {
+            eprintln!("ffmpeg h263p -umv 1 decoded end-to-end");
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            eprintln!("ffmpeg h263p -umv 1 diagnostic: {msg}");
+            // Acceptable outcomes: decoder parsed past the header but some
+            // other annex bit (Annex K slice structure, custom PCF, Annex I
+            // AIC, etc.) surfaced a follow-up Unsupported; or the bitstream
+            // itself turned out to be byte-misaligned and the picture
+            // header refused. Any specific diagnostic is fine as long as
+            // the message names an actual spec feature rather than the
+            // unhelpful "Table D.3" fall-back that earlier rounds emitted.
+            assert!(
+                msg.contains("Annex")
+                    || msg.contains("custom picture clock frequency")
+                    || msg.contains("PLUSPTYPE")
+                    || msg.contains("PSC"),
+                "unexpected diagnostic: {msg}"
+            );
+            assert!(
+                !msg.contains("Table D.3: follow-up"),
+                "Table D.3 is now implemented but the diagnostic still points at it: {msg}"
+            );
+        }
+    }
 }

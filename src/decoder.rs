@@ -22,6 +22,7 @@ use oxideav_core::{
 use crate::gob::parse_gob_header;
 use crate::mb::{
     apply_p_mb_reconstruction, decode_intra_mb, decode_p_mb, decode_p_mb_pass1, IPicture, PMbInfo,
+    UmvMode,
 };
 use crate::motion::MvGrid;
 use crate::picture::{parse_picture_header, PictureCodingType, PictureHeader};
@@ -241,6 +242,7 @@ pub fn decode_p_picture(
     let gob_starts = collect_gob_offsets(bytes);
 
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
+    let umv_mode = UmvMode::from_header(hdr);
 
     if !hdr.advanced_prediction {
         // Fast single-pass path: MC is a strict function of the current MB's
@@ -262,7 +264,7 @@ pub fn decode_p_picture(
                     &mut pic,
                     reference,
                     &mut mv_grid,
-                    hdr.umv_mode,
+                    umv_mode,
                 )
                 .map_err(|e| {
                     Error::invalid(format!(
@@ -300,7 +302,7 @@ pub fn decode_p_picture(
                 quant,
                 &mut pic,
                 &mut mv_grid,
-                hdr.umv_mode,
+                umv_mode,
                 true, // advanced_prediction
                 gob_top_rows[mb_y],
             )
