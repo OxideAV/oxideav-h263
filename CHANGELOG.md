@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Annex F (Advanced Prediction — 4MV + OBMC) **encoder emission**, opt-in
+  via `H263Encoder::set_enable_annex_f`. When on, every P-picture header
+  sets PTYPE bit 12 and the encoder runs a two-pass per-MB loop: pass 1
+  compares the single-MV SAD against the four-block SAD sum and picks the
+  one that wins by a material margin, also falling back to `skipped` /
+  `intra-in-P` where cheaper; pass 2 computes the §F.3 OBMC-blended
+  predictor against the full `MvGrid` and emits `Inter4MV` / `Inter` MCBPC
+  + CBPY + up-to-4 MVDs + per-block residual TCOEF, with the chroma MV
+  derived from the §F.2 Table F.1 sum-of-4 rule for 4MV MBs. The cached
+  reference is produced by running the decoder's
+  `apply_p_mb_reconstruction(advanced_prediction=true)` over the encoded
+  state, so encoder ↔ decoder reconstruction stays bit-identical.
 - Annex D (Unrestricted Motion Vector mode) decode path for baseline-PTYPE
   streams: PTYPE bit 10 (UMV) is now accepted; MV differentials are
   reconstructed via the §D.2 sign-of-predictor rule with the extended

@@ -210,29 +210,37 @@ pub fn write_mcbpc_intra(bw: &mut BitWriter, cbpc: u8) {
 }
 
 /// P-picture MCBPC inter table (Table 16/H.263 — rows for the mb-types we
-/// actually emit: Inter (0..=3), Intra (4..=7), InterQ (8..=11), IntraQ
-/// (12..=15)). Mirrors `oxideav_mpeg4video::tables::mcbpc::P_ROWS`.
+/// emit: Inter (0..=3), Intra (4..=7), InterQ (8..=11), IntraQ (12..=15),
+/// Inter4MV (16..=19), Inter4MVQ (20..=23)). Mirrors
+/// `oxideav_mpeg4video::tables::mcbpc::P_ROWS`.
 ///
 /// Indexed by the encoded value `group * 4 + cbpc` with `group` = 0 (Inter),
-/// 1 (Intra), 2 (InterQ), 3 (IntraQ). Inter4MV rows are NOT emitted by this
-/// baseline encoder.
-const P_MCBPC_VLC: [(u8, u32); 16] = [
-    (1, 0b1),         // Inter,  cbpc=00
-    (4, 0b0011),      // Inter,  cbpc=01
-    (4, 0b0010),      // Inter,  cbpc=10
-    (6, 0b000101),    // Inter,  cbpc=11
-    (5, 0b00011),     // Intra,  cbpc=00
-    (8, 0b00000100),  // Intra,  cbpc=01
-    (8, 0b00000011),  // Intra,  cbpc=10
-    (7, 0b0000011),   // Intra,  cbpc=11
-    (3, 0b011),       // InterQ, cbpc=00
-    (7, 0b0000111),   // InterQ, cbpc=01
-    (7, 0b0000110),   // InterQ, cbpc=10
-    (9, 0b000000101), // InterQ, cbpc=11
-    (6, 0b000100),    // IntraQ, cbpc=00
-    (9, 0b000000100), // IntraQ, cbpc=01
-    (9, 0b000000011), // IntraQ, cbpc=10
-    (9, 0b000000010), // IntraQ, cbpc=11
+/// 1 (Intra), 2 (InterQ), 3 (IntraQ), 4 (Inter4MV), 5 (Inter4MVQ).
+const P_MCBPC_VLC: [(u8, u32); 24] = [
+    (1, 0b1),              // Inter,    cbpc=00
+    (4, 0b0011),           // Inter,    cbpc=01
+    (4, 0b0010),           // Inter,    cbpc=10
+    (6, 0b000101),         // Inter,    cbpc=11
+    (5, 0b00011),          // Intra,    cbpc=00
+    (8, 0b00000100),       // Intra,    cbpc=01
+    (8, 0b00000011),       // Intra,    cbpc=10
+    (7, 0b0000011),        // Intra,    cbpc=11
+    (3, 0b011),            // InterQ,   cbpc=00
+    (7, 0b0000111),        // InterQ,   cbpc=01
+    (7, 0b0000110),        // InterQ,   cbpc=10
+    (9, 0b000000101),      // InterQ,   cbpc=11
+    (6, 0b000100),         // IntraQ,   cbpc=00
+    (9, 0b000000100),      // IntraQ,   cbpc=01
+    (9, 0b000000011),      // IntraQ,   cbpc=10
+    (9, 0b000000010),      // IntraQ,   cbpc=11
+    (3, 0b010),            // Inter4MV, cbpc=00
+    (7, 0b0000101),        // Inter4MV, cbpc=01
+    (7, 0b0000100),        // Inter4MV, cbpc=10
+    (8, 0b00000101),       // Inter4MV, cbpc=11
+    (11, 0b00000000010),   // Inter4MVQ, cbpc=00
+    (13, 0b0000000001100), // Inter4MVQ, cbpc=01
+    (13, 0b0000000001110), // Inter4MVQ, cbpc=10
+    (13, 0b0000000001111), // Inter4MVQ, cbpc=11
 ];
 
 /// P-picture mb_type selector for `write_mcbpc_inter`.
@@ -246,6 +254,10 @@ pub enum PMbKind {
     InterQ,
     /// `IntraQ` (mb_type 3) — embedded intra with DQUANT.
     IntraQ,
+    /// `Inter4MV` (mb_type 4) — 4 MVs, no DQUANT. Requires Annex F.
+    Inter4MV,
+    /// `Inter4MVQ` (mb_type 6) — 4 MVs with DQUANT. Requires Annex F.
+    Inter4MVQ,
 }
 
 /// Write the MCBPC for a P-picture MB.
@@ -256,6 +268,8 @@ pub fn write_mcbpc_inter(bw: &mut BitWriter, kind: PMbKind, cbpc: u8) {
         PMbKind::Intra => 1,
         PMbKind::InterQ => 2,
         PMbKind::IntraQ => 3,
+        PMbKind::Inter4MV => 4,
+        PMbKind::Inter4MVQ => 5,
     };
     let idx = (group * 4 + cbpc) as usize;
     let (bits, code) = P_MCBPC_VLC[idx];

@@ -19,10 +19,19 @@
 //! * GOP control: first frame is always I; subsequent frames are P until
 //!   `gop_size` frames have elapsed, at which point we insert another I.
 //!
+//! * **Annex F — Advanced Prediction (4MV + OBMC) emission**. Opt-in via
+//!   [`H263Encoder::set_enable_annex_f`]. When enabled, PTYPE bit 12 is set
+//!   on every P-picture and the encoder runs a 2-pass per-MB loop: pass 1
+//!   decides `skipped` / `intra-in-P` / `1-MV inter` / `4-MV inter` by
+//!   comparing SADs (one 16×16 search vs. four 8×8 searches); pass 2
+//!   computes the OBMC-blended predictor against the full `MvGrid` and
+//!   emits the MB bitstream (Inter4MV MCBPC + four MVDs + MVDCHR-derived
+//!   chroma, per §F.2 / §F.3). The local reconstruction matches what the
+//!   decoder's two-pass §F.3 path produces.
+//!
 //! Out of scope (returns `Error::Unsupported`):
-//! * Annex D (UMV), Annex E (SAC), Annex F (Advanced Prediction — 4MV/OBMC),
-//!   Annex G (PB-frames), Annex I (Advanced Intra Coding), Annex T
-//!   (Modified Quantization).
+//! * Annex D (UMV), Annex E (SAC), Annex G (PB-frames), Annex I (Advanced
+//!   Intra Coding), Annex T (Modified Quantization).
 //! * H.263+ PLUSPTYPE custom picture format / custom PCF / DF-bit signalling
 //!   (Annex J deblocking is applied out-of-band; the bitstream itself is
 //!   still baseline).
@@ -48,8 +57,8 @@ use crate::enc_tables::{write_cbpy, write_mcbpc_inter, write_mcbpc_intra, write_
 use crate::interp::{predict_block, sad_block};
 use crate::mb::IPicture;
 use crate::motion::{
-    encode_mv_component, luma_to_chroma_mv, predict_mv, MbMotion, MvGrid, MV_RANGE_MAX_HALF,
-    MV_RANGE_MIN_HALF,
+    chroma_mv_4mv, encode_mv_component, luma_to_chroma_mv, predict_mv, predict_mv_block, MbMotion,
+    MvGrid, MV_RANGE_MAX_HALF, MV_RANGE_MIN_HALF, OBMC_H0, OBMC_H1, OBMC_H2,
 };
 use crate::picture::SourceFormat;
 use oxideav_core::bits::BitWriter;
@@ -97,6 +106,14 @@ pub struct H263Encoder {
     /// with the same flag via
     /// [`crate::decoder::H263Decoder::set_enable_annex_j`].
     enable_annex_j: bool,
+    /// When `true`, enable Annex F (Advanced Prediction): 4-MV per MB with
+    /// OBMC blending at 8×8 block granularity. The encoder sets PTYPE bit 12
+    /// (AP) in the picture header and decides per-MB whether 4MV pays for
+    /// itself over the 1-MV baseline. When an MB picks 4MV, the OBMC weights
+    /// (§F.3, Figures F.2/F.3/F.4) are applied to the local reconstruction so
+    /// that the next P-picture's reference matches what the decoder
+    /// produces.
+    enable_annex_f: bool,
 }
 
 impl H263Encoder {
@@ -149,6 +166,7 @@ impl H263Encoder {
             eof: false,
             next_tr: 0,
             enable_annex_j: false,
+            enable_annex_f: false,
         })
     }
 
@@ -162,6 +180,19 @@ impl H263Encoder {
     /// Returns whether Annex J deblocking is currently enabled.
     pub fn enable_annex_j(&self) -> bool {
         self.enable_annex_j
+    }
+
+    /// Enable or disable Annex F (Advanced Prediction — 4MV + OBMC) emission.
+    /// Must be set before the first frame is submitted. When on, the encoder
+    /// sets PTYPE bit 12 (AP) in each P-picture header and selects 4-MV mode
+    /// on a per-MB basis when it materially reduces the predictor SAD.
+    pub fn set_enable_annex_f(&mut self, enable: bool) {
+        self.enable_annex_f = enable;
+    }
+
+    /// Returns whether Annex F (Advanced Prediction) is currently enabled.
+    pub fn enable_annex_f(&self) -> bool {
+        self.enable_annex_f
     }
 }
 
@@ -213,7 +244,7 @@ impl Encoder for H263Encoder {
             (bytes, pic, true)
         } else {
             let reference = self.reference.as_ref().expect("reference checked above");
-            let (bytes, pic) = encode_p_picture(
+            let (bytes, pic) = encode_p_picture_with_opts(
                 self.width,
                 self.height,
                 self.source_format,
@@ -221,6 +252,7 @@ impl Encoder for H263Encoder {
                 tr,
                 v,
                 reference,
+                self.enable_annex_f,
             )?;
             (bytes, pic, false)
         };
@@ -317,7 +349,14 @@ pub fn encode_i_picture_with_recon(
     let mut bw = BitWriter::with_capacity(8192);
     let mut recon = IPicture::new(width as usize, height as usize);
 
-    write_picture_header(&mut bw, source_format, pquant, temporal_reference, false)?;
+    write_picture_header(
+        &mut bw,
+        source_format,
+        pquant,
+        temporal_reference,
+        false,
+        false,
+    )?;
 
     for mb_y in 0..mb_h {
         // GOB header at every GOB except the first.
@@ -338,7 +377,8 @@ pub fn encode_i_picture_with_recon(
 
 /// Encode a single P-picture against the supplied `reference`. Returns the
 /// bitstream bytes and the locally reconstructed picture (used as the next
-/// MC reference).
+/// MC reference). Equivalent to [`encode_p_picture_with_opts`] with
+/// `enable_annex_f = false`.
 pub fn encode_p_picture(
     width: u32,
     height: u32,
@@ -347,6 +387,44 @@ pub fn encode_p_picture(
     temporal_reference: u8,
     frame: &VideoFrame,
     reference: &IPicture,
+) -> Result<(Vec<u8>, IPicture)> {
+    encode_p_picture_with_opts(
+        width,
+        height,
+        source_format,
+        pquant,
+        temporal_reference,
+        frame,
+        reference,
+        false,
+    )
+}
+
+/// Like [`encode_p_picture`] but with an `enable_annex_f` knob that toggles
+/// Advanced Prediction (4MV + OBMC). When on, PTYPE bit 12 is set and each
+/// MB independently picks 1MV vs 4MV based on an SAD comparison.
+///
+/// When `enable_annex_f` is on, the encode path is two-pass:
+///   1. Visit every MB, decide `MbDecision` (skipped / intra / 1-MV inter /
+///      4-MV inter), populate `mv_grid`. No bitstream output yet.
+///   2. With a fully populated `mv_grid`, visit every MB again, compute the
+///      OBMC-blended predictor (mirroring the decoder's §F.3 math), quantise
+///      the residual against that predictor, and emit the per-MB bitstream
+///      (COD/MCBPC/CBPY/MVD(s)/ACs). Reconstruction is stored in `recon` via
+///      `apply_p_mb_reconstruction` so the next-picture's reference is bit-
+///      identical to the decoder's output.
+///
+/// The single-pass baseline path (no AP) is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_picture_with_opts(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+    enable_annex_f: bool,
 ) -> Result<(Vec<u8>, IPicture)> {
     let mb_w = width.div_ceil(16) as usize;
     let mb_h = height.div_ceil(16) as usize;
@@ -358,28 +436,322 @@ pub fn encode_p_picture(
     let mut recon = IPicture::new(width as usize, height as usize);
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
 
-    write_picture_header(&mut bw, source_format, pquant, temporal_reference, true)?;
+    write_picture_header(
+        &mut bw,
+        source_format,
+        pquant,
+        temporal_reference,
+        true,
+        enable_annex_f,
+    )?;
 
-    // No GOB headers in P-pictures: the baseline spec treats GOB headers as
-    // optional resync points. Emitting them triggers MV-predictor reset in
-    // downstream decoders (§5.3.7.2), which is fine but makes the bitstream
-    // larger. Short clips don't benefit, so we skip them — this matches
-    // what ffmpeg's h263 encoder does for P-pictures too.
+    if !enable_annex_f {
+        // Single-pass baseline path — matches the old `encode_p_picture`
+        // behaviour byte-for-byte.
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                let _info = encode_p_mb(
+                    &mut bw,
+                    mb_x,
+                    mb_y,
+                    pquant,
+                    frame,
+                    reference,
+                    &mut recon,
+                    &mut mv_grid,
+                    false,
+                )?;
+            }
+        }
+        return Ok((bw.finish(), recon));
+    }
+
+    // --- Annex F two-pass path -------------------------------------------
+    let mut decisions: Vec<MbDecision> = Vec::with_capacity(mb_w * mb_h);
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            encode_p_mb(
-                &mut bw,
-                mb_x,
-                mb_y,
-                pquant,
-                frame,
-                reference,
-                &mut recon,
-                &mut mv_grid,
-            )?;
+            let d = decide_p_mb(frame, reference, &mv_grid, mb_x, mb_y, pquant);
+            // Populate `mv_grid` so downstream neighbours' predictors see it.
+            match d {
+                MbDecision::Skipped => {
+                    mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), false, false));
+                }
+                MbDecision::Intra => {
+                    mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), true, true));
+                }
+                MbDecision::Inter1Mv(mv) => {
+                    mv_grid.set(mb_x, mb_y, MbMotion::mv1(mv, true, false));
+                }
+                MbDecision::Inter4Mv(mvs4) => {
+                    mv_grid.set(mb_x, mb_y, MbMotion::mv4(mvs4));
+                }
+            }
+            decisions.push(d);
         }
     }
+
+    // Pass 2: emit bitstream and reconstruct with OBMC.
+    let mut infos: Vec<crate::mb::PMbInfo> = Vec::with_capacity(mb_w * mb_h);
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            let d = decisions[mb_y * mb_w + mb_x];
+            let info = emit_p_mb_ap(
+                &mut bw, mb_x, mb_y, pquant, frame, reference, &mv_grid, d, &mut recon,
+            )?;
+            infos.push(info);
+        }
+    }
+
+    // Pass 3: run the decoder's OBMC reconstruction into a fresh picture,
+    // then overwrite `recon` with the result. Intra MBs already sit in
+    // `recon` (pass 2 wrote them); carry them over.
+    let mut obmc_recon = IPicture::new(width as usize, height as usize);
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            let info = &infos[mb_y * mb_w + mb_x];
+            if info.intra {
+                copy_mb_from_to(&recon, &mut obmc_recon, mb_x, mb_y);
+                continue;
+            }
+            crate::mb::apply_p_mb_reconstruction(
+                mb_x,
+                mb_y,
+                &mut obmc_recon,
+                reference,
+                &mv_grid,
+                info,
+                true,
+            );
+        }
+    }
+    recon = obmc_recon;
+
     Ok((bw.finish(), recon))
+}
+
+/// Copy one MB (Y + Cb + Cr) from `src` to `dst`. Used to preserve intra
+/// MBs during the Annex F pass 2.
+fn copy_mb_from_to(src: &IPicture, dst: &mut IPicture, mb_x: usize, mb_y: usize) {
+    for j in 0..16 {
+        let so = (mb_y * 16 + j) * src.y_stride + mb_x * 16;
+        let doff = (mb_y * 16 + j) * dst.y_stride + mb_x * 16;
+        dst.y[doff..doff + 16].copy_from_slice(&src.y[so..so + 16]);
+    }
+    for j in 0..8 {
+        let so = (mb_y * 8 + j) * src.c_stride + mb_x * 8;
+        let doff = (mb_y * 8 + j) * dst.c_stride + mb_x * 8;
+        dst.cb[doff..doff + 8].copy_from_slice(&src.cb[so..so + 8]);
+        dst.cr[doff..doff + 8].copy_from_slice(&src.cr[so..so + 8]);
+    }
+}
+
+/// Pass-1 decision for an MB in Annex F mode. `Inter1Mv` carries the
+/// chosen MV; `Inter4Mv` carries the four per-block MVs (Figure 5 order).
+#[derive(Clone, Copy, Debug)]
+enum MbDecision {
+    Skipped,
+    Intra,
+    Inter1Mv((i32, i32)),
+    Inter4Mv([(i32, i32); 4]),
+}
+
+/// Pass-1 MV decision. Picks 1-MV vs 4-MV vs intra vs skipped based on
+/// SADs. Returns the decision; does NOT emit any bitstream.
+fn decide_p_mb(
+    frame: &VideoFrame,
+    reference: &IPicture,
+    mv_grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+) -> MbDecision {
+    let (mvx, mvy, mv_sad) = motion_estimate_mb(frame, reference, mb_x, mb_y);
+    let zero_sad = sad_block(
+        &frame.planes[0].data,
+        frame.planes[0].stride,
+        (mb_x * 16) as i32,
+        (mb_y * 16) as i32,
+        &reference.y,
+        reference.y_stride,
+        reference.y_stride as i32,
+        (reference.y.len() / reference.y_stride) as i32,
+        (mb_x * 16) as i32,
+        (mb_y * 16) as i32,
+        0,
+        0,
+        16,
+    );
+    let (pmx, pmy) = predict_mv(mv_grid, mb_x, mb_y);
+    let can_skip = pmx == 0 && pmy == 0 && zero_sad < mv_sad + 128;
+
+    // Quick intra / skip check based on MB luma variance.
+    let src_y = &frame.planes[0];
+    let mut luma_abs_sum = 0u32;
+    // Use the zero-MV predictor for the skip / intra test; the final
+    // residual-against-OBMC check happens in pass 2.
+    for j in 0..16 {
+        for i in 0..16 {
+            let s = src_y.data[(mb_y * 16 + j) * src_y.stride + (mb_x * 16 + i)] as i32;
+            let p = {
+                // zero-MV predictor sample
+                let ref_w = reference.y_stride as i32;
+                let ref_h = (reference.y.len() / reference.y_stride) as i32;
+                let x = ((mb_x * 16) as i32 + i as i32 + (mvx >> 1)).clamp(0, ref_w - 1) as usize;
+                let y = ((mb_y * 16) as i32 + j as i32 + (mvy >> 1)).clamp(0, ref_h - 1) as usize;
+                reference.y[y * reference.y_stride + x] as i32
+            };
+            luma_abs_sum += (s - p).unsigned_abs();
+        }
+    }
+    let intra_variance = mb_luma_variance(src_y, mb_x, mb_y);
+    let try_intra = intra_variance * 5 < luma_abs_sum;
+
+    if can_skip && luma_abs_sum < (quant as u32) * 128 {
+        return MbDecision::Skipped;
+    }
+    if try_intra {
+        return MbDecision::Intra;
+    }
+
+    // Try 4MV.
+    let (mvs4, sad_sum) = motion_estimate_4mv(frame, reference, mb_x, mb_y);
+    let threshold = mv_sad.saturating_sub(mv_sad / 20 + 80);
+    // Allow an env-flag override for A/B testing — exporting
+    // `OXIDEAV_H263_FORCE_1MV=1` disables 4MV even in AP mode, which lets
+    // us isolate the 1-MV-with-OBMC correctness from the 4-MV selection.
+    let force_1mv = std::env::var("OXIDEAV_H263_FORCE_1MV").ok().as_deref() == Some("1");
+    if sad_sum < threshold && !force_1mv {
+        return MbDecision::Inter4Mv(mvs4);
+    }
+    MbDecision::Inter1Mv((mvx, mvy))
+}
+
+/// Pass-2 emit for an MB with a fully populated `mv_grid` (Annex F path).
+/// Computes OBMC-blended predictor + residual and writes the MB bitstream
+/// (COD/MCBPC/CBPY/MVD(s)/ACs). Writes `recon` as `pred + clipped residual`
+/// for downstream passes; pass 3 will overwrite with the decoder-equivalent
+/// OBMC reconstruction.
+#[allow(clippy::too_many_arguments)]
+fn emit_p_mb_ap(
+    bw: &mut BitWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+    mv_grid: &MvGrid,
+    decision: MbDecision,
+    recon: &mut IPicture,
+) -> Result<crate::mb::PMbInfo> {
+    match decision {
+        MbDecision::Skipped => {
+            bw.write_bits(1, 1);
+            // Copy the zero-MV predictor into recon so pass-3 has a valid
+            // source to build from (actually pass 3 rewrites from the
+            // reference via apply_p_mb_reconstruction, so recon content is
+            // overwritten, but we still keep a sensible value here).
+            let mut y_pred = [0u8; 256];
+            let mut u_pred = [0u8; 64];
+            let mut v_pred = [0u8; 64];
+            build_mb_predictor(
+                reference,
+                mb_x,
+                mb_y,
+                0,
+                0,
+                &mut y_pred,
+                &mut u_pred,
+                &mut v_pred,
+            );
+            copy_predictor_to_recon(recon, mb_x, mb_y, &y_pred, &u_pred, &v_pred);
+            Ok(crate::mb::PMbInfo::empty_skipped())
+        }
+        MbDecision::Intra => {
+            bw.write_bits(0, 1); // COD = 0
+            encode_p_mb_intra(bw, mb_x, mb_y, quant, frame, recon)?;
+            Ok(crate::mb::PMbInfo {
+                coded: true,
+                intra: true,
+                residual: vec![0i16; 6 * 64],
+                residual_present: [false; 6],
+                intra_done: true,
+            })
+        }
+        MbDecision::Inter1Mv(mv) => {
+            bw.write_bits(0, 1); // COD = 0
+                                 // Build OBMC predictor using the full mv_grid (each block's MV
+                                 // is the same; remote neighbours come from mv_grid).
+            let mvs4 = [mv; 4];
+            let (y_pred, _cmx, _cmy) =
+                build_mb_predictor_4mv_obmc(reference, mv_grid, mb_x, mb_y, &mvs4);
+            // Chroma: baseline 1-MV mapping.
+            let (cmx_1mv, cmy_1mv) = (luma_to_chroma_mv(mv.0), luma_to_chroma_mv(mv.1));
+            let mut u_pred = [0u8; 64];
+            let mut v_pred = [0u8; 64];
+            build_chroma_predictor(
+                reference,
+                mb_x,
+                mb_y,
+                cmx_1mv,
+                cmy_1mv,
+                &mut u_pred,
+                &mut v_pred,
+            );
+            let info = encode_p_mb_inter(
+                bw,
+                mb_x,
+                mb_y,
+                quant,
+                &frame.planes[0],
+                &frame.planes[1],
+                &frame.planes[2],
+                reference,
+                recon,
+                mv,
+                &mut mv_grid.clone(), // unused for final state — we already
+                // seeded mv_grid in pass 1. The
+                // `encode_p_mb_inter` call internally
+                // calls `mv_grid.set(...)` to finalise,
+                // which we don't want to mutate the
+                // pass-1 state. A clone suffices.
+                &y_pred,
+                &u_pred,
+                &v_pred,
+            )?;
+            Ok(info)
+        }
+        MbDecision::Inter4Mv(mvs4) => {
+            bw.write_bits(0, 1); // COD = 0
+            let (y_pred, cmx, cmy) =
+                build_mb_predictor_4mv_obmc(reference, mv_grid, mb_x, mb_y, &mvs4);
+            let mut u_pred = [0u8; 64];
+            let mut v_pred = [0u8; 64];
+            build_chroma_predictor(reference, mb_x, mb_y, cmx, cmy, &mut u_pred, &mut v_pred);
+            // We need a fresh per-MB MvGrid clone so the internal "seed
+            // mvs4[b] incrementally" dance in `encode_p_mb_inter_4mv`
+            // writes into a local scratch and doesn't disturb the pass-1
+            // mv_grid. After the call finishes, the final mvs4 is the same
+            // as what's already in pass-1 state, so correctness is
+            // preserved.
+            let mut scratch = mv_grid.clone();
+            let info = encode_p_mb_inter_4mv(
+                bw,
+                mb_x,
+                mb_y,
+                quant,
+                &frame.planes[0],
+                &frame.planes[1],
+                &frame.planes[2],
+                recon,
+                &mvs4,
+                &mut scratch,
+                &y_pred,
+                &u_pred,
+                &v_pred,
+            )?;
+            Ok(info)
+        }
+    }
 }
 
 fn write_picture_header(
@@ -388,6 +760,7 @@ fn write_picture_header(
     pquant: u8,
     tr: u8,
     is_p_picture: bool,
+    advanced_prediction: bool,
 ) -> Result<()> {
     // PSC: 22 bits = `0000 0000 0000 0000 1 00000`. Write byte-aligned to
     // simplify start-code recognition.
@@ -432,7 +805,15 @@ fn write_picture_header(
     bw.write_bits(u32::from(is_p_picture), 1); // bit 9 picture coding type (I=0, P=1)
     bw.write_bits(0, 1); // bit 10 UMV
     bw.write_bits(0, 1); // bit 11 SAC
-    bw.write_bits(0, 1); // bit 12 AP
+                         // bit 12 AP — Annex F Advanced Prediction. Set iff the encoder is in
+                         // 4MV/OBMC mode AND this is a P-picture (I-pictures have no MVs). On
+                         // I-pictures the bit must be 0 even if the knob is on.
+    let ap_bit = if is_p_picture && advanced_prediction {
+        1
+    } else {
+        0
+    };
+    bw.write_bits(ap_bit, 1); // bit 12 AP
     bw.write_bits(0, 1); // bit 13 PB
 
     // PQUANT (5 bits).
@@ -932,6 +1313,464 @@ fn motion_estimate_mb(
     best
 }
 
+/// Four-block motion estimation for Annex F. Runs the 8×8 SDSP diamond per
+/// block and returns `(mvs4, sad_sum)` — the sum of SADs of the four 8×8
+/// predictors. Used to decide between 1MV and 4MV for a given MB.
+fn motion_estimate_4mv(
+    frame: &VideoFrame,
+    reference: &IPicture,
+    mb_x: usize,
+    mb_y: usize,
+) -> ([(i32, i32); 4], u32) {
+    let mut mvs = [(0i32, 0i32); 4];
+    let mut total: u32 = 0;
+    for b in 0..4 {
+        let (sub_x, sub_y) = match b {
+            0 => (0, 0),
+            1 => (8, 0),
+            2 => (0, 8),
+            3 => (8, 8),
+            _ => unreachable!(),
+        };
+        let (mx, my, sad) = motion_estimate_block(frame, reference, mb_x, mb_y, sub_x, sub_y);
+        mvs[b] = (mx, my);
+        total = total.saturating_add(sad);
+    }
+    (mvs, total)
+}
+
+/// Motion-estimate a single 8×8 luma block at `(mb_x * 16 + sub_x, mb_y *
+/// 16 + sub_y)` against `reference`. Uses the same LDSP + SDSP + half-pel
+/// refinement dance as [`motion_estimate_mb`] but for an 8×8 source.
+fn motion_estimate_block(
+    frame: &VideoFrame,
+    reference: &IPicture,
+    mb_x: usize,
+    mb_y: usize,
+    sub_x: usize,
+    sub_y: usize,
+) -> (i32, i32, u32) {
+    let src = &frame.planes[0];
+    let src_stride = src.stride;
+    let src_x = (mb_x * 16 + sub_x) as i32;
+    let src_y = (mb_y * 16 + sub_y) as i32;
+    let blk_px = src_x;
+    let blk_py = src_y;
+    let ref_w = reference.y_stride as i32;
+    let ref_h = (reference.y.len() / reference.y_stride) as i32;
+    let pic_w = reference.width as i32;
+    let pic_h = reference.height as i32;
+
+    // 8×8 version of `mv_ok`: the predictor occupies an 8×8 window + the
+    // half-pel extension.
+    let mv_ok = |mvx: i32, mvy: i32| -> bool {
+        let ix = mvx >> 1;
+        let iy = mvy >> 1;
+        let ext_x = (mvx & 1).abs();
+        let ext_y = (mvy & 1).abs();
+        let left = blk_px + ix;
+        let top = blk_py + iy;
+        let right = blk_px + 8 + ix + ext_x;
+        let bottom = blk_py + 8 + iy + ext_y;
+        left >= 0 && top >= 0 && right <= pic_w && bottom <= pic_h
+    };
+    let mv_range = MV_RANGE_MIN_HALF..=MV_RANGE_MAX_HALF;
+
+    let eval = |ix: i32, iy: i32| -> Option<u32> {
+        let mvx = ix * 2;
+        let mvy = iy * 2;
+        if !mv_range.contains(&mvx) || !mv_range.contains(&mvy) {
+            return None;
+        }
+        if !mv_ok(mvx, mvy) {
+            return None;
+        }
+        Some(sad_block(
+            &src.data,
+            src_stride,
+            src_x,
+            src_y,
+            &reference.y,
+            reference.y_stride,
+            ref_w,
+            ref_h,
+            blk_px,
+            blk_py,
+            mvx,
+            mvy,
+            8,
+        ))
+    };
+
+    let mut cx = 0i32;
+    let mut cy = 0i32;
+    let mut best_sad = eval(cx, cy).unwrap_or(u32::MAX);
+    for _ in 0..MAX_LDSP_STEPS {
+        let mut improved = false;
+        let mut next = (cx, cy);
+        for &(dx, dy) in LDSP.iter().skip(1) {
+            let ix = cx + dx;
+            let iy = cy + dy;
+            if let Some(s) = eval(ix, iy) {
+                if s < best_sad {
+                    best_sad = s;
+                    next = (ix, iy);
+                    improved = true;
+                }
+            }
+        }
+        if !improved {
+            break;
+        }
+        cx = next.0;
+        cy = next.1;
+    }
+    for &(dx, dy) in SDSP.iter().skip(1) {
+        let ix = cx + dx;
+        let iy = cy + dy;
+        if let Some(s) = eval(ix, iy) {
+            if s < best_sad {
+                best_sad = s;
+                cx = ix;
+                cy = iy;
+            }
+        }
+    }
+    let mut best = (cx * 2, cy * 2, best_sad);
+    let (ix, iy, _) = best;
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let mvx = ix + dx;
+            let mvy = iy + dy;
+            if !mv_range.contains(&mvx) || !mv_range.contains(&mvy) {
+                continue;
+            }
+            if !mv_ok(mvx, mvy) {
+                continue;
+            }
+            let sad = sad_block(
+                &src.data,
+                src_stride,
+                src_x,
+                src_y,
+                &reference.y,
+                reference.y_stride,
+                ref_w,
+                ref_h,
+                blk_px,
+                blk_py,
+                mvx,
+                mvy,
+                8,
+            );
+            if sad < best.2 {
+                best = (mvx, mvy, sad);
+            }
+        }
+    }
+    best
+}
+
+/// Build the OBMC-blended 16×16 luma predictor for a 4MV MB, mirroring the
+/// decoder's §F.3 math so the encoder's residual target is the same pel
+/// grid the decoder will reconstruct. Also returns the chroma MV `(cmx,
+/// cmy)` derived from the 4 luma MVs via the §F.2 `sum/8` rule (Table F.1).
+///
+/// Note: the §F.3 remote-MV fall-back rules are applied via `mv_grid`
+/// lookups. Since the encoder visits MBs in raster order and only the
+/// current MB's `mvs4` is unset at the point we call this, we pre-populate
+/// a scratch motion entry with the candidate `mvs4` so the remote-MV
+/// helpers see the current block's vectors. Right / below neighbours that
+/// haven't been encoded yet are still at their `MbMotion::default()`
+/// values — `!coded` → the §F.3 "not coded → current block MV" substitution
+/// kicks in.
+fn build_mb_predictor_4mv_obmc(
+    reference: &IPicture,
+    mv_grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    mvs4: &[(i32, i32); 4],
+) -> ([u8; 256], i32, i32) {
+    let mut y_pred = [0u8; 256];
+    let ref_y_h = (reference.y.len() / reference.y_stride) as i32;
+    let ref_w = reference.y_stride as i32;
+
+    // Install a scratch motion entry for the current MB so the OBMC lookup
+    // can read the in-MB neighbour MVs. We restore the grid after we're
+    // done to avoid side-effects (the real write happens inside
+    // `encode_p_mb_inter_4mv` once the decision is final).
+    //
+    // We clone the grid only as much as needed: because `predict_block` is
+    // read-only on reference and we only mutate a single entry, a local
+    // clone of that single entry + revert-at-end is enough.
+    let prev_entry = mv_grid.get(mb_x, mb_y);
+    // SAFETY: caller passes `&MvGrid`, we need interior mutation. Use a
+    // local mutable copy of the whole grid instead — O(mb_w * mb_h)
+    // MbMotions at QCIF (99 entries) is negligible.
+    let mut scratch = mv_grid.clone();
+    scratch.set(mb_x, mb_y, MbMotion::mv4(*mvs4));
+
+    for b in 0..4 {
+        let (sub_x, sub_y) = match b {
+            0 => (0usize, 0usize),
+            1 => (8, 0),
+            2 => (0, 8),
+            3 => (8, 8),
+            _ => unreachable!(),
+        };
+        let blk_px = (mb_x * 16 + sub_x) as i32;
+        let blk_py = (mb_y * 16 + sub_y) as i32;
+        let mut blk = [0u8; 64];
+        obmc_predict_block_enc(
+            &mut blk, reference, &scratch, mb_x, mb_y, b, blk_px, blk_py, ref_w, ref_y_h,
+        );
+        for j in 0..8 {
+            for i in 0..8 {
+                y_pred[(sub_y + j) * 16 + (sub_x + i)] = blk[j * 8 + i];
+            }
+        }
+    }
+    // Restore prev entry (we passed in an immutable reference; scratch was
+    // local so no restore needed on the caller's grid — but for tidiness
+    // let the compiler ensure we didn't accidentally leak.).
+    let _ = prev_entry;
+
+    let (cmx, cmy) = chroma_mv_4mv(mvs4);
+    (y_pred, cmx, cmy)
+}
+
+/// Produce the OBMC-blended predictor for one 8×8 luma block of the
+/// current MB, using the same weight matrices and neighbour-MV
+/// substitution rules as the decoder's `obmc_luma_block` (§F.3). Kept
+/// parallel to `mb::obmc_luma_block` so encoder reconstruction stays
+/// bit-identical with what the decoder produces.
+#[allow(clippy::too_many_arguments)]
+fn obmc_predict_block_enc(
+    dst: &mut [u8; 64],
+    reference: &IPicture,
+    mv_grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    block_idx: usize,
+    blk_px: i32,
+    blk_py: i32,
+    ref_w: i32,
+    ref_h: i32,
+) {
+    let motion = mv_grid.get(mb_x, mb_y);
+    let mv0 = motion.mvs4[block_idx];
+    let mut q_pred = [0u8; 64];
+    predict_block(
+        &reference.y,
+        reference.y_stride,
+        ref_w,
+        ref_h,
+        blk_px,
+        blk_py,
+        mv0.0,
+        mv0.1,
+        8,
+        &mut q_pred,
+        8,
+    );
+
+    let in_top_row = block_idx < 2;
+    let in_left_col = block_idx == 0 || block_idx == 2;
+
+    // Top-neighbour remote MV.
+    let mv_top = if in_top_row {
+        if mb_y == 0 {
+            mv0
+        } else {
+            let nb = mv_grid.get(mb_x, mb_y - 1);
+            let sibling_idx = block_idx & 1; // col 0 -> block 0, col 1 -> block 1 of that MB ... (top row of that MB)
+                                             // For Top-neighbour when we're in top row, we want the BOTTOM row of the above MB:
+            let bot_sibling = (block_idx & 1) + 2; // blocks 2 or 3 of the above MB
+            let _ = sibling_idx;
+            enc_neighbour_mv(nb, bot_sibling, mv0)
+        }
+    } else {
+        // Blocks 2 or 3: top-neighbour is block 0 or 1 of the same MB.
+        motion.mvs4[block_idx & 1]
+    };
+    // Bottom-neighbour remote MV.
+    // Spec §F.3 last paragraph: for bottom-of-MB blocks (2 / 3) and Bottom
+    // side, force remote MV = current MV.
+    let mv_bot = if !in_top_row {
+        mv0
+    } else {
+        // Blocks 0 or 1: bottom-neighbour is block 2 or 3 of same MB.
+        motion.mvs4[(block_idx & 1) + 2]
+    };
+
+    // Left-neighbour remote MV.
+    let mv_left = if in_left_col {
+        if mb_x == 0 {
+            mv0
+        } else {
+            let nb = mv_grid.get(mb_x - 1, mb_y);
+            // Current is LEFT col (blocks 0/2) — left neighbour in prev MB is
+            // RIGHT col (blocks 1/3) at same row.
+            let row = block_idx >> 1; // 0 or 1
+            let right_sibling = row * 2 + 1;
+            enc_neighbour_mv(nb, right_sibling, mv0)
+        }
+    } else {
+        // Blocks 1 or 3 — left is block 0 or 2 of same MB.
+        let row = block_idx >> 1;
+        motion.mvs4[row * 2]
+    };
+    let mv_right = if in_left_col {
+        // Blocks 0/2 — right is block 1/3 of same MB.
+        let row = block_idx >> 1;
+        motion.mvs4[row * 2 + 1]
+    } else {
+        // Blocks 1/3 — right neighbour in next MB's LEFT col, same row.
+        if mb_x + 1 >= mv_grid.mb_w {
+            mv0
+        } else {
+            let nb = mv_grid.get(mb_x + 1, mb_y);
+            let row = block_idx >> 1;
+            let left_sibling = row * 2;
+            enc_neighbour_mv(nb, left_sibling, mv0)
+        }
+    };
+
+    let mut r_top_pred = [0u8; 64];
+    let mut r_bot_pred = [0u8; 64];
+    predict_block(
+        &reference.y,
+        reference.y_stride,
+        ref_w,
+        ref_h,
+        blk_px,
+        blk_py,
+        mv_top.0,
+        mv_top.1,
+        8,
+        &mut r_top_pred,
+        8,
+    );
+    predict_block(
+        &reference.y,
+        reference.y_stride,
+        ref_w,
+        ref_h,
+        blk_px,
+        blk_py,
+        mv_bot.0,
+        mv_bot.1,
+        8,
+        &mut r_bot_pred,
+        8,
+    );
+    let mut s_left_pred = [0u8; 64];
+    let mut s_right_pred = [0u8; 64];
+    predict_block(
+        &reference.y,
+        reference.y_stride,
+        ref_w,
+        ref_h,
+        blk_px,
+        blk_py,
+        mv_left.0,
+        mv_left.1,
+        8,
+        &mut s_left_pred,
+        8,
+    );
+    predict_block(
+        &reference.y,
+        reference.y_stride,
+        ref_w,
+        ref_h,
+        blk_px,
+        blk_py,
+        mv_right.0,
+        mv_right.1,
+        8,
+        &mut s_right_pred,
+        8,
+    );
+
+    for j in 0..8usize {
+        for i in 0..8usize {
+            let h0 = OBMC_H0[j][i] as i32;
+            let h1 = OBMC_H1[j][i] as i32;
+            let h2 = OBMC_H2[j][i] as i32;
+            let q = q_pred[j * 8 + i] as i32;
+            let r = if j < 4 {
+                r_top_pred[j * 8 + i] as i32
+            } else {
+                r_bot_pred[j * 8 + i] as i32
+            };
+            let s = if i < 4 {
+                s_left_pred[j * 8 + i] as i32
+            } else {
+                s_right_pred[j * 8 + i] as i32
+            };
+            let v = (q * h0 + r * h1 + s * h2 + 4) / 8;
+            dst[j * 8 + i] = v.clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// Pick a neighbour block's MV from an `MbMotion`, applying the §F.3
+/// fall-backs for "not coded" (→ zero) and "intra" (→ current MV).
+fn enc_neighbour_mv(nb: MbMotion, block_idx: usize, cur_mv: (i32, i32)) -> (i32, i32) {
+    if !nb.coded {
+        return (0, 0);
+    }
+    if nb.intra {
+        return cur_mv;
+    }
+    nb.mvs4[block_idx]
+}
+
+/// Build an 8×8 chroma predictor block into `u_pred` / `v_pred`.
+fn build_chroma_predictor(
+    reference: &IPicture,
+    mb_x: usize,
+    mb_y: usize,
+    cmx: i32,
+    cmy: i32,
+    u_pred: &mut [u8; 64],
+    v_pred: &mut [u8; 64],
+) {
+    let ref_c_h = (reference.cb.len() / reference.c_stride) as i32;
+    let blk_px = (mb_x * 8) as i32;
+    let blk_py = (mb_y * 8) as i32;
+    predict_block(
+        &reference.cb,
+        reference.c_stride,
+        reference.c_stride as i32,
+        ref_c_h,
+        blk_px,
+        blk_py,
+        cmx,
+        cmy,
+        8,
+        u_pred,
+        8,
+    );
+    predict_block(
+        &reference.cr,
+        reference.c_stride,
+        reference.c_stride as i32,
+        ref_c_h,
+        blk_px,
+        blk_py,
+        cmx,
+        cmy,
+        8,
+        v_pred,
+        8,
+    );
+}
+
 /// Encode one P-picture macroblock. Chooses one of:
 /// * **Skipped** (COD=1): when the predicted MB with MV=(0,0) has residual
 ///   energy below threshold AND the median predictor is (0,0). Copies
@@ -953,7 +1792,8 @@ fn encode_p_mb(
     reference: &IPicture,
     recon: &mut IPicture,
     mv_grid: &mut MvGrid,
-) -> Result<()> {
+    enable_annex_f: bool,
+) -> Result<crate::mb::PMbInfo> {
     // 1. Motion-estimate on luma 16×16.
     let (mvx, mvy, mv_sad) = motion_estimate_mb(frame, reference, mb_x, mb_y);
 
@@ -1028,7 +1868,7 @@ fn encode_p_mb(
         // Copy predictor into recon.
         copy_predictor_to_recon(recon, mb_x, mb_y, &y_pred, &u_pred, &v_pred);
         mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), false, false));
-        return Ok(());
+        return Ok(crate::mb::PMbInfo::empty_skipped());
     }
 
     // COD = 0 — MB is coded.
@@ -1037,15 +1877,28 @@ fn encode_p_mb(
     if try_intra {
         encode_p_mb_intra(bw, mb_x, mb_y, quant, frame, recon)?;
         mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), true, true));
-        return Ok(());
+        return Ok(crate::mb::PMbInfo {
+            coded: true,
+            intra: true,
+            residual: vec![0i16; 6 * 64],
+            residual_present: [false; 6],
+            intra_done: true,
+        });
     }
 
+    // Note: the Annex F 4-MV / OBMC encode path does NOT go through this
+    // single-pass function — it routes via `emit_p_mb_ap` after a
+    // two-pass decision phase. `enable_annex_f` arriving here therefore
+    // means the caller is in a transitional configuration; honour it by
+    // ignoring (emit single-pass 1-MV inter).
+    let _ = enable_annex_f;
+
     // Inter path.
-    encode_p_mb_inter(
+    let info = encode_p_mb_inter(
         bw, mb_x, mb_y, quant, src_y, src_cb, src_cr, reference, recon, decide_mv, mv_grid,
         &y_pred, &u_pred, &v_pred,
     )?;
-    Ok(())
+    Ok(info)
 }
 
 /// Intra encode of a P-MB block. Same bitstream as an I-MB's Intra MCBPC,
@@ -1109,7 +1962,7 @@ fn encode_p_mb_inter(
     y_pred: &[u8; 256],
     u_pred: &[u8; 64],
     v_pred: &[u8; 64],
-) -> Result<()> {
+) -> Result<crate::mb::PMbInfo> {
     // 1. For each of the 6 blocks, compute residual DCT → quantise → check
     //    if any nonzero AC exists. Track (cbpy, cbpc) and the recon pels.
     let mut levels_all = [[0i32; 64]; 6];
@@ -1186,7 +2039,16 @@ fn encode_p_mb_inter(
     }
 
     // 5. Reconstruct blocks into recon: predictor + dequantised residual
-    //    IDCT, clipped.
+    //    IDCT, clipped. Also stash the signed IDCT residual into `info` so
+    //    the Annex F pass-2 OBMC can re-add it to the OBMC-blended
+    //    predictor.
+    let mut info = crate::mb::PMbInfo {
+        coded: true,
+        intra: false,
+        residual: vec![0i16; 6 * 64],
+        residual_present: [false; 6],
+        intra_done: false,
+    };
     for b in 0..4 {
         let (sub_x, sub_y) = match b {
             0 => (0, 0),
@@ -1207,6 +2069,13 @@ fn encode_p_mb_inter(
                 plane[(py + j) * stride + (px + i)] = (p + r).clamp(0, 255) as u8;
             }
         }
+        if has_ac[b] {
+            let dst = info.residual_block_mut(b);
+            for (i, &v) in resid_out.iter().enumerate() {
+                dst[i] = v.clamp(-4096, 4095) as i16;
+            }
+            info.residual_present[b] = true;
+        }
     }
     for ci in 0..2usize {
         let b = 4 + ci;
@@ -1223,10 +2092,188 @@ fn encode_p_mb_inter(
                 plane[(py + j) * stride + (px + i)] = (p + r).clamp(0, 255) as u8;
             }
         }
+        if has_ac[b] {
+            let dst = info.residual_block_mut(b);
+            for (i, &v) in resid_out.iter().enumerate() {
+                dst[i] = v.clamp(-4096, 4095) as i16;
+            }
+            info.residual_present[b] = true;
+        }
     }
 
     mv_grid.set(mb_x, mb_y, MbMotion::mv1(mv, true, false));
-    Ok(())
+    Ok(info)
+}
+
+/// Inter encode of a P-MB in 4MV mode (§F / Annex F) — Inter4MV MCBPC +
+/// CBPY + four MVDs + MVDCHR-derived chroma + residual TCOEF per coded
+/// block. The luma predictor is the OBMC-blended one (pre-built by the
+/// caller so the residual targets the same pels the decoder will
+/// reconstruct).
+#[allow(clippy::too_many_arguments)]
+fn encode_p_mb_inter_4mv(
+    bw: &mut BitWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    src_y: &oxideav_core::frame::VideoPlane,
+    src_cb: &oxideav_core::frame::VideoPlane,
+    src_cr: &oxideav_core::frame::VideoPlane,
+    recon: &mut IPicture,
+    mvs4: &[(i32, i32); 4],
+    mv_grid: &mut MvGrid,
+    y_pred: &[u8; 256],
+    u_pred: &[u8; 64],
+    v_pred: &[u8; 64],
+) -> Result<crate::mb::PMbInfo> {
+    // 1. Per-block residual DCT → quantise.
+    let mut levels_all = [[0i32; 64]; 6];
+    let mut has_ac = [false; 6];
+    for b in 0..4 {
+        let (sub_x, sub_y) = match b {
+            0 => (0, 0),
+            1 => (8, 0),
+            2 => (0, 8),
+            3 => (8, 8),
+            _ => unreachable!(),
+        };
+        let mut resid = [0.0f32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                let py = mb_y * 16 + sub_y + j;
+                let px = mb_x * 16 + sub_x + i;
+                let s = src_y.data[py * src_y.stride + px] as i32;
+                let p = y_pred[(sub_y + j) * 16 + (sub_x + i)] as i32;
+                resid[j * 8 + i] = (s - p) as f32;
+            }
+        }
+        let mut dctf = resid;
+        fdct8x8(&mut dctf);
+        let levels = quantise_inter_block(&dctf, quant);
+        has_ac[b] = levels.iter().any(|&l| l != 0);
+        levels_all[b] = levels;
+    }
+    for (ci, plane) in [(0, src_cb), (1, src_cr)].iter() {
+        let pred = if *ci == 0 { u_pred } else { v_pred };
+        let mut resid = [0.0f32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                let py = mb_y * 8 + j;
+                let px = mb_x * 8 + i;
+                let s = plane.data[py * plane.stride + px] as i32;
+                let p = pred[j * 8 + i] as i32;
+                resid[j * 8 + i] = (s - p) as f32;
+            }
+        }
+        let mut dctf = resid;
+        fdct8x8(&mut dctf);
+        let levels = quantise_inter_block(&dctf, quant);
+        let b = 4 + ci;
+        has_ac[b] = levels.iter().any(|&l| l != 0);
+        levels_all[b] = levels;
+    }
+
+    // 2. CBPC / CBPY (XOR for inter).
+    let cbpc: u8 = ((has_ac[4] as u8) << 1) | (has_ac[5] as u8);
+    let cbpy_true: u8 = ((has_ac[0] as u8) << 3)
+        | ((has_ac[1] as u8) << 2)
+        | ((has_ac[2] as u8) << 1)
+        | (has_ac[3] as u8);
+    let cbpy_on_wire = cbpy_true ^ 0xF;
+
+    // 3. Emit MCBPC Inter4MV + CBPY + 4 MVDs.
+    write_mcbpc_inter(bw, PMbKind::Inter4MV, cbpc);
+    write_cbpy(bw, cbpy_on_wire);
+
+    // The decoder decodes MVDs in block order 0..=3 using the §F.2
+    // per-block predictor (redefined MV1/MV2/MV3 per Figure F.1). After each
+    // component is decoded, the decoder updates `mv_grid.mvs4[b]` so later
+    // blocks can see it (block 1's left-neighbour is block 0 of the same MB,
+    // etc.). We must mirror that exactly on the encoder side — start the MB
+    // entry as a 4-MV record with zero slots and fill them in order.
+    mv_grid.set(mb_x, mb_y, MbMotion::mv4([(0, 0); 4]));
+    for b in 0..4 {
+        let (pmx, pmy) = predict_mv_block(mv_grid, mb_x, mb_y, b);
+        encode_mv_component(bw, mvs4[b].0, pmx);
+        encode_mv_component(bw, mvs4[b].1, pmy);
+        let mut cur = mv_grid.get(mb_x, mb_y);
+        cur.mvs4[b] = mvs4[b];
+        cur.mv = mvs4[0];
+        mv_grid.set(mb_x, mb_y, cur);
+    }
+    // Finalise the MbMotion record so downstream neighbours see a proper
+    // 4MV entry.
+    mv_grid.set(mb_x, mb_y, MbMotion::mv4(*mvs4));
+
+    // 4. Per-block AC.
+    for b in 0..6 {
+        if has_ac[b] {
+            write_block_ac_inter(bw, &levels_all[b]);
+        }
+    }
+
+    // 5. Reconstruct blocks (predictor + dequantised residual IDCT + clip)
+    //    and stash the residual for the Annex F pass-2 OBMC.
+    let mut info = crate::mb::PMbInfo {
+        coded: true,
+        intra: false,
+        residual: vec![0i16; 6 * 64],
+        residual_present: [false; 6],
+        intra_done: false,
+    };
+    for b in 0..4 {
+        let (sub_x, sub_y) = match b {
+            0 => (0, 0),
+            1 => (8, 0),
+            2 => (0, 8),
+            3 => (8, 8),
+            _ => unreachable!(),
+        };
+        let coeffs = dequantise_block(&levels_all[b], quant, false);
+        let mut c = coeffs;
+        let mut resid_out = [0i32; 64];
+        crate::block::idct_signed(&mut c, &mut resid_out);
+        let (plane, stride, px, py) = block_dst(recon, b, mb_x, mb_y);
+        for j in 0..8 {
+            for i in 0..8 {
+                let p = y_pred[(sub_y + j) * 16 + (sub_x + i)] as i32;
+                let r = resid_out[j * 8 + i];
+                plane[(py + j) * stride + (px + i)] = (p + r).clamp(0, 255) as u8;
+            }
+        }
+        if has_ac[b] {
+            let dst = info.residual_block_mut(b);
+            for (i, &v) in resid_out.iter().enumerate() {
+                dst[i] = v.clamp(-4096, 4095) as i16;
+            }
+            info.residual_present[b] = true;
+        }
+    }
+    for ci in 0..2usize {
+        let b = 4 + ci;
+        let pred = if ci == 0 { u_pred } else { v_pred };
+        let coeffs = dequantise_block(&levels_all[b], quant, false);
+        let mut c = coeffs;
+        let mut resid_out = [0i32; 64];
+        crate::block::idct_signed(&mut c, &mut resid_out);
+        let (plane, stride, px, py) = block_dst(recon, b, mb_x, mb_y);
+        for j in 0..8 {
+            for i in 0..8 {
+                let p = pred[j * 8 + i] as i32;
+                let r = resid_out[j * 8 + i];
+                plane[(py + j) * stride + (px + i)] = (p + r).clamp(0, 255) as u8;
+            }
+        }
+        if has_ac[b] {
+            let dst = info.residual_block_mut(b);
+            for (i, &v) in resid_out.iter().enumerate() {
+                dst[i] = v.clamp(-4096, 4095) as i16;
+            }
+            info.residual_present[b] = true;
+        }
+    }
+
+    Ok(info)
 }
 
 /// Quantise a residual (inter) block. Uses the same deadzone bias as the
