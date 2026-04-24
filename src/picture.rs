@@ -215,11 +215,10 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
             "h263 Annex E syntax-based arithmetic coding: follow-up",
         ));
     }
-    if advanced_prediction {
-        return Err(Error::unsupported(
-            "h263 Annex F advanced prediction (4MV / OBMC): follow-up",
-        ));
-    }
+    // Annex F (Advanced Prediction — 4MV + OBMC) is accepted on baseline
+    // PTYPE streams and handled by the P-MB decoder via `decode_p_mb`.
+    // The PLUSPTYPE form is still rejected (Table D.3 intersection /
+    // OPPTYPE AP bit still returns Unsupported in `parse_plusptype_tail`).
     if pb_frames {
         return Err(Error::unsupported(
             "h263 Annex G PB-frames mode: follow-up (B-pictures)",
@@ -348,7 +347,9 @@ fn parse_plusptype_tail(
     //   Bit 14:   MQ  (Annex T modified quantization).
     //   Bit 15:   Marker, must be "1".
     //   Bits 16-18: Reserved, must be "000".
-    let (opptype_src_format, custom_src_format, custom_pcf, umv_mode, df_mode) = if ufep == 0b001 {
+    let (opptype_src_format, custom_src_format, custom_pcf, umv_mode, df_mode, ap_mode) = if ufep
+        == 0b001
+    {
         let opptype = br.read_u32(18)?;
         // MSB-first helpers: `bit(k)` returns the k-th spec bit
         // (1-indexed, where 1 is the MSB of the 18-bit field).
@@ -387,11 +388,9 @@ fn parse_plusptype_tail(
                 "h263 Annex E syntax-based arithmetic coding (PLUSPTYPE): follow-up",
             ));
         }
-        if ap {
-            return Err(Error::unsupported(
-                "h263 Annex F advanced prediction (PLUSPTYPE): follow-up",
-            ));
-        }
+        // Annex F AP in PLUSPTYPE — accepted, same 4MV/OBMC path as the
+        // baseline PTYPE form. `advanced_prediction` is reflected back to
+        // the caller via the returned `PictureHeader`.
         if aic {
             return Err(Error::unsupported(
                 "h263 Annex I advanced intra coding (PLUSPTYPE): follow-up",
@@ -431,7 +430,7 @@ fn parse_plusptype_tail(
                 "h263 Annex D unrestricted MV mode in PLUSPTYPE form (Table D.3): follow-up",
             ));
         }
-        (src_fmt_code as u8, custom_src, custom_pcf, umv, df)
+        (src_fmt_code as u8, custom_src, custom_pcf, umv, df, ap)
     } else if ufep == 0b000 {
         // Inherit previous-picture OPPTYPE state. Since we do not yet retain
         // OPPTYPE across pictures, we treat the inherited state as "baseline
@@ -443,7 +442,7 @@ fn parse_plusptype_tail(
         // bit that actually matters. `opptype_src_format = 0` signals
         // "no OPPTYPE, dimensions must be inferable from later CPFMT (which
         // in turn will not be present for UFEP==000)".
-        (0, false, false, false, false)
+        (0, false, false, false, false, false)
     } else {
         return Err(Error::invalid(format!(
             "h263 PLUSPTYPE: invalid UFEP {ufep:03b}"
@@ -615,7 +614,7 @@ fn parse_plusptype_tail(
         coding_type,
         umv_mode,
         sac_mode: false,
-        advanced_prediction: false,
+        advanced_prediction: ap_mode,
         pb_frames: false,
         pquant,
         cpm,

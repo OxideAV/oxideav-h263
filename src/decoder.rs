@@ -20,7 +20,9 @@ use oxideav_core::{
 };
 
 use crate::gob::parse_gob_header;
-use crate::mb::{decode_intra_mb, decode_p_mb, IPicture};
+use crate::mb::{
+    apply_p_mb_reconstruction, decode_intra_mb, decode_p_mb, decode_p_mb_pass1, IPicture, PMbInfo,
+};
 use crate::motion::MvGrid;
 use crate::picture::{parse_picture_header, PictureCodingType, PictureHeader};
 use crate::start_code::{find_next_start_code, StartCode, GN_EOS, GN_PICTURE};
@@ -240,32 +242,85 @@ pub fn decode_p_picture(
 
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
 
+    if !hdr.advanced_prediction {
+        // Fast single-pass path: MC is a strict function of the current MB's
+        // MV and the reference, so we can write final pels as we decode.
+        for mb_y in 0..mb_h {
+            if mb_y > 0 && (mb_y as u32) % mb_rows_per_gob == 0 {
+                let consumed = try_consume_gob_header(br, &gob_starts, hdr, &mut quant)?;
+                if consumed {
+                    // GOB header present → MV-predictor reset (§5.3.7.2).
+                    mv_grid = MvGrid::new(mb_w, mb_h);
+                }
+            }
+            for mb_x in 0..mb_w {
+                quant = decode_p_mb(
+                    br,
+                    mb_x,
+                    mb_y,
+                    quant,
+                    &mut pic,
+                    reference,
+                    &mut mv_grid,
+                    hdr.umv_mode,
+                )
+                .map_err(|e| {
+                    Error::invalid(format!(
+                        "h263 P-picture MB ({mb_x},{mb_y}) (q={quant}): {e}"
+                    ))
+                })?;
+            }
+        }
+        return Ok(pic);
+    }
+
+    // Two-pass Annex F path: pass 1 populates `mv_grid` + per-MB residuals;
+    // pass 2 runs OBMC and writes final pels. Unlike the fast path we do NOT
+    // reset `mv_grid` at non-empty GOB boundaries — §F.3 says "remote motion
+    // vectors from other video picture segments are used in the same way as
+    // remote motion vectors inside the current GOB" (outside Slice
+    // Structured / Independent Segment Decoding, neither of which this
+    // crate implements). Instead we pass a `gob_top_row` flag into the MV
+    // predictor, which collapses above-row neighbours to `(0,0)` for
+    // predictor purposes only — OBMC still reads the real MVs.
+    let mut residuals: Vec<PMbInfo> = Vec::with_capacity(mb_w * mb_h);
+    let mut gob_top_rows = vec![false; mb_h];
     for mb_y in 0..mb_h {
         if mb_y > 0 && (mb_y as u32) % mb_rows_per_gob == 0 {
             let consumed = try_consume_gob_header(br, &gob_starts, hdr, &mut quant)?;
             if consumed {
-                // GOB header present → MV-predictor reset (§5.3.7.2).
-                mv_grid = MvGrid::new(mb_w, mb_h);
+                gob_top_rows[mb_y] = true;
             }
         }
         for mb_x in 0..mb_w {
-            quant = decode_p_mb(
+            let (new_q, info) = decode_p_mb_pass1(
                 br,
                 mb_x,
                 mb_y,
                 quant,
                 &mut pic,
-                reference,
                 &mut mv_grid,
                 hdr.umv_mode,
+                true, // advanced_prediction
+                gob_top_rows[mb_y],
             )
             .map_err(|e| {
                 Error::invalid(format!(
                     "h263 P-picture MB ({mb_x},{mb_y}) (q={quant}): {e}"
                 ))
             })?;
+            quant = new_q;
+            residuals.push(info);
         }
     }
+
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            let info = &residuals[mb_y * mb_w + mb_x];
+            apply_p_mb_reconstruction(mb_x, mb_y, &mut pic, reference, &mv_grid, info, true);
+        }
+    }
+
     Ok(pic)
 }
 

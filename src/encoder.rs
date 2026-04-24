@@ -1027,15 +1027,7 @@ fn encode_p_mb(
         bw.write_bits(1, 1);
         // Copy predictor into recon.
         copy_predictor_to_recon(recon, mb_x, mb_y, &y_pred, &u_pred, &v_pred);
-        mv_grid.set(
-            mb_x,
-            mb_y,
-            MbMotion {
-                mv: (0, 0),
-                coded: false,
-                intra: false,
-            },
-        );
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), false, false));
         return Ok(());
     }
 
@@ -1044,15 +1036,7 @@ fn encode_p_mb(
 
     if try_intra {
         encode_p_mb_intra(bw, mb_x, mb_y, quant, frame, recon)?;
-        mv_grid.set(
-            mb_x,
-            mb_y,
-            MbMotion {
-                mv: (0, 0),
-                coded: true,
-                intra: true,
-            },
-        );
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), true, true));
         return Ok(());
     }
 
@@ -1241,15 +1225,7 @@ fn encode_p_mb_inter(
         }
     }
 
-    mv_grid.set(
-        mb_x,
-        mb_y,
-        MbMotion {
-            mv,
-            coded: true,
-            intra: false,
-        },
-    );
+    mv_grid.set(mb_x, mb_y, MbMotion::mv1(mv, true, false));
     Ok(())
 }
 

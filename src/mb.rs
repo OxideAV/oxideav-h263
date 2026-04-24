@@ -33,7 +33,10 @@ use oxideav_mpeg4video::tables::{cbpy, mcbpc, vlc};
 
 use crate::block::{decode_ac, decode_intradc, idct_and_clip};
 use crate::interp::predict_block;
-use crate::motion::{decode_mv_component_umv, luma_to_chroma_mv, predict_mv, MbMotion, MvGrid};
+use crate::motion::{
+    chroma_mv_4mv, decode_mv_component_umv, luma_to_chroma_mv, predict_mv_block_with_gob_mask,
+    predict_mv_with_gob_mask, MbMotion, MvGrid, OBMC_H0, OBMC_H1, OBMC_H2,
+};
 
 /// Signed `dquant` adjustment — Table 12/H.263. 2-bit code indexes `[-1, -2, 1, 2]`.
 const DQUANT_DELTA: [i32; 4] = [-1, -2, 1, 2];
@@ -200,41 +203,80 @@ fn block_dst(
     }
 }
 
-/// Decode one P-picture macroblock at `(mb_x, mb_y)`. Reads from `br`,
-/// writes decoded pels into `pic`, consults `reference` for motion
-/// compensation, and updates `mv_grid` so subsequent MBs see the correct
-/// median predictor. When `umv` is `true`, the MV decoder uses the Annex D
-/// "sign-of-predictor" reconstruction rule and accepts the extended half-pel
-/// range `[-63, +63]`.
+/// Per-MB decoded state retained after the first pass of a P-picture body, so
+/// the second pass (Annex F OBMC) can apply the overlapped motion-compensation
+/// predictor with full knowledge of the neighbour MVs before writing final
+/// pels into `pic`.
+///
+/// The residual blocks are stored in signed-IDCT form (pre-addition to the
+/// predictor); `coded[k]` says whether block `k` (0..4 luma, 4..6 chroma)
+/// carries a residual at all. A non-coded block contributes zero residual to
+/// the (pure MC) output.
+#[derive(Clone)]
+pub struct PMbInfo {
+    pub coded: bool,
+    pub intra: bool,
+    /// Residual pels (IDCT output, signed) for each of the 6 blocks. Zeroes
+    /// when `residual_present[k]` is false.
+    pub residual: Vec<i16>,
+    pub residual_present: [bool; 6],
+    /// Intra path reconstructed pels (post-clip). When `intra` is true these
+    /// blocks have already been written to `pic` during pass 1 and pass 2
+    /// leaves them alone.
+    pub intra_done: bool,
+}
+
+impl PMbInfo {
+    pub fn empty_skipped() -> Self {
+        Self {
+            coded: false,
+            intra: false,
+            residual: vec![0i16; 6 * 64],
+            residual_present: [false; 6],
+            intra_done: false,
+        }
+    }
+
+    pub fn residual_block(&self, k: usize) -> &[i16] {
+        &self.residual[k * 64..(k + 1) * 64]
+    }
+
+    pub fn residual_block_mut(&mut self, k: usize) -> &mut [i16] {
+        &mut self.residual[k * 64..(k + 1) * 64]
+    }
+}
+
+/// Pass 1: decode one P-picture macroblock. Populates `mv_grid` and returns a
+/// [`PMbInfo`] holding residuals so that [`apply_p_mb_reconstruction`] can do
+/// the actual pixel write later. When `advanced_prediction` is `true`, the
+/// MCBPC Inter4MV / Inter4MVQ codes are accepted and three extra MV codewords
+/// (MVD2..MVD4, §5.3.8) are read.
+///
+/// Intra MBs are written to `pic` directly (no OBMC dependence) — they
+/// don't need pass 2.
 ///
 /// Returns the (possibly updated) quantiser.
-pub fn decode_p_mb(
+#[allow(clippy::too_many_arguments)]
+pub fn decode_p_mb_pass1(
     br: &mut BitReader<'_>,
     mb_x: usize,
     mb_y: usize,
     quant_in: u32,
     pic: &mut IPicture,
-    reference: &IPicture,
     mv_grid: &mut MvGrid,
     umv: bool,
-) -> Result<u32> {
-    // 1. COD flag (§5.3.1). 1 → not_coded: copy from reference, MV(0,0).
+    advanced_prediction: bool,
+    gob_top_row: bool,
+) -> Result<(u32, PMbInfo)> {
+    // 1. COD flag (§5.3.1). 1 → not_coded: MV (0,0), no residual. Pass 2 still
+    //    runs OBMC on this MB when AP is active (§F.3 note).
     let cod = br.read_u1()?;
     if cod == 1 {
-        copy_skipped_mb(pic, reference, mb_x, mb_y);
-        mv_grid.set(
-            mb_x,
-            mb_y,
-            MbMotion {
-                mv: (0, 0),
-                coded: false,
-                intra: false,
-            },
-        );
-        return Ok(quant_in);
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), false, false));
+        return Ok((quant_in, PMbInfo::empty_skipped()));
     }
 
-    // 2. MCBPC inter — Table 16/H.263 (identical to MPEG-4 Table B-13).
+    // 2. MCBPC inter.
     let mcbpc_v = loop {
         let v = vlc::decode(br, mcbpc::p_table())?;
         if v != mcbpc::INTER_STUFFING {
@@ -243,21 +285,24 @@ pub fn decode_p_mb(
     };
     let (mb_type, cbpc) = mcbpc::decompose_inter(mcbpc_v);
     use mcbpc::PMbType;
-    if matches!(mb_type, PMbType::Inter4MV | PMbType::Inter4MVQ) {
+
+    let is_4mv = matches!(mb_type, PMbType::Inter4MV | PMbType::Inter4MVQ);
+    if is_4mv && !advanced_prediction {
         return Err(Error::unsupported(
-            "h263 P-MB: Inter4MV (Annex F advanced prediction): follow-up",
+            "h263 P-MB: Inter4MV present but Advanced Prediction mode not signalled",
         ));
     }
     let is_intra = matches!(mb_type, PMbType::Intra | PMbType::IntraQ);
-    let needs_dquant = matches!(mb_type, PMbType::InterQ | PMbType::IntraQ);
+    let needs_dquant = matches!(
+        mb_type,
+        PMbType::InterQ | PMbType::IntraQ | PMbType::Inter4MVQ
+    );
 
-    // 3. CBPY. Inter MBs invert the 4-bit pattern (§5.3.3) — `0` in the
-    //    decoded VLC corresponds to "AC coded" for inter. Intra (embedded in
-    //    P) uses the raw pattern.
+    // 3. CBPY.
     let cbpy_raw = vlc::decode(br, cbpy::table())?;
     let cbpy = if is_intra { cbpy_raw } else { cbpy_raw ^ 0xF };
 
-    // 4. DQUANT — 2 signed bits, if mb_type is `*Q`.
+    // 4. DQUANT.
     let mut quant = quant_in;
     if needs_dquant {
         const DQUANT_DELTA: [i32; 4] = [-1, -2, 1, 2];
@@ -266,35 +311,36 @@ pub fn decode_p_mb(
         quant = new_q.clamp(1, 31) as u32;
     }
 
-    // 5. Motion vector (only for inter MBs). Intra MBs carry MV(0,0) as a
-    //    neighbour predictor and their texture is decoded via the intra
-    //    path.
-    let mv_half: (i32, i32) = if is_intra {
-        mv_grid.set(
-            mb_x,
-            mb_y,
-            MbMotion {
-                mv: (0, 0),
-                coded: true,
-                intra: true,
-            },
-        );
-        (0, 0)
+    // 5. Motion vectors.
+    if is_intra {
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), true, true));
+    } else if is_4mv {
+        // Decode 4 per-block MVs using the §F.2 Fig F.1 redefined predictors.
+        // Each per-block MV is stored into `mv_grid` as it's decoded, so that
+        // later blocks in the same MB can see it (blocks 1..3 reference
+        // block 0 / block 0/1 / block 2 within the same MB).
+        let mut mvs = [(0i32, 0i32); 4];
+        // Start with the stored MB entry being 4-MV-mode so `predict_mv_block`
+        // picks up partial in-MB neighbours correctly.
+        mv_grid.set(mb_x, mb_y, MbMotion::mv4([(0, 0); 4]));
+        for b in 0..4 {
+            let (px, py) = predict_mv_block_with_gob_mask(mv_grid, mb_x, mb_y, b, gob_top_row);
+            let mvx = decode_mv_component_umv(br, px, umv)?;
+            let mvy = decode_mv_component_umv(br, py, umv)?;
+            mvs[b] = (mvx, mvy);
+            // Update partial mvs4 so subsequent block predictors see it.
+            let mut cur = mv_grid.get(mb_x, mb_y);
+            cur.mvs4[b] = (mvx, mvy);
+            cur.mv = mvs[0]; // summary MV = block 0's.
+            mv_grid.set(mb_x, mb_y, cur);
+        }
+        mv_grid.set(mb_x, mb_y, MbMotion::mv4(mvs));
     } else {
-        let (px, py) = predict_mv(mv_grid, mb_x, mb_y);
+        let (px, py) = predict_mv_with_gob_mask(mv_grid, mb_x, mb_y, gob_top_row);
         let mvx = decode_mv_component_umv(br, px, umv)?;
         let mvy = decode_mv_component_umv(br, py, umv)?;
-        mv_grid.set(
-            mb_x,
-            mb_y,
-            MbMotion {
-                mv: (mvx, mvy),
-                coded: true,
-                intra: false,
-            },
-        );
-        (mvx, mvy)
-    };
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((mvx, mvy), true, false));
+    }
 
     // 6. Per-block texture.
     let luma_coded = [
@@ -306,6 +352,7 @@ pub fn decode_p_mb(
     let chroma_coded = [(cbpc >> 1) & 1 != 0, cbpc & 1 != 0];
 
     if is_intra {
+        // Intra blocks — decode and write directly to `pic` (no OBMC needed).
         for block_idx in 0..6usize {
             let coded = if block_idx < 4 {
                 luma_coded[block_idx]
@@ -314,81 +361,105 @@ pub fn decode_p_mb(
             };
             decode_one_intra_block_in_p(br, block_idx, coded, mb_x, mb_y, quant, pic)?;
         }
-        return Ok(quant);
+        return Ok((
+            quant,
+            PMbInfo {
+                coded: true,
+                intra: true,
+                residual: vec![0i16; 6 * 64],
+                residual_present: [false; 6],
+                intra_done: true,
+            },
+        ));
     }
 
-    // Inter path: predict from reference with MV, add AC residual.
-    decode_inter_mb_texture(
-        br,
-        mb_x,
-        mb_y,
-        quant,
-        pic,
-        reference,
-        mv_half,
-        &luma_coded,
-        &chroma_coded,
-    )?;
-    Ok(quant)
+    // Inter path — decode each block's AC residual into the PMbInfo buffer;
+    // do NOT touch `pic` yet. Pass 2 applies MC + residual.
+    let mut info = PMbInfo {
+        coded: true,
+        intra: false,
+        residual: vec![0i16; 6 * 64],
+        residual_present: [false; 6],
+        intra_done: false,
+    };
+    for block_idx in 0..6usize {
+        let coded = if block_idx < 4 {
+            luma_coded[block_idx]
+        } else {
+            chroma_coded[block_idx - 4]
+        };
+        if !coded {
+            continue;
+        }
+        let mut coeffs = [0i32; 64];
+        decode_ac(br, &mut coeffs, 0, quant)?;
+        let mut resid = [0i32; 64];
+        crate::block::idct_signed(&mut coeffs, &mut resid);
+        let dst = info.residual_block_mut(block_idx);
+        for (i, &v) in resid.iter().enumerate() {
+            dst[i] = v.clamp(-4096, 4095) as i16;
+        }
+        info.residual_present[block_idx] = true;
+    }
+    Ok((quant, info))
 }
 
-/// Decode the 6 blocks of an inter MB: MC predictor + (optional) residual for
-/// each. `luma_coded` / `chroma_coded` are the CBP bits after the inter XOR.
-#[allow(clippy::too_many_arguments)]
-fn decode_inter_mb_texture(
-    br: &mut BitReader<'_>,
+/// Pass 2: apply motion compensation (with OBMC when `advanced_prediction` is
+/// on) + residual addition to produce final pels in `pic`.
+pub fn apply_p_mb_reconstruction(
     mb_x: usize,
     mb_y: usize,
-    quant: u32,
     pic: &mut IPicture,
     reference: &IPicture,
-    mv_half: (i32, i32),
-    luma_coded: &[bool; 4],
-    chroma_coded: &[bool; 2],
-) -> Result<()> {
-    let ref_y_h = reference.y.len() / reference.y_stride;
-    let ref_c_h = reference.cb.len() / reference.c_stride;
-    let (mvx, mvy) = mv_half;
+    mv_grid: &MvGrid,
+    info: &PMbInfo,
+    advanced_prediction: bool,
+) {
+    // Intra MBs were written in pass 1.
+    if info.intra_done {
+        return;
+    }
 
+    let motion = mv_grid.get(mb_x, mb_y);
+
+    // Luma blocks (0..=3).
     for block_idx in 0..4usize {
-        let (sub_x, sub_y) = match block_idx {
-            0 => (0, 0),
-            1 => (8, 0),
-            2 => (0, 8),
-            3 => (8, 8),
-            _ => unreachable!(),
-        };
-        let blk_px = (mb_x * 16 + sub_x) as i32;
-        let blk_py = (mb_y * 16 + sub_y) as i32;
         let mut pred = [0u8; 64];
-        predict_block(
-            &reference.y,
-            reference.y_stride,
-            reference.y_stride as i32,
-            ref_y_h as i32,
-            blk_px,
-            blk_py,
-            mvx,
-            mvy,
-            8,
-            &mut pred,
-            8,
-        );
-
-        if luma_coded[block_idx] {
-            let mut coeffs = [0i32; 64];
-            decode_ac(br, &mut coeffs, 0, quant)?;
-            let mut resid = [0i32; 64];
-            crate::block::idct_signed(&mut coeffs, &mut resid);
-            let (plane, stride, px, py) = block_dst(pic, block_idx, mb_x, mb_y);
+        if advanced_prediction {
+            obmc_luma_block(
+                &mut pred, reference, mv_grid, mb_x, mb_y, block_idx, &motion,
+            );
+        } else {
+            // Plain single-MV MC.
+            let (sub_x, sub_y) = block_offset(block_idx);
+            let blk_px = (mb_x * 16 + sub_x) as i32;
+            let blk_py = (mb_y * 16 + sub_y) as i32;
+            let (mvx, mvy) = motion.mvs4[block_idx];
+            let ref_y_h = reference.y.len() / reference.y_stride;
+            predict_block(
+                &reference.y,
+                reference.y_stride,
+                reference.y_stride as i32,
+                ref_y_h as i32,
+                blk_px,
+                blk_py,
+                mvx,
+                mvy,
+                8,
+                &mut pred,
+                8,
+            );
+        }
+        let (plane, stride, px, py) = block_dst(pic, block_idx, mb_x, mb_y);
+        if info.residual_present[block_idx] {
+            let resid = info.residual_block(block_idx);
             for j in 0..8 {
                 for i in 0..8 {
-                    let s = pred[j * 8 + i] as i32 + resid[j * 8 + i];
+                    let s = pred[j * 8 + i] as i32 + resid[j * 8 + i] as i32;
                     plane[(py + j) * stride + (px + i)] = s.clamp(0, 255) as u8;
                 }
             }
         } else {
-            let (plane, stride, px, py) = block_dst(pic, block_idx, mb_x, mb_y);
             for j in 0..8 {
                 for i in 0..8 {
                     plane[(py + j) * stride + (px + i)] = pred[j * 8 + i];
@@ -397,9 +468,14 @@ fn decode_inter_mb_texture(
         }
     }
 
-    // Chroma: single MV scaled to chroma grid.
-    let cmx = luma_to_chroma_mv(mvx);
-    let cmy = luma_to_chroma_mv(mvy);
+    // Chroma — single MVDCHR derived from the luma 4MV (F.2) or the 1MV path.
+    let (cmx, cmy) = if advanced_prediction && motion.four_mv {
+        chroma_mv_4mv(&motion.mvs4)
+    } else {
+        (luma_to_chroma_mv(motion.mv.0), luma_to_chroma_mv(motion.mv.1))
+    };
+
+    let ref_c_h = reference.cb.len() / reference.c_stride;
     for (plane_idx, block_idx) in (4..6usize).enumerate() {
         let blk_px = (mb_x * 8) as i32;
         let blk_py = (mb_y * 8) as i32;
@@ -422,20 +498,16 @@ fn decode_inter_mb_texture(
             &mut pred,
             8,
         );
-        if chroma_coded[plane_idx] {
-            let mut coeffs = [0i32; 64];
-            decode_ac(br, &mut coeffs, 0, quant)?;
-            let mut resid = [0i32; 64];
-            crate::block::idct_signed(&mut coeffs, &mut resid);
-            let (plane, stride, px, py) = block_dst(pic, block_idx, mb_x, mb_y);
+        let (plane, stride, px, py) = block_dst(pic, block_idx, mb_x, mb_y);
+        if info.residual_present[block_idx] {
+            let resid = info.residual_block(block_idx);
             for j in 0..8 {
                 for i in 0..8 {
-                    let s = pred[j * 8 + i] as i32 + resid[j * 8 + i];
+                    let s = pred[j * 8 + i] as i32 + resid[j * 8 + i] as i32;
                     plane[(py + j) * stride + (px + i)] = s.clamp(0, 255) as u8;
                 }
             }
         } else {
-            let (plane, stride, px, py) = block_dst(pic, block_idx, mb_x, mb_y);
             for j in 0..8 {
                 for i in 0..8 {
                     plane[(py + j) * stride + (px + i)] = pred[j * 8 + i];
@@ -443,7 +515,344 @@ fn decode_inter_mb_texture(
             }
         }
     }
-    Ok(())
+}
+
+/// §F.3 — build the overlapped-motion-compensated luma predictor for one 8×8
+/// block. Weights from `OBMC_H0` / `OBMC_H1` / `OBMC_H2` are applied to three
+/// separate half-pel predictions (current block's MV, plus two "remote"
+/// neighbour MVs) and the combined result is rounded by `(+ 4) / 8`.
+#[allow(clippy::too_many_arguments)]
+fn obmc_luma_block(
+    dst: &mut [u8; 64],
+    reference: &IPicture,
+    mv_grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    block_idx: usize,
+    motion: &MbMotion,
+) {
+    let ref_y_h = reference.y.len() / reference.y_stride;
+    let ref_w = reference.y_stride as i32;
+    let ref_h = ref_y_h as i32;
+
+    let (sub_x, sub_y) = block_offset(block_idx);
+    let blk_px = (mb_x * 16 + sub_x) as i32;
+    let blk_py = (mb_y * 16 + sub_y) as i32;
+
+    // Build three predictions: q (current MV), r (top/bottom remote MV), s
+    // (left/right remote MV). Each is a full 8×8 block.
+    let mv0 = motion.mvs4[block_idx];
+    let mut q_pred = [0u8; 64];
+    predict_block(
+        &reference.y,
+        reference.y_stride,
+        ref_w,
+        ref_h,
+        blk_px,
+        blk_py,
+        mv0.0,
+        mv0.1,
+        8,
+        &mut q_pred,
+        8,
+    );
+
+    // "Top or bottom" remote MV per pixel column: in the upper 4 rows of the
+    // block we use the MV of the block ABOVE; in the lower 4 rows we use the
+    // MV of the block BELOW. Since the weighting matrix H1 is symmetric
+    // top/bottom (§F.3), we compute two separate predictions (r_top, r_bot)
+    // using the top-neighbour MV and bottom-neighbour MV respectively and
+    // pick per row in the weighted sum.
+    let mv_top = obmc_remote_mv_vertical(mv_grid, mb_x, mb_y, block_idx, mv0, VerticalSide::Top);
+    let mv_bot =
+        obmc_remote_mv_vertical(mv_grid, mb_x, mb_y, block_idx, mv0, VerticalSide::Bottom);
+    let mut r_top_pred = [0u8; 64];
+    let mut r_bot_pred = [0u8; 64];
+    predict_block(
+        &reference.y,
+        reference.y_stride,
+        ref_w,
+        ref_h,
+        blk_px,
+        blk_py,
+        mv_top.0,
+        mv_top.1,
+        8,
+        &mut r_top_pred,
+        8,
+    );
+    predict_block(
+        &reference.y,
+        reference.y_stride,
+        ref_w,
+        ref_h,
+        blk_px,
+        blk_py,
+        mv_bot.0,
+        mv_bot.1,
+        8,
+        &mut r_bot_pred,
+        8,
+    );
+
+    // Left / right remote MV, likewise split into two predictions.
+    let mv_left =
+        obmc_remote_mv_horizontal(mv_grid, mb_x, mb_y, block_idx, mv0, HorizontalSide::Left);
+    let mv_right =
+        obmc_remote_mv_horizontal(mv_grid, mb_x, mb_y, block_idx, mv0, HorizontalSide::Right);
+    let mut s_left_pred = [0u8; 64];
+    let mut s_right_pred = [0u8; 64];
+    predict_block(
+        &reference.y,
+        reference.y_stride,
+        ref_w,
+        ref_h,
+        blk_px,
+        blk_py,
+        mv_left.0,
+        mv_left.1,
+        8,
+        &mut s_left_pred,
+        8,
+    );
+    predict_block(
+        &reference.y,
+        reference.y_stride,
+        ref_w,
+        ref_h,
+        blk_px,
+        blk_py,
+        mv_right.0,
+        mv_right.1,
+        8,
+        &mut s_right_pred,
+        8,
+    );
+
+    for j in 0..8usize {
+        for i in 0..8usize {
+            let h0 = OBMC_H0[j][i] as i32;
+            let h1 = OBMC_H1[j][i] as i32;
+            let h2 = OBMC_H2[j][i] as i32;
+            let q = q_pred[j * 8 + i] as i32;
+            let r = if j < 4 {
+                r_top_pred[j * 8 + i] as i32
+            } else {
+                r_bot_pred[j * 8 + i] as i32
+            };
+            let s = if i < 4 {
+                s_left_pred[j * 8 + i] as i32
+            } else {
+                s_right_pred[j * 8 + i] as i32
+            };
+            let v = (q * h0 + r * h1 + s * h2 + 4) / 8;
+            dst[j * 8 + i] = v.clamp(0, 255) as u8;
+        }
+    }
+}
+
+enum VerticalSide {
+    Top,
+    Bottom,
+}
+
+enum HorizontalSide {
+    Left,
+    Right,
+}
+
+/// Remote vertical-neighbour MV for OBMC per §F.3. For each 8×8 block `k` of
+/// the current MB, pick the MV of the block immediately above (`Top`) or
+/// below (`Bottom`) at the 8×8 block granularity.
+///
+/// Fall-back rules (§F.3):
+/// * If the neighbour MB was not coded → remote MV = (0, 0).
+/// * If the neighbour block was intra coded → remote MV = current block MV.
+/// * If the neighbour block is outside the picture → remote MV = current block MV.
+/// * For blocks 2 and 3 (bottom row of the MB) with `Bottom` side, the
+///   §F.3 last-paragraph rule forces the remote MV to be the current
+///   block's MV.
+fn obmc_remote_mv_vertical(
+    mv_grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    block_idx: usize,
+    cur_mv: (i32, i32),
+    side: VerticalSide,
+) -> (i32, i32) {
+    // Block rows inside MB: block 0/1 on top row, 2/3 on bottom row.
+    let in_top_row = block_idx < 2;
+
+    // Spec rule: for bottom-of-MB blocks (2 and 3) and Bottom-side neighbour,
+    // force remote MV = current MV.
+    if !in_top_row && matches!(side, VerticalSide::Bottom) {
+        return cur_mv;
+    }
+    // Symmetric rule for top-of-MB blocks with Top-side neighbour when it
+    // would reach into the row ABOVE the current MB. We still look up the
+    // actual neighbour there though (the spec only special-cases the
+    // "neighbour in MB below" rule explicitly, but does also describe
+    // substitution for any missing neighbour).
+
+    match side {
+        VerticalSide::Top => {
+            if in_top_row {
+                // Neighbour lives in MB (mb_x, mb_y-1). The block physically
+                // adjacent to our current block (which is in the TOP row of
+                // this MB) is the BOTTOM-row block of that MB with the same
+                // column — i.e. block 2 for column 0, block 3 for column 1.
+                if mb_y == 0 {
+                    return cur_mv;
+                }
+                let nb = mv_grid.get(mb_x, mb_y - 1);
+                neighbour_mv(nb, sibling_block_in_row(block_idx, false), cur_mv)
+            } else {
+                // Block 2 or 3 — top neighbour is block 0 or 1 of the SAME MB
+                // (same column, top row).
+                let cur_mb = mv_grid.get(mb_x, mb_y);
+                cur_mb.mvs4[sibling_block_in_row(block_idx, true)]
+            }
+        }
+        VerticalSide::Bottom => {
+            // We return here for the in_top_row case only; bottom-row was
+            // handled at the top of the function.
+            debug_assert!(in_top_row);
+            // Neighbour is block 2 or 3 of same MB — look in our own MB's
+            // already-decoded entry.
+            let cur_mb = mv_grid.get(mb_x, mb_y);
+            cur_mb.mvs4[sibling_block_in_row(block_idx, false)]
+        }
+    }
+}
+
+/// Remote horizontal-neighbour MV for OBMC per §F.3.
+fn obmc_remote_mv_horizontal(
+    mv_grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    block_idx: usize,
+    cur_mv: (i32, i32),
+    side: HorizontalSide,
+) -> (i32, i32) {
+    // Block cols inside MB: blocks 0/2 on left, 1/3 on right.
+    let in_left_col = block_idx == 0 || block_idx == 2;
+
+    match side {
+        HorizontalSide::Left => {
+            if in_left_col {
+                // Current block is in LEFT column of this MB. Its left
+                // neighbour physically is the RIGHT column of MB (mb_x-1),
+                // same row — block 1 for top row, block 3 for bottom row.
+                if mb_x == 0 {
+                    return cur_mv;
+                }
+                let nb = mv_grid.get(mb_x - 1, mb_y);
+                neighbour_mv(nb, sibling_block_in_col(block_idx, false), cur_mv)
+            } else {
+                // Blocks 1 or 3 — left neighbour is blocks 0 or 2 in same MB
+                // (same row, left column).
+                let cur_mb = mv_grid.get(mb_x, mb_y);
+                cur_mb.mvs4[sibling_block_in_col(block_idx, true)]
+            }
+        }
+        HorizontalSide::Right => {
+            if in_left_col {
+                // Blocks 0 or 2 — right neighbour is blocks 1 or 3 in same MB.
+                let cur_mb = mv_grid.get(mb_x, mb_y);
+                cur_mb.mvs4[sibling_block_in_col(block_idx, false)]
+            } else {
+                // Blocks 1 or 3 — right neighbour in MB (mb_x+1, mb_y), LEFT
+                // column — block 0 for top row, block 2 for bottom row.
+                if mb_x + 1 >= mv_grid.mb_w {
+                    return cur_mv;
+                }
+                let nb = mv_grid.get(mb_x + 1, mb_y);
+                neighbour_mv(nb, sibling_block_in_col(block_idx, true), cur_mv)
+            }
+        }
+    }
+}
+
+/// Pick a neighbour block's MV from an `MbMotion`, applying the §F.3
+/// fall-backs for "not coded" (→ zero) and "intra" (→ current MV).
+fn neighbour_mv(nb: MbMotion, block_idx: usize, cur_mv: (i32, i32)) -> (i32, i32) {
+    if !nb.coded {
+        return (0, 0);
+    }
+    if nb.intra {
+        return cur_mv;
+    }
+    nb.mvs4[block_idx]
+}
+
+/// For block `block_idx` in the current MB, return the sibling block index
+/// in the other row of the same MB. If `top`, we want the block in the top
+/// row (used for Top-side remote MVs when looking up the sibling in MB
+/// above — where we want the bottom-row block of THAT MB, hence flipped
+/// semantics handled at the caller).
+///
+/// The mapping is symmetric:
+///   col-0, row-0 (block 0) ↔ col-0, row-1 (block 2)
+///   col-1, row-0 (block 1) ↔ col-1, row-1 (block 3)
+///
+/// For a current block on the top row of THIS MB, the "Top" neighbour lives
+/// in the MB above → we want THAT MB's bottom-row block in the same column,
+/// i.e. block 2 for col-0 / block 3 for col-1. So `want_top = false` in the
+/// above-MB indexing when our block is top-row.
+fn sibling_block_in_row(block_idx: usize, want_top_of_that_mb: bool) -> usize {
+    // Column = block_idx % 2 (0 or 1).
+    let col = block_idx & 1;
+    if want_top_of_that_mb {
+        col // blocks 0 or 1 are top-row.
+    } else {
+        col + 2 // blocks 2 or 3 are bottom-row.
+    }
+}
+
+/// Sibling block in the other COLUMN of the same MB (for left/right lookups).
+/// If `want_left`, return the left-column sibling (0 or 2).
+fn sibling_block_in_col(block_idx: usize, want_left_of_that_mb: bool) -> usize {
+    // Row = block_idx / 2 (0 or 1).
+    let row = block_idx >> 1;
+    if want_left_of_that_mb {
+        row * 2 // blocks 0 or 2 are left col.
+    } else {
+        row * 2 + 1 // blocks 1 or 3 are right col.
+    }
+}
+
+/// (sub_x, sub_y) offset inside a 16×16 MB for each 8×8 luma block index.
+fn block_offset(block_idx: usize) -> (usize, usize) {
+    match block_idx {
+        0 => (0, 0),
+        1 => (8, 0),
+        2 => (0, 8),
+        3 => (8, 8),
+        _ => unreachable!("luma block_idx must be 0..=3"),
+    }
+}
+
+/// Legacy one-pass decoder used when Annex F is not enabled. Kept for
+/// backwards compatibility with existing callers / tests. Calls
+/// `decode_p_mb_pass1` followed by `apply_p_mb_reconstruction` for the
+/// current MB only — this is correct without OBMC (the reconstruction is
+/// purely local), but would produce wrong output if AP were set. Callers
+/// that need AP must drive the two-pass path via the decoder.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_p_mb(
+    br: &mut BitReader<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    quant_in: u32,
+    pic: &mut IPicture,
+    reference: &IPicture,
+    mv_grid: &mut MvGrid,
+    umv: bool,
+) -> Result<u32> {
+    let (quant, info) =
+        decode_p_mb_pass1(br, mb_x, mb_y, quant_in, pic, mv_grid, umv, false, false)?;
+    apply_p_mb_reconstruction(mb_x, mb_y, pic, reference, mv_grid, &info, false);
+    Ok(quant)
 }
 
 /// Intra block decode when the MB is an embedded intra inside a P-picture.
@@ -475,21 +884,3 @@ fn decode_one_intra_block_in_p(
     Ok(())
 }
 
-/// Copy a skipped MB from the reference frame verbatim. MV(0,0).
-fn copy_skipped_mb(pic: &mut IPicture, reference: &IPicture, mb_x: usize, mb_y: usize) {
-    let py = mb_y * 16;
-    let px = mb_x * 16;
-    for j in 0..16 {
-        let dst_off = (py + j) * pic.y_stride + px;
-        let src_off = (py + j) * reference.y_stride + px;
-        pic.y[dst_off..dst_off + 16].copy_from_slice(&reference.y[src_off..src_off + 16]);
-    }
-    let cy = mb_y * 8;
-    let cx = mb_x * 8;
-    for j in 0..8 {
-        let dst_off = (cy + j) * pic.c_stride + cx;
-        let src_off = (cy + j) * reference.c_stride + cx;
-        pic.cb[dst_off..dst_off + 8].copy_from_slice(&reference.cb[src_off..src_off + 8]);
-        pic.cr[dst_off..dst_off + 8].copy_from_slice(&reference.cr[src_off..src_off + 8]);
-    }
-}

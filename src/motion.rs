@@ -253,15 +253,59 @@ pub fn encode_mv_component(bw: &mut BitWriter, mv_half: i32, predictor_half: i32
 /// Per-MB motion-vector slot (luma half-pel units). One vector per MB in 1MV
 /// mode — all four luma blocks share it. The value is also used for the
 /// median predictor of subsequent MBs.
+///
+/// When Advanced Prediction (Annex F) is active, `mvs4` carries a per-8×8-block
+/// vector (raster: `[top-left, top-right, bottom-left, bottom-right]`,
+/// matching Figure 5's luminance block numbering 1..=4). For 1MV mode MBs all
+/// four entries are copies of `mv` — this matches the spec's
+/// "if only one motion vector is transmitted... this is defined as four
+/// vectors with the same value" (§F.2). The picture-level predictor for a
+/// subsequent MB's block uses the per-block neighbour (block 2 / block 4 /
+/// block 3 depending on position; see [`predict_mv_block`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MbMotion {
     pub mv: (i32, i32),
+    /// Per-8×8-luma-block motion vectors, indexed `0..4` in Figure 5 order.
+    /// Always populated — in 1MV mode all four entries hold the same value
+    /// as `mv`.
+    pub mvs4: [(i32, i32); 4],
     /// True iff this MB was coded (intra or inter). A non-coded (skipped) MB
     /// contributes `(0, 0)` to future MV predictors per §5.3.4.
     pub coded: bool,
     /// True iff this MB is intra-in-P — in which case its MV is (0,0) and
     /// shouldn't propagate. We still keep it as a neighbour with MV (0,0).
     pub intra: bool,
+    /// True iff the MB carried 4 per-block motion vectors (Annex F 4MV mode).
+    pub four_mv: bool,
+}
+
+impl MbMotion {
+    /// Construct a 1-MV `MbMotion` where all four per-block slots are copies
+    /// of `mv`. Used by every decode / encode path that doesn't explicitly
+    /// handle Annex F 4MV mode.
+    pub fn mv1(mv: (i32, i32), coded: bool, intra: bool) -> Self {
+        Self {
+            mv,
+            mvs4: [mv; 4],
+            coded,
+            intra,
+            four_mv: false,
+        }
+    }
+
+    /// Construct a 4-MV `MbMotion` for Annex F (Advanced Prediction). `mv` is
+    /// the first block's MV (conventionally used as the summary MV when
+    /// downstream code still thinks in 1MV terms — e.g. for median-predictor
+    /// fallback when a neighbour wasn't 4MV-aware).
+    pub fn mv4(mvs4: [(i32, i32); 4]) -> Self {
+        Self {
+            mv: mvs4[0],
+            mvs4,
+            coded: true,
+            intra: false,
+            four_mv: true,
+        }
+    }
 }
 
 /// Raster grid of per-MB motion vectors, queried by the median predictor.
@@ -289,6 +333,19 @@ impl MvGrid {
     pub fn set(&mut self, mb_x: usize, mb_y: usize, m: MbMotion) {
         self.mvs[mb_y * self.mb_w + mb_x] = m;
     }
+
+    /// Safe lookup that returns `None` when `(mb_x, mb_y)` is outside the
+    /// grid. Used by the OBMC path.
+    pub fn get_opt(&self, mb_x: isize, mb_y: isize) -> Option<MbMotion> {
+        if mb_x < 0 || mb_y < 0 {
+            return None;
+        }
+        let (x, y) = (mb_x as usize, mb_y as usize);
+        if x >= self.mb_w || y >= self.mb_h {
+            return None;
+        }
+        Some(self.get(x, y))
+    }
 }
 
 /// Compute the median motion-vector predictor for the current MB (§5.3.7.3
@@ -306,6 +363,21 @@ impl MvGrid {
 /// Non-coded neighbours contribute `(0,0)` as their MV (per §5.3.4) — this is
 /// already what the `MbMotion::default()` gives.
 pub fn predict_mv(grid: &MvGrid, mb_x: usize, mb_y: usize) -> (i32, i32) {
+    predict_mv_with_gob_mask(grid, mb_x, mb_y, false)
+}
+
+/// Variant of [`predict_mv`] that treats the "above" neighbour row as
+/// unavailable for predictor purposes when `gob_top_row` is `true`. Per
+/// §6.1.1 rule 3, a non-empty GOB header forces MV2 and MV3 → MV1 (which,
+/// combined with rule 4 for picture edges, collapses to all-zero at a
+/// corner). The actual MV values remain in `grid` for OBMC lookups (§F.3
+/// explicitly allows cross-GOB remote MVs outside Slice Structured mode).
+pub fn predict_mv_with_gob_mask(
+    grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    gob_top_row: bool,
+) -> (i32, i32) {
     let get = |x: usize, y: usize| -> (i32, i32) {
         if x >= grid.mb_w || y >= grid.mb_h {
             (0, 0)
@@ -319,12 +391,13 @@ pub fn predict_mv(grid: &MvGrid, mb_x: usize, mb_y: usize) -> (i32, i32) {
     } else {
         None
     };
-    let mv2 = if mb_y > 0 {
+    let above_available = mb_y > 0 && !gob_top_row;
+    let mv2 = if above_available {
         Some(get(mb_x, mb_y - 1))
     } else {
         None
     };
-    let mv3 = if mb_y > 0 && mb_x + 1 < grid.mb_w {
+    let mv3 = if above_available && mb_x + 1 < grid.mb_w {
         Some(get(mb_x + 1, mb_y - 1))
     } else {
         None
@@ -339,6 +412,210 @@ pub fn predict_mv(grid: &MvGrid, mb_x: usize, mb_y: usize) -> (i32, i32) {
 
     (median3(mv1.0, mv2.0, mv3.0), median3(mv1.1, mv2.1, mv3.1))
 }
+
+/// Compute the median predictor for one 8×8 luminance block inside macroblock
+/// `(mb_x, mb_y)` when Annex F (4MV / Advanced Prediction) is active. Per
+/// §F.2 Figure F.1 the candidate predictors MV1, MV2 and MV3 are redefined
+/// for each of the four blocks (Figure 5 numbering, `block_idx = 0..=3`):
+///
+/// * `block_idx == 0` (top-left): MV1 = left MB's block 1 (bottom-right
+///   position of that MB's 2×2 block grid); MV2 = above MB's block 2
+///   (bottom-left); MV3 = above-right MB's block 2.
+/// * `block_idx == 1` (top-right): MV1 = same MB's block 0; MV2 = above MB's
+///   block 3 (bottom-right); MV3 = above-right MB's block 2.
+/// * `block_idx == 2` (bottom-left): MV1 = left MB's block 3 (bottom-right);
+///   MV2 = same MB's block 0; MV3 = same MB's block 1.
+/// * `block_idx == 3` (bottom-right): MV1 = same MB's block 2; MV2 = same
+///   MB's block 1; MV3 = the above-right-of-this-block position which lies in
+///   the right-neighbour MB's block 2 — that MB hasn't been decoded yet, so
+///   per §6.1.1 rule 4 MV3 is considered outside the picture and treated
+///   as unavailable (substituted per the standard `{None-cascade}` rules).
+///
+/// Missing neighbours follow the §6.1.1 cascade: if MV1 is unavailable all
+/// three collapse to `(0,0)`; if only MV2 missing then MV2 = MV3 = MV1; if
+/// only MV3 missing then MV3 = `(0,0)`.
+///
+/// Intra / skipped neighbours contribute `(0,0)` per §6.1.1 rule 1, which is
+/// already the stored value for [`MbMotion::default()`] (the non-coded slot).
+pub fn predict_mv_block(grid: &MvGrid, mb_x: usize, mb_y: usize, block_idx: usize) -> (i32, i32) {
+    predict_mv_block_with_gob_mask(grid, mb_x, mb_y, block_idx, false)
+}
+
+/// GOB-boundary variant of [`predict_mv_block`]: when `gob_top_row` is
+/// `true`, the "above" neighbour row is treated as unavailable for the
+/// per-block predictor (same substitution as the 1MV path does in
+/// [`predict_mv_with_gob_mask`]).
+pub fn predict_mv_block_with_gob_mask(
+    grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    block_idx: usize,
+    gob_top_row: bool,
+) -> (i32, i32) {
+    let get_block = |mx: usize, my: usize, bi: usize| -> (i32, i32) {
+        if mx >= grid.mb_w || my >= grid.mb_h {
+            return (0, 0);
+        }
+        let m = grid.get(mx, my);
+        if !m.coded || m.intra {
+            return (0, 0);
+        }
+        m.mvs4[bi]
+    };
+
+    let above_available_row = mb_y > 0 && !gob_top_row;
+
+    // Determine which of the four 8×8 blocks the current block is.
+    // block_idx ordering: 0=top-left, 1=top-right, 2=bot-left, 3=bot-right.
+    let (mv1, mv2, mv3) = match block_idx {
+        0 => {
+            // Left MB's block 1 (top-right): same MB-row, MB_x-1.
+            let left = if mb_x > 0 {
+                Some(get_block(mb_x - 1, mb_y, 1))
+            } else {
+                None
+            };
+            // Above MB's block 2 (bottom-left): same MB-column, MB_y-1.
+            let above = if above_available_row {
+                Some(get_block(mb_x, mb_y - 1, 2))
+            } else {
+                None
+            };
+            // Above-right MB's block 2 (bottom-left of that MB).
+            let above_right = if above_available_row && mb_x + 1 < grid.mb_w {
+                Some(get_block(mb_x + 1, mb_y - 1, 2))
+            } else {
+                None
+            };
+            (left, above, above_right)
+        }
+        1 => {
+            // Left = block 0 of the same MB (always available after block 0
+            // is decoded — all four block vectors are decoded sequentially
+            // in the MB layer before the OBMC pass).
+            let left = Some(grid.get(mb_x, mb_y).mvs4[0]);
+            // Above MB's block 3 (bottom-right).
+            let above = if above_available_row {
+                Some(get_block(mb_x, mb_y - 1, 3))
+            } else {
+                None
+            };
+            // Above-right MB's block 2 (bottom-left of above-right MB).
+            let above_right = if above_available_row && mb_x + 1 < grid.mb_w {
+                Some(get_block(mb_x + 1, mb_y - 1, 2))
+            } else {
+                None
+            };
+            (left, above, above_right)
+        }
+        2 => {
+            // Left MB's block 3 (bottom-right).
+            let left = if mb_x > 0 {
+                Some(get_block(mb_x - 1, mb_y, 3))
+            } else {
+                None
+            };
+            // Above = block 0 of same MB.
+            let above = Some(grid.get(mb_x, mb_y).mvs4[0]);
+            // Above-right = block 1 of same MB.
+            let above_right = Some(grid.get(mb_x, mb_y).mvs4[1]);
+            (left, above, above_right)
+        }
+        3 => {
+            // Left = block 2 of same MB.
+            let left = Some(grid.get(mb_x, mb_y).mvs4[2]);
+            // Above = block 1 of same MB.
+            let above = Some(grid.get(mb_x, mb_y).mvs4[1]);
+            // Above-right is in the right-neighbour MB which hasn't been
+            // decoded yet — treat as unavailable (set to zero per §6.1.1
+            // rule 4).
+            let above_right: Option<(i32, i32)> = None;
+            (left, above, above_right)
+        }
+        _ => unreachable!("block_idx must be 0..=3"),
+    };
+
+    let (mv1, mv2, mv3) = match (mv1, mv2, mv3) {
+        (None, _, _) => ((0, 0), (0, 0), (0, 0)),
+        (Some(a), None, _) => (a, a, a),
+        (Some(a), Some(b), None) => (a, b, (0, 0)),
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+    };
+
+    (median3(mv1.0, mv2.0, mv3.0), median3(mv1.1, mv2.1, mv3.1))
+}
+
+/// Compute MVDCHR (§F.2): sum the four luma per-block MVs, divide by 8, and
+/// apply Table F.1 rounding towards the nearest half-pixel (sixteenth-pixel →
+/// half-pixel). Returns the chroma MV in luma half-pel units (i.e. already
+/// matching the chroma-plane coordinate system used by `predict_block`).
+pub fn chroma_mv_4mv(mvs: &[(i32, i32); 4]) -> (i32, i32) {
+    // Each luma MV is in half-pel units. Sum/8 gives sixteenth-pel chroma
+    // (luma-half divided by 8 = quarter-pel, then ÷2 for chroma → eighth-pel
+    // in luma half-pel units; the exact derivation is given by Table F.1).
+    //
+    // Table F.1 maps a sixteenth-pel value s = sum(mvs)/8 to a half-pel
+    // chroma coordinate as:
+    //   s mod 16:  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+    //   out half:  0  0  0  1  1  1  1  1  1  1  1  1  1  1  2  2
+    // i.e. effectively "quantise the fractional sixteenth towards the
+    // nearest half" with a threshold at 3/16 and 14/16.
+    let map = |sum: i32| -> i32 {
+        // sum = sixteenth-pel * 1 (sum of luma halfpels).
+        // chroma half-pel = floor(sum/16)*2 + round_table[sum mod 16].
+        // Negative sums must map symmetrically: the standard does so by
+        // treating `sum` as a signed value and the rounding is applied to
+        // the 16-residue (computed on the positive-wrapped value).
+        let div = sum.div_euclid(16); // signed floor-div.
+        let rem = sum.rem_euclid(16) as usize; // 0..=15
+        const TABLE: [i32; 16] = [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2];
+        div * 2 + TABLE[rem]
+    };
+
+    let sx = mvs[0].0 + mvs[1].0 + mvs[2].0 + mvs[3].0;
+    let sy = mvs[0].1 + mvs[1].1 + mvs[2].1 + mvs[3].1;
+    (map(sx), map(sy))
+}
+
+/// OBMC weighting matrix `H0` for the current-block MV (§F.3, Figure F.2).
+/// Row-major 8×8 matrix — index `[j * 8 + i]` for column `i`, row `j`.
+#[rustfmt::skip]
+pub const OBMC_H0: [[u8; 8]; 8] = [
+    [4, 5, 5, 5, 5, 5, 5, 4],
+    [5, 5, 5, 5, 5, 5, 5, 5],
+    [5, 5, 6, 6, 6, 6, 5, 5],
+    [5, 5, 6, 6, 6, 6, 5, 5],
+    [5, 5, 6, 6, 6, 6, 5, 5],
+    [5, 5, 6, 6, 6, 6, 5, 5],
+    [5, 5, 5, 5, 5, 5, 5, 5],
+    [4, 5, 5, 5, 5, 5, 5, 4],
+];
+
+/// OBMC weighting matrix `H1` for the top/bottom remote MV (§F.3, Figure F.3).
+#[rustfmt::skip]
+pub const OBMC_H1: [[u8; 8]; 8] = [
+    [2, 2, 2, 2, 2, 2, 2, 2],
+    [1, 1, 2, 2, 2, 2, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 2, 2, 2, 2, 1, 1],
+    [2, 2, 2, 2, 2, 2, 2, 2],
+];
+
+/// OBMC weighting matrix `H2` for the left/right remote MV (§F.3, Figure F.4).
+#[rustfmt::skip]
+pub const OBMC_H2: [[u8; 8]; 8] = [
+    [2, 1, 1, 1, 1, 1, 1, 2],
+    [2, 2, 1, 1, 1, 1, 2, 2],
+    [2, 2, 1, 1, 1, 1, 2, 2],
+    [2, 2, 1, 1, 1, 1, 2, 2],
+    [2, 2, 1, 1, 1, 1, 2, 2],
+    [2, 2, 1, 1, 1, 1, 2, 2],
+    [2, 2, 1, 1, 1, 1, 2, 2],
+    [2, 1, 1, 1, 1, 1, 1, 2],
+];
 
 fn median3(a: i32, b: i32, c: i32) -> i32 {
     if a > b {
@@ -423,33 +700,9 @@ mod tests {
     fn predict_mv_median() {
         let mut grid = MvGrid::new(3, 3);
         // Place known MVs at neighbours of (1,1): left=(4,0), top=(6,0), top-right=(8,0).
-        grid.set(
-            0,
-            1,
-            MbMotion {
-                mv: (4, 0),
-                coded: true,
-                intra: false,
-            },
-        );
-        grid.set(
-            1,
-            0,
-            MbMotion {
-                mv: (6, 0),
-                coded: true,
-                intra: false,
-            },
-        );
-        grid.set(
-            2,
-            0,
-            MbMotion {
-                mv: (8, 0),
-                coded: true,
-                intra: false,
-            },
-        );
+        grid.set(0, 1, MbMotion::mv1((4, 0), true, false));
+        grid.set(1, 0, MbMotion::mv1((6, 0), true, false));
+        grid.set(2, 0, MbMotion::mv1((8, 0), true, false));
         // median(4, 6, 8) = 6.
         assert_eq!(predict_mv(&grid, 1, 1), (6, 0));
     }
