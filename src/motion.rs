@@ -19,6 +19,21 @@
 //! right". `(1, 0)` is a half-pel position that requires bilinear
 //! interpolation.
 //!
+//! # Annex D — Unrestricted Motion Vectors
+//! When the picture header signals UMV (PTYPE bit 10 without PLUSPTYPE, or
+//! OPPTYPE bit 5 in a PLUSPTYPE form) the MV component range is extended to
+//! `[-31.5, 31.5]` pels = `[-63, 63]` halfpel for baseline-form streams, and
+//! motion vectors may point outside the picture — the interpolator replicates
+//! edge samples to form out-of-picture references (§D.1). The MVD VLC is
+//! still Table 14, but its *interpretation* changes per §D.2: if the
+//! median predictor lies in `[-31, +32]` halfpel (= `[-15.5, +16]` pel), the
+//! decoded differential `d` is used directly (same as baseline). If the
+//! predictor is outside that range, the decoder picks among `{d, d+64, d-64}`
+//! whichever produces a reconstructed component that lies in `[-63, +63]`
+//! halfpel **and** has the same sign as the predictor (zero counts as
+//! either sign). For PLUSPTYPE-form Annex D, Table D.3 is used instead —
+//! that path is not yet supported by this crate.
+//!
 //! Cross-checked against libavcodec's `h263dec.c` MV parsing + `h263.c`
 //! median predictor.
 
@@ -33,6 +48,14 @@ use oxideav_core::bits::BitWriter;
 pub const MV_RANGE_MIN_HALF: i32 = -32;
 pub const MV_RANGE_MAX_HALF: i32 = 31;
 
+/// Valid half-pel MV range when Annex D (UMV) is signalled without PLUSPTYPE.
+/// Each component may land anywhere in `[-63, +63]` half-pel units (i.e.
+/// `[-31.5, +31.5]` pels). The §D.2 "sign-of-predictor" constraint still
+/// restricts which half of the range a given predictor can reach, but the
+/// wrapped / absolute value itself lives in this extended interval.
+pub const MV_RANGE_UMV_MIN_HALF: i32 = -63;
+pub const MV_RANGE_UMV_MAX_HALF: i32 = 63;
+
 /// Fold a reconstructed MV component into the valid half-pel domain.
 ///
 /// H.263 §5.3.7.3: if the predictor + decoded differential falls outside
@@ -46,6 +69,62 @@ pub fn wrap_mv_component(v: i32) -> i32 {
         m -= 2 * range;
     }
     m
+}
+
+/// Apply the §D.2 reconstruction rule for Annex D without PLUSPTYPE.
+///
+/// Given a predictor `pred_half` (halfpel units) and a decoded differential
+/// magnitude `mag_half` (positive) with `sign` `+1` or `-1`, pick the signed
+/// differential among `{d, d+64, d-64}` whose sum with `pred_half` yields a
+/// component in `[-63, 63]`. When multiple candidates qualify (possible when
+/// the predictor is near the baseline boundary), prefer the candidate with
+/// the same sign as `pred_half` per §D.2; `0` counts as either sign.
+///
+/// Returns the reconstructed absolute MV component in halfpel units.
+pub fn reconstruct_umv_component(pred_half: i32, mag: i32, sign: i32) -> i32 {
+    let raw_diff = mag * sign; // positive sign → `-diff` as the VLC sign bit semantics
+    // Candidates per §D.2.
+    let candidates = [raw_diff, raw_diff + 64, raw_diff - 64];
+    // Filter to those that land inside the extended UMV range.
+    let mut best: Option<i32> = None;
+    for &d in &candidates {
+        let v = pred_half + d;
+        if !(MV_RANGE_UMV_MIN_HALF..=MV_RANGE_UMV_MAX_HALF).contains(&v) {
+            continue;
+        }
+        // §D.2 "same sign as predictor (including zero)" rule when the
+        // predictor is outside `[-31, +32]`. When the predictor is inside
+        // that baseline range, the spec says "only the first column
+        // applies" → the raw, unshifted `d` is the answer and no wrapping
+        // should be needed unless the raw differential magnitude itself is
+        // already in [−32, +31]: the first `d` candidate is then the hit.
+        if (-31..=32).contains(&pred_half) {
+            // Baseline interpretation — the raw `d` (candidates[0]) wins;
+            // keep it only if in range.
+            if d == raw_diff {
+                return v;
+            } else {
+                continue;
+            }
+        }
+        // Predictor outside baseline range: pick candidate whose sign
+        // matches the predictor (zero counts as same-sign).
+        let same_sign = match pred_half.cmp(&0) {
+            std::cmp::Ordering::Greater => v >= 0,
+            std::cmp::Ordering::Less => v <= 0,
+            std::cmp::Ordering::Equal => true,
+        };
+        if same_sign {
+            return v;
+        }
+        // Remember as fallback.
+        if best.is_none() {
+            best = Some(v);
+        }
+    }
+    // Fallback: any in-range candidate. This shouldn't happen on conforming
+    // streams but guards against rounding.
+    best.unwrap_or_else(|| wrap_mv_component(pred_half + raw_diff))
 }
 
 /// Reverse map for the MV magnitude VLC (`mv_tab::table()`). Magnitude index →
@@ -97,18 +176,42 @@ const MV_ENC_VLC: [(u8, u32); 33] = [
 /// (no `motion_residual` because f_code == 1). The reconstructed vector is
 /// `predictor + diff` folded into `[-32, +31]` via `wrap_mv_component`.
 pub fn decode_mv_component(br: &mut BitReader<'_>, predictor_half: i32) -> Result<i32> {
+    decode_mv_component_umv(br, predictor_half, false)
+}
+
+/// Decode one MV component with optional Annex D Unrestricted Motion Vector
+/// interpretation. When `umv` is `true`, the §D.2 "sign-of-predictor" rule
+/// is applied and the output range widens to `[-63, +63]` halfpel
+/// (`MV_RANGE_UMV_*`). When `false`, behaviour matches
+/// [`decode_mv_component`] / baseline H.263 (range folded to `[-32, +31]`).
+pub fn decode_mv_component_umv(
+    br: &mut BitReader<'_>,
+    predictor_half: i32,
+    umv: bool,
+) -> Result<i32> {
     let magnitude = vlc::decode(br, mv_tab::table())? as i32;
-    let diff = if magnitude == 0 {
-        0
-    } else {
-        let sign = br.read_u1()? as i32;
-        if sign == 1 {
-            -magnitude
+    if magnitude == 0 {
+        return Ok(if umv {
+            // §D.2: with UMV and zero magnitude, the result is just the
+            // predictor (no wrap needed — predictor is already in range).
+            predictor_half
         } else {
-            magnitude
-        }
-    };
-    Ok(wrap_mv_component(predictor_half + diff))
+            wrap_mv_component(predictor_half)
+        });
+    }
+    let sign_bit = br.read_u1()? as i32;
+    // VLC sign: `1` = negative differential, `0` = positive.
+    let sign_dir = if sign_bit == 1 { -1 } else { 1 };
+    if umv {
+        Ok(reconstruct_umv_component(
+            predictor_half,
+            magnitude,
+            sign_dir,
+        ))
+    } else {
+        let diff = magnitude * sign_dir;
+        Ok(wrap_mv_component(predictor_half + diff))
+    }
 }
 
 /// Encode one MV component into `bw`, given the predictor.
@@ -357,5 +460,67 @@ mod tests {
         assert_eq!(wrap_mv_component(32), -32);
         assert_eq!(wrap_mv_component(-32), -32);
         assert_eq!(wrap_mv_component(-33), 31);
+    }
+
+    /// Annex D §D.2 — when the predictor is inside the baseline range
+    /// `[-31, +32]` halfpel the UMV decode collapses to the plain "predictor
+    /// plus signed magnitude" form (no wrap, no sign-of-predictor games).
+    #[test]
+    fn umv_inside_baseline_range_is_transparent() {
+        // magnitude=8, positive sign, predictor=0 → diff=+8 → 8.
+        for (pred, mag, sign_bit, want) in [
+            (0i32, 8i32, 0u32, 8i32),
+            (0, 8, 1, -8),
+            (15, 10, 0, 25),
+            (-20, 5, 1, -25),
+        ] {
+            let mut bw = BitWriter::new();
+            // encode the magnitude via the regular encoder — same VLC table.
+            encode_mv_component(&mut bw, want, pred);
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let got = decode_mv_component_umv(&mut br, pred, true).unwrap();
+            assert_eq!(got, want, "pred={pred} mag={mag} sign={sign_bit}");
+        }
+    }
+
+    /// Annex D §D.2 — predictor out of `[-31, +32]` → reconstruction picks
+    /// the `{d, d+64, d-64}` candidate that stays in `[-63, +63]` *and*
+    /// matches the predictor's sign.
+    #[test]
+    fn umv_predictor_out_of_range_picks_sign_matching_candidate() {
+        // Predictor = 40 (outside baseline range). We want to encode an MV of
+        // 50 (halfpel); raw_diff = 10 → sum 50 (positive, in range, same sign
+        // as predictor). Easy case: the first candidate already works.
+        let pred: i32 = 40;
+        let want: i32 = 50;
+        let diff_raw: i32 = want - pred; // 10
+        let mut bw = BitWriter::new();
+        // Encode a positive differential of +10 via the raw MV VLC path.
+        let mag = diff_raw.unsigned_abs() as usize;
+        let (bits, code) = MV_ENC_VLC[mag];
+        bw.write_bits(code, bits as u32);
+        bw.write_bits(0, 1); // positive sign
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let got = decode_mv_component_umv(&mut br, pred, true).unwrap();
+        assert_eq!(got, want);
+    }
+
+    /// Annex D §D.1 — reconstruct_umv_component picks the wrap that keeps
+    /// the result inside `[-63, 63]` when the straightforward sum would
+    /// overflow the extended range.
+    #[test]
+    fn umv_wraps_to_extended_range_when_out_of_bounds() {
+        // pred = 40 halfpel, diff = +30 → 70 overflows 63; candidate d-64 =
+        // -34 yields 6 (positive, matches predictor's sign, in range).
+        // Actually: {30, 94, -34} → viable in range & positive: just -34 → 6.
+        let got = reconstruct_umv_component(40, 30, 1);
+        assert_eq!(got, 6);
+
+        // pred = -40, diff = -30 → -70 overflows; candidate +34 → -6 (neg,
+        // matches predictor sign).
+        let got = reconstruct_umv_component(-40, 30, -1);
+        assert_eq!(got, -6);
     }
 }

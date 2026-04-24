@@ -24,6 +24,18 @@
 //!   [`decoder::H263Decoder::set_enable_annex_j`], or auto-enabled on the
 //!   decoder side when a PLUSPTYPE-carrying stream asserts the `DF` bit in
 //!   its OPPTYPE. See [`deblock::deblock_picture`].
+//! * **Annex D — Unrestricted Motion Vectors (decode path, baseline PTYPE
+//!   form)**: the decoder accepts PTYPE bit 10 (UMV) on non-PLUSPTYPE
+//!   streams and applies the §D.2 sign-of-predictor reconstruction rule
+//!   for MV differentials when the median predictor falls outside the
+//!   baseline `[-15.5, 16]` pel band. The picture-edge extrapolation
+//!   required by §D.1 (samples outside the reference picture replicate
+//!   from the nearest valid edge) was already present in
+//!   [`interp::predict_block`] via `x.clamp(0, w-1)` and is exercised by
+//!   the Annex D tests. The PLUSPTYPE-form Annex D variant (Table D.3
+//!   VLC, UUI bit) is parsed but currently rejected with a specific
+//!   diagnostic; the baseline-form path is the common case emitted by
+//!   pre-H.263+ encoders.
 //! * **PLUSPTYPE parse** (H.263+, ITU-T Rec. H.263 01/2005 Annex U): the
 //!   decoder recognises extended picture headers carrying source-format
 //!   code `111`, reads UFEP / MPPTYPE / OPPTYPE + CPFMT, and either returns
@@ -35,10 +47,11 @@
 //!
 //! Out of scope (returns `Error::Unsupported`):
 //! * PB-frames mode (§G) and every B-picture flavour.
-//! * Annex D (Unrestricted MV), Annex E (SAC), Annex F (Advanced Prediction
-//!   — 4MV/OBMC), Annex G (PB-frames), Annex I (Advanced Intra Coding),
-//!   Annex K (Slice Structured Mode), Annex N (RPS), Annex P (Reference
-//!   Picture Resampling), Annex T (Modified Quantization).
+//! * Annex D in its PLUSPTYPE form (Table D.3 MVD VLC + UUI range selection).
+//! * Annex E (SAC), Annex F (Advanced Prediction — 4MV/OBMC), Annex G
+//!   (PB-frames), Annex I (Advanced Intra Coding), Annex K (Slice
+//!   Structured Mode), Annex N (RPS), Annex P (Reference Picture
+//!   Resampling), Annex T (Modified Quantization).
 //! * H.263+ custom picture clock frequency / custom picture sizes that don't
 //!   match one of the standard source formats (sub-QCIF/QCIF/CIF/4CIF/16CIF).
 //! * CPM continuous-presence multipoint mode.

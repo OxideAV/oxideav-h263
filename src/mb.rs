@@ -33,7 +33,7 @@ use oxideav_mpeg4video::tables::{cbpy, mcbpc, vlc};
 
 use crate::block::{decode_ac, decode_intradc, idct_and_clip};
 use crate::interp::predict_block;
-use crate::motion::{decode_mv_component, luma_to_chroma_mv, predict_mv, MbMotion, MvGrid};
+use crate::motion::{decode_mv_component_umv, luma_to_chroma_mv, predict_mv, MbMotion, MvGrid};
 
 /// Signed `dquant` adjustment — Table 12/H.263. 2-bit code indexes `[-1, -2, 1, 2]`.
 const DQUANT_DELTA: [i32; 4] = [-1, -2, 1, 2];
@@ -203,7 +203,9 @@ fn block_dst(
 /// Decode one P-picture macroblock at `(mb_x, mb_y)`. Reads from `br`,
 /// writes decoded pels into `pic`, consults `reference` for motion
 /// compensation, and updates `mv_grid` so subsequent MBs see the correct
-/// median predictor.
+/// median predictor. When `umv` is `true`, the MV decoder uses the Annex D
+/// "sign-of-predictor" reconstruction rule and accepts the extended half-pel
+/// range `[-63, +63]`.
 ///
 /// Returns the (possibly updated) quantiser.
 pub fn decode_p_mb(
@@ -214,6 +216,7 @@ pub fn decode_p_mb(
     pic: &mut IPicture,
     reference: &IPicture,
     mv_grid: &mut MvGrid,
+    umv: bool,
 ) -> Result<u32> {
     // 1. COD flag (§5.3.1). 1 → not_coded: copy from reference, MV(0,0).
     let cod = br.read_u1()?;
@@ -279,8 +282,8 @@ pub fn decode_p_mb(
         (0, 0)
     } else {
         let (px, py) = predict_mv(mv_grid, mb_x, mb_y);
-        let mvx = decode_mv_component(br, px)?;
-        let mvy = decode_mv_component(br, py)?;
+        let mvx = decode_mv_component_umv(br, px, umv)?;
+        let mvy = decode_mv_component_umv(br, py, umv)?;
         mv_grid.set(
             mb_x,
             mb_y,

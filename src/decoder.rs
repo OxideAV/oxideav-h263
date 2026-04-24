@@ -249,13 +249,21 @@ pub fn decode_p_picture(
             }
         }
         for mb_x in 0..mb_w {
-            quant = decode_p_mb(br, mb_x, mb_y, quant, &mut pic, reference, &mut mv_grid).map_err(
-                |e| {
-                    Error::invalid(format!(
-                        "h263 P-picture MB ({mb_x},{mb_y}) (q={quant}): {e}"
-                    ))
-                },
-            )?;
+            quant = decode_p_mb(
+                br,
+                mb_x,
+                mb_y,
+                quant,
+                &mut pic,
+                reference,
+                &mut mv_grid,
+                hdr.umv_mode,
+            )
+            .map_err(|e| {
+                Error::invalid(format!(
+                    "h263 P-picture MB ({mb_x},{mb_y}) (q={quant}): {e}"
+                ))
+            })?;
         }
     }
     Ok(pic)

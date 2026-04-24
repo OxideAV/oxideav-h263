@@ -210,11 +210,6 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
     let advanced_prediction = br.read_u1()? == 1;
     let pb_frames = br.read_u1()? == 1;
 
-    if umv_mode {
-        return Err(Error::unsupported(
-            "h263 Annex D unrestricted MV mode: follow-up",
-        ));
-    }
     if sac_mode {
         return Err(Error::unsupported(
             "h263 Annex E syntax-based arithmetic coding: follow-up",
@@ -328,38 +323,64 @@ fn parse_plusptype_tail(
 ) -> Result<PictureHeader> {
     let ufep = br.read_u32(3)?;
 
-    // OPPTYPE (18 bits) — present only when UFEP == `001`. If absent, the
-    // decoder is expected to carry the optional-feature flags from the last
-    // full PLUSPTYPE seen on the stream. We don't track cross-picture state
-    // yet, so we only accept pictures that either carry the full OPPTYPE
-    // (and use a subset we support) or default everything to baseline.
-    let (custom_src_format, custom_pcf, df_mode) = if ufep == 0b001 {
+    // OPPTYPE (18 bits, MSB first per §5.1.4.2) — present only when UFEP ==
+    // `001`. If absent, the decoder is expected to carry the optional-
+    // feature flags from the last full PLUSPTYPE seen on the stream. We
+    // don't track cross-picture state yet, so we only accept pictures that
+    // either carry the full OPPTYPE (and use a subset we support) or
+    // default everything to baseline.
+    //
+    // Field layout (spec bits 1..=18 mapped to helper bit positions where
+    // bit `N` is the (18-N)-th LSB of the 18-bit value — spec bit 1 is the
+    // MSB of OPPTYPE, read first from the stream):
+    //   Bits 1-3: Source Format (3 bits, identical codes as baseline PTYPE,
+    //             with 6 = custom format).
+    //   Bit 4:    Custom PCF.
+    //   Bit 5:    UMV (Annex D).
+    //   Bit 6:    SAC (Annex E).
+    //   Bit 7:    AP  (Annex F).
+    //   Bit 8:    AIC (Annex I).
+    //   Bit 9:    DF  (Annex J deblocking).
+    //   Bit 10:   SS  (Annex K slice structured).
+    //   Bit 11:   RPS (Annex N reference picture selection).
+    //   Bit 12:   ISD (Annex R).
+    //   Bit 13:   AIV (Annex S alternative inter VLC).
+    //   Bit 14:   MQ  (Annex T modified quantization).
+    //   Bit 15:   Marker, must be "1".
+    //   Bits 16-18: Reserved, must be "000".
+    let (opptype_src_format, custom_src_format, custom_pcf, umv_mode, df_mode) = if ufep == 0b001 {
         let opptype = br.read_u32(18)?;
-        // Bit 17 (MSB of OPPTYPE): custom source format follows (CPFMT).
-        let custom_src = (opptype >> 17) & 1 != 0;
-        // Bit 16: custom PCF (Picture Clock Frequency — custom frame rate).
-        let custom_pcf = (opptype >> 16) & 1 != 0;
-        let umv = (opptype >> 15) & 1 != 0;
-        let sac = (opptype >> 14) & 1 != 0;
-        let ap = (opptype >> 13) & 1 != 0;
-        let aic = (opptype >> 12) & 1 != 0;
-        let df = (opptype >> 11) & 1 != 0;
-        let sss = (opptype >> 10) & 1 != 0;
-        let rps = (opptype >> 9) & 1 != 0;
-        let isd = (opptype >> 8) & 1 != 0;
-        let aiv = (opptype >> 7) & 1 != 0;
-        let mq = (opptype >> 6) & 1 != 0;
-        let marker = (opptype >> 5) & 1;
-        // Low 5 bits: 1 marker + 3 reserved + 1 marker? Spec says "1" + "000"
-        // + "0" + "0" (1 marker then 4 reserved). We require the marker bits
-        // to be `1` and the reserved bits to be `0`.
+        // MSB-first helpers: `bit(k)` returns the k-th spec bit
+        // (1-indexed, where 1 is the MSB of the 18-bit field).
+        let bit = |k: u32| -> u32 { (opptype >> (18 - k)) & 1 };
+        let src_fmt_code = (opptype >> (18 - 3)) & 0b111;
+        let custom_pcf = bit(4) != 0;
+        let umv = bit(5) != 0;
+        let sac = bit(6) != 0;
+        let ap = bit(7) != 0;
+        let aic = bit(8) != 0;
+        let df = bit(9) != 0;
+        let sss = bit(10) != 0;
+        let rps = bit(11) != 0;
+        let isd = bit(12) != 0;
+        let aiv = bit(13) != 0;
+        let mq = bit(14) != 0;
+        let marker = bit(15);
+        // Reserved bits 16..=18 must all be zero.
+        let reserved = (opptype & 0b111) as u8;
         if marker != 1 {
             return Err(Error::invalid("h263 PLUSPTYPE: OPPTYPE marker bit != 1"));
         }
-        if umv {
-            return Err(Error::unsupported(
-                "h263 Annex D unrestricted MV mode (PLUSPTYPE): follow-up",
-            ));
+        if reserved != 0 {
+            return Err(Error::invalid(format!(
+                "h263 PLUSPTYPE: OPPTYPE reserved bits != 000 (got {reserved:03b})"
+            )));
+        }
+        let custom_src = src_fmt_code == 0b110;
+        if src_fmt_code == 0b000 || src_fmt_code == 0b111 {
+            return Err(Error::invalid(format!(
+                "h263 PLUSPTYPE: reserved OPPTYPE source format {src_fmt_code:03b}"
+            )));
         }
         if sac {
             return Err(Error::unsupported(
@@ -401,7 +422,16 @@ fn parse_plusptype_tail(
                 "h263 Annex T modified quantization: follow-up",
             ));
         }
-        (custom_src, custom_pcf, df)
+        if umv {
+            // PLUSPTYPE + UMV requires Table D.3 (§D.2) instead of Table 14
+            // for the MV differential VLC. That table is not yet
+            // implemented — reject these streams with a specific
+            // diagnostic so callers can fall back.
+            return Err(Error::unsupported(
+                "h263 Annex D unrestricted MV mode in PLUSPTYPE form (Table D.3): follow-up",
+            ));
+        }
+        (src_fmt_code as u8, custom_src, custom_pcf, umv, df)
     } else if ufep == 0b000 {
         // Inherit previous-picture OPPTYPE state. Since we do not yet retain
         // OPPTYPE across pictures, we treat the inherited state as "baseline
@@ -410,8 +440,10 @@ fn parse_plusptype_tail(
         // whose very first PLUSPTYPE picture supplies a full OPPTYPE and
         // whose subsequent P-pictures keep the same options (the common
         // case); anything else will diverge downstream on the first feature
-        // bit that actually matters.
-        (false, false, false)
+        // bit that actually matters. `opptype_src_format = 0` signals
+        // "no OPPTYPE, dimensions must be inferable from later CPFMT (which
+        // in turn will not be present for UFEP==000)".
+        (0, false, false, false, false)
     } else {
         return Err(Error::invalid(format!(
             "h263 PLUSPTYPE: invalid UFEP {ufep:03b}"
@@ -478,7 +510,8 @@ fn parse_plusptype_tail(
     }
 
     // CPFMT (23 bits): PAR code (4) | PWI (9) | `1` marker | PHI (9). Only
-    // present when OPPTYPE said so.
+    // present when OPPTYPE signalled a custom source format (code 110). For
+    // the standard codes 001..=101 the dimensions are implied.
     let (width, height) = if custom_src_format {
         let par_code = br.read_u32(4)?;
         let pwi = br.read_u32(9)?;
@@ -504,13 +537,23 @@ fn parse_plusptype_tail(
             )));
         }
         (w, h)
+    } else if ufep == 0b001 {
+        // OPPTYPE present → standard source-format code in bits 1-3.
+        let (w, h) = SourceFormat::from_code(opptype_src_format)
+            .dimensions()
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "h263 PLUSPTYPE OPPTYPE source format {opptype_src_format:03b} has no dimensions"
+                ))
+            })?;
+        (w, h)
     } else {
         // When not signalled, size is inherited from the last full PLUSPTYPE
         // which in our stateless parse means "we don't know". Baseline
         // decoding is impossible without a size.
         return Err(Error::unsupported(
-            "h263 PLUSPTYPE without custom-source-format bit: cross-picture \
-             state inheritance for source size is not yet tracked",
+            "h263 PLUSPTYPE with UFEP=000: cross-picture OPPTYPE inheritance \
+             (picture size) is not yet tracked",
         ));
     };
 
@@ -522,10 +565,27 @@ fn parse_plusptype_tail(
         ));
     }
 
-    // UUI (Annex D). Syntax: `1` = default; `01` = explicit 2-bit code follows.
-    // Because UMV was already rejected above, UUI is effectively never needed
-    // on a stream we accept — but the spec still requires the bit. It is only
-    // sent when OPPTYPE had UMV set, which we rejected, so no UUI here.
+    // UUI (Annex D) — variable-length, 1 or 2 bits, only present when OPPTYPE
+    // had UMV set. "1" → range limited per Tables D.1/D.2. "01" → range
+    // unlimited except by picture size (§5.1.9). UMV in the PLUSPTYPE path
+    // is rejected above because it requires Table D.3 for the MVD VLC, so
+    // the body below never actually triggers on an accepted stream — but
+    // we keep the parse shape correct so that the pattern remains useful
+    // once Table D.3 lands.
+    let _uui_unlimited = if umv_mode {
+        let first = br.read_u1()?;
+        if first == 1 {
+            false
+        } else {
+            let second = br.read_u1()?;
+            if second != 1 {
+                return Err(Error::invalid("h263 PLUSPTYPE: invalid UUI prefix"));
+            }
+            true
+        }
+    } else {
+        false
+    };
 
     // SSS (Annex K) — only if slice structured was signalled (rejected above).
 
@@ -553,7 +613,7 @@ fn parse_plusptype_tail(
         freeze_release,
         source_format,
         coding_type,
-        umv_mode: false,
+        umv_mode,
         sac_mode: false,
         advanced_prediction: false,
         pb_frames: false,
@@ -645,6 +705,42 @@ mod tests {
         }
     }
 
+    /// Build an OPPTYPE u32 from spec-numbered bit fields. Bit 1 is the MSB
+    /// of the 18-bit field. The helper takes each optional-mode flag as a
+    /// bool and packs the marker + reserved bits for the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn pack_opptype(
+        src_fmt: u32,
+        custom_pcf: bool,
+        umv: bool,
+        sac: bool,
+        ap: bool,
+        aic: bool,
+        df: bool,
+        sss: bool,
+        rps: bool,
+        isd: bool,
+        aiv: bool,
+        mq: bool,
+    ) -> u32 {
+        let b = |k: u32, v: u32| (v & 1) << (18 - k);
+        // Bits 1-3 (MSB): source-format code (placed at bits 17..=15).
+        let srcf = (src_fmt & 0b111) << 15;
+        srcf | b(4, custom_pcf as u32)
+            | b(5, umv as u32)
+            | b(6, sac as u32)
+            | b(7, ap as u32)
+            | b(8, aic as u32)
+            | b(9, df as u32)
+            | b(10, sss as u32)
+            | b(11, rps as u32)
+            | b(12, isd as u32)
+            | b(13, aiv as u32)
+            | b(14, mq as u32)
+            | b(15, 1) // marker
+            // bits 16-18 = reserved 0.
+    }
+
     #[test]
     fn plusptype_qcif_iframe_with_df_flag() {
         let mut w = BitBuf::new();
@@ -661,31 +757,16 @@ mod tests {
         // PLUSPTYPE tail starts here.
         // UFEP = 001
         w.put(0b001, 3);
-        // OPPTYPE (18): custom_src=1, custom_pcf=0, UMV=0, SAC=0, AP=0, AIC=0,
-        // DF=1, SSS=0, RPS=0, ISD=0, AIV=0, MQ=0, marker=1, reserved=00000
-        let opptype = (1u32 << 17)
-            | (0u32 << 16)
-            | (0u32 << 15)
-            | (0u32 << 14)
-            | (0u32 << 13)
-            | (0u32 << 12)
-            | (1u32 << 11)
-            | (0u32 << 10)
-            | (0u32 << 9)
-            | (0u32 << 8)
-            | (0u32 << 7)
-            | (0u32 << 6)
-            | (1u32 << 5);
+        // OPPTYPE: src_fmt=010 (QCIF, standard), DF=1, rest off.
+        let opptype = pack_opptype(
+            0b010, false, false, false, false, false, true, false, false, false, false, false,
+        );
         w.put(opptype, 18);
         // MPPTYPE (9): PCT=000 (I) | RPR=0 | RRU=0 | RTYPE=0 | marker=001
         w.put(0b000_0_0_0_001, 9);
         // CPM = 0
         w.put(0, 1);
-        // CPFMT (23): PAR=0001 (1:1), PWI = 176/4 - 1 = 43, marker=1, PHI=36
-        w.put(0b0001, 4);
-        w.put(43, 9);
-        w.put(1, 1);
-        w.put(36, 9);
+        // No CPFMT (std src fmt). No UUI (UMV off).
         // PQUANT = 5
         w.put(5, 5);
         // PEI = 0
@@ -701,8 +782,11 @@ mod tests {
         assert!(p.deblocking_filter);
     }
 
+    /// PLUSPTYPE path currently rejects UMV with a specific diagnostic
+    /// pointing to Table D.3 (Annex D in PLUSPTYPE form requires that
+    /// alternative VLC, which isn't implemented yet).
     #[test]
-    fn plusptype_rejects_unsupported_annex_d() {
+    fn plusptype_umv_rejected_with_table_d3_diagnostic() {
         let mut w = BitBuf::new();
         w.put(0b00_0000_0000_0000_0000_1_00000, 22);
         w.put(0, 8);
@@ -713,16 +797,47 @@ mod tests {
         w.put(0, 1);
         w.put(0b111, 3);
         w.put(0b001, 3);
-        // OPPTYPE with UMV=1.
-        let opptype = (1u32 << 17) | (1u32 << 15) | (1u32 << 5);
+        // OPPTYPE: src_fmt=010 (QCIF), UMV=1.
+        let opptype = pack_opptype(
+            0b010, false, true, false, false, false, false, false, false, false, false, false,
+        );
         w.put(opptype, 18);
         let data = w.finish();
         let mut br = BitReader::new(&data);
         let err = parse_picture_header(&mut br).unwrap_err();
         let msg = format!("{err}");
-        assert!(
-            msg.contains("Annex D"),
-            "expected Annex D rejection, got {msg}"
-        );
+        assert!(msg.contains("Table D.3"), "got {msg}");
+    }
+
+    /// Baseline PTYPE (no PLUSPTYPE) with UMV enabled should now parse — the
+    /// MV decoder handles §D.2 directly on top of Table 14.
+    #[test]
+    fn baseline_ptype_umv_accepted() {
+        let mut w = BitBuf::new();
+        w.put(0b00_0000_0000_0000_0000_1_00000, 22);
+        w.put(0, 8);
+        // PTYPE bits (13): 1, 0, split=0, cam=0, freeze=0, fmt=010 QCIF, P-pic,
+        //                   UMV=1, SAC=0, AP=0, PB=0
+        w.put(1, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0b010, 3); // QCIF
+        w.put(1, 1); // P-picture
+        w.put(1, 1); // UMV ON
+        w.put(0, 1); // SAC
+        w.put(0, 1); // AP
+        w.put(0, 1); // PB
+        w.put(5, 5); // PQUANT=5
+        w.put(0, 1); // CPM
+        w.put(0, 1); // PEI=0
+        let data = w.finish();
+        let mut br = BitReader::new(&data);
+        let p = parse_picture_header(&mut br).unwrap();
+        assert!(p.umv_mode, "UMV flag should be latched");
+        assert_eq!(p.source_format, SourceFormat::Qcif);
+        assert_eq!(p.coding_type, PictureCodingType::Predicted);
+        assert!(!p.plusptype);
     }
 }
