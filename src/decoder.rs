@@ -150,15 +150,6 @@ impl H263Decoder {
                 Ok(())
             }
             PictureCodingType::Predicted => {
-                if hdr.sac_mode {
-                    // SAC P-pictures need the COD / MVD models wired into
-                    // the MB / motion paths — separate work from the
-                    // I-picture SAC bridge.
-                    return Err(Error::unsupported(
-                        "h263 Annex E SAC P-picture: MB-layer SAC bridge currently I-only \
-                         (COD + MVD models pending wiring; arithmetic coder lives in crate::sac)",
-                    ));
-                }
                 let reference = self.reference.as_ref().ok_or_else(|| {
                     Error::invalid(
                         "h263 P-picture: no reference frame available (stream must start with I)",
@@ -170,7 +161,12 @@ impl H263Decoder {
                         "h263 P-picture: dimension change without I-picture",
                     ));
                 }
-                let mut pic = decode_p_picture(&mut br, &hdr, bytes, reference)?;
+                let mut pic = if hdr.sac_mode {
+                    // Round 14 — SAC P-picture body driver.
+                    crate::mb_sac::decode_p_picture_sac(&hdr, bytes, reference)?
+                } else {
+                    decode_p_picture(&mut br, &hdr, bytes, reference)?
+                };
                 self.maybe_deblock(&mut pic, &hdr);
                 let frame = pic_to_video_frame(&pic, self.pending_pts, self.pending_tb);
                 self.reference = Some(pic);

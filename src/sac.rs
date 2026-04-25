@@ -723,44 +723,66 @@ pub fn intradc_index_to_byte(index: usize) -> Option<u8> {
 }
 
 /// Convert an 8-bit two's-complement LEVEL byte (used in the VLC ESCAPE
-/// body) into the §E.7 cumf_LEVEL / cumf_LEVEL_intra index space. Spec
-/// Table 17 lists FLC 0x80..=0xFF for levels -128..=-1 (with -128 forbidden
-/// in baseline) and FLC 0x01..=0x7F for levels 1..=127. The cumf_LEVEL
-/// model has 254 entries indexed 0..=253; we map FLC bytes contiguously
-/// starting at index 0 = -128, 1 = -127, ..., 127 = -1, [skip 0 = forbidden],
-/// 128 = +1, ..., 254 = +127. (Index 127 corresponds to FLC 0x80 = -128 and
-/// is only used in Modified Quantization mode; baseline encoders won't emit
-/// it but the model still reserves the slot.)
+/// body) into the §E.7 cumf_LEVEL / cumf_LEVEL_intra index space.
 ///
-/// The cumul_freq array's monotone-decreasing constraint means the
-/// "common" small-magnitude levels sit at high indices; the spec ordering
-/// is by FLC byte value, which interleaves negatives at low indices and
-/// positives at high indices. The §E.8 array reflects this directly — see
-/// the [`models::LEVEL`] table.
+/// Spec Table 17 lists FLC 0x81..=0xFF for levels -127..=-1 and FLC
+/// 0x01..=0x7F for levels +1..=+127. (FLC 0x00 is forbidden — level 0 has
+/// no codeword. FLC 0x80 = -128 is forbidden in baseline; only Modified
+/// Quantization (Annex T) uses it.)
+///
+/// The cumul-frequency arrays in §E.8 (`cumf_LEVEL[255]` /
+/// `cumf_LEVEL_intra[255]`) hold 254 symbols indexed 0..=253 plus the
+/// trailing zero sentinel. We pack the negative half (indices 0..=126
+/// for FLC 0x81..=0xFF = levels -127..=-1) before the positive half
+/// (indices 127..=253 for FLC 0x01..=0x7F = levels +1..=+127). The
+/// forbidden FLC 0x80 (level -128) has no slot — callers that pass it
+/// trip a debug-assert.
 pub fn level_byte_to_index(byte: u8) -> usize {
+    debug_assert!(byte != 0x00, "LEVEL byte 0x00 (level 0) is forbidden");
+    debug_assert!(
+        byte != 0x80,
+        "LEVEL byte 0x80 (level -128) is forbidden in baseline"
+    );
     if byte & 0x80 != 0 {
-        // 0x80..=0xFF → indices 0..=127 (with 0x80 = idx 0 = -128).
-        (byte - 0x80) as usize
+        // 0x81..=0xFF (-127..=-1) → indices 0..=126.
+        (byte - 0x81) as usize
     } else {
-        // 0x01..=0x7F → indices 127..=253 (skipping 0 which is forbidden;
-        // we allocate 0x01 to index 127, 0x02 to 128, ..., 0x7F to 253).
-        // NOTE: index 127 is shared between FLC 0xFF (-1) and FLC 0x01
-        // (+1) — but since FLC 0xFF maps to byte 0xFF (>=0x80) above, the
-        // overlap is resolved by the branch.
-        debug_assert!(byte != 0, "LEVEL byte 0x00 is forbidden");
+        // 0x01..=0x7F (+1..=+127) → indices 127..=253.
         ((byte - 1) as usize) + 127
     }
 }
 
-/// Inverse of [`level_byte_to_index`].
+/// Inverse of [`level_byte_to_index`]. Returns the FLC byte for a given
+/// SAC LEVEL index 0..=253.
 pub fn level_index_to_byte(index: usize) -> u8 {
-    if index < 128 {
-        // -128..=-1: FLC 0x80..=0xFF
-        0x80u8.wrapping_add(index as u8)
+    debug_assert!(index <= 253, "LEVEL index {index} out of range 0..=253");
+    if index < 127 {
+        // -127..=-1: FLC 0x81..=0xFF.
+        0x81u8.wrapping_add(index as u8)
     } else {
-        // +1..=+127: FLC 0x01..=0x7F
-        ((index - 127) as u8) & 0x7F
+        // +1..=+127: FLC 0x01..=0x7F.
+        (index - 126) as u8
     }
+}
+
+/// SAC encoding of an MVD half-pel differential. Per §E.7 the differential
+/// is indexed into `cumf_MVD` using Table 14's `Index` column: index 0 →
+/// vector −32 halfpel, index 32 → 0, index 63 → +31 halfpel. The wrap is
+/// performed by the caller (folding `mv − predictor` into `[−32, +31]`); we
+/// just translate to `index = diff + 32`.
+pub fn mvd_diff_to_index(diff_half: i32) -> usize {
+    debug_assert!(
+        (-32..=31).contains(&diff_half),
+        "MVD diff {diff_half} outside [-32, +31] halfpel"
+    );
+    (diff_half + 32) as usize
+}
+
+/// Inverse of [`mvd_diff_to_index`]. Returns the signed half-pel
+/// differential for SAC `cumf_MVD` index 0..=63.
+pub fn mvd_index_to_diff(index: usize) -> i32 {
+    debug_assert!(index < 64, "MVD index {index} out of range 0..=63");
+    index as i32 - 32
 }
 
 /// High-level SAC bridge for emitting the body of an I-picture macroblock.
@@ -1001,6 +1023,318 @@ impl<'a> SacIPictureReader<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Round 14 — SAC bridge for the P-picture MB body.
+//
+// The §E.8 cumf_COD model handles the per-MB COD bit; cumf_MCBPC_no4MVQ
+// (or cumf_MCBPC_4MVQ when Annex F or Annex J is in use) carries the
+// MB-type + cbpc; cumf_CBPY for the inter CBPY pattern (raw, NOT XOR'd —
+// §E.7 indexes by Table 12 directly); cumf_DQUANT for the optional 2-bit
+// dquant token; cumf_MVD for each MV component differential (Table 14
+// indexing); then the inter TCOEF1/2/3/r + SIGN + LAST/RUN/LEVEL escape
+// chain (already wired in `SacIPictureWriter::write_tcoef` via the
+// `intra_block=false` branch).
+// ---------------------------------------------------------------------------
+
+/// Whether the picture-level model variant is `cumf_MCBPC_no4MVQ` (baseline
+/// or Annex F/J off) or `cumf_MCBPC_4MVQ` (Annex F advanced prediction OR
+/// Annex J deblocking filter active per §E.7). Plumbed from the picture
+/// header to the MB-layer SAC bridge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PMcbpcModel {
+    /// `cumf_MCBPC_no4MVQ` — 21 indices (0..=20). MB types 0..=4 in
+    /// Table 8, plus stuffing.
+    No4MvQ,
+    /// `cumf_MCBPC_4MVQ` — 25 indices (0..=24). Same as `No4MvQ` plus the
+    /// MB type 5 / Inter4MV+Q rows (21..=24).
+    Mv4Q,
+}
+
+impl PMcbpcModel {
+    /// Spec-literal cumul-frequency table for this model variant.
+    pub fn model(self) -> &'static [u32] {
+        match self {
+            PMcbpcModel::No4MvQ => models::MCBPC_NO_4MVQ,
+            PMcbpcModel::Mv4Q => models::MCBPC_4MVQ,
+        }
+    }
+
+    /// Highest legal index (== model's symbol count − 1).
+    pub fn max_index(self) -> usize {
+        match self {
+            PMcbpcModel::No4MvQ => 20, // 0..=20 (stuffing at 20)
+            PMcbpcModel::Mv4Q => 24,   // 0..=24 (stuffing at 20, mb_type 5 at 21..=24)
+        }
+    }
+
+    /// Index value reserved for MB-layer stuffing (per Table 8 row 20).
+    pub const STUFFING_INDEX: usize = 20;
+}
+
+/// Encoder-side SAC bridge for one P-picture body. Mirrors
+/// [`SacIPictureWriter`] but exposes the P-MB syntax elements (COD, MCBPC
+/// inter, CBPY inter, DQUANT, MVD, INTER TCOEF) instead of the I-MB set.
+pub struct SacPPictureWriter {
+    enc: SacEncoder,
+    fifo: PscFifoWriter,
+    mcbpc_model: PMcbpcModel,
+}
+
+impl SacPPictureWriter {
+    pub fn new(mcbpc_model: PMcbpcModel) -> Self {
+        Self {
+            enc: SacEncoder::new(),
+            fifo: PscFifoWriter::new(),
+            mcbpc_model,
+        }
+    }
+
+    /// Encode a single COD bit. `coded == false` (COD=1, "not coded")
+    /// terminates the MB's SAC tokens.
+    pub fn write_cod(&mut self, coded: bool) {
+        // COD=0 ↔ index 0 (coded), COD=1 ↔ index 1 (not coded). §E.7.
+        let idx = if coded { 0 } else { 1 };
+        self.enc.encode_symbol(idx, models::COD, &mut self.fifo);
+    }
+
+    /// Encode an MCBPC index (Table 8 column "Index"). Stuffing (index
+    /// `PMcbpcModel::STUFFING_INDEX` = 20) is allowed but should be avoided
+    /// by callers that want the smallest stream.
+    pub fn write_mcbpc(&mut self, index: usize) -> Result<()> {
+        if index > self.mcbpc_model.max_index() {
+            return Err(Error::invalid(format!(
+                "SAC MCBPC P: index {index} > model max {}",
+                self.mcbpc_model.max_index()
+            )));
+        }
+        self.enc
+            .encode_symbol(index, self.mcbpc_model.model(), &mut self.fifo);
+        Ok(())
+    }
+
+    /// Encode the CBPY (inter form). Per §E.7 the indexing is Table 12
+    /// directly (the raw 4-bit CBPY value, NOT XOR'd). The VLC encode path
+    /// uses `cbpy_on_wire = cbpy_true ^ 0xF`; for SAC we feed the raw
+    /// `cbpy_true`.
+    pub fn write_cbpy_inter(&mut self, cbpy_raw: u8) -> Result<()> {
+        if cbpy_raw >= 16 {
+            return Err(Error::invalid("SAC CBPY: value out of 0..=15"));
+        }
+        self.enc
+            .encode_symbol(cbpy_raw as usize, models::CBPY, &mut self.fifo);
+        Ok(())
+    }
+
+    /// Encode a DQUANT token (Table 13 index 0..=3 for deltas
+    /// `[-1, -2, +1, +2]`).
+    pub fn write_dquant(&mut self, index: usize) -> Result<()> {
+        if index > 3 {
+            return Err(Error::invalid("SAC DQUANT: index out of 0..=3"));
+        }
+        self.enc
+            .encode_symbol(index, models::DQUANT, &mut self.fifo);
+        Ok(())
+    }
+
+    /// Encode one MV-component half-pel differential (`diff` already folded
+    /// into `[-32, +31]` by the caller using the same wrap rule as the VLC
+    /// path).
+    pub fn write_mvd_component(&mut self, diff_half: i32) {
+        let idx = mvd_diff_to_index(diff_half);
+        self.enc.encode_symbol(idx, models::MVD, &mut self.fifo);
+    }
+
+    /// Public escape hatch: encode an arbitrary symbol against any §E.8
+    /// model through this writer's encoder + PSC_FIFO. Used by the
+    /// `mb_sac` driver for the intra-in-P TCOEF / CBPY / INTRADC paths
+    /// that need the INTRA-flavour models (CBPY_INTRA, INTRADC,
+    /// TCOEF*_INTRA, LAST_INTRA / RUN_INTRA / LEVEL_INTRA).
+    pub fn encode_symbol_via(&mut self, model: &[u32], idx: usize) {
+        self.enc.encode_symbol(idx, model, &mut self.fifo);
+    }
+
+    /// Encode one inter TCOEF event. Same dispatch as
+    /// [`SacIPictureWriter::write_tcoef`] but always with `intra_block=false`.
+    /// `position` is the 1-based event count inside the block (1 → TCOEF1,
+    /// 2 → TCOEF2, 3 → TCOEF3, ≥ 4 → TCOEFr).
+    pub fn write_tcoef_inter(&mut self, position: usize, last: bool, run: u8, level: i32) {
+        debug_assert!(level != 0);
+        let abs = level.unsigned_abs();
+        let tcoef_model: &[u32] = match position {
+            1 => models::TCOEF1,
+            2 => models::TCOEF2,
+            3 => models::TCOEF3,
+            _ => models::TCOEFR,
+        };
+        let sign_bit: usize = if level < 0 { 1 } else { 0 };
+        if abs <= 12 {
+            if let Some(idx) = tcoef_lookup_index(last, run, abs as u8) {
+                self.enc.encode_symbol(idx, tcoef_model, &mut self.fifo);
+                self.enc
+                    .encode_symbol(sign_bit, models::SIGN, &mut self.fifo);
+                return;
+            }
+        }
+        // ESCAPE.
+        self.enc
+            .encode_symbol(TCOEF_ESCAPE_INDEX, tcoef_model, &mut self.fifo);
+        self.enc
+            .encode_symbol(if last { 1 } else { 0 }, models::LAST, &mut self.fifo);
+        self.enc
+            .encode_symbol(run as usize, models::RUN, &mut self.fifo);
+        let level_byte: u8 = level.rem_euclid(256) as u8;
+        let level_idx = level_byte_to_index(level_byte);
+        self.enc
+            .encode_symbol(level_idx, models::LEVEL, &mut self.fifo);
+    }
+
+    /// Flush the arithmetic coder and return the PSC_FIFO bytes. After
+    /// flushing the writer's encoder is reset (§E.7) — call again to start
+    /// a fresh segment (e.g. after a GOB boundary). Consumes self for the
+    /// final picture-end flush; use [`Self::flush_into`] to keep the writer
+    /// alive across mid-picture GOB boundaries.
+    pub fn finish(mut self) -> Vec<u8> {
+        self.enc.flush(&mut self.fifo);
+        self.fifo.finish()
+    }
+
+    /// Flush + reset the arithmetic coder mid-stream (§E.7 `encoder_flush`).
+    /// The PSC_FIFO state is preserved so the next segment continues into
+    /// the same byte buffer; the encoder's `low / high / opposite_bits`
+    /// reset to fresh values.
+    ///
+    /// Caller responsibility: also pad the PSC_FIFO output stream to a byte
+    /// boundary using [`Self::take_byte_aligned_bytes`] before emitting a
+    /// fixed-length header (per §E.6, the header layer bypasses PSC_FIFO and
+    /// goes directly to the bitstream after the SAC body bytes are
+    /// byte-aligned).
+    pub fn encoder_flush(&mut self) {
+        self.enc.flush(&mut self.fifo);
+    }
+
+    /// Drain the PSC_FIFO accumulator into a byte buffer at a byte
+    /// boundary. Replaces the writer's internal `PscFifoWriter` with a fresh
+    /// one (zero zero-run state) so the next SAC segment starts clean. Used
+    /// at GOB boundaries to hand the just-flushed bytes back to the picture
+    /// emitter that needs to append a (VLC-coded) GOB header before the
+    /// next SAC segment resumes.
+    pub fn take_byte_aligned_bytes(&mut self) -> Vec<u8> {
+        let fifo = std::mem::take(&mut self.fifo);
+        fifo.finish()
+    }
+}
+
+/// Decoder-side SAC bridge for one P-picture body. Mirror of
+/// [`SacIPictureReader`] but with P-MB syntax elements.
+pub struct SacPPictureReader<'a> {
+    dec: SacDecoder,
+    fifo: PscFifoReader<'a>,
+    mcbpc_model: PMcbpcModel,
+}
+
+impl<'a> SacPPictureReader<'a> {
+    pub fn new(br: &'a mut BitReader<'a>, mcbpc_model: PMcbpcModel) -> Result<Self> {
+        let mut fifo = PscFifoReader::new(br);
+        let dec = SacDecoder::new(&mut fifo)?;
+        Ok(Self {
+            dec,
+            fifo,
+            mcbpc_model,
+        })
+    }
+
+    /// Public escape hatch that lets sibling modules (the `mb_sac` driver)
+    /// decode against an arbitrary `cumf_*` model without duplicating the
+    /// reader's encoder/fifo plumbing. Same role as
+    /// `SacIPictureReader::decode_with_model`.
+    pub fn decode_symbol_internal(&mut self, model: &[u32]) -> Result<usize> {
+        self.dec.decode_symbol(model, &mut self.fifo)
+    }
+
+    /// Decode the next COD bit. Returns `false` for COD=1 (skipped), `true`
+    /// for COD=0 (coded).
+    pub fn read_cod(&mut self) -> Result<bool> {
+        let v = self.dec.decode_symbol(models::COD, &mut self.fifo)?;
+        Ok(v == 0)
+    }
+
+    /// Decode the next MCBPC index against the picture-level model variant.
+    pub fn read_mcbpc(&mut self) -> Result<usize> {
+        self.dec
+            .decode_symbol(self.mcbpc_model.model(), &mut self.fifo)
+    }
+
+    /// Decode the next inter CBPY (raw 4-bit value, NOT XOR'd).
+    pub fn read_cbpy_inter(&mut self) -> Result<u8> {
+        let v = self.dec.decode_symbol(models::CBPY, &mut self.fifo)?;
+        if v >= 16 {
+            return Err(Error::invalid("SAC CBPY P: index out of range"));
+        }
+        Ok(v as u8)
+    }
+
+    /// Decode the next DQUANT (2-bit token, Table 13 index 0..=3).
+    pub fn read_dquant(&mut self) -> Result<usize> {
+        let v = self.dec.decode_symbol(models::DQUANT, &mut self.fifo)?;
+        if v > 3 {
+            return Err(Error::invalid("SAC DQUANT P: index out of range"));
+        }
+        Ok(v)
+    }
+
+    /// Decode one MV-component half-pel differential (already folded into
+    /// `[−32, +31]` per Table 14). The caller is responsible for adding the
+    /// median predictor and applying the §5.3.7.3 wrap.
+    pub fn read_mvd_component(&mut self) -> Result<i32> {
+        let idx = self.dec.decode_symbol(models::MVD, &mut self.fifo)?;
+        if idx >= 64 {
+            return Err(Error::invalid("SAC MVD: index out of range"));
+        }
+        Ok(mvd_index_to_diff(idx))
+    }
+
+    /// Decode one inter TCOEF event (mirror of
+    /// [`SacIPictureReader::read_tcoef`] with `intra_block=false`).
+    pub fn read_tcoef_inter(&mut self, position: usize) -> Result<(bool, u8, i32)> {
+        let tcoef_model: &[u32] = match position {
+            1 => models::TCOEF1,
+            2 => models::TCOEF2,
+            3 => models::TCOEF3,
+            _ => models::TCOEFR,
+        };
+        let idx = self.dec.decode_symbol(tcoef_model, &mut self.fifo)?;
+        if idx == TCOEF_ESCAPE_INDEX {
+            let last_idx = self.dec.decode_symbol(models::LAST, &mut self.fifo)?;
+            let run = self.dec.decode_symbol(models::RUN, &mut self.fifo)? as u8;
+            let level_idx = self.dec.decode_symbol(models::LEVEL, &mut self.fifo)?;
+            let level_byte = level_index_to_byte(level_idx);
+            if level_byte == 0 {
+                return Err(Error::invalid("SAC TCOEF ESCAPE P: level == 0 forbidden"));
+            }
+            if level_byte == 0x80 {
+                return Err(Error::invalid(
+                    "SAC TCOEF ESCAPE P: level == -128 forbidden",
+                ));
+            }
+            let level = if level_byte & 0x80 != 0 {
+                level_byte as i32 - 256
+            } else {
+                level_byte as i32
+            };
+            return Ok((last_idx == 1, run, level));
+        }
+        let (last, run, abs) = tcoef_index_to_event(idx)
+            .ok_or_else(|| Error::invalid("SAC TCOEF P: bad event index"))?;
+        let sign_idx = self.dec.decode_symbol(models::SIGN, &mut self.fifo)?;
+        let level = if sign_idx == 1 {
+            -(abs as i32)
+        } else {
+            abs as i32
+        };
+        Ok((last, run, level))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,6 +1514,105 @@ mod tests {
         let b = dec.decode_symbol(models::COD, &mut rdr).unwrap();
         let c = dec.decode_symbol(models::COD, &mut rdr).unwrap();
         assert_eq!((b, c), (1, 1));
+    }
+
+    /// `level_byte_to_index` ↔ `level_index_to_byte` round-trip for every
+    /// legal §E.7 LEVEL byte (FLC 0x01..=0x7F + 0x81..=0xFF, 254 bytes
+    /// total). This guards against the round-13 bug where the inverse
+    /// was off-by-one in the positive branch (encoder wrote +30 → idx
+    /// 156 → decoder read +29).
+    #[test]
+    fn level_byte_index_round_trips_all_legal_bytes() {
+        for raw in 1u32..=255u32 {
+            let b = raw as u8;
+            if b == 0x80 {
+                continue; // forbidden in baseline
+            }
+            let idx = level_byte_to_index(b);
+            assert!(idx <= 253, "byte 0x{b:02x} → idx {idx} out of 0..=253");
+            let back = level_index_to_byte(idx);
+            assert_eq!(
+                back, b,
+                "byte 0x{b:02x} → idx {idx} → 0x{back:02x} (round-trip)"
+            );
+        }
+    }
+
+    /// Indices 0..=253 must each round-trip to a unique legal FLC byte
+    /// AND back to the same index.
+    #[test]
+    fn level_index_round_trips_full_range() {
+        let mut seen = std::collections::HashSet::new();
+        for idx in 0..=253usize {
+            let b = level_index_to_byte(idx);
+            assert!(
+                b != 0x00 && b != 0x80,
+                "idx {idx} → forbidden byte 0x{b:02x}"
+            );
+            assert!(seen.insert(b), "idx {idx} → byte 0x{b:02x} (duplicate)");
+            let back = level_byte_to_index(b);
+            assert_eq!(back, idx, "idx {idx} → 0x{b:02x} → idx {back}");
+        }
+    }
+
+    /// `mvd_diff_to_index` ↔ `mvd_index_to_diff` round-trip across the
+    /// whole legal half-pel range.
+    #[test]
+    fn mvd_diff_index_round_trips_full_range() {
+        for diff in -32..=31i32 {
+            let idx = mvd_diff_to_index(diff);
+            assert!(idx < 64);
+            assert_eq!(mvd_index_to_diff(idx), diff);
+        }
+    }
+
+    /// Full P-MB byte-pattern round-trip through `SacPPictureWriter` /
+    /// `SacPPictureReader`: COD + MCBPC + CBPY + DQUANT + 2 MV components +
+    /// a couple of inter TCOEFs.
+    #[test]
+    fn sac_p_picture_writer_reader_roundtrip() {
+        let mut w = SacPPictureWriter::new(PMcbpcModel::No4MvQ);
+        // MB 1: coded inter, MCBPC index 0 (Inter, cbpc=0), CBPY raw=0xF
+        // (all coded), no DQUANT, MV diff (-1, +2), one TCOEF event
+        // (last=true, run=0, level=+3) at position 1.
+        w.write_cod(true);
+        w.write_mcbpc(0).unwrap();
+        w.write_cbpy_inter(0xF).unwrap();
+        w.write_mvd_component(-1);
+        w.write_mvd_component(2);
+        w.write_tcoef_inter(1, true, 0, 3);
+        // MB 2: skipped.
+        w.write_cod(false);
+        // MB 3: coded inter+Q, MCBPC index 8 (InterQ, cbpc=0), CBPY=0,
+        // DQUANT delta +1 (index 2), MV diff (0, 0), no TCOEF (CBPC=0 +
+        // CBPY=0 means no coded blocks — caller wouldn't call write_tcoef).
+        w.write_cod(true);
+        w.write_mcbpc(8).unwrap();
+        w.write_cbpy_inter(0).unwrap();
+        w.write_dquant(2).unwrap();
+        w.write_mvd_component(0);
+        w.write_mvd_component(0);
+        let bytes = w.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let mut r = SacPPictureReader::new(&mut br, PMcbpcModel::No4MvQ).unwrap();
+        // MB 1.
+        assert!(r.read_cod().unwrap());
+        assert_eq!(r.read_mcbpc().unwrap(), 0);
+        assert_eq!(r.read_cbpy_inter().unwrap(), 0xF);
+        assert_eq!(r.read_mvd_component().unwrap(), -1);
+        assert_eq!(r.read_mvd_component().unwrap(), 2);
+        let (last, run, level) = r.read_tcoef_inter(1).unwrap();
+        assert_eq!((last, run, level), (true, 0, 3));
+        // MB 2.
+        assert!(!r.read_cod().unwrap());
+        // MB 3.
+        assert!(r.read_cod().unwrap());
+        assert_eq!(r.read_mcbpc().unwrap(), 8);
+        assert_eq!(r.read_cbpy_inter().unwrap(), 0);
+        assert_eq!(r.read_dquant().unwrap(), 2);
+        assert_eq!(r.read_mvd_component().unwrap(), 0);
+        assert_eq!(r.read_mvd_component().unwrap(), 0);
     }
 
     /// PSC_FIFO writer + reader in isolation — a bit stream with an

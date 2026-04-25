@@ -62,28 +62,37 @@
 //! * Reuses VLC tables and IDCT/dequantisation from `oxideav-mpeg4video`
 //!   (the MPEG-4 Part 2 VLCs are identical to the H.263 baseline ones).
 //!
-//! * **Annex E — Syntax-based Arithmetic Coding (I-pictures)**: the §E.2 /
-//!   §E.3 arithmetic encoder + decoder + every §E.8 cumulative-frequency
-//!   model live in [`sac`], and the I-picture MB-layer bridge that swaps
-//!   the VLC code path for SAC symbols (MCBPC_INTRA, CBPY_INTRA, INTRADC,
+//! * **Annex E — Syntax-based Arithmetic Coding (I- and P-pictures)**: the
+//!   §E.2 / §E.3 arithmetic encoder + decoder + every §E.8 cumulative-
+//!   frequency model live in [`sac`], and the MB-layer bridge that swaps
+//!   the VLC code path for SAC symbols lives in [`mb_sac`]. Round 13
+//!   landed the I-picture path (MCBPC_INTRA, CBPY_INTRA, INTRADC,
 //!   TCOEF1/2/3/r_intra + SIGN + LAST_INTRA / RUN_INTRA / LEVEL_INTRA
-//!   escape body) lives in [`mb_sac`]. Round 13: encoder-side opt-in via
-//!   [`encoder::H263Encoder::set_enable_annex_e`] sets PTYPE bit 11 and
-//!   emits the I-picture body through a single SAC segment per picture
-//!   (no in-body GOB headers); the decoder front-end picks the SAC body
-//!   driver automatically when the picture-header SAC bit is set. The
-//!   §E.5 PSC_FIFO emulation-prevention (14-zero stuffing) is handled by
-//!   [`sac::PscFifoWriter`] / [`sac::PscFifoReader`]. Self-roundtrip is
-//!   bit-exact against the VLC encoder's reconstruction (both pipelines
-//!   share the DCT/quant/IDCT path; only the entropy coder differs).
-//!   P-picture SAC bodies (which need cumf_COD + cumf_MVD wired into the
-//!   COD / MV decode paths) are deferred — the decoder rejects SAC-active
-//!   P-pictures with a specific diagnostic.
+//!   escape); round 14 wires the P-picture path (cumf_COD,
+//!   cumf_MCBPC_no4MVQ, cumf_CBPY (raw, NOT XOR'd per §E.7), cumf_DQUANT,
+//!   cumf_MVD, INTER cumf_TCOEF1/2/3/r + SIGN + LAST/RUN/LEVEL escape).
+//!   Encoder-side opt-in via [`encoder::H263Encoder::set_enable_annex_e`]
+//!   sets PTYPE bit 11 on every I- and P-picture; the decoder front-end
+//!   picks the SAC body driver automatically when the picture-header SAC
+//!   bit is set. The §E.5 PSC_FIFO emulation-prevention (14-zero
+//!   stuffing) is handled by [`sac::PscFifoWriter`] /
+//!   [`sac::PscFifoReader`]. GOB-boundary `encoder_flush` /
+//!   `decoder_reset` boundaries (§E.7 / §E.3) are wired in
+//!   [`mb_sac::encode_p_picture_sac_body`] and
+//!   [`mb_sac::decode_p_picture_sac`] — opt-in via
+//!   [`encoder::encode_p_picture_sac_with_recon_opts`] for streams that
+//!   want mid-picture resync points; the default (mirroring the VLC
+//!   P-encoder) is to emit a single SAC segment per picture for byte-
+//!   exact reconstruction parity. Self-roundtrip and SAC-vs-VLC
+//!   pixel-identical reconstruction tests cover both. SAC + Annex F
+//!   (Advanced Prediction / 4MV / OBMC) is rejected at the encoder —
+//!   `cumf_MCBPC_4MVQ` + per-block MVD wiring is the next-round
+//!   follow-up.
 //!
 //! Out of scope (returns `Error::Unsupported`):
 //! * PB-frames mode (§G) and every B-picture flavour.
-//! * Annex E P-picture wiring — COD / MVD models for SAC P-MB are still
-//!   pending; SAC-active P-pictures are rejected with a follow-up message.
+//! * Annex E + Annex F combination — `cumf_MCBPC_4MVQ` + per-block MVD
+//!   wiring for 4MV-mode SAC P-pictures is pending.
 //! * Annex G (PB-frames), Annex I (Advanced Intra Coding), Annex K (Slice
 //!   Structured Mode — detected with a specific diagnostic since ffmpeg's
 //!   `h263p -umv 1` bundles it with Annex D), Annex N (RPS), Annex P

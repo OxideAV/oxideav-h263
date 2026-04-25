@@ -114,11 +114,16 @@ pub struct H263Encoder {
     /// that the next P-picture's reference matches what the decoder
     /// produces.
     enable_annex_f: bool,
-    /// When `true`, emit I-pictures using Annex E syntax-based arithmetic
-    /// coding (SAC) instead of the VLC path. PTYPE bit 11 is set in the
-    /// picture header. P-pictures still use the VLC path — the encoder-side
-    /// SAC bridge for P-MB syntax (COD / MVD models) is the next round's
-    /// follow-up.
+    /// When `true`, emit both I- and P-pictures using Annex E syntax-based
+    /// arithmetic coding (SAC) instead of the VLC path. PTYPE bit 11 is
+    /// set in every picture header. The I-MB layer goes through cumf_*
+    /// models for MCBPC_INTRA / CBPY_INTRA / INTRADC / TCOEF*_INTRA +
+    /// LAST_INTRA / RUN_INTRA / LEVEL_INTRA escape; the P-MB layer goes
+    /// through cumf_COD + cumf_MCBPC_no4MVQ + cumf_CBPY + cumf_DQUANT +
+    /// cumf_MVD + INTER cumf_TCOEF1/2/3/r + SIGN + LAST/RUN/LEVEL escape.
+    /// SAC + Annex F (4MV/OBMC) emission is rejected at `send_frame` — the
+    /// `cumf_MCBPC_4MVQ` + per-block MVD wiring needed for 4MV-mode SAC
+    /// is pending.
     enable_annex_e: bool,
 }
 
@@ -202,14 +207,14 @@ impl H263Encoder {
         self.enable_annex_f
     }
 
-    /// Enable or disable Annex E (Syntax-based Arithmetic Coding) emission
-    /// for I-pictures. Must be set before the first frame is submitted.
-    /// When on, every I-picture sets PTYPE bit 11 (SAC) and writes the
-    /// macroblock layer through the §E.2 arithmetic coder instead of the
-    /// VLC path; the decoder must mirror this on parse (it does so
-    /// automatically — `H263Decoder` reads the SAC body when the PTYPE
-    /// bit is set). Round 13 wires the I-MB path only; P-pictures fall
-    /// back to the VLC encode regardless of this flag.
+    /// Enable or disable Annex E (Syntax-based Arithmetic Coding) emission.
+    /// Must be set before the first frame is submitted. When on, every
+    /// I- and P-picture sets PTYPE bit 11 (SAC) and writes the macroblock
+    /// layer through the §E.2 arithmetic coder instead of the VLC path;
+    /// the decoder mirrors this on parse (`H263Decoder` reads the SAC
+    /// body when the PTYPE bit is set). Round 13 landed the I-MB path,
+    /// round 14 added the P-MB path. Combining SAC with Annex F
+    /// (Advanced Prediction / 4MV / OBMC) is rejected at `send_frame`.
     pub fn set_enable_annex_e(&mut self, enable: bool) {
         self.enable_annex_e = enable;
     }
@@ -279,16 +284,41 @@ impl Encoder for H263Encoder {
             (bytes, pic, true)
         } else {
             let reference = self.reference.as_ref().expect("reference checked above");
-            let (bytes, pic) = encode_p_picture_with_opts(
-                self.width,
-                self.height,
-                self.source_format,
-                self.pquant,
-                tr,
-                v,
-                reference,
-                self.enable_annex_f,
-            )?;
+            let (bytes, pic) = if self.enable_annex_e {
+                // Round 14 — SAC P-picture body. Routes COD / MCBPC /
+                // CBPY / DQUANT / MVD / TCOEF through the §E.7 models
+                // (`crate::sac` + `crate::mb_sac`). Annex F (4MV/OBMC) is
+                // not combined with SAC here — the encoder rejects an
+                // attempt to enable both on the same picture (§E.7
+                // expects `cumf_MCBPC_4MVQ` if AP/DF is on, which we don't
+                // exercise yet).
+                if self.enable_annex_f {
+                    return Err(Error::unsupported(
+                        "h263 SAC + Annex F advanced prediction: combined SAC/AP \
+                         emit not implemented (§E.7 cumf_MCBPC_4MVQ wiring pending)",
+                    ));
+                }
+                encode_p_picture_sac_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                    reference,
+                )?
+            } else {
+                encode_p_picture_with_opts(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                    reference,
+                    self.enable_annex_f,
+                )?
+            };
             (bytes, pic, false)
         };
 
@@ -450,6 +480,89 @@ pub fn encode_i_picture_sac_with_recon(
         bw.write_bits(0, 1);
     }
     crate::mb_sac::encode_i_picture_sac_body(&mut bw, width, height, pquant, frame, &mut recon)?;
+    Ok((bw.finish(), recon))
+}
+
+/// Encode a single P-picture as a SAC (Annex E) bitstream — sets PTYPE
+/// bit 11 in the picture header and routes the MB layer through the
+/// §E.7 models (cumf_COD + cumf_MCBPC_no4MVQ + cumf_CBPY + cumf_DQUANT +
+/// cumf_MVD + INTER cumf_TCOEF1/2/3/r + SIGN + LAST/RUN/LEVEL escape).
+///
+/// Equivalent to [`encode_p_picture_sac_with_recon_opts`] with
+/// `emit_gob_headers = false` — matches the VLC P-encoder's "single
+/// segment per picture" baseline behaviour and so produces the same
+/// reconstructed-frame buffer for the same DCT/quant/MV pipeline.
+pub fn encode_p_picture_sac_with_recon(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+) -> Result<(Vec<u8>, IPicture)> {
+    encode_p_picture_sac_with_recon_opts(
+        width,
+        height,
+        source_format,
+        pquant,
+        temporal_reference,
+        frame,
+        reference,
+        false,
+    )
+}
+
+/// Like [`encode_p_picture_sac_with_recon`] but with an `emit_gob_headers`
+/// knob. When true, each MB-row boundary that lines up with the source
+/// format's GOB layout triggers an `encoder_flush` (§E.7) + byte-aligned
+/// PSC_FIFO drain + GOB header (VLC) + fresh SAC segment, mirroring §E.5.
+/// The decoder in [`crate::mb_sac::decode_p_picture_sac`] re-primes the
+/// arithmetic decoder at every GBSC (§E.3 `decoder_reset`). Useful for
+/// SAC streams that need mid-picture resync points.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_picture_sac_with_recon_opts(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+    emit_gob_headers: bool,
+) -> Result<(Vec<u8>, IPicture)> {
+    let (_num_gobs, mb_rows_per_gob) = source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263 SAC P encoder: source format has no GOB layout"))?;
+    let mut bw = BitWriter::with_capacity(8192);
+    let mut recon = IPicture::new(width as usize, height as usize);
+
+    write_picture_header_with_opts(
+        &mut bw,
+        source_format,
+        pquant,
+        temporal_reference,
+        true,  // P-picture
+        false, // no AP — SAC + Annex F combination is rejected upstream
+        true,  // SAC bit on
+    )?;
+    // SAC body must start at a byte boundary (§E.6 / §E.5).
+    while !bw.is_byte_aligned() {
+        bw.write_bits(0, 1);
+    }
+
+    crate::mb_sac::encode_p_picture_sac_body(
+        &mut bw,
+        width,
+        height,
+        pquant,
+        frame,
+        reference,
+        &mut recon,
+        mb_rows_per_gob,
+        emit_gob_headers,
+    )?;
+
     Ok((bw.finish(), recon))
 }
 
@@ -2508,6 +2621,97 @@ fn copy_predictor_to_recon(
         recon.cb[off..off + 8].copy_from_slice(&u_pred[j * 8..j * 8 + 8]);
         recon.cr[off..off + 8].copy_from_slice(&v_pred[j * 8..j * 8 + 8]);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Public re-exports for the SAC P-encoder bridge in `mb_sac.rs`. These wrap
+// the private encoder helpers without exposing them to the world; the
+// `_pub` suffix flags them as the bridge's surface, and the original
+// implementations stay private to keep the encoder module's API stable.
+// ---------------------------------------------------------------------------
+
+/// SAC-bridge wrapper around the private [`motion_estimate_mb`].
+pub fn motion_estimate_mb_pub(
+    frame: &VideoFrame,
+    reference: &IPicture,
+    mb_x: usize,
+    mb_y: usize,
+) -> (i32, i32, u32) {
+    motion_estimate_mb(frame, reference, mb_x, mb_y)
+}
+
+/// SAC-bridge wrapper around the private [`build_mb_predictor`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_mb_predictor_pub(
+    reference: &IPicture,
+    mb_x: usize,
+    mb_y: usize,
+    mvx: i32,
+    mvy: i32,
+    y_pred: &mut [u8; 256],
+    u_pred: &mut [u8; 64],
+    v_pred: &mut [u8; 64],
+) {
+    build_mb_predictor(reference, mb_x, mb_y, mvx, mvy, y_pred, u_pred, v_pred);
+}
+
+/// SAC-bridge wrapper around the private [`copy_predictor_to_recon`].
+pub fn copy_predictor_to_recon_pub(
+    recon: &mut IPicture,
+    mb_x: usize,
+    mb_y: usize,
+    y_pred: &[u8; 256],
+    u_pred: &[u8; 64],
+    v_pred: &[u8; 64],
+) {
+    copy_predictor_to_recon(recon, mb_x, mb_y, y_pred, u_pred, v_pred);
+}
+
+/// SAC-bridge wrapper around the private [`mb_luma_variance`].
+pub fn mb_luma_variance_pub(
+    src: &oxideav_core::frame::VideoPlane,
+    mb_x: usize,
+    mb_y: usize,
+) -> u32 {
+    mb_luma_variance(src, mb_x, mb_y)
+}
+
+/// SAC-bridge wrapper around the private [`quantise_inter_block`].
+pub fn quantise_inter_block_pub(dctf: &[f32; 64], quant: u8) -> [i32; 64] {
+    quantise_inter_block(dctf, quant)
+}
+
+/// SAC-bridge wrapper around the private [`dequantise_block`].
+pub fn dequantise_block_pub(levels: &[i32; 64], quant: u8, skip_dc: bool) -> [i32; 64] {
+    dequantise_block(levels, quant, skip_dc)
+}
+
+/// SAC-bridge wrapper around the private [`sad_block`].
+#[allow(clippy::too_many_arguments)]
+pub fn sad_block_pub(
+    src: &[u8],
+    src_stride: usize,
+    src_x: i32,
+    src_y: i32,
+    refp: &[u8],
+    ref_stride: usize,
+    ref_w: i32,
+    ref_h: i32,
+    blk_px: i32,
+    blk_py: i32,
+    mvx: i32,
+    mvy: i32,
+    block_size: i32,
+) -> u32 {
+    sad_block(
+        src, src_stride, src_x, src_y, refp, ref_stride, ref_w, ref_h, blk_px, blk_py, mvx, mvy,
+        block_size,
+    )
+}
+
+/// SAC-bridge wrapper around the private [`write_gob_header`].
+pub fn write_gob_header_pub(bw: &mut BitWriter, gn: u8, gquant: u8) -> Result<()> {
+    write_gob_header(bw, gn, gquant)
 }
 
 /// Sum of absolute differences between the luma MB and its mean — cheap
