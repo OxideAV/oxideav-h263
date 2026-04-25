@@ -94,7 +94,19 @@
 //!   blending is applied on the local reconstruction so the decoder's
 //!   pass-2 OBMC produces the same picture. SAC↔VLC byte-identical
 //!   reconstruction parity holds for the AP path as well as the
-//!   non-AP path.
+//!   non-AP path. Round 16 wires SAC + Annex J (deblocking filter) per
+//!   §E.7 — when DF is on (out-of-band on baseline PTYPE via
+//!   `set_enable_annex_j` on both encoder and decoder), the MCBPC
+//!   selector flips to `cumf_MCBPC_4MVQ` even with 1-MV macroblocks,
+//!   matching what AP already does. Round 16 also adds per-GOB resync
+//!   to the SAC + AP path
+//!   ([`encoder::encode_p_picture_sac_ap_with_recon_opts`]'s
+//!   `emit_gob_headers` knob): every GOB row boundary fires the §E.5
+//!   SAC-flush + GOB-header bridge + fresh segment, mirroring the
+//!   non-AP SAC path's behaviour. The MV predictor and §F.3 OBMC
+//!   reconstruction stay full-picture across resync points (§F.3 allows
+//!   AP-mode predictors to reach across segments outside Slice
+//!   Structured / ISD).
 //!
 //! Out of scope (returns `Error::Unsupported`):
 //! * PB-frames mode (§G) and every B-picture flavour.

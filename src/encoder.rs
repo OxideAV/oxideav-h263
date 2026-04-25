@@ -296,6 +296,10 @@ impl Encoder for H263Encoder {
                 // MVDs (Inter4MV variants of Table 8) and OBMC-blended
                 // local reconstruction (§F.3).
                 if self.enable_annex_f {
+                    // Round 16: even when Annex J is also on, the AP path
+                    // already uses `cumf_MCBPC_4MVQ` (§E.7); the local recon
+                    // gets the deblock filter applied below by the
+                    // post-recon Annex-J pass.
                     encode_p_picture_sac_ap_with_recon(
                         self.width,
                         self.height,
@@ -306,7 +310,10 @@ impl Encoder for H263Encoder {
                         reference,
                     )?
                 } else {
-                    encode_p_picture_sac_with_recon(
+                    // Round 16: SAC + Annex J (no Annex F) routes through
+                    // the same P-picture body but with `cumf_MCBPC_4MVQ`
+                    // selected — see §E.7 (DF active → 4MVQ MCBPC).
+                    encode_p_picture_sac_with_recon_opts(
                         self.width,
                         self.height,
                         self.source_format,
@@ -314,6 +321,8 @@ impl Encoder for H263Encoder {
                         tr,
                         v,
                         reference,
+                        false,
+                        self.enable_annex_j,
                     )?
                 }
             } else {
@@ -519,16 +528,24 @@ pub fn encode_p_picture_sac_with_recon(
         frame,
         reference,
         false,
+        false,
     )
 }
 
-/// Like [`encode_p_picture_sac_with_recon`] but with an `emit_gob_headers`
-/// knob. When true, each MB-row boundary that lines up with the source
-/// format's GOB layout triggers an `encoder_flush` (§E.7) + byte-aligned
-/// PSC_FIFO drain + GOB header (VLC) + fresh SAC segment, mirroring §E.5.
-/// The decoder in [`crate::mb_sac::decode_p_picture_sac`] re-primes the
-/// arithmetic decoder at every GBSC (§E.3 `decoder_reset`). Useful for
-/// SAC streams that need mid-picture resync points.
+/// Like [`encode_p_picture_sac_with_recon`] but with extra knobs.
+///
+/// `emit_gob_headers`: when true, each MB-row boundary that lines up with
+/// the source format's GOB layout triggers an `encoder_flush` (§E.7) +
+/// byte-aligned PSC_FIFO drain + GOB header (VLC) + fresh SAC segment,
+/// mirroring §E.5. The decoder in [`crate::mb_sac::decode_p_picture_sac`]
+/// re-primes the arithmetic decoder at every GBSC (§E.3 `decoder_reset`).
+/// Useful for SAC streams that need mid-picture resync points.
+///
+/// `enable_annex_j`: when true, the MB-layer SAC encoder selects
+/// `cumf_MCBPC_4MVQ` per §E.7 (DF on → 4MVQ MCBPC model, even with 1-MV
+/// macroblocks). The encoder still applies the deblocking filter to the
+/// local recon out-of-band (`enable_annex_j` knob on `H263Encoder`); the
+/// decoder must be told the same flag — baseline PTYPE has no DF bit.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_p_picture_sac_with_recon_opts(
     width: u32,
@@ -539,6 +556,7 @@ pub fn encode_p_picture_sac_with_recon_opts(
     frame: &VideoFrame,
     reference: &IPicture,
     emit_gob_headers: bool,
+    enable_annex_j: bool,
 ) -> Result<(Vec<u8>, IPicture)> {
     let (_num_gobs, mb_rows_per_gob) = source_format
         .gob_layout()
@@ -552,7 +570,7 @@ pub fn encode_p_picture_sac_with_recon_opts(
         pquant,
         temporal_reference,
         true,  // P-picture
-        false, // no AP — SAC + Annex F combination is rejected upstream
+        false, // no AP — SAC + Annex F goes through `encode_p_picture_sac_ap_with_recon`
         true,  // SAC bit on
     )?;
     // SAC body must start at a byte boundary (§E.6 / §E.5).
@@ -570,6 +588,7 @@ pub fn encode_p_picture_sac_with_recon_opts(
         &mut recon,
         mb_rows_per_gob,
         emit_gob_headers,
+        enable_annex_j,
     )?;
 
     Ok((bw.finish(), recon))
@@ -584,7 +603,8 @@ pub fn encode_p_picture_sac_with_recon_opts(
 ///
 /// Single SAC segment per picture (no in-body GOB resync, matching the
 /// VLC AP P-encoder's "no GOB headers" baseline behaviour for byte-exact
-/// reconstruction parity).
+/// reconstruction parity). Use [`encode_p_picture_sac_ap_with_recon_opts`]
+/// to opt into per-GOB resync.
 pub fn encode_p_picture_sac_ap_with_recon(
     width: u32,
     height: u32,
@@ -594,6 +614,40 @@ pub fn encode_p_picture_sac_ap_with_recon(
     frame: &VideoFrame,
     reference: &IPicture,
 ) -> Result<(Vec<u8>, IPicture)> {
+    encode_p_picture_sac_ap_with_recon_opts(
+        width,
+        height,
+        source_format,
+        pquant,
+        temporal_reference,
+        frame,
+        reference,
+        false,
+    )
+}
+
+/// Round 16 — like [`encode_p_picture_sac_ap_with_recon`] but with an
+/// `emit_gob_headers` knob. When true, every GOB row boundary fires the
+/// §E.5/§E.6 SAC-flush + GOB-header bridge + fresh SAC segment. Mirrors
+/// the non-AP `encode_p_picture_sac_with_recon_opts` pattern. The MV
+/// predictor is NOT reset across segments — §F.3 explicitly allows the
+/// AP path to reach across GOB boundaries (outside Slice Structured /
+/// ISD), which lets the encoder + decoder stay in lockstep on the
+/// pre-OBMC mv_grid.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_picture_sac_ap_with_recon_opts(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+    emit_gob_headers: bool,
+) -> Result<(Vec<u8>, IPicture)> {
+    let (_num_gobs, mb_rows_per_gob) = source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263 SAC+AP P encoder: source format has no GOB layout"))?;
     let mut bw = BitWriter::with_capacity(8192);
     let mut recon = IPicture::new(width as usize, height as usize);
 
@@ -611,7 +665,15 @@ pub fn encode_p_picture_sac_ap_with_recon(
     }
 
     crate::mb_sac::encode_p_picture_sac_ap_body(
-        &mut bw, width, height, pquant, frame, reference, &mut recon,
+        &mut bw,
+        width,
+        height,
+        pquant,
+        frame,
+        reference,
+        &mut recon,
+        mb_rows_per_gob,
+        emit_gob_headers,
     )?;
 
     Ok((bw.finish(), recon))

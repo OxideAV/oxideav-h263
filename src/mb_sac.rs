@@ -583,6 +583,14 @@ use oxideav_mpeg4video::tables::mcbpc::PMbType;
 /// "no GOB headers in P-pictures" baseline behaviour and so produces a
 /// byte-identical reconstruction).
 ///
+/// `enable_annex_j` selects the MCBPC cumul-frequency model per §E.7:
+/// `false` → `cumf_MCBPC_no4MVQ`, `true` → `cumf_MCBPC_4MVQ` (same model
+/// used by Annex F / 4MV — the encoder still emits only 1-MV inter MBs
+/// here, so indices 16..=24 never appear, but the cumf range must match
+/// the decoder's expectations). The decoder side must be told the same
+/// flag out-of-band — baseline PTYPE has no DF bit, so neither side can
+/// learn DF from the bitstream alone.
+///
 /// Reconstruction is written into `recon` for use as the next picture's MC
 /// reference.
 #[allow(clippy::too_many_arguments)]
@@ -596,16 +604,25 @@ pub fn encode_p_picture_sac_body(
     recon: &mut IPicture,
     mb_rows_per_gob: u32,
     emit_gob_headers: bool,
+    enable_annex_j: bool,
 ) -> Result<()> {
     let mb_w = width.div_ceil(16) as usize;
     let mb_h = height.div_ceil(16) as usize;
 
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
-    // Round 14 keeps `cumf_MCBPC_no4MVQ` because we don't emit Annex F or
-    // Annex J in the SAC P-path. Per §E.7, the moment AP/DF turns on this
-    // selector flips to `cumf_MCBPC_4MVQ`; the encoder does not currently
-    // combine SAC with AP/DF.
-    let mcbpc_model = PMcbpcModel::No4MvQ;
+    // §E.7 — MCBPC model selector. Baseline / non-AP / non-DF stays on
+    // `cumf_MCBPC_no4MVQ` (21 indices). Annex J (DF) on its own flips to
+    // `cumf_MCBPC_4MVQ` (25 indices) even with 1-MV macroblocks; we still
+    // never emit indices 16..=24 (no Inter4MV without Annex F), but the
+    // cumul frequencies the encoder draws from must match what the decoder
+    // expects to reverse. Annex F + DF combined would also use the 4MVQ
+    // model — that combination is wired through the dedicated
+    // `encode_p_picture_sac_ap_body` driver.
+    let mcbpc_model = if enable_annex_j {
+        PMcbpcModel::Mv4Q
+    } else {
+        PMcbpcModel::No4MvQ
+    };
     let mut sac = SacPPictureWriter::new(mcbpc_model);
 
     for mb_y in 0..mb_h {
@@ -1106,10 +1123,18 @@ use crate::start_code::{GN_EOS, GN_PICTURE};
 ///
 /// `bytes` is the full picture (PSC + body) so we can locate the post-
 /// header byte boundary and any GOB headers.
+///
+/// `enable_annex_j` mirrors the encoder-side knob (§E.7): when true the
+/// MCBPC stream is decoded with `cumf_MCBPC_4MVQ` instead of
+/// `cumf_MCBPC_no4MVQ`. Baseline PTYPE has no DF bit on the wire, so the
+/// caller must opt in to match whatever the encoder did. With 1-MV
+/// macroblocks (this path) MCBPC indices 16..=24 must never appear; the
+/// `decompose_mcbpc_for_no4mvq` helper rejects them with a diagnostic.
 pub fn decode_p_picture_sac(
     hdr: &PictureHeader,
     bytes: &[u8],
     reference: &IPicture,
+    enable_annex_j: bool,
 ) -> Result<IPicture> {
     let mb_w = hdr.width.div_ceil(16) as usize;
     let mb_h = hdr.height.div_ceil(16) as usize;
@@ -1136,7 +1161,15 @@ pub fn decode_p_picture_sac(
     // Sentinel — past the body.
     gob_offsets.push(trailing.len());
 
-    let mcbpc_model = PMcbpcModel::No4MvQ;
+    // §E.7: DF on (without AP) still flips the MCBPC selector to 4MVQ.
+    // Annex J is signalled out-of-band on baseline PTYPE; the caller
+    // (decoder.rs) honours its `set_enable_annex_j` knob OR the PLUSPTYPE
+    // header's DF bit and passes the result here.
+    let mcbpc_model = if enable_annex_j {
+        PMcbpcModel::Mv4Q
+    } else {
+        PMcbpcModel::No4MvQ
+    };
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
 
     // Walk the body in segments. Each segment runs from a byte offset
@@ -1643,11 +1676,22 @@ impl<'a> SacPPictureReader<'a> {
 use crate::encoder::MbDecision;
 
 /// Encode the body of a P-picture (with Annex F Advanced Prediction on) as
-/// a single SAC segment and append the bytes to `bw`. `bw` must already
+/// one or more SAC segments and append the bytes to `bw`. `bw` must already
 /// hold the byte-aligned picture header (with PTYPE bits 11 SAC + 12 AP set).
+///
+/// `mb_rows_per_gob` and `emit_gob_headers` follow the same semantics as
+/// the non-AP SAC P encoder (§E.5/§E.6): when the flag is set, every GOB
+/// row boundary triggers an `encoder_flush` (§E.7) on the SAC writer, a
+/// VLC GOB header through `bw`, and a fresh `SacPPictureWriter` for the
+/// next segment. Pass 1 (decisions + mv_grid) and pass 3 (OBMC) still
+/// operate over the full picture — §F.3 explicitly allows remote MVs
+/// across GOB boundaries to be used the same way as in-GOB ones outside
+/// of Slice Structured / ISD, so the MV predictor is NOT reset across
+/// segments (matching what the VLC AP encoder + decoder do today).
 ///
 /// Reconstruction (after OBMC) is written into `recon` for use as the
 /// next-picture's MC reference.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_p_picture_sac_ap_body(
     bw: &mut BitWriter,
     width: u32,
@@ -1656,17 +1700,23 @@ pub fn encode_p_picture_sac_ap_body(
     frame: &VideoFrame,
     reference: &IPicture,
     recon: &mut IPicture,
+    mb_rows_per_gob: u32,
+    emit_gob_headers: bool,
 ) -> Result<()> {
     let mb_w = width.div_ceil(16) as usize;
     let mb_h = height.div_ceil(16) as usize;
 
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
 
-    // §E.7: AP active → cumf_MCBPC_4MVQ.
+    // §E.7: AP active → cumf_MCBPC_4MVQ. Annex J on top of AP doesn't
+    // change the model selector (already 4MVQ); the deblock pass is
+    // applied to the local recon after we finish.
     let mcbpc_model = PMcbpcModel::Mv4Q;
     let mut sac = SacPPictureWriter::new(mcbpc_model);
 
-    // Pass 1: per-MB decision + mv_grid population.
+    // Pass 1: per-MB decision + mv_grid population. Walks the full picture
+    // — predictor never resets across GOB boundaries (see top-level
+    // comment / §F.3).
     let mut decisions: Vec<MbDecision> = Vec::with_capacity(mb_w * mb_h);
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
@@ -1690,10 +1740,28 @@ pub fn encode_p_picture_sac_ap_body(
         }
     }
 
-    // Pass 2: emit SAC tokens + per-MB local reconstruction (intra writes to
-    // `recon` directly; inter blocks stash residuals for pass 3).
+    // Pass 2: emit SAC tokens + per-MB local reconstruction (intra writes
+    // to `recon` directly; inter blocks stash residuals for pass 3). When
+    // `emit_gob_headers`, fence each GOB row boundary with the §E.5/§E.6
+    // SAC flush + GOB-header bridge + fresh segment.
     let mut infos: Vec<crate::mb::PMbInfo> = Vec::with_capacity(mb_w * mb_h);
     for mb_y in 0..mb_h {
+        if emit_gob_headers && mb_y > 0 && (mb_y as u32) % mb_rows_per_gob == 0 {
+            // SAC flush, drain to byte boundary, write GOB header, then
+            // start a new SAC writer for the next segment. Identical to
+            // the non-AP path's GOB bridge.
+            sac.encoder_flush();
+            let segment_bytes = sac.take_byte_aligned_bytes();
+            for b in &segment_bytes {
+                bw.write_bits(*b as u32, 8);
+            }
+            let gn = (mb_y as u32 / mb_rows_per_gob) as u8;
+            crate::encoder::write_gob_header_pub(bw, gn, pquant)?;
+            while !bw.is_byte_aligned() {
+                bw.write_bits(0, 1);
+            }
+            sac = SacPPictureWriter::new(mcbpc_model);
+        }
         for mb_x in 0..mb_w {
             let d = decisions[mb_y * mb_w + mb_x];
             let info = encode_p_mb_sac_ap(
@@ -1703,7 +1771,8 @@ pub fn encode_p_picture_sac_ap_body(
         }
     }
 
-    // Pass 3: OBMC reconstruction into a fresh picture.
+    // Pass 3: OBMC reconstruction into a fresh picture. Reads the full
+    // mv_grid regardless of segment boundaries.
     let mut obmc_recon = IPicture::new(width as usize, height as usize);
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
@@ -2149,9 +2218,14 @@ fn copy_mb_pic_to_pic(src: &IPicture, dst: &mut IPicture, mb_x: usize, mb_y: usi
 /// `bytes` is the full picture. The picture-header AP bit is honoured by
 /// the caller (`decoder.rs`); this driver assumes 4MVQ MCBPC indexing.
 ///
-/// Single SAC segment per picture (no in-body GOB resync) — matches the
-/// SAC+AP encoder. If the bitstream carries GOB headers inside the body
-/// the decoder rejects with `Error::unsupported`.
+/// Round 16: in-body GOB headers are accepted. The encoder side
+/// (`encode_p_picture_sac_ap_body` with `emit_gob_headers = true`) flushes
+/// the SAC writer at every GOB row boundary, drains a byte-aligned PSC_FIFO
+/// segment, writes the GOB header through the VLC channel, then opens a
+/// fresh SAC writer. The decoder mirrors with a fresh `SacPPictureReader`
+/// per segment (§E.3 `decoder_reset`). The MV predictor and OBMC step are
+/// NOT reset across GOB boundaries — §F.3 allows AP-mode predictors to
+/// reach across segments outside Slice Structured / ISD.
 pub fn decode_p_picture_sac_ap(
     hdr: &PictureHeader,
     bytes: &[u8],
@@ -2159,39 +2233,82 @@ pub fn decode_p_picture_sac_ap(
 ) -> Result<IPicture> {
     let mb_w = hdr.width.div_ceil(16) as usize;
     let mb_h = hdr.height.div_ceil(16) as usize;
+    let (_num_gobs, mb_rows_per_gob) = hdr
+        .source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263 SAC+AP P: source format has no GOB layout"))?;
     let mut pic = IPicture::new(hdr.width as usize, hdr.height as usize);
     let mut quant = hdr.pquant as u32;
 
     let body_byte_pos = locate_body_byte_pos(bytes)?;
     let trailing = &bytes[body_byte_pos..];
 
-    // Reject in-body GOB headers (matches the SAC+AP encoder, which emits
-    // a single segment per picture).
-    if let Some(sc) = find_next_start_code(trailing, 0) {
+    // Pre-locate every in-body GBSC (excluding the picture's own PSC and
+    // any EOS marker). Sentinel = end-of-body.
+    let mut gob_offsets: Vec<usize> = Vec::new();
+    let mut pos = 0usize;
+    while let Some(sc) = find_next_start_code(trailing, pos) {
         if sc.gn != GN_PICTURE && sc.gn != GN_EOS {
-            return Err(Error::unsupported(
-                "h263 SAC+AP P-picture: in-body GOB headers not supported \
-                 (decoder accepts a single SAC segment per AP picture)",
-            ));
+            gob_offsets.push(sc.byte_pos);
         }
+        pos = sc.byte_pos + 3;
     }
+    gob_offsets.push(trailing.len());
 
     let mcbpc_model = PMcbpcModel::Mv4Q;
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
-
-    let mut br = BitReader::new(trailing);
-    let mut rdr = SacPPictureReader::new(&mut br, mcbpc_model)?;
-
     let mut infos: Vec<crate::mb::PMbInfo> = Vec::with_capacity(mb_w * mb_h);
-    for mb_y in 0..mb_h {
-        for mb_x in 0..mb_w {
-            let info =
-                decode_p_mb_sac_ap(&mut rdr, mb_x, mb_y, &mut quant, &mut pic, &mut mv_grid)?;
-            infos.push(info);
+
+    // Walk segments. Each runs from `seg_start` to the next GBSC (or end-of-
+    // body). For SAC, the encoder calls `encoder_flush` immediately before
+    // each GOB header; the decoder constructs a fresh `SacPPictureReader`
+    // over the byte tail just past the GOB header (§E.3 `decoder_reset`).
+    let mut seg_start = 0usize;
+    let mut next_gob_idx = 0usize;
+    let mut mb_y = 0usize;
+
+    while mb_y < mb_h {
+        let seg_end = gob_offsets[next_gob_idx];
+        let segment = &trailing[seg_start..seg_end];
+
+        let rows_left = mb_h - mb_y;
+        let has_more_gobs = next_gob_idx < gob_offsets.len() - 1;
+        let rows_in_seg = if has_more_gobs {
+            (mb_rows_per_gob as usize).min(rows_left)
+        } else {
+            rows_left
+        };
+
+        let mut br = BitReader::new(segment);
+        let mut rdr = SacPPictureReader::new(&mut br, mcbpc_model)?;
+
+        for _ in 0..rows_in_seg {
+            for mb_x in 0..mb_w {
+                let info =
+                    decode_p_mb_sac_ap(&mut rdr, mb_x, mb_y, &mut quant, &mut pic, &mut mv_grid)?;
+                infos.push(info);
+            }
+            mb_y += 1;
+        }
+
+        if next_gob_idx < gob_offsets.len() - 1 {
+            // Consume the GOB header through a fresh VLC bit reader,
+            // then resume SAC at the next byte.
+            let gob_seg = &trailing[seg_end..];
+            let mut gob_br = BitReader::new(gob_seg);
+            let gob = crate::gob::parse_gob_header(&mut gob_br, hdr.cpm)?;
+            quant = gob.gquant as u32;
+            let bit_pos_after = gob_br.bit_position();
+            let bytes_consumed = bit_pos_after.div_ceil(8) as usize;
+            seg_start = seg_end + bytes_consumed;
+            next_gob_idx += 1;
+        } else {
+            break;
         }
     }
 
-    // Pass 2: §F.3 OBMC reconstruction.
+    // Pass 2: §F.3 OBMC reconstruction. Walks the full picture; ignores
+    // segment boundaries (mv_grid is fully populated).
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
             let info = &infos[mb_y * mb_w + mb_x];

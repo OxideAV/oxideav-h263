@@ -288,7 +288,8 @@ fn sac_p_picture_gob_resync_cif() {
             idx as u8,
             f,
             &recon,
-            true, // emit_gob_headers
+            true,  // emit_gob_headers
+            false, // enable_annex_j
         )
         .expect("encode P");
         packets.push(Packet::new(0, TimeBase::new(1, 30), p_bytes));

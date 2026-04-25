@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Annex E (SAC) + Annex J (deblocking) **interaction** (round 16). Per
+  §E.7 the MCBPC selector flips from `cumf_MCBPC_no4MVQ` to
+  `cumf_MCBPC_4MVQ` whenever Annex F (4MV/OBMC) OR Annex J (deblocking
+  filter) is active. The SAC P-picture encoder + decoder now plumb the
+  Annex-J flag through (out-of-band on baseline PTYPE — there is no DF
+  bit on the wire) and pick the 4MVQ model when DF is on. Encoder /
+  decoder must agree via `set_enable_annex_j` on both sides; the
+  out-of-band gate matches `H263Decoder::maybe_deblock`'s existing
+  semantics. Validation in `tests/sac_annex_j_roundtrip.rs`: SAC+J
+  roundtrip stays in sync, SAC+J ↔ VLC+J produce byte-identical decoded
+  YUV (entropy stage only differs).
+- Annex E (SAC) + Annex F (AP) **per-GOB resync** (round 16 / Part B).
+  `encode_p_picture_sac_ap_with_recon_opts` now accepts an
+  `emit_gob_headers` knob; when set, the SAC AP encoder calls
+  `encoder_flush` (§E.7) at every GOB row boundary, drains a byte-aligned
+  PSC_FIFO segment, writes the GOB header through the VLC channel, and
+  opens a fresh `SacPPictureWriter` for the next segment. The decoder
+  side (`decode_p_picture_sac_ap`) mirrors with a fresh
+  `SacPPictureReader` per segment (§E.3 `decoder_reset`). The MV
+  predictor and §F.3 OBMC reconstruction stay full-picture — §F.3 allows
+  AP-mode predictors to reach across segments outside Slice Structured /
+  ISD. Test coverage: `sac_ap_picture_with_gob_resync_cif` (CIF source,
+  17 internal GOB boundaries per P-picture).
 - Annex E (Syntax-based Arithmetic Coding) **I-picture MB-layer wiring**:
   the §E.7 VLC→SAC swap is now driven end-to-end on I-pictures. Encoder
   opt-in via `H263Encoder::set_enable_annex_e` sets PTYPE bit 11 and emits

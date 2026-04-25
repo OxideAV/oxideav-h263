@@ -165,10 +165,16 @@ impl H263Decoder {
                     // Round 14 — SAC P-picture body driver.
                     // Round 15 — when AP is also signalled, dispatch to the
                     // 4MVQ MCBPC + 2-pass OBMC variant.
+                    // Round 16 — SAC + Annex J (no AP) flips the MCBPC
+                    // model to `cumf_MCBPC_4MVQ` per §E.7. Baseline PTYPE
+                    // has no DF bit on the wire; we honour the out-of-band
+                    // `set_enable_annex_j` knob OR the PLUSPTYPE DF bit,
+                    // matching `maybe_deblock`'s gate.
                     if hdr.advanced_prediction {
                         crate::mb_sac::decode_p_picture_sac_ap(&hdr, bytes, reference)?
                     } else {
-                        crate::mb_sac::decode_p_picture_sac(&hdr, bytes, reference)?
+                        let df_active = self.enable_annex_j || hdr.deblocking_filter;
+                        crate::mb_sac::decode_p_picture_sac(&hdr, bytes, reference, df_active)?
                     }
                 } else {
                     decode_p_picture(&mut br, &hdr, bytes, reference)?
