@@ -12,12 +12,12 @@
 
 use std::process::Command;
 
-use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::bits::BitReader;
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, Packet, PixelFormat, Rational, TimeBase, VideoFrame,
 };
+use oxideav_core::{Decoder, Encoder};
 use oxideav_h263::decoder::H263Decoder;
 use oxideav_h263::encoder::H263Encoder;
 use oxideav_h263::picture::parse_picture_header;

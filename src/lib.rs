@@ -103,8 +103,8 @@ pub mod picture;
 pub mod sac;
 pub mod start_code;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 /// The canonical oxideav codec id for ITU-T H.263 baseline video.
 ///

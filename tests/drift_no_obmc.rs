@@ -66,7 +66,7 @@ fn compare_with_and_without_obmc() {
         .output()
         .unwrap();
 
-    use oxideav_codec::Decoder;
+    use oxideav_core::Decoder;
     use oxideav_core::{CodecId, Frame, Packet, TimeBase};
     use oxideav_h263::decoder::H263Decoder;
 

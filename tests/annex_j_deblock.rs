@@ -10,11 +10,11 @@
 //! crate docs — PLUSPTYPE/OPPTYPE is out of scope), the test drives both
 //! sides through the public `set_enable_annex_j(true)` setter.
 
-use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::{
     frame::VideoPlane, CodecId, CodecParameters, Frame, MediaType, PixelFormat, Rational, TimeBase,
     VideoFrame,
 };
+use oxideav_core::{Decoder, Encoder};
 use oxideav_h263::decoder::H263Decoder;
 use oxideav_h263::encoder::H263Encoder;
 use oxideav_h263::CODEC_ID_STR;

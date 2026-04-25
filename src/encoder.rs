@@ -45,7 +45,7 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Rational, Result,
     TimeBase, VideoFrame,
@@ -2469,7 +2469,7 @@ mod tests {
         let bytes = encode_i_picture(176, 144, SourceFormat::Qcif, 5, 0, &frame).expect("encode");
         // Decode it back.
         use crate::decoder::H263Decoder;
-        use oxideav_codec::Decoder;
+        use oxideav_core::Decoder;
         use oxideav_core::Frame as CoreFrame;
 
         let mut dec = H263Decoder::new(CodecId::new(crate::CODEC_ID_STR));

@@ -11,9 +11,9 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::Decoder;
 use oxideav_core::bits::BitReader;
 use oxideav_core::frame::VideoPlane;
+use oxideav_core::Decoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Rational, Result, TimeBase,
     VideoFrame,

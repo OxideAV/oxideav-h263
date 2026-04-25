@@ -16,8 +16,8 @@
 
 use std::process::Command;
 
-use oxideav_codec::Decoder;
 use oxideav_core::bits::BitReader;
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase, VideoFrame};
 use oxideav_h263::decoder::H263Decoder;
 use oxideav_h263::motion::{chroma_mv_4mv, OBMC_H0, OBMC_H1, OBMC_H2};
