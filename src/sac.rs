@@ -624,6 +624,383 @@ pub mod models {
     pub const INTRA_AC_DC: &[u32] = &[16383, 9229, 5461, 0];
 }
 
+// ---------------------------------------------------------------------------
+// MB-layer SAC bridge — symbol-table forward/inverse helpers and high-level
+// I-picture MB writer / reader.
+//
+// The encoder side maps the spec's natural symbols (CBP patterns, INTRADC
+// byte values, (last,run,|level|) TCOEF events) onto the integer indices
+// used by the §E.8 cumulative-frequency models. The decoder side does the
+// inverse. Mappings follow Tables 7 / 12 / 15 / 16 / 17 of H.263 (01/2005)
+// and §E.7 of Annex E.
+// ---------------------------------------------------------------------------
+
+/// Sentinel index in the SAC `TCOEF*` models that means "ESCAPE: read LAST,
+/// RUN, LEVEL from cumf_LAST(_intra), cumf_RUN(_intra), cumf_LEVEL(_intra)
+/// next". Per §E.7 this is the last index in the model (the same slot the
+/// VLC `0000011` ESCAPE prefix occupies in Table 16, row 102).
+pub const TCOEF_ESCAPE_INDEX: usize = 102;
+
+/// Forward table for `(last, run, |level|)` → SAC TCOEF index, last=0 half.
+/// Matches Table 16 indices 0..=57 and the `INTER_LAST0_RUN/LEVEL` arrays in
+/// `enc_tables.rs`. 58 entries.
+const TCOEF_LAST0_RUN: [u8; 58] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6,
+    6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+];
+const TCOEF_LAST0_LEVEL: [u8; 58] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 1, 2, 3, 1, 2, 3, 1, 2, 3,
+    1, 2, 3, 1, 2, 1, 2, 1, 2, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+];
+
+/// Forward table, last=1 half — Table 16 indices 58..=101. 44 entries.
+const TCOEF_LAST1_RUN: [u8; 44] = [
+    0, 0, 0, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+    24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+];
+const TCOEF_LAST1_LEVEL: [u8; 44] = [
+    1, 2, 3, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+];
+
+/// Look up `(last, run, |level|)` in the SAC TCOEF index space. Returns
+/// `Some(idx)` for indices 0..=101; the caller falls back to
+/// [`TCOEF_ESCAPE_INDEX`] when the triple isn't tabulated.
+pub fn tcoef_lookup_index(last: bool, run: u8, level_abs: u8) -> Option<usize> {
+    let (runs, levels, base): (&[u8], &[u8], usize) = if last {
+        (&TCOEF_LAST1_RUN, &TCOEF_LAST1_LEVEL, 58)
+    } else {
+        (&TCOEF_LAST0_RUN, &TCOEF_LAST0_LEVEL, 0)
+    };
+    for (i, (&r, &l)) in runs.iter().zip(levels.iter()).enumerate() {
+        if r == run && l == level_abs {
+            return Some(base + i);
+        }
+    }
+    None
+}
+
+/// Inverse of [`tcoef_lookup_index`] — decode a non-escape SAC TCOEF index
+/// (0..=101) into `(last, run, |level|)`. Returns `None` for the escape
+/// index or anything out of range.
+pub fn tcoef_index_to_event(index: usize) -> Option<(bool, u8, u8)> {
+    if index < 58 {
+        Some((false, TCOEF_LAST0_RUN[index], TCOEF_LAST0_LEVEL[index]))
+    } else if index < 102 {
+        let i = index - 58;
+        Some((true, TCOEF_LAST1_RUN[i], TCOEF_LAST1_LEVEL[i]))
+    } else {
+        None
+    }
+}
+
+/// SAC encoding of the INTRADC byte → §E.7 / Table 15 index.
+/// FLC values 0x01..=0x7F map to indices 0..=126, FLC 0xFF maps to 127, FLC
+/// 0x81..=0xFE maps to 128..=253. The spec's Table 15 column "Index" gives
+/// the same mapping; see §E.7 ("indexing is defined in ... Table 15
+/// respectively"). Returns `None` for the two reserved values 0x00 / 0x80.
+pub fn intradc_byte_to_index(byte: u8) -> Option<usize> {
+    match byte {
+        0x00 | 0x80 => None,
+        0x01..=0x7F => Some((byte - 1) as usize), // 0..=126
+        0xFF => Some(127),
+        0x81..=0xFE => Some((byte - 0x81 + 128) as usize), // 128..=253
+    }
+}
+
+/// Inverse of [`intradc_byte_to_index`] — return the on-the-wire FLC byte
+/// for the given §E.7 index. Returns `None` for indices ≥ 254.
+pub fn intradc_index_to_byte(index: usize) -> Option<u8> {
+    if index <= 126 {
+        Some((index as u8) + 1) // 0->0x01 ... 126->0x7F
+    } else if index == 127 {
+        Some(0xFF)
+    } else if index <= 253 {
+        Some(((index - 128) as u8) + 0x81) // 128->0x81 ... 253->0xFE
+    } else {
+        None
+    }
+}
+
+/// Convert an 8-bit two's-complement LEVEL byte (used in the VLC ESCAPE
+/// body) into the §E.7 cumf_LEVEL / cumf_LEVEL_intra index space. Spec
+/// Table 17 lists FLC 0x80..=0xFF for levels -128..=-1 (with -128 forbidden
+/// in baseline) and FLC 0x01..=0x7F for levels 1..=127. The cumf_LEVEL
+/// model has 254 entries indexed 0..=253; we map FLC bytes contiguously
+/// starting at index 0 = -128, 1 = -127, ..., 127 = -1, [skip 0 = forbidden],
+/// 128 = +1, ..., 254 = +127. (Index 127 corresponds to FLC 0x80 = -128 and
+/// is only used in Modified Quantization mode; baseline encoders won't emit
+/// it but the model still reserves the slot.)
+///
+/// The cumul_freq array's monotone-decreasing constraint means the
+/// "common" small-magnitude levels sit at high indices; the spec ordering
+/// is by FLC byte value, which interleaves negatives at low indices and
+/// positives at high indices. The §E.8 array reflects this directly — see
+/// the [`models::LEVEL`] table.
+pub fn level_byte_to_index(byte: u8) -> usize {
+    if byte & 0x80 != 0 {
+        // 0x80..=0xFF → indices 0..=127 (with 0x80 = idx 0 = -128).
+        (byte - 0x80) as usize
+    } else {
+        // 0x01..=0x7F → indices 127..=253 (skipping 0 which is forbidden;
+        // we allocate 0x01 to index 127, 0x02 to 128, ..., 0x7F to 253).
+        // NOTE: index 127 is shared between FLC 0xFF (-1) and FLC 0x01
+        // (+1) — but since FLC 0xFF maps to byte 0xFF (>=0x80) above, the
+        // overlap is resolved by the branch.
+        debug_assert!(byte != 0, "LEVEL byte 0x00 is forbidden");
+        ((byte - 1) as usize) + 127
+    }
+}
+
+/// Inverse of [`level_byte_to_index`].
+pub fn level_index_to_byte(index: usize) -> u8 {
+    if index < 128 {
+        // -128..=-1: FLC 0x80..=0xFF
+        0x80u8.wrapping_add(index as u8)
+    } else {
+        // +1..=+127: FLC 0x01..=0x7F
+        ((index - 127) as u8) & 0x7F
+    }
+}
+
+/// High-level SAC bridge for emitting the body of an I-picture macroblock.
+/// Owns a [`SacEncoder`] + [`PscFifoWriter`] pair and exposes one method per
+/// I-MB syntax element so that callers can mirror the VLC code path
+/// element-for-element.
+///
+/// Picture-header-layer bytes are written by the caller into a separate
+/// `BitWriter` (the spec keeps fixed-length header layers outside the
+/// PSC_FIFO mux per §E.6); after the header is closed and byte-aligned, the
+/// caller hands the picture-body bytes to this SAC writer. On `finish`, the
+/// arithmetic encoder is flushed (§E.7 `encoder_flush`) and the PSC_FIFO
+/// returns the final byte sequence (right-padded with zeros).
+pub struct SacIPictureWriter {
+    enc: SacEncoder,
+    fifo: PscFifoWriter,
+}
+
+impl Default for SacIPictureWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SacIPictureWriter {
+    pub fn new() -> Self {
+        Self {
+            enc: SacEncoder::new(),
+            fifo: PscFifoWriter::new(),
+        }
+    }
+
+    /// Encode the MCBPC for an I-picture intra MB. `index` is Table 7's
+    /// `Index` column (0..=7 for the (mb_type, cbpc) pairs the encoder
+    /// emits; index 8 would be MB-stuffing — never emitted).
+    pub fn write_mcbpc_intra(&mut self, index: usize) {
+        self.enc
+            .encode_symbol(index, models::MCBPC_INTRA, &mut self.fifo);
+    }
+
+    /// Encode the CBPY for an I-picture intra MB — `cbpy` is the raw 4-bit
+    /// pattern (no XOR for intra), Table 12 index column.
+    pub fn write_cbpy_intra(&mut self, cbpy: u8) {
+        self.enc
+            .encode_symbol(cbpy as usize, models::CBPY_INTRA, &mut self.fifo);
+    }
+
+    /// Encode an INTRADC byte (must be one of the 254 legal FLC values per
+    /// Table 15 — the caller already remapped 128 → 0xFF). `byte` is what
+    /// the VLC path would have written as a fixed 8-bit field.
+    pub fn write_intradc(&mut self, byte: u8) -> Result<()> {
+        let idx = intradc_byte_to_index(byte)
+            .ok_or_else(|| Error::invalid("SAC INTRADC: illegal byte 0x00 / 0x80"))?;
+        self.enc.encode_symbol(idx, models::INTRADC, &mut self.fifo);
+        Ok(())
+    }
+
+    /// Encode one TCOEF event (`last`, `run`, signed `level`). Picks the
+    /// appropriate TCOEF model based on the position in the block —
+    /// position-1 → TCOEF1, position-2 → TCOEF2, position-3 → TCOEF3,
+    /// position ≥ 4 → TCOEFr. `intra_block` selects the INTRA-flavoured
+    /// SAC models from §E.7. Out-of-table tuples emit the ESCAPE index
+    /// followed by LAST + RUN + LEVEL through the cumf_LAST / cumf_RUN /
+    /// cumf_LEVEL models.
+    pub fn write_tcoef(
+        &mut self,
+        intra_block: bool,
+        position: usize,
+        last: bool,
+        run: u8,
+        level: i32,
+    ) {
+        debug_assert!(level != 0);
+        let abs = level.unsigned_abs();
+        let tcoef_model: &[u32] = match (intra_block, position) {
+            (false, 1) => models::TCOEF1,
+            (false, 2) => models::TCOEF2,
+            (false, 3) => models::TCOEF3,
+            (false, _) => models::TCOEFR,
+            (true, 1) => models::TCOEF1_INTRA,
+            (true, 2) => models::TCOEF2_INTRA,
+            (true, 3) => models::TCOEF3_INTRA,
+            (true, _) => models::TCOEFR_INTRA,
+        };
+        let sign_bit: usize = if level < 0 { 1 } else { 0 };
+        if abs <= 12 {
+            // |level| can fit in the table; check.
+            if let Some(idx) = tcoef_lookup_index(last, run, abs as u8) {
+                self.enc.encode_symbol(idx, tcoef_model, &mut self.fifo);
+                self.enc
+                    .encode_symbol(sign_bit, models::SIGN, &mut self.fifo);
+                return;
+            }
+        }
+        // ESCAPE path.
+        self.enc
+            .encode_symbol(TCOEF_ESCAPE_INDEX, tcoef_model, &mut self.fifo);
+        let last_model = if intra_block {
+            models::LAST_INTRA
+        } else {
+            models::LAST
+        };
+        let run_model = if intra_block {
+            models::RUN_INTRA
+        } else {
+            models::RUN
+        };
+        let level_model = if intra_block {
+            models::LEVEL_INTRA
+        } else {
+            models::LEVEL
+        };
+        self.enc
+            .encode_symbol(if last { 1 } else { 0 }, last_model, &mut self.fifo);
+        self.enc
+            .encode_symbol(run as usize, run_model, &mut self.fifo);
+        // ESCAPE LEVEL is the signed 8-bit byte (§5.4.2 Table 17). Two's
+        // complement maps the level to its FLC form for index lookup.
+        let level_byte: u8 = level.rem_euclid(256) as u8;
+        let level_idx = level_byte_to_index(level_byte);
+        self.enc
+            .encode_symbol(level_idx, level_model, &mut self.fifo);
+    }
+
+    /// Flush the arithmetic coder (§E.7 `encoder_flush`) and return the
+    /// PSC_FIFO byte stream. Consumes `self`.
+    pub fn finish(mut self) -> Vec<u8> {
+        self.enc.flush(&mut self.fifo);
+        self.fifo.finish()
+    }
+}
+
+/// High-level SAC bridge for reading the body of an I-picture macroblock.
+/// Owns a [`SacDecoder`] + [`PscFifoReader`] pair and exposes one method per
+/// I-MB syntax element so that callers mirror the VLC decode path
+/// element-for-element.
+pub struct SacIPictureReader<'a> {
+    dec: SacDecoder,
+    fifo: PscFifoReader<'a>,
+}
+
+impl<'a> SacIPictureReader<'a> {
+    /// Construct from a borrowed [`BitReader`] positioned at the start of
+    /// the SAC-coded picture body. Primes the arithmetic decoder per
+    /// `decoder_reset` (§E.3) by reading 16 bits.
+    pub fn new(br: &'a mut BitReader<'a>) -> Result<Self> {
+        let mut fifo = PscFifoReader::new(br);
+        let dec = SacDecoder::new(&mut fifo)?;
+        Ok(Self { dec, fifo })
+    }
+
+    /// Generic escape hatch — decode one symbol against an arbitrary
+    /// cumul-frequency model. Used by the MB-layer bridge for models that
+    /// don't have a dedicated wrapper (DQUANT, SIGN, etc.) so callers can
+    /// stay inside the reader's PSC_FIFO state without poking the inner
+    /// decoder directly.
+    pub fn decode_with_model(&mut self, model: &[u32]) -> Result<usize> {
+        self.dec.decode_symbol(model, &mut self.fifo)
+    }
+
+    pub fn read_mcbpc_intra(&mut self) -> Result<usize> {
+        self.dec.decode_symbol(models::MCBPC_INTRA, &mut self.fifo)
+    }
+
+    pub fn read_cbpy_intra(&mut self) -> Result<u8> {
+        let v = self.dec.decode_symbol(models::CBPY_INTRA, &mut self.fifo)?;
+        if v >= 16 {
+            return Err(Error::invalid("SAC CBPY: index out of range"));
+        }
+        Ok(v as u8)
+    }
+
+    pub fn read_intradc(&mut self) -> Result<u8> {
+        let idx = self.dec.decode_symbol(models::INTRADC, &mut self.fifo)?;
+        intradc_index_to_byte(idx).ok_or_else(|| Error::invalid("SAC INTRADC: index out of range"))
+    }
+
+    /// Read one TCOEF event from the SAC stream. Returns `(last, run,
+    /// signed_level)`. Mirrors the encoder's [`SacIPictureWriter::write_tcoef`].
+    pub fn read_tcoef(&mut self, intra_block: bool, position: usize) -> Result<(bool, u8, i32)> {
+        let tcoef_model: &[u32] = match (intra_block, position) {
+            (false, 1) => models::TCOEF1,
+            (false, 2) => models::TCOEF2,
+            (false, 3) => models::TCOEF3,
+            (false, _) => models::TCOEFR,
+            (true, 1) => models::TCOEF1_INTRA,
+            (true, 2) => models::TCOEF2_INTRA,
+            (true, 3) => models::TCOEF3_INTRA,
+            (true, _) => models::TCOEFR_INTRA,
+        };
+        let idx = self.dec.decode_symbol(tcoef_model, &mut self.fifo)?;
+        if idx == TCOEF_ESCAPE_INDEX {
+            // ESCAPE path: LAST + RUN + LEVEL.
+            let last_model = if intra_block {
+                models::LAST_INTRA
+            } else {
+                models::LAST
+            };
+            let run_model = if intra_block {
+                models::RUN_INTRA
+            } else {
+                models::RUN
+            };
+            let level_model = if intra_block {
+                models::LEVEL_INTRA
+            } else {
+                models::LEVEL
+            };
+            let last_idx = self.dec.decode_symbol(last_model, &mut self.fifo)?;
+            let run = self.dec.decode_symbol(run_model, &mut self.fifo)? as u8;
+            let level_idx = self.dec.decode_symbol(level_model, &mut self.fifo)?;
+            let level_byte = level_index_to_byte(level_idx);
+            // Two's-complement decode (Table 17). Reject 0x00 (level 0)
+            // and 0x80 (level -128) per §5.4.2.
+            if level_byte == 0 {
+                return Err(Error::invalid("SAC TCOEF ESCAPE: level == 0 forbidden"));
+            }
+            if level_byte == 0x80 {
+                return Err(Error::invalid("SAC TCOEF ESCAPE: level == -128 forbidden"));
+            }
+            let level = if level_byte & 0x80 != 0 {
+                level_byte as i32 - 256
+            } else {
+                level_byte as i32
+            };
+            Ok((last_idx == 1, run, level))
+        } else {
+            let (last, run, abs) = tcoef_index_to_event(idx)
+                .ok_or_else(|| Error::invalid("SAC TCOEF: bad event index"))?;
+            let sign_idx = self.dec.decode_symbol(models::SIGN, &mut self.fifo)?;
+            let level = if sign_idx == 1 {
+                -(abs as i32)
+            } else {
+                abs as i32
+            };
+            Ok((last, run, level))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

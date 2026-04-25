@@ -137,7 +137,12 @@ impl H263Decoder {
         let hdr = parse_picture_header(&mut br)?;
         match hdr.coding_type {
             PictureCodingType::Intra => {
-                let mut pic = decode_i_picture(&mut br, &hdr, bytes)?;
+                let mut pic = if hdr.sac_mode {
+                    // Annex E SAC body — arithmetic-coded MB layer per §E.7.
+                    crate::mb_sac::decode_i_picture_sac(&hdr, bytes)?
+                } else {
+                    decode_i_picture(&mut br, &hdr, bytes)?
+                };
                 self.maybe_deblock(&mut pic, &hdr);
                 let frame = pic_to_video_frame(&pic, self.pending_pts, self.pending_tb);
                 self.reference = Some(pic);
@@ -145,6 +150,15 @@ impl H263Decoder {
                 Ok(())
             }
             PictureCodingType::Predicted => {
+                if hdr.sac_mode {
+                    // SAC P-pictures need the COD / MVD models wired into
+                    // the MB / motion paths — separate work from the
+                    // I-picture SAC bridge.
+                    return Err(Error::unsupported(
+                        "h263 Annex E SAC P-picture: MB-layer SAC bridge currently I-only \
+                         (COD + MVD models pending wiring; arithmetic coder lives in crate::sac)",
+                    ));
+                }
                 let reference = self.reference.as_ref().ok_or_else(|| {
                     Error::invalid(
                         "h263 P-picture: no reference frame available (stream must start with I)",

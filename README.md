@@ -35,7 +35,8 @@ this crate does not activate any MPEG-4 decoding behaviour.
 | PLUSPTYPE / OPPTYPE header parse (H.263+)        | yes    | no     |
 | Annex J via PLUSPTYPE DF bit (auto-deblock)      | yes    | no     |
 | Annex D (UMV)                                    | no     | no     |
-| Annex E (SAC arithmetic coding)                  | no     | no     |
+| Annex E (SAC arithmetic coding) — I-pictures     | yes    | yes    |
+| Annex E (SAC arithmetic coding) — P-pictures     | no     | no     |
 | Annex F (Advanced Prediction: 4MV / OBMC)        | no     | no     |
 | Annex G (PB-frames) and all B-pictures           | no     | no     |
 | Annex I (Advanced Intra Coding)                  | no     | no     |

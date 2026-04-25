@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Annex E (Syntax-based Arithmetic Coding) **I-picture MB-layer wiring**:
+  the §E.7 VLC→SAC swap is now driven end-to-end on I-pictures. Encoder
+  opt-in via `H263Encoder::set_enable_annex_e` sets PTYPE bit 11 and emits
+  the I-picture body as a single SAC segment per picture
+  (no in-body GOB headers — a follow-up will add `encoder_flush` /
+  `decoder_reset` boundaries for sparse GOB resync). The decoder picks
+  the SAC body driver automatically when the picture-header SAC bit is
+  set. Every §E.8 model used by I-MB syntax is wired:
+  cumf_MCBPC_intra, cumf_CBPY_intra, cumf_DQUANT, cumf_INTRADC,
+  cumf_TCOEF1/2/3/r_intra (with cumf_SIGN), and the cumf_LAST_intra /
+  cumf_RUN_intra / cumf_LEVEL_intra escape body. P-picture SAC is still
+  rejected with a specific diagnostic — wiring cumf_COD + cumf_MCBPC +
+  cumf_MVD into the COD / MV decode paths is the next round.
+- `mb_sac` module hosting the I-picture SAC bridge:
+  `SacIPictureWriter` / `SacIPictureReader` thin wrappers over the §E.2
+  arithmetic coder + §E.5 PSC_FIFO, plus `decode_i_picture_sac` and
+  `encode_i_picture_sac_body` MB-loop drivers. Self-roundtrip integration
+  test (`tests/sac_iframe_roundtrip.rs`) confirms SAC-encoded → SAC-decoded
+  output is byte-identical to the corresponding VLC pipeline.
+- ffmpeg interop probe (`tests/sac_ffmpeg_interop.rs`, `#[ignore]`d):
+  ffmpeg 8.1 explicitly rejects our SAC-encoded I-pictures with `H.263
+  SAC not supported` — confirms our PSC + PTYPE header is well-formed
+  (ffmpeg parses it correctly and identifies the SAC bit) but ffmpeg's
+  baseline H.263 decoder never implemented the SAC body.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-h263/compare/v0.0.5...v0.0.6) - 2026-04-25
 
 ### Other

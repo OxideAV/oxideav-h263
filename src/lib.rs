@@ -62,19 +62,28 @@
 //! * Reuses VLC tables and IDCT/dequantisation from `oxideav-mpeg4video`
 //!   (the MPEG-4 Part 2 VLCs are identical to the H.263 baseline ones).
 //!
-//! * **Annex E — Syntax-based Arithmetic Coding (core)**: the §E.2 / §E.3
-//!   arithmetic encoder + decoder and every §E.8 cumulative-frequency model
-//!   live in [`sac`]. The §E.5 PSC_FIFO emulation-prevention (14-zero
-//!   stuffing) is handled by [`sac::PscFifoWriter`] / [`sac::PscFifoReader`].
-//!   Round-trip unit tests walk every symbol of every model. End-to-end
-//!   integration with the picture / MB / block decoder is the next step;
-//!   until that wiring is in place, SAC-signalled streams are rejected at
-//!   the picture-header layer.
+//! * **Annex E — Syntax-based Arithmetic Coding (I-pictures)**: the §E.2 /
+//!   §E.3 arithmetic encoder + decoder + every §E.8 cumulative-frequency
+//!   model live in [`sac`], and the I-picture MB-layer bridge that swaps
+//!   the VLC code path for SAC symbols (MCBPC_INTRA, CBPY_INTRA, INTRADC,
+//!   TCOEF1/2/3/r_intra + SIGN + LAST_INTRA / RUN_INTRA / LEVEL_INTRA
+//!   escape body) lives in [`mb_sac`]. Round 13: encoder-side opt-in via
+//!   [`encoder::H263Encoder::set_enable_annex_e`] sets PTYPE bit 11 and
+//!   emits the I-picture body through a single SAC segment per picture
+//!   (no in-body GOB headers); the decoder front-end picks the SAC body
+//!   driver automatically when the picture-header SAC bit is set. The
+//!   §E.5 PSC_FIFO emulation-prevention (14-zero stuffing) is handled by
+//!   [`sac::PscFifoWriter`] / [`sac::PscFifoReader`]. Self-roundtrip is
+//!   bit-exact against the VLC encoder's reconstruction (both pipelines
+//!   share the DCT/quant/IDCT path; only the entropy coder differs).
+//!   P-picture SAC bodies (which need cumf_COD + cumf_MVD wired into the
+//!   COD / MV decode paths) are deferred — the decoder rejects SAC-active
+//!   P-pictures with a specific diagnostic.
 //!
 //! Out of scope (returns `Error::Unsupported`):
 //! * PB-frames mode (§G) and every B-picture flavour.
-//! * Annex E wiring (VLC→SAC swap at the MB layer); the arithmetic coder
-//!   is implemented in [`sac`], but SAC-active streams are not yet driven.
+//! * Annex E P-picture wiring — COD / MVD models for SAC P-MB are still
+//!   pending; SAC-active P-pictures are rejected with a follow-up message.
 //! * Annex G (PB-frames), Annex I (Advanced Intra Coding), Annex K (Slice
 //!   Structured Mode — detected with a specific diagnostic since ffmpeg's
 //!   `h263p -umv 1` bundles it with Annex D), Annex N (RPS), Annex P
@@ -98,6 +107,7 @@ pub mod encoder;
 pub mod gob;
 pub mod interp;
 pub mod mb;
+pub mod mb_sac;
 pub mod motion;
 pub mod picture;
 pub mod sac;

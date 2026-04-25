@@ -114,6 +114,12 @@ pub struct H263Encoder {
     /// that the next P-picture's reference matches what the decoder
     /// produces.
     enable_annex_f: bool,
+    /// When `true`, emit I-pictures using Annex E syntax-based arithmetic
+    /// coding (SAC) instead of the VLC path. PTYPE bit 11 is set in the
+    /// picture header. P-pictures still use the VLC path — the encoder-side
+    /// SAC bridge for P-MB syntax (COD / MVD models) is the next round's
+    /// follow-up.
+    enable_annex_e: bool,
 }
 
 impl H263Encoder {
@@ -167,6 +173,7 @@ impl H263Encoder {
             next_tr: 0,
             enable_annex_j: false,
             enable_annex_f: false,
+            enable_annex_e: false,
         })
     }
 
@@ -193,6 +200,23 @@ impl H263Encoder {
     /// Returns whether Annex F (Advanced Prediction) is currently enabled.
     pub fn enable_annex_f(&self) -> bool {
         self.enable_annex_f
+    }
+
+    /// Enable or disable Annex E (Syntax-based Arithmetic Coding) emission
+    /// for I-pictures. Must be set before the first frame is submitted.
+    /// When on, every I-picture sets PTYPE bit 11 (SAC) and writes the
+    /// macroblock layer through the §E.2 arithmetic coder instead of the
+    /// VLC path; the decoder must mirror this on parse (it does so
+    /// automatically — `H263Decoder` reads the SAC body when the PTYPE
+    /// bit is set). Round 13 wires the I-MB path only; P-pictures fall
+    /// back to the VLC encode regardless of this flag.
+    pub fn set_enable_annex_e(&mut self, enable: bool) {
+        self.enable_annex_e = enable;
+    }
+
+    /// Returns whether Annex E (SAC) emission is currently enabled.
+    pub fn enable_annex_e(&self) -> bool {
+        self.enable_annex_e
     }
 }
 
@@ -233,14 +257,25 @@ impl Encoder for H263Encoder {
             || self.since_keyframe + 1 >= self.gop_size;
 
         let (data, mut recon, is_key) = if force_i {
-            let (bytes, pic) = encode_i_picture_with_recon(
-                self.width,
-                self.height,
-                self.source_format,
-                self.pquant,
-                tr,
-                v,
-            )?;
+            let (bytes, pic) = if self.enable_annex_e {
+                encode_i_picture_sac_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                )?
+            } else {
+                encode_i_picture_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                )?
+            };
             (bytes, pic, true)
         } else {
             let reference = self.reference.as_ref().expect("reference checked above");
@@ -372,6 +407,49 @@ pub fn encode_i_picture_with_recon(
     // (BitWriter::finish handles padding, but the spec requires the final
     // byte to align to a multiple of 8). No EOS marker — short clips don't
     // need one and ffmpeg accepts the stream without it.
+    Ok((bw.finish(), recon))
+}
+
+/// Encode a single I-picture as a SAC (Annex E) bitstream — same picture
+/// header as the VLC variant but with PTYPE bit 11 set, and an
+/// arithmetic-coded MB layer. Returns the bitstream bytes and the locally
+/// reconstructed picture (used as the next MC reference).
+///
+/// The body is emitted as a single SAC segment with no internal GOB
+/// headers — sub-QCIF / QCIF have 6/9 single-row GOBs that would each need
+/// an `encoder_flush` + `decoder_reset` boundary; we keep the segment
+/// monolithic per picture for simplicity. The decoder side
+/// (`mb_sac::decode_i_picture_sac`) rejects in-body GOB headers.
+pub fn encode_i_picture_sac_with_recon(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+) -> Result<(Vec<u8>, IPicture)> {
+    let mut bw = BitWriter::with_capacity(8192);
+    let mut recon = IPicture::new(width as usize, height as usize);
+    write_picture_header_with_opts(
+        &mut bw,
+        source_format,
+        pquant,
+        temporal_reference,
+        false, // I-picture
+        false, // no AP
+        true,  // SAC bit on
+    )?;
+    // The picture header ends on a byte boundary (PSC + TR + PTYPE + PQUANT
+    // + CPM + PEI sum to 50 bits, padded to 56 = 7 bytes by the BitWriter
+    // before any further byte-level write — we explicitly pad here so the
+    // SAC body starts on a byte boundary regardless of prior layout
+    // choices). H.263 baseline only needs alignment when concatenating
+    // byte-stuffed sections; the SAC PSC_FIFO output is already byte-
+    // aligned by `PscFifoWriter::finish`.
+    while !bw.is_byte_aligned() {
+        bw.write_bits(0, 1);
+    }
+    crate::mb_sac::encode_i_picture_sac_body(&mut bw, width, height, pquant, frame, &mut recon)?;
     Ok((bw.finish(), recon))
 }
 
@@ -762,6 +840,29 @@ fn write_picture_header(
     is_p_picture: bool,
     advanced_prediction: bool,
 ) -> Result<()> {
+    write_picture_header_with_opts(
+        bw,
+        source_format,
+        pquant,
+        tr,
+        is_p_picture,
+        advanced_prediction,
+        false,
+    )
+}
+
+/// Picture header writer that also takes an Annex E (SAC) flag. Sets PTYPE
+/// bit 11 (SAC) when `sac_mode` is true. Otherwise identical to
+/// [`write_picture_header`].
+fn write_picture_header_with_opts(
+    bw: &mut BitWriter,
+    source_format: SourceFormat,
+    pquant: u8,
+    tr: u8,
+    is_p_picture: bool,
+    advanced_prediction: bool,
+    sac_mode: bool,
+) -> Result<()> {
     // PSC: 22 bits = `0000 0000 0000 0000 1 00000`. Write byte-aligned to
     // simplify start-code recognition.
     debug_assert!(bw.is_byte_aligned());
@@ -804,10 +905,10 @@ fn write_picture_header(
     bw.write_bits(src_code, 3); // bits 6-8 source format
     bw.write_bits(u32::from(is_p_picture), 1); // bit 9 picture coding type (I=0, P=1)
     bw.write_bits(0, 1); // bit 10 UMV
-    bw.write_bits(0, 1); // bit 11 SAC
-                         // bit 12 AP — Annex F Advanced Prediction. Set iff the encoder is in
-                         // 4MV/OBMC mode AND this is a P-picture (I-pictures have no MVs). On
-                         // I-pictures the bit must be 0 even if the knob is on.
+    bw.write_bits(if sac_mode { 1 } else { 0 }, 1); // bit 11 SAC
+                                                    // bit 12 AP — Annex F Advanced Prediction. Set iff the encoder is in
+                                                    // 4MV/OBMC mode AND this is a P-picture (I-pictures have no MVs). On
+                                                    // I-pictures the bit must be 0 even if the knob is on.
     let ap_bit = if is_p_picture && advanced_prediction {
         1
     } else {

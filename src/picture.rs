@@ -215,15 +215,19 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
     let pb_frames = br.read_u1()? == 1;
 
     if sac_mode {
-        // Annex E arithmetic coder + every §E.8 probability model are
-        // implemented in `crate::sac`, but the wiring that replaces VLC
-        // decodes at the MB / block layer with SAC calls is not yet in
-        // place. Reject the stream with a diagnostic that points at the
-        // actual integration gap rather than leaving callers guessing.
-        return Err(Error::unsupported(
-            "h263 Annex E syntax-based arithmetic coding: MB-layer wiring \
-             pending (arithmetic coder lives in crate::sac)",
-        ));
+        // Annex E syntax-based arithmetic coding (round 13).
+        //
+        // The SAC arithmetic coder + all §E.8 cumulative-frequency models
+        // live in `crate::sac` and are bridged into the MB layer via
+        // [`crate::sac::SacIPictureWriter`] / [`crate::sac::SacIPictureReader`]
+        // for I-pictures. The decoder now drives the I-MB body through the
+        // SAC reader when this flag is set; P-picture SAC bodies are still
+        // pending (they need the MV/ COD models wired into `mb::decode_p_mb`)
+        // and will be rejected here once the picture coding type is checked
+        // against `coding_bit` later in the body parse below. We accept the
+        // header here unconditionally so the picture-coding-type / PB-frames
+        // / CPM / PEI checks below can still surface their own diagnostics
+        // before we get to the MB layer.
     }
     // Annex F (Advanced Prediction — 4MV + OBMC) is accepted on baseline
     // PTYPE streams and handled by the P-MB decoder via `decode_p_mb`.
