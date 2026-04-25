@@ -287,26 +287,35 @@ impl Encoder for H263Encoder {
             let (bytes, pic) = if self.enable_annex_e {
                 // Round 14 — SAC P-picture body. Routes COD / MCBPC /
                 // CBPY / DQUANT / MVD / TCOEF through the §E.7 models
-                // (`crate::sac` + `crate::mb_sac`). Annex F (4MV/OBMC) is
-                // not combined with SAC here — the encoder rejects an
-                // attempt to enable both on the same picture (§E.7
-                // expects `cumf_MCBPC_4MVQ` if AP/DF is on, which we don't
-                // exercise yet).
+                // (`crate::sac` + `crate::mb_sac`).
+                //
+                // Round 15 (this one) wires SAC + Annex F (Advanced
+                // Prediction / 4MV / OBMC): when both knobs are on, the
+                // P-picture sets PTYPE bits 11 (SAC) AND 12 (AP), and the
+                // MB layer uses `cumf_MCBPC_4MVQ` (§E.8) with per-block
+                // MVDs (Inter4MV variants of Table 8) and OBMC-blended
+                // local reconstruction (§F.3).
                 if self.enable_annex_f {
-                    return Err(Error::unsupported(
-                        "h263 SAC + Annex F advanced prediction: combined SAC/AP \
-                         emit not implemented (§E.7 cumf_MCBPC_4MVQ wiring pending)",
-                    ));
+                    encode_p_picture_sac_ap_with_recon(
+                        self.width,
+                        self.height,
+                        self.source_format,
+                        self.pquant,
+                        tr,
+                        v,
+                        reference,
+                    )?
+                } else {
+                    encode_p_picture_sac_with_recon(
+                        self.width,
+                        self.height,
+                        self.source_format,
+                        self.pquant,
+                        tr,
+                        v,
+                        reference,
+                    )?
                 }
-                encode_p_picture_sac_with_recon(
-                    self.width,
-                    self.height,
-                    self.source_format,
-                    self.pquant,
-                    tr,
-                    v,
-                    reference,
-                )?
             } else {
                 encode_p_picture_with_opts(
                     self.width,
@@ -566,6 +575,48 @@ pub fn encode_p_picture_sac_with_recon_opts(
     Ok((bw.finish(), recon))
 }
 
+/// Round 15 — encode a single P-picture as a SAC bitstream **with Annex F
+/// (Advanced Prediction / 4MV / OBMC) on**. Sets PTYPE bits 11 (SAC) and
+/// 12 (AP) in the picture header. The MB layer routes through
+/// `cumf_MCBPC_4MVQ` (§E.8) with per-block MVDs (Inter4MV variants of
+/// Table 8) and an OBMC-blended local reconstruction (§F.3) that mirrors
+/// what the decoder produces.
+///
+/// Single SAC segment per picture (no in-body GOB resync, matching the
+/// VLC AP P-encoder's "no GOB headers" baseline behaviour for byte-exact
+/// reconstruction parity).
+pub fn encode_p_picture_sac_ap_with_recon(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+) -> Result<(Vec<u8>, IPicture)> {
+    let mut bw = BitWriter::with_capacity(8192);
+    let mut recon = IPicture::new(width as usize, height as usize);
+
+    write_picture_header_with_opts(
+        &mut bw,
+        source_format,
+        pquant,
+        temporal_reference,
+        true, // P-picture
+        true, // AP — Annex F
+        true, // SAC bit on
+    )?;
+    while !bw.is_byte_aligned() {
+        bw.write_bits(0, 1);
+    }
+
+    crate::mb_sac::encode_p_picture_sac_ap_body(
+        &mut bw, width, height, pquant, frame, reference, &mut recon,
+    )?;
+
+    Ok((bw.finish(), recon))
+}
+
 /// Encode a single P-picture against the supplied `reference`. Returns the
 /// bitstream bytes and the locally reconstructed picture (used as the next
 /// MC reference). Equivalent to [`encode_p_picture_with_opts`] with
@@ -739,7 +790,7 @@ fn copy_mb_from_to(src: &IPicture, dst: &mut IPicture, mb_x: usize, mb_y: usize)
 /// Pass-1 decision for an MB in Annex F mode. `Inter1Mv` carries the
 /// chosen MV; `Inter4Mv` carries the four per-block MVs (Figure 5 order).
 #[derive(Clone, Copy, Debug)]
-enum MbDecision {
+pub enum MbDecision {
     Skipped,
     Intra,
     Inter1Mv((i32, i32)),
@@ -2712,6 +2763,60 @@ pub fn sad_block_pub(
 /// SAC-bridge wrapper around the private [`write_gob_header`].
 pub fn write_gob_header_pub(bw: &mut BitWriter, gn: u8, gquant: u8) -> Result<()> {
     write_gob_header(bw, gn, gquant)
+}
+
+/// SAC + Annex F (round 15) — wrapper around [`motion_estimate_4mv`] for the
+/// per-MB 4-MV decision. Returns `(mvs4, summed_sad)` where `mvs4` is the
+/// per-block luma MV (Figure 5 ordering — block 0 top-left, block 1 top-right,
+/// block 2 bottom-left, block 3 bottom-right).
+pub fn motion_estimate_4mv_pub(
+    frame: &VideoFrame,
+    reference: &IPicture,
+    mb_x: usize,
+    mb_y: usize,
+) -> ([(i32, i32); 4], u32) {
+    motion_estimate_4mv(frame, reference, mb_x, mb_y)
+}
+
+/// SAC + Annex F (round 15) — wrapper around [`build_mb_predictor_4mv_obmc`].
+/// Returns the OBMC-blended luma 16×16 predictor and the chroma MV the caller
+/// must use (`MVDCHR` from §F.2 — sum of 4 luma MVs / 8, rounded by Table F.1).
+pub fn build_mb_predictor_4mv_obmc_pub(
+    reference: &IPicture,
+    mv_grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    mvs4: &[(i32, i32); 4],
+) -> ([u8; 256], i32, i32) {
+    build_mb_predictor_4mv_obmc(reference, mv_grid, mb_x, mb_y, mvs4)
+}
+
+/// SAC + Annex F (round 15) — wrapper around [`decide_p_mb`]. Picks the
+/// per-MB encode mode (skipped / intra / 1-MV inter / 4-MV inter) using
+/// the same SAD heuristics as the VLC AP encoder, so SAC + AP traverses
+/// the same decision tree.
+pub fn decide_p_mb_pub(
+    frame: &VideoFrame,
+    reference: &IPicture,
+    mv_grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+) -> MbDecision {
+    decide_p_mb(frame, reference, mv_grid, mb_x, mb_y, quant)
+}
+
+/// SAC + Annex F (round 15) — wrapper around [`build_chroma_predictor`].
+pub fn build_chroma_predictor_pub(
+    reference: &IPicture,
+    mb_x: usize,
+    mb_y: usize,
+    cmx: i32,
+    cmy: i32,
+    u_pred: &mut [u8; 64],
+    v_pred: &mut [u8; 64],
+) {
+    build_chroma_predictor(reference, mb_x, mb_y, cmx, cmy, u_pred, v_pred);
 }
 
 /// Sum of absolute differences between the luma MB and its mean — cheap

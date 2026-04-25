@@ -20,9 +20,10 @@
 //! intra), 8 (MCBPC inter), 12 (CBPY), 13 (DQUANT), 14 (MVD), 15
 //! (INTRADC), 16 (TCOEF), and 17 (RUN/LEVEL FLC) of clause 5.
 //!
-//! Combining SAC with Annex F (Advanced Prediction / 4MV / OBMC) is
-//! rejected at the encoder — `cumf_MCBPC_4MVQ` + per-block MVD wiring
-//! is the next-round follow-up.
+//! Round 15 wires SAC + Annex F (Advanced Prediction / 4MV / OBMC):
+//! `encode_p_picture_sac_ap_body` (encoder) and `decode_p_picture_sac_ap`
+//! (decoder) handle the AP path — `cumf_MCBPC_4MVQ` MCBPC indexing,
+//! per-block MVDs (§F.2 Fig F.1), and §F.3 OBMC reconstruction.
 
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
@@ -566,7 +567,10 @@ fn read_dquant_via(rdr: &mut SacIPictureReader<'_>) -> Result<usize> {
 // ---------------------------------------------------------------------------
 
 use crate::interp::predict_block;
-use crate::motion::{luma_to_chroma_mv, predict_mv, wrap_mv_component, MbMotion, MvGrid};
+use crate::motion::{
+    chroma_mv_4mv, luma_to_chroma_mv, predict_mv, predict_mv_block, wrap_mv_component, MbMotion,
+    MvGrid,
+};
 use crate::sac::{PMcbpcModel, SacPPictureReader, SacPPictureWriter};
 use oxideav_mpeg4video::tables::mcbpc::PMbType;
 
@@ -1612,6 +1616,769 @@ impl<'a> SacPPictureReader<'a> {
 
 // `decode_symbol_internal` is colocated with the reader's other private
 // items in `sac.rs` for visibility — see the impl block there.
+
+// ---------------------------------------------------------------------------
+// Round 15 — SAC + Annex F (Advanced Prediction / 4MV / OBMC) encoder driver.
+//
+// Per §E.7, when the picture-header AP bit (PTYPE bit 12) OR the DF bit is
+// set, the MCBPC model switches from `cumf_MCBPC_no4MVQ` to
+// `cumf_MCBPC_4MVQ`. The 4MVQ table extends the no4MVQ index space with
+// rows for `Inter4MV` (16..=19, plus stuffing at 20) and `Inter4MV+Q`
+// (21..=24) — see Tables 7/8 + §E.8 cumul-frequency listing.
+//
+// 4MV macroblocks emit four MVDs per §F.2 (Figure F.1 redefined predictors).
+// The encoder applies §F.3 OBMC blending on the local reconstruction so
+// that the next-picture MC reference matches what the decoder produces.
+//
+// The encode is two-pass (mirrors the VLC AP path):
+//   Pass 1 — visit every MB, decide skipped / intra / 1-MV / 4-MV via the
+//     same SAD heuristics as `encoder::decide_p_mb`, populate `mv_grid`.
+//   Pass 2 — visit every MB again with the full `mv_grid`, build the
+//     OBMC-blended predictor, quantise the residual against it, emit SAC
+//     tokens, and stash residuals for pass 3.
+//   Pass 3 — apply §F.3 OBMC reconstruction into a fresh picture and
+//     overwrite `recon`. Intra MBs already sit in `recon` from pass 2.
+// ---------------------------------------------------------------------------
+
+use crate::encoder::MbDecision;
+
+/// Encode the body of a P-picture (with Annex F Advanced Prediction on) as
+/// a single SAC segment and append the bytes to `bw`. `bw` must already
+/// hold the byte-aligned picture header (with PTYPE bits 11 SAC + 12 AP set).
+///
+/// Reconstruction (after OBMC) is written into `recon` for use as the
+/// next-picture's MC reference.
+pub fn encode_p_picture_sac_ap_body(
+    bw: &mut BitWriter,
+    width: u32,
+    height: u32,
+    pquant: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+    recon: &mut IPicture,
+) -> Result<()> {
+    let mb_w = width.div_ceil(16) as usize;
+    let mb_h = height.div_ceil(16) as usize;
+
+    let mut mv_grid = MvGrid::new(mb_w, mb_h);
+
+    // §E.7: AP active → cumf_MCBPC_4MVQ.
+    let mcbpc_model = PMcbpcModel::Mv4Q;
+    let mut sac = SacPPictureWriter::new(mcbpc_model);
+
+    // Pass 1: per-MB decision + mv_grid population.
+    let mut decisions: Vec<MbDecision> = Vec::with_capacity(mb_w * mb_h);
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            let d = crate::encoder::decide_p_mb_pub(frame, reference, &mv_grid, mb_x, mb_y, pquant);
+            // Seed mv_grid so downstream neighbours' predictors see this MB.
+            match d {
+                MbDecision::Skipped => {
+                    mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), false, false));
+                }
+                MbDecision::Intra => {
+                    mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), true, true));
+                }
+                MbDecision::Inter1Mv(mv) => {
+                    mv_grid.set(mb_x, mb_y, MbMotion::mv1(mv, true, false));
+                }
+                MbDecision::Inter4Mv(mvs4) => {
+                    mv_grid.set(mb_x, mb_y, MbMotion::mv4(mvs4));
+                }
+            }
+            decisions.push(d);
+        }
+    }
+
+    // Pass 2: emit SAC tokens + per-MB local reconstruction (intra writes to
+    // `recon` directly; inter blocks stash residuals for pass 3).
+    let mut infos: Vec<crate::mb::PMbInfo> = Vec::with_capacity(mb_w * mb_h);
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            let d = decisions[mb_y * mb_w + mb_x];
+            let info = encode_p_mb_sac_ap(
+                &mut sac, mb_x, mb_y, pquant, frame, reference, recon, &mv_grid, d,
+            )?;
+            infos.push(info);
+        }
+    }
+
+    // Pass 3: OBMC reconstruction into a fresh picture.
+    let mut obmc_recon = IPicture::new(width as usize, height as usize);
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            let info = &infos[mb_y * mb_w + mb_x];
+            if info.intra {
+                copy_mb_pic_to_pic(recon, &mut obmc_recon, mb_x, mb_y);
+                continue;
+            }
+            crate::mb::apply_p_mb_reconstruction(
+                mb_x,
+                mb_y,
+                &mut obmc_recon,
+                reference,
+                &mv_grid,
+                info,
+                true, // OBMC on
+            );
+        }
+    }
+    *recon = obmc_recon;
+
+    // Final flush + drain.
+    let body_bytes = sac.finish();
+    if !bw.is_byte_aligned() {
+        return Err(Error::invalid(
+            "h263 SAC+AP P encoder: bit writer not byte-aligned before final body drain",
+        ));
+    }
+    for b in &body_bytes {
+        bw.write_bits(*b as u32, 8);
+    }
+    Ok(())
+}
+
+/// Emit one SAC token stream for an AP-mode P-MB and produce its `PMbInfo`
+/// (residuals stashed for pass 3 OBMC). `mv_grid` is the fully-populated
+/// pass-1 grid (read-only — does not mutate).
+#[allow(clippy::too_many_arguments)]
+fn encode_p_mb_sac_ap(
+    sac: &mut SacPPictureWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+    recon: &mut IPicture,
+    mv_grid: &MvGrid,
+    decision: MbDecision,
+) -> Result<crate::mb::PMbInfo> {
+    match decision {
+        MbDecision::Skipped => {
+            // COD = 1 (not coded). Skipped MBs in AP mode still go through
+            // OBMC in pass 3 (per §F.3 note: "OBMC is applied to every inter
+            // MB in AP mode, including those signalled COD=1").
+            sac.write_cod(false);
+            Ok(crate::mb::PMbInfo::empty_skipped())
+        }
+        MbDecision::Intra => {
+            sac.write_cod(true);
+            encode_p_mb_intra_sac_ap(sac, mb_x, mb_y, quant, frame, recon)?;
+            Ok(crate::mb::PMbInfo {
+                coded: true,
+                intra: true,
+                residual: vec![0i16; 6 * 64],
+                residual_present: [false; 6],
+                intra_done: true,
+            })
+        }
+        MbDecision::Inter1Mv(mv) => {
+            sac.write_cod(true);
+            // §F.3: even 1-MV inter MBs in AP mode get OBMC. The luma
+            // predictor is built from the OBMC blend (using mvs4 = [mv;4]
+            // so all four sub-blocks share `mv`). Chroma uses the §F.2
+            // luma_to_chroma_mv mapping (1-MV path).
+            let mvs4 = [mv; 4];
+            let (y_pred, _cmx, _cmy) = crate::encoder::build_mb_predictor_4mv_obmc_pub(
+                reference, mv_grid, mb_x, mb_y, &mvs4,
+            );
+            let (cmx_1mv, cmy_1mv) = (luma_to_chroma_mv(mv.0), luma_to_chroma_mv(mv.1));
+            let mut u_pred = [0u8; 64];
+            let mut v_pred = [0u8; 64];
+            crate::encoder::build_chroma_predictor_pub(
+                reference,
+                mb_x,
+                mb_y,
+                cmx_1mv,
+                cmy_1mv,
+                &mut u_pred,
+                &mut v_pred,
+            );
+            encode_p_mb_inter_sac_ap_1mv(
+                sac, mb_x, mb_y, quant, frame, mv_grid, recon, mv, &y_pred, &u_pred, &v_pred,
+            )
+        }
+        MbDecision::Inter4Mv(mvs4) => {
+            sac.write_cod(true);
+            // 4MV path. Luma OBMC predictor + chroma MVDCHR (§F.2).
+            let (y_pred, cmx, cmy) = crate::encoder::build_mb_predictor_4mv_obmc_pub(
+                reference, mv_grid, mb_x, mb_y, &mvs4,
+            );
+            let mut u_pred = [0u8; 64];
+            let mut v_pred = [0u8; 64];
+            crate::encoder::build_chroma_predictor_pub(
+                reference,
+                mb_x,
+                mb_y,
+                cmx,
+                cmy,
+                &mut u_pred,
+                &mut v_pred,
+            );
+            encode_p_mb_inter_sac_ap_4mv(
+                sac, mb_x, mb_y, quant, frame, mv_grid, recon, &mvs4, &y_pred, &u_pred, &v_pred,
+            )
+        }
+    }
+}
+
+/// Intra-in-P MB encode — same as the no-AP path but uses the AP MCBPC
+/// indexing under `cumf_MCBPC_4MVQ`. Per Table 7/8: Intra cells live at
+/// indices 4..=7 in both `no4MVQ` and `4MVQ` MCBPC tables, so the index
+/// arithmetic (`4 + cbpc`) is unchanged.
+fn encode_p_mb_intra_sac_ap(
+    sac: &mut SacPPictureWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    frame: &VideoFrame,
+    recon: &mut IPicture,
+) -> Result<()> {
+    let mut blocks = [[0i32; 64]; 6];
+    let mut dc_pels = [128u8; 6];
+    let mut block_has_ac = [false; 6];
+
+    for b in 0..6 {
+        let mut samples = [0.0f32; 64];
+        sample_block_for(frame, mb_x, mb_y, b, &mut samples);
+        let mut dctf = samples;
+        fdct8x8(&mut dctf);
+        let (dc_byte, levels, any_ac) = quantise_intra_block(&dctf, quant);
+        dc_pels[b] = dc_byte;
+        block_has_ac[b] = any_ac;
+        blocks[b] = levels;
+    }
+    let cbpc: u8 = ((block_has_ac[4] as u8) << 1) | (block_has_ac[5] as u8);
+    let cbpy: u8 = ((block_has_ac[0] as u8) << 3)
+        | ((block_has_ac[1] as u8) << 2)
+        | ((block_has_ac[2] as u8) << 1)
+        | (block_has_ac[3] as u8);
+
+    let mcbpc_index = 4 + cbpc as usize;
+    sac.write_mcbpc(mcbpc_index)?;
+    sac.enc_intra_cbpy(cbpy)?;
+    for b in 0..6 {
+        sac.enc_intradc(dc_pels[b])?;
+        if block_has_ac[b] {
+            for ev in tcoef_intra_events(&blocks[b]) {
+                sac.write_tcoef_inter_intra_pos(ev);
+            }
+        }
+        reconstruct_intra_block(recon, b, mb_x, mb_y, dc_pels[b], &blocks[b], quant);
+    }
+    Ok(())
+}
+
+/// 1-MV inter MB encode under SAC+AP. Same as `encode_p_mb_inter_sac` but
+/// emits via the `cumf_MCBPC_4MVQ` indexing and with the OBMC predictor as
+/// the residual target. Returns a `PMbInfo` carrying the per-block
+/// residuals so the pass-3 OBMC reconstruction has them.
+#[allow(clippy::too_many_arguments)]
+fn encode_p_mb_inter_sac_ap_1mv(
+    sac: &mut SacPPictureWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    frame: &VideoFrame,
+    mv_grid: &MvGrid,
+    _recon: &mut IPicture,
+    mv: (i32, i32),
+    y_pred: &[u8; 256],
+    u_pred: &[u8; 64],
+    v_pred: &[u8; 64],
+) -> Result<crate::mb::PMbInfo> {
+    let src_y = &frame.planes[0];
+    let src_cb = &frame.planes[1];
+    let src_cr = &frame.planes[2];
+
+    let mut levels_all = [[0i32; 64]; 6];
+    let mut has_ac = [false; 6];
+
+    for b in 0..4 {
+        let (sub_x, sub_y) = sub_block_offset(b);
+        let mut resid = [0.0f32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                let py = mb_y * 16 + sub_y + j;
+                let px = mb_x * 16 + sub_x + i;
+                let s = src_y.data[py * src_y.stride + px] as i32;
+                let p = y_pred[(sub_y + j) * 16 + (sub_x + i)] as i32;
+                resid[j * 8 + i] = (s - p) as f32;
+            }
+        }
+        let mut dctf = resid;
+        fdct8x8(&mut dctf);
+        let levels = crate::encoder::quantise_inter_block_pub(&dctf, quant);
+        has_ac[b] = levels.iter().any(|&l| l != 0);
+        levels_all[b] = levels;
+    }
+    for (ci, plane) in [(0, src_cb), (1, src_cr)].iter() {
+        let pred = if *ci == 0 { u_pred } else { v_pred };
+        let mut resid = [0.0f32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                let py = mb_y * 8 + j;
+                let px = mb_x * 8 + i;
+                let s = plane.data[py * plane.stride + px] as i32;
+                let p = pred[j * 8 + i] as i32;
+                resid[j * 8 + i] = (s - p) as f32;
+            }
+        }
+        let mut dctf = resid;
+        fdct8x8(&mut dctf);
+        let levels = crate::encoder::quantise_inter_block_pub(&dctf, quant);
+        let b = 4 + ci;
+        has_ac[b] = levels.iter().any(|&l| l != 0);
+        levels_all[b] = levels;
+    }
+
+    let cbpc: u8 = ((has_ac[4] as u8) << 1) | (has_ac[5] as u8);
+    let cbpy_true: u8 = ((has_ac[0] as u8) << 3)
+        | ((has_ac[1] as u8) << 2)
+        | ((has_ac[2] as u8) << 1)
+        | (has_ac[3] as u8);
+
+    // Table 8 mb_type=0 (Inter, 1-MV) → indices 0..=3 (same in both no4MVQ
+    // and 4MVQ models).
+    sac.write_mcbpc(cbpc as usize)?;
+    sac.write_cbpy_inter(cbpy_true)?;
+
+    // Single MVD (predictor + diff). Predictor uses the 1-MV §5.3.7.2 median
+    // (NOT the §F.2 per-block redefined predictor — that's only for 4MV).
+    let (pmx, pmy) = predict_mv(mv_grid, mb_x, mb_y);
+    let diff_x = fold_mvd(mv.0 - pmx);
+    let diff_y = fold_mvd(mv.1 - pmy);
+    debug_assert_eq!(wrap_mv_component(pmx + diff_x), mv.0);
+    debug_assert_eq!(wrap_mv_component(pmy + diff_y), mv.1);
+    sac.write_mvd_component(diff_x);
+    sac.write_mvd_component(diff_y);
+
+    for b in 0..6 {
+        if has_ac[b] {
+            for ev in tcoef_inter_events(&levels_all[b]) {
+                sac.write_tcoef_inter(ev.position, ev.last, ev.run, ev.level);
+            }
+        }
+    }
+
+    // Stash dequantised residuals for pass-3 OBMC reconstruction.
+    let mut info = crate::mb::PMbInfo {
+        coded: true,
+        intra: false,
+        residual: vec![0i16; 6 * 64],
+        residual_present: [false; 6],
+        intra_done: false,
+    };
+    for b in 0..6 {
+        if has_ac[b] {
+            let coeffs = crate::encoder::dequantise_block_pub(&levels_all[b], quant, false);
+            let mut c = coeffs;
+            let mut resid_out = [0i32; 64];
+            crate::block::idct_signed(&mut c, &mut resid_out);
+            let dst = info.residual_block_mut(b);
+            for (i, &v) in resid_out.iter().enumerate() {
+                dst[i] = v.clamp(-4096, 4095) as i16;
+            }
+            info.residual_present[b] = true;
+        }
+    }
+    Ok(info)
+}
+
+/// 4-MV inter MB encode under SAC+AP. The MCBPC index is `16 + cbpc`
+/// (Table 8 row 4 = Inter4MV, indices 16..=19 in `cumf_MCBPC_4MVQ`).
+/// Emits four MVDs in block order 0..=3, each predicted via the §F.2
+/// per-block redefined predictor. The OBMC blended predictor is what we
+/// quantise the residual against (matches what the decoder pass-3 OBMC
+/// produces, so the reconstruction is bit-identical).
+#[allow(clippy::too_many_arguments)]
+fn encode_p_mb_inter_sac_ap_4mv(
+    sac: &mut SacPPictureWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    frame: &VideoFrame,
+    mv_grid: &MvGrid,
+    _recon: &mut IPicture,
+    mvs4: &[(i32, i32); 4],
+    y_pred: &[u8; 256],
+    u_pred: &[u8; 64],
+    v_pred: &[u8; 64],
+) -> Result<crate::mb::PMbInfo> {
+    let src_y = &frame.planes[0];
+    let src_cb = &frame.planes[1];
+    let src_cr = &frame.planes[2];
+
+    let mut levels_all = [[0i32; 64]; 6];
+    let mut has_ac = [false; 6];
+
+    for b in 0..4 {
+        let (sub_x, sub_y) = sub_block_offset(b);
+        let mut resid = [0.0f32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                let py = mb_y * 16 + sub_y + j;
+                let px = mb_x * 16 + sub_x + i;
+                let s = src_y.data[py * src_y.stride + px] as i32;
+                let p = y_pred[(sub_y + j) * 16 + (sub_x + i)] as i32;
+                resid[j * 8 + i] = (s - p) as f32;
+            }
+        }
+        let mut dctf = resid;
+        fdct8x8(&mut dctf);
+        let levels = crate::encoder::quantise_inter_block_pub(&dctf, quant);
+        has_ac[b] = levels.iter().any(|&l| l != 0);
+        levels_all[b] = levels;
+    }
+    for (ci, plane) in [(0, src_cb), (1, src_cr)].iter() {
+        let pred = if *ci == 0 { u_pred } else { v_pred };
+        let mut resid = [0.0f32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                let py = mb_y * 8 + j;
+                let px = mb_x * 8 + i;
+                let s = plane.data[py * plane.stride + px] as i32;
+                let p = pred[j * 8 + i] as i32;
+                resid[j * 8 + i] = (s - p) as f32;
+            }
+        }
+        let mut dctf = resid;
+        fdct8x8(&mut dctf);
+        let levels = crate::encoder::quantise_inter_block_pub(&dctf, quant);
+        let b = 4 + ci;
+        has_ac[b] = levels.iter().any(|&l| l != 0);
+        levels_all[b] = levels;
+    }
+
+    let cbpc: u8 = ((has_ac[4] as u8) << 1) | (has_ac[5] as u8);
+    let cbpy_true: u8 = ((has_ac[0] as u8) << 3)
+        | ((has_ac[1] as u8) << 2)
+        | ((has_ac[2] as u8) << 1)
+        | (has_ac[3] as u8);
+
+    // Table 8 mb_type=4 (Inter4MV) → indices 16..=19 in cumf_MCBPC_4MVQ.
+    let mcbpc_index = 16 + cbpc as usize;
+    sac.write_mcbpc(mcbpc_index)?;
+    sac.write_cbpy_inter(cbpy_true)?;
+
+    // Four MVDs, one per 8×8 luma block. The §F.2 Figure F.1 predictor
+    // sees the *partially populated* MV record for the current MB so that
+    // block 1's left neighbour is block 0 of the same MB, etc. We mutate a
+    // local clone of the grid for that bookkeeping (the pass-1 mv_grid is
+    // already finalised and passed in as `&MvGrid`).
+    let mut scratch = mv_grid.clone();
+    scratch.set(mb_x, mb_y, MbMotion::mv4([(0, 0); 4]));
+    for b in 0..4 {
+        let (pmx, pmy) = predict_mv_block(&scratch, mb_x, mb_y, b);
+        let diff_x = fold_mvd(mvs4[b].0 - pmx);
+        let diff_y = fold_mvd(mvs4[b].1 - pmy);
+        debug_assert_eq!(wrap_mv_component(pmx + diff_x), mvs4[b].0);
+        debug_assert_eq!(wrap_mv_component(pmy + diff_y), mvs4[b].1);
+        sac.write_mvd_component(diff_x);
+        sac.write_mvd_component(diff_y);
+        let mut cur = scratch.get(mb_x, mb_y);
+        cur.mvs4[b] = mvs4[b];
+        cur.mv = mvs4[0];
+        scratch.set(mb_x, mb_y, cur);
+    }
+    let _ = chroma_mv_4mv; // referenced for symmetry with the OBMC predictor builder
+
+    for b in 0..6 {
+        if has_ac[b] {
+            for ev in tcoef_inter_events(&levels_all[b]) {
+                sac.write_tcoef_inter(ev.position, ev.last, ev.run, ev.level);
+            }
+        }
+    }
+
+    // Stash dequantised residuals for pass-3 OBMC reconstruction.
+    let mut info = crate::mb::PMbInfo {
+        coded: true,
+        intra: false,
+        residual: vec![0i16; 6 * 64],
+        residual_present: [false; 6],
+        intra_done: false,
+    };
+    for b in 0..6 {
+        if has_ac[b] {
+            let coeffs = crate::encoder::dequantise_block_pub(&levels_all[b], quant, false);
+            let mut c = coeffs;
+            let mut resid_out = [0i32; 64];
+            crate::block::idct_signed(&mut c, &mut resid_out);
+            let dst = info.residual_block_mut(b);
+            for (i, &v) in resid_out.iter().enumerate() {
+                dst[i] = v.clamp(-4096, 4095) as i16;
+            }
+            info.residual_present[b] = true;
+        }
+    }
+    Ok(info)
+}
+
+fn sub_block_offset(b: usize) -> (usize, usize) {
+    match b {
+        0 => (0, 0),
+        1 => (8, 0),
+        2 => (0, 8),
+        3 => (8, 8),
+        _ => unreachable!(),
+    }
+}
+
+fn copy_mb_pic_to_pic(src: &IPicture, dst: &mut IPicture, mb_x: usize, mb_y: usize) {
+    for j in 0..16 {
+        let so = (mb_y * 16 + j) * src.y_stride + mb_x * 16;
+        let doff = (mb_y * 16 + j) * dst.y_stride + mb_x * 16;
+        dst.y[doff..doff + 16].copy_from_slice(&src.y[so..so + 16]);
+    }
+    for j in 0..8 {
+        let so = (mb_y * 8 + j) * src.c_stride + mb_x * 8;
+        let doff = (mb_y * 8 + j) * dst.c_stride + mb_x * 8;
+        dst.cb[doff..doff + 8].copy_from_slice(&src.cb[so..so + 8]);
+        dst.cr[doff..doff + 8].copy_from_slice(&src.cr[so..so + 8]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round 15 — SAC + Annex F decoder driver. Two-pass mirror of the encoder
+// path: pass 1 reads SAC tokens (cumf_MCBPC_4MVQ) and stashes per-MB
+// residuals + four MVs; pass 2 applies §F.3 OBMC and adds residuals.
+// ---------------------------------------------------------------------------
+
+/// Decode a SAC-coded P-picture body that uses Annex F (Advanced Prediction).
+/// `bytes` is the full picture. The picture-header AP bit is honoured by
+/// the caller (`decoder.rs`); this driver assumes 4MVQ MCBPC indexing.
+///
+/// Single SAC segment per picture (no in-body GOB resync) — matches the
+/// SAC+AP encoder. If the bitstream carries GOB headers inside the body
+/// the decoder rejects with `Error::unsupported`.
+pub fn decode_p_picture_sac_ap(
+    hdr: &PictureHeader,
+    bytes: &[u8],
+    reference: &IPicture,
+) -> Result<IPicture> {
+    let mb_w = hdr.width.div_ceil(16) as usize;
+    let mb_h = hdr.height.div_ceil(16) as usize;
+    let mut pic = IPicture::new(hdr.width as usize, hdr.height as usize);
+    let mut quant = hdr.pquant as u32;
+
+    let body_byte_pos = locate_body_byte_pos(bytes)?;
+    let trailing = &bytes[body_byte_pos..];
+
+    // Reject in-body GOB headers (matches the SAC+AP encoder, which emits
+    // a single segment per picture).
+    if let Some(sc) = find_next_start_code(trailing, 0) {
+        if sc.gn != GN_PICTURE && sc.gn != GN_EOS {
+            return Err(Error::unsupported(
+                "h263 SAC+AP P-picture: in-body GOB headers not supported \
+                 (decoder accepts a single SAC segment per AP picture)",
+            ));
+        }
+    }
+
+    let mcbpc_model = PMcbpcModel::Mv4Q;
+    let mut mv_grid = MvGrid::new(mb_w, mb_h);
+
+    let mut br = BitReader::new(trailing);
+    let mut rdr = SacPPictureReader::new(&mut br, mcbpc_model)?;
+
+    let mut infos: Vec<crate::mb::PMbInfo> = Vec::with_capacity(mb_w * mb_h);
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            let info =
+                decode_p_mb_sac_ap(&mut rdr, mb_x, mb_y, &mut quant, &mut pic, &mut mv_grid)?;
+            infos.push(info);
+        }
+    }
+
+    // Pass 2: §F.3 OBMC reconstruction.
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            let info = &infos[mb_y * mb_w + mb_x];
+            crate::mb::apply_p_mb_reconstruction(
+                mb_x, mb_y, &mut pic, reference, &mv_grid, info, true, // OBMC on
+            );
+        }
+    }
+
+    Ok(pic)
+}
+
+fn decode_p_mb_sac_ap(
+    rdr: &mut SacPPictureReader<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    quant: &mut u32,
+    pic: &mut IPicture,
+    mv_grid: &mut MvGrid,
+) -> Result<crate::mb::PMbInfo> {
+    // 1. COD.
+    let coded = rdr.read_cod()?;
+    if !coded {
+        // Skipped — MV (0,0), no residual. Pass 2 will still run OBMC.
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), false, false));
+        return Ok(crate::mb::PMbInfo::empty_skipped());
+    }
+
+    // 2. MCBPC — loop over stuffing.
+    let mcbpc_v = loop {
+        let v = rdr.read_mcbpc()?;
+        if v != PMcbpcModel::STUFFING_INDEX {
+            break v;
+        }
+    };
+    let (mb_type, cbpc) = decompose_mcbpc_for_4mvq(mcbpc_v)?;
+    let is_intra = matches!(mb_type, PMbType::Intra | PMbType::IntraQ);
+    let is_4mv = matches!(mb_type, PMbType::Inter4MV | PMbType::Inter4MVQ);
+    let needs_dquant = matches!(
+        mb_type,
+        PMbType::InterQ | PMbType::IntraQ | PMbType::Inter4MVQ
+    );
+
+    // 3. CBPY (intra → CBPY_INTRA model; inter → CBPY model — both raw).
+    let cbpy = if is_intra {
+        rdr.read_cbpy_intra_via()?
+    } else {
+        rdr.read_cbpy_inter()?
+    };
+
+    // 4. DQUANT.
+    if needs_dquant {
+        let d = rdr.read_dquant()?;
+        const DQUANT_DELTA: [i32; 4] = [-1, -2, 1, 2];
+        let new_q = (*quant as i32) + DQUANT_DELTA[d];
+        *quant = new_q.clamp(1, 31) as u32;
+    }
+
+    // 5. MVs.
+    if is_intra {
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), true, true));
+    } else if is_4mv {
+        // Four per-block MVs using the §F.2 Fig F.1 redefined predictor.
+        // Update the partial mvs4 entry in `mv_grid` as we go so
+        // `predict_mv_block` sees in-MB neighbours.
+        mv_grid.set(mb_x, mb_y, MbMotion::mv4([(0, 0); 4]));
+        let mut mvs = [(0i32, 0i32); 4];
+        for b in 0..4 {
+            let (pmx, pmy) = predict_mv_block(mv_grid, mb_x, mb_y, b);
+            let dx = rdr.read_mvd_component()?;
+            let dy = rdr.read_mvd_component()?;
+            let mvx = wrap_mv_component(pmx + dx);
+            let mvy = wrap_mv_component(pmy + dy);
+            mvs[b] = (mvx, mvy);
+            let mut cur = mv_grid.get(mb_x, mb_y);
+            cur.mvs4[b] = (mvx, mvy);
+            cur.mv = mvs[0];
+            mv_grid.set(mb_x, mb_y, cur);
+        }
+        mv_grid.set(mb_x, mb_y, MbMotion::mv4(mvs));
+    } else {
+        // 1-MV inter: §5.3.7.2 median predictor.
+        let (pmx, pmy) = predict_mv(mv_grid, mb_x, mb_y);
+        let dx = rdr.read_mvd_component()?;
+        let dy = rdr.read_mvd_component()?;
+        let mvx = wrap_mv_component(pmx + dx);
+        let mvy = wrap_mv_component(pmy + dy);
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((mvx, mvy), true, false));
+    }
+
+    // 6. Per-block AC.
+    let luma_coded = [
+        (cbpy >> 3) & 1 != 0,
+        (cbpy >> 2) & 1 != 0,
+        (cbpy >> 1) & 1 != 0,
+        cbpy & 1 != 0,
+    ];
+    let chroma_coded = [(cbpc >> 1) & 1 != 0, cbpc & 1 != 0];
+
+    if is_intra {
+        for block_idx in 0..6usize {
+            let coded_b = if block_idx < 4 {
+                luma_coded[block_idx]
+            } else {
+                chroma_coded[block_idx - 4]
+            };
+            decode_one_intra_block_sac_in_p(rdr, block_idx, coded_b, mb_x, mb_y, *quant, pic)?;
+        }
+        return Ok(crate::mb::PMbInfo {
+            coded: true,
+            intra: true,
+            residual: vec![0i16; 6 * 64],
+            residual_present: [false; 6],
+            intra_done: true,
+        });
+    }
+
+    // Inter — stash per-block IDCT residuals into PMbInfo for pass 2.
+    let mut info = crate::mb::PMbInfo {
+        coded: true,
+        intra: false,
+        residual: vec![0i16; 6 * 64],
+        residual_present: [false; 6],
+        intra_done: false,
+    };
+    for block_idx in 0..6usize {
+        let coded_b = if block_idx < 4 {
+            luma_coded[block_idx]
+        } else {
+            chroma_coded[block_idx - 4]
+        };
+        if !coded_b {
+            continue;
+        }
+        let mut coeffs = [0i32; 64];
+        decode_inter_ac_sac(rdr, &mut coeffs, *quant)?;
+        let mut resid_out = [0i32; 64];
+        crate::block::idct_signed(&mut coeffs, &mut resid_out);
+        let dst = info.residual_block_mut(block_idx);
+        for (i, &v) in resid_out.iter().enumerate() {
+            dst[i] = v.clamp(-4096, 4095) as i16;
+        }
+        info.residual_present[block_idx] = true;
+    }
+    Ok(info)
+}
+
+/// Decompose a `cumf_MCBPC_4MVQ` index back to `(mb_type, cbpc)`. Per
+/// Table 8 (with §E.7's 4MVQ extension) — indices 0..=3 → Inter, 4..=7 →
+/// Intra, 8..=11 → InterQ, 12..=15 → IntraQ, 16..=19 → Inter4MV, 20 →
+/// stuffing (caller filters), 21..=24 → Inter4MV+Q.
+fn decompose_mcbpc_for_4mvq(idx: usize) -> Result<(PMbType, u8)> {
+    let cbpc = (idx & 0x3) as u8;
+    let group = idx >> 2;
+    let ty = match group {
+        0 => PMbType::Inter,
+        1 => PMbType::Intra,
+        2 => PMbType::InterQ,
+        3 => PMbType::IntraQ,
+        4 => PMbType::Inter4MV,
+        5 => {
+            // Indices 20..=23: 20 is stuffing (handled by caller), 21..=23
+            // are the first three of Inter4MV+Q.
+            if idx == 20 {
+                return Err(Error::invalid(
+                    "h263 SAC+AP MCBPC: stuffing index reached decompose (caller bug)",
+                ));
+            }
+            PMbType::Inter4MVQ
+        }
+        6 => PMbType::Inter4MVQ, // index 24 → Inter4MV+Q cbpc=0 (group 6 / cbpc 0)
+        _ => {
+            return Err(Error::invalid(format!(
+                "h263 SAC+AP MCBPC: bad group {group} (idx {idx})"
+            )));
+        }
+    };
+    // The Inter4MV+Q rows occupy indices 21..=24 (cbpc 1, 2, 3, 0 in that
+    // order in §E.8 listing). Recompute cbpc to match the table.
+    let cbpc = if (21..=24).contains(&idx) {
+        // 21→cbpc 1, 22→2, 23→3, 24→0
+        ((idx - 21 + 1) & 0x3) as u8
+    } else {
+        cbpc
+    };
+    Ok((ty, cbpc))
+}
 
 #[cfg(test)]
 mod tests {

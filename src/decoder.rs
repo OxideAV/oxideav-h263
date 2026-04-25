@@ -163,7 +163,13 @@ impl H263Decoder {
                 }
                 let mut pic = if hdr.sac_mode {
                     // Round 14 — SAC P-picture body driver.
-                    crate::mb_sac::decode_p_picture_sac(&hdr, bytes, reference)?
+                    // Round 15 — when AP is also signalled, dispatch to the
+                    // 4MVQ MCBPC + 2-pass OBMC variant.
+                    if hdr.advanced_prediction {
+                        crate::mb_sac::decode_p_picture_sac_ap(&hdr, bytes, reference)?
+                    } else {
+                        crate::mb_sac::decode_p_picture_sac(&hdr, bytes, reference)?
+                    }
                 } else {
                     decode_p_picture(&mut br, &hdr, bytes, reference)?
                 };

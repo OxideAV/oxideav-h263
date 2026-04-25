@@ -84,15 +84,20 @@
 //!   want mid-picture resync points; the default (mirroring the VLC
 //!   P-encoder) is to emit a single SAC segment per picture for byte-
 //!   exact reconstruction parity. Self-roundtrip and SAC-vs-VLC
-//!   pixel-identical reconstruction tests cover both. SAC + Annex F
-//!   (Advanced Prediction / 4MV / OBMC) is rejected at the encoder —
-//!   `cumf_MCBPC_4MVQ` + per-block MVD wiring is the next-round
-//!   follow-up.
+//!   pixel-identical reconstruction tests cover both. Round 15 wires the
+//!   SAC + Annex F (Advanced Prediction / 4MV / OBMC) combination: when
+//!   both `set_enable_annex_e(true)` AND `set_enable_annex_f(true)` are
+//!   on, the P-picture sets PTYPE bits 11 (SAC) AND 12 (AP), the MB
+//!   layer routes through `cumf_MCBPC_4MVQ` (§E.8 — `Inter4MV` rows
+//!   16..=19, `Inter4MV+Q` rows 21..=24), each `Inter4MV` MB emits four
+//!   MVDs via the §F.2 Figure F.1 redefined predictor, and §F.3 OBMC
+//!   blending is applied on the local reconstruction so the decoder's
+//!   pass-2 OBMC produces the same picture. SAC↔VLC byte-identical
+//!   reconstruction parity holds for the AP path as well as the
+//!   non-AP path.
 //!
 //! Out of scope (returns `Error::Unsupported`):
 //! * PB-frames mode (§G) and every B-picture flavour.
-//! * Annex E + Annex F combination — `cumf_MCBPC_4MVQ` + per-block MVD
-//!   wiring for 4MV-mode SAC P-pictures is pending.
 //! * Annex G (PB-frames), Annex I (Advanced Intra Coding), Annex K (Slice
 //!   Structured Mode — detected with a specific diagnostic since ffmpeg's
 //!   `h263p -umv 1` bundles it with Annex D), Annex N (RPS), Annex P
