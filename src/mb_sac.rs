@@ -312,7 +312,7 @@ pub fn encode_i_picture_sac_body(
 
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            encode_intra_mb_sac(&mut sac, mb_x, mb_y, pquant, frame, recon)?;
+            encode_intra_mb_sac(&mut sac, mb_x, mb_y, pquant, frame, width, height, recon)?;
         }
     }
 
@@ -328,12 +328,15 @@ pub fn encode_i_picture_sac_body(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_intra_mb_sac(
     sac: &mut SacIPictureWriter,
     mb_x: usize,
     mb_y: usize,
     quant: u8,
     frame: &VideoFrame,
+    width: u32,
+    height: u32,
     recon: &mut IPicture,
 ) -> Result<()> {
     // 1. Pull samples for all 6 blocks, run forward DCT + intra quantiser,
@@ -344,7 +347,7 @@ fn encode_intra_mb_sac(
 
     for b in 0..6 {
         let mut samples = [0.0f32; 64];
-        sample_block_for(frame, mb_x, mb_y, b, &mut samples);
+        sample_block_for(frame, width, height, mb_x, mb_y, b, &mut samples);
         let mut dctf = samples;
         fdct8x8(&mut dctf);
         let (dc_byte, levels, any_ac) = quantise_intra_block(&dctf, quant);
@@ -407,8 +410,13 @@ fn quantise_intra_block(dctf: &[f32; 64], quant: u8) -> (u8, [i32; 64], bool) {
 
 /// Mirror of `encoder::sample_block_for`. Replicated locally so the encoder
 /// module doesn't need to expose its private helper.
+///
+/// `width` / `height` come from the encoder's stream params (the per-frame
+/// dimensions were dropped from `VideoFrame`).
 fn sample_block_for(
     frame: &VideoFrame,
+    width: u32,
+    height: u32,
     mb_x: usize,
     mb_y: usize,
     block_idx: usize,
@@ -424,24 +432,24 @@ fn sample_block_for(
                 p.stride,
                 x,
                 y,
-                frame.width as usize,
-                frame.height as usize,
+                width as usize,
+                height as usize,
             )
         }
         4 => {
             let x = mb_x * 8;
             let y = mb_y * 8;
             let p = &frame.planes[1];
-            let cw = (frame.width as usize).div_ceil(2);
-            let ch = (frame.height as usize).div_ceil(2);
+            let cw = (width as usize).div_ceil(2);
+            let ch = (height as usize).div_ceil(2);
             (p.data.as_slice(), p.stride, x, y, cw, ch)
         }
         5 => {
             let x = mb_x * 8;
             let y = mb_y * 8;
             let p = &frame.planes[2];
-            let cw = (frame.width as usize).div_ceil(2);
-            let ch = (frame.height as usize).div_ceil(2);
+            let cw = (width as usize).div_ceil(2);
+            let ch = (height as usize).div_ceil(2);
             (p.data.as_slice(), p.stride, x, y, cw, ch)
         }
         _ => unreachable!(),
@@ -659,6 +667,8 @@ pub fn encode_p_picture_sac_body(
                 mb_y,
                 pquant,
                 frame,
+                width,
+                height,
                 reference,
                 recon,
                 &mut mv_grid,
@@ -689,6 +699,8 @@ fn encode_p_mb_sac(
     mb_y: usize,
     quant: u8,
     frame: &VideoFrame,
+    width: u32,
+    height: u32,
     reference: &IPicture,
     recon: &mut IPicture,
     mv_grid: &mut MvGrid,
@@ -759,7 +771,7 @@ fn encode_p_mb_sac(
     sac.write_cod(true);
 
     if try_intra {
-        encode_p_mb_intra_sac(sac, mb_x, mb_y, quant, frame, recon)?;
+        encode_p_mb_intra_sac(sac, mb_x, mb_y, quant, frame, width, height, recon)?;
         mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), true, true));
         return Ok(());
     }
@@ -773,12 +785,15 @@ fn encode_p_mb_sac(
 
 /// Intra encode of a P-MB via SAC. Index 4 (mb_type=1, cbpc=0) base in
 /// Table 8 → `4 + cbpc` for cbpc 0..=3.
+#[allow(clippy::too_many_arguments)]
 fn encode_p_mb_intra_sac(
     sac: &mut SacPPictureWriter,
     mb_x: usize,
     mb_y: usize,
     quant: u8,
     frame: &VideoFrame,
+    width: u32,
+    height: u32,
     recon: &mut IPicture,
 ) -> Result<()> {
     let mut blocks = [[0i32; 64]; 6];
@@ -787,7 +802,7 @@ fn encode_p_mb_intra_sac(
 
     for b in 0..6 {
         let mut samples = [0.0f32; 64];
-        sample_block_for(frame, mb_x, mb_y, b, &mut samples);
+        sample_block_for(frame, width, height, mb_x, mb_y, b, &mut samples);
         let mut dctf = samples;
         fdct8x8(&mut dctf);
         let (dc_byte, levels, any_ac) = quantise_intra_block(&dctf, quant);
@@ -1765,7 +1780,7 @@ pub fn encode_p_picture_sac_ap_body(
         for mb_x in 0..mb_w {
             let d = decisions[mb_y * mb_w + mb_x];
             let info = encode_p_mb_sac_ap(
-                &mut sac, mb_x, mb_y, pquant, frame, reference, recon, &mv_grid, d,
+                &mut sac, mb_x, mb_y, pquant, frame, width, height, reference, recon, &mv_grid, d,
             )?;
             infos.push(info);
         }
@@ -1817,6 +1832,8 @@ fn encode_p_mb_sac_ap(
     mb_y: usize,
     quant: u8,
     frame: &VideoFrame,
+    width: u32,
+    height: u32,
     reference: &IPicture,
     recon: &mut IPicture,
     mv_grid: &MvGrid,
@@ -1832,7 +1849,7 @@ fn encode_p_mb_sac_ap(
         }
         MbDecision::Intra => {
             sac.write_cod(true);
-            encode_p_mb_intra_sac_ap(sac, mb_x, mb_y, quant, frame, recon)?;
+            encode_p_mb_intra_sac_ap(sac, mb_x, mb_y, quant, frame, width, height, recon)?;
             Ok(crate::mb::PMbInfo {
                 coded: true,
                 intra: true,
@@ -1895,12 +1912,15 @@ fn encode_p_mb_sac_ap(
 /// indexing under `cumf_MCBPC_4MVQ`. Per Table 7/8: Intra cells live at
 /// indices 4..=7 in both `no4MVQ` and `4MVQ` MCBPC tables, so the index
 /// arithmetic (`4 + cbpc`) is unchanged.
+#[allow(clippy::too_many_arguments)]
 fn encode_p_mb_intra_sac_ap(
     sac: &mut SacPPictureWriter,
     mb_x: usize,
     mb_y: usize,
     quant: u8,
     frame: &VideoFrame,
+    width: u32,
+    height: u32,
     recon: &mut IPicture,
 ) -> Result<()> {
     let mut blocks = [[0i32; 64]; 6];
@@ -1909,7 +1929,7 @@ fn encode_p_mb_intra_sac_ap(
 
     for b in 0..6 {
         let mut samples = [0.0f32; 64];
-        sample_block_for(frame, mb_x, mb_y, b, &mut samples);
+        sample_block_for(frame, width, height, mb_x, mb_y, b, &mut samples);
         let mut dctf = samples;
         fdct8x8(&mut dctf);
         let (dc_byte, levels, any_ac) = quantise_intra_block(&dctf, quant);

@@ -239,15 +239,6 @@ impl Encoder for H263Encoder {
             Frame::Video(v) => v,
             _ => return Err(Error::invalid("h263 encoder: video frames only")),
         };
-        if v.width != self.width || v.height != self.height {
-            return Err(Error::invalid(format!(
-                "h263 encoder: frame dims {}x{} do not match encoder {}x{}",
-                v.width, v.height, self.width, self.height
-            )));
-        }
-        if v.format != PixelFormat::Yuv420P {
-            return Err(Error::invalid("h263 encoder: only Yuv420P input frames"));
-        }
         if v.planes.len() != 3 {
             return Err(Error::invalid("h263 encoder: expected 3 planes"));
         }
@@ -448,7 +439,7 @@ pub fn encode_i_picture_with_recon(
             write_gob_header(&mut bw, gn, pquant)?;
         }
         for mb_x in 0..mb_w {
-            encode_intra_mb(&mut bw, mb_x, mb_y, pquant, frame, &mut recon)?;
+            encode_intra_mb(&mut bw, mb_x, mb_y, pquant, frame, width, height, &mut recon)?;
         }
     }
     // Trailing zero stuffing to ensure the encoder leaves a byte boundary
@@ -760,6 +751,8 @@ pub fn encode_p_picture_with_opts(
                     mb_y,
                     pquant,
                     frame,
+                    width,
+                    height,
                     reference,
                     &mut recon,
                     &mut mv_grid,
@@ -800,7 +793,8 @@ pub fn encode_p_picture_with_opts(
         for mb_x in 0..mb_w {
             let d = decisions[mb_y * mb_w + mb_x];
             let info = emit_p_mb_ap(
-                &mut bw, mb_x, mb_y, pquant, frame, reference, &mv_grid, d, &mut recon,
+                &mut bw, mb_x, mb_y, pquant, frame, width, height, reference, &mv_grid, d,
+                &mut recon,
             )?;
             infos.push(info);
         }
@@ -942,6 +936,8 @@ fn emit_p_mb_ap(
     mb_y: usize,
     quant: u8,
     frame: &VideoFrame,
+    width: u32,
+    height: u32,
     reference: &IPicture,
     mv_grid: &MvGrid,
     decision: MbDecision,
@@ -972,7 +968,7 @@ fn emit_p_mb_ap(
         }
         MbDecision::Intra => {
             bw.write_bits(0, 1); // COD = 0
-            encode_p_mb_intra(bw, mb_x, mb_y, quant, frame, recon)?;
+            encode_p_mb_intra(bw, mb_x, mb_y, quant, frame, width, height, recon)?;
             Ok(crate::mb::PMbInfo {
                 coded: true,
                 intra: true,
@@ -1189,12 +1185,15 @@ fn write_gob_header(bw: &mut BitWriter, gn: u8, gquant: u8) -> Result<()> {
 ///
 /// Also reconstructs the MB locally into `recon` so the caller can use it as
 /// the MC reference for the next P-picture.
+#[allow(clippy::too_many_arguments)]
 fn encode_intra_mb(
     bw: &mut BitWriter,
     mb_x: usize,
     mb_y: usize,
     quant: u8,
     frame: &VideoFrame,
+    width: u32,
+    height: u32,
     recon: &mut IPicture,
 ) -> Result<()> {
     // 1. Pull samples for all 6 blocks, run forward DCT + quantise, build CBP.
@@ -1204,7 +1203,7 @@ fn encode_intra_mb(
 
     for b in 0..6 {
         let mut samples = [0.0f32; 64];
-        sample_block_for(frame, mb_x, mb_y, b, &mut samples);
+        sample_block_for(frame, width, height, mb_x, mb_y, b, &mut samples);
 
         let mut dctf = samples;
         fdct8x8(&mut dctf);
@@ -1364,8 +1363,13 @@ fn block_dst(
 
 /// Pull one 8×8 block of samples from a 4:2:0 YUV frame, with edge replication
 /// for blocks that overhang the picture boundary.
+///
+/// `width` / `height` are the stream's picture dimensions (carried on the
+/// encoder's `CodecParameters`, not on the per-frame `VideoFrame`).
 fn sample_block_for(
     frame: &VideoFrame,
+    width: u32,
+    height: u32,
     mb_x: usize,
     mb_y: usize,
     block_idx: usize,
@@ -1381,24 +1385,24 @@ fn sample_block_for(
                 p.stride,
                 x,
                 y,
-                frame.width as usize,
-                frame.height as usize,
+                width as usize,
+                height as usize,
             )
         }
         4 => {
             let x = mb_x * 8;
             let y = mb_y * 8;
             let p = &frame.planes[1];
-            let cw = (frame.width as usize).div_ceil(2);
-            let ch = (frame.height as usize).div_ceil(2);
+            let cw = (width as usize).div_ceil(2);
+            let ch = (height as usize).div_ceil(2);
             (p.data.as_slice(), p.stride, x, y, cw, ch)
         }
         5 => {
             let x = mb_x * 8;
             let y = mb_y * 8;
             let p = &frame.planes[2];
-            let cw = (frame.width as usize).div_ceil(2);
-            let ch = (frame.height as usize).div_ceil(2);
+            let cw = (width as usize).div_ceil(2);
+            let ch = (height as usize).div_ceil(2);
             (p.data.as_slice(), p.stride, x, y, cw, ch)
         }
         _ => unreachable!(),
@@ -2116,6 +2120,8 @@ fn encode_p_mb(
     mb_y: usize,
     quant: u8,
     frame: &VideoFrame,
+    width: u32,
+    height: u32,
     reference: &IPicture,
     recon: &mut IPicture,
     mv_grid: &mut MvGrid,
@@ -2202,7 +2208,7 @@ fn encode_p_mb(
     bw.write_bits(0, 1);
 
     if try_intra {
-        encode_p_mb_intra(bw, mb_x, mb_y, quant, frame, recon)?;
+        encode_p_mb_intra(bw, mb_x, mb_y, quant, frame, width, height, recon)?;
         mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), true, true));
         return Ok(crate::mb::PMbInfo {
             coded: true,
@@ -2231,12 +2237,15 @@ fn encode_p_mb(
 /// Intra encode of a P-MB block. Same bitstream as an I-MB's Intra MCBPC,
 /// but prefixed with COD=0 by the caller AND using the inter MCBPC table
 /// (PMbKind::Intra).
+#[allow(clippy::too_many_arguments)]
 fn encode_p_mb_intra(
     bw: &mut BitWriter,
     mb_x: usize,
     mb_y: usize,
     quant: u8,
     frame: &VideoFrame,
+    width: u32,
+    height: u32,
     recon: &mut IPicture,
 ) -> Result<()> {
     let mut blocks = [[0i32; 64]; 6];
@@ -2245,7 +2254,7 @@ fn encode_p_mb_intra(
 
     for b in 0..6 {
         let mut samples = [0.0f32; 64];
-        sample_block_for(frame, mb_x, mb_y, b, &mut samples);
+        sample_block_for(frame, width, height, mb_x, mb_y, b, &mut samples);
         let mut dctf = samples;
         fdct8x8(&mut dctf);
         let (dc_byte, levels, any_ac) = quantise_intra_block(&dctf, quant);
@@ -2911,11 +2920,7 @@ mod tests {
         let cw = w.div_ceil(2) as usize;
         let ch = h.div_ceil(2) as usize;
         VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: w,
-            height: h,
             pts: Some(0),
-            time_base: TimeBase::new(1, 30),
             planes: vec![
                 VideoPlane {
                     stride: w as usize,
@@ -2953,18 +2958,22 @@ mod tests {
             CoreFrame::Video(v) => v,
             _ => panic!("not video"),
         };
-        // Check: most pels should be ≈100 in luma.
+        // Check: most pels should be ≈100 in luma. The decoder produces a
+        // 176×144 YUV420 picture; its dimensions live on the stream params
+        // (we pass them explicitly here since this is an internal test).
         let yp = &v.planes[0];
+        let width = 176usize;
+        let height = 144usize;
         let mut hits = 0usize;
-        for y in 0..v.height as usize {
-            for x in 0..v.width as usize {
+        for y in 0..height {
+            for x in 0..width {
                 let p = yp.data[y * yp.stride + x] as i32;
                 if (p - 100).abs() <= 2 {
                     hits += 1;
                 }
             }
         }
-        let total = (v.width * v.height) as usize;
+        let total = width * height;
         assert!(hits * 100 / total >= 99, "constant Y match {hits}/{total}");
     }
 }

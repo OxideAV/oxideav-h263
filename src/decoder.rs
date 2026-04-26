@@ -15,8 +15,7 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Rational, Result, TimeBase,
-    VideoFrame,
+    CodecId, CodecParameters, Error, Frame, Packet, Rational, Result, TimeBase, VideoFrame,
 };
 
 use crate::gob::parse_gob_header;
@@ -395,7 +394,11 @@ fn try_consume_gob_header(
 }
 
 /// Build a stride-packed YUV420P `VideoFrame` from an `IPicture`.
-pub fn pic_to_video_frame(pic: &IPicture, pts: Option<i64>, tb: TimeBase) -> VideoFrame {
+///
+/// Stream-level properties (pixel format, width, height, time base) live on
+/// the stream's `CodecParameters`; the frame only carries pts + planes. The
+/// `_tb` argument is retained for source-compat but ignored.
+pub fn pic_to_video_frame(pic: &IPicture, pts: Option<i64>, _tb: TimeBase) -> VideoFrame {
     let w = pic.width;
     let h = pic.height;
     let cw = w.div_ceil(2);
@@ -413,11 +416,7 @@ pub fn pic_to_video_frame(pic: &IPicture, pts: Option<i64>, tb: TimeBase) -> Vid
             .copy_from_slice(&pic.cr[row * pic.c_stride..row * pic.c_stride + cw]);
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w as u32,
-        height: h as u32,
         pts,
-        time_base: tb,
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
