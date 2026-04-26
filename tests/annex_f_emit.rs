@@ -68,11 +68,7 @@ fn testsrc_qcif(pts: i64) -> VideoFrame {
     let cb = vec![128u8; cw * ch];
     let cr = vec![128u8; cw * ch];
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: W,
-        height: H,
         pts: Some(pts),
-        time_base: TimeBase::new(1, 15),
         planes: vec![
             VideoPlane {
                 stride: W as usize,
@@ -91,9 +87,14 @@ fn testsrc_qcif(pts: i64) -> VideoFrame {
 }
 
 fn psnr(src: &VideoFrame, dec: &VideoFrame) -> f64 {
-    assert_eq!(src.width, dec.width);
-    assert_eq!(src.height, dec.height);
-    let (w, h) = (src.width as usize, src.height as usize);
+    // Width/height now live on the stream's CodecParameters; both sides of
+    // the comparison are built against the same (W, H) constants in this
+    // test, so derive plane geometry from the luma plane on `src`.
+    let luma = &src.planes[0];
+    let w = luma.stride;
+    let h = luma.data.len() / luma.stride;
+    assert_eq!(dec.planes[0].stride, w);
+    assert_eq!(dec.planes[0].data.len() / dec.planes[0].stride, h);
     let mut mse = 0f64;
     let mut n = 0u64;
     for (plane, (pa, pb)) in src.planes.iter().zip(dec.planes.iter()).enumerate() {
@@ -255,11 +256,7 @@ fn annex_f_stream_decodes_with_ffmpeg() {
         let cb = ref_bytes[base + y_size..base + y_size + c_size].to_vec();
         let cr = ref_bytes[base + y_size + c_size..base + per_frame].to_vec();
         let ffm = VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: W,
-            height: H,
             pts: Some(i as i64),
-            time_base: TimeBase::new(1, 15),
             planes: vec![
                 VideoPlane {
                     stride: W as usize,
@@ -368,11 +365,7 @@ fn baseline_p_ours_vs_ffmpeg_agree() {
         let cb = ref_bytes[base + y_size..base + y_size + c_size].to_vec();
         let cr = ref_bytes[base + y_size + c_size..base + per_frame].to_vec();
         let ffm = VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: W,
-            height: H,
             pts: Some(i as i64),
-            time_base: TimeBase::new(1, 15),
             planes: vec![
                 VideoPlane {
                     stride: W as usize,
@@ -468,11 +461,7 @@ fn annex_f_ours_vs_ffmpeg_agree() {
         let cb = ref_bytes[base + y_size..base + y_size + c_size].to_vec();
         let cr = ref_bytes[base + y_size + c_size..base + per_frame].to_vec();
         let ffm = VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: W,
-            height: H,
             pts: Some(i as i64),
-            time_base: TimeBase::new(1, 15),
             planes: vec![
                 VideoPlane {
                     stride: W as usize,
@@ -551,11 +540,7 @@ fn annex_f_emits_inter4mv_mbs() {
         let cb = vec![128u8; cw * ch];
         let cr = vec![128u8; cw * ch];
         VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: W,
-            height: H,
             pts: Some(pts),
-            time_base: TimeBase::new(1, 15),
             planes: vec![
                 VideoPlane {
                     stride: W as usize,

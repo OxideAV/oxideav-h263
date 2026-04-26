@@ -51,11 +51,7 @@ fn moving_square_frame(sx: i32, sy: i32, pts: i64) -> VideoFrame {
     let cb = vec![128u8; cw * ch];
     let cr = vec![128u8; cw * ch];
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: W,
-        height: H,
         pts: Some(pts),
-        time_base: TimeBase::new(1, 10),
         planes: vec![
             VideoPlane {
                 stride: W as usize,
@@ -74,9 +70,13 @@ fn moving_square_frame(sx: i32, sy: i32, pts: i64) -> VideoFrame {
 }
 
 fn psnr(src: &VideoFrame, dec: &VideoFrame) -> f64 {
-    assert_eq!(src.width, dec.width);
-    assert_eq!(src.height, dec.height);
-    let (w, h) = (src.width as usize, src.height as usize);
+    // Geometry now lives on the stream's CodecParameters; both frames in
+    // these tests are built against the same dims, so derive from luma.
+    let sl = &src.planes[0];
+    let w = sl.stride;
+    let h = sl.data.len() / sl.stride;
+    assert_eq!(dec.planes[0].stride, w);
+    assert_eq!(dec.planes[0].data.len() / dec.planes[0].stride, h);
     let mut mse = 0f64;
     let mut n = 0u64;
     let sp = &src.planes[0];
@@ -280,11 +280,7 @@ fn encode_decode_panning_gradient_round_trip() {
         let cb = vec![128u8; cw * ch];
         let cr = vec![128u8; cw * ch];
         VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: W,
-            height: H,
             pts: Some(pts),
-            time_base: TimeBase::new(1, 10),
             planes: vec![
                 VideoPlane {
                     stride: W as usize,
@@ -486,11 +482,7 @@ fn diamond_search_tracks_large_motion() {
         let cb = vec![128u8; cw * ch];
         let cr = vec![128u8; cw * ch];
         VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: W,
-            height: H,
             pts: Some(pts),
-            time_base: TimeBase::new(1, 10),
             planes: vec![
                 VideoPlane {
                     stride: W as usize,

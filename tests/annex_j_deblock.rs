@@ -11,7 +11,7 @@
 //! sides through the public `set_enable_annex_j(true)` setter.
 
 use oxideav_core::{
-    frame::VideoPlane, CodecId, CodecParameters, Frame, MediaType, PixelFormat, Rational, TimeBase,
+    frame::VideoPlane, CodecId, CodecParameters, Frame, MediaType, PixelFormat, Rational,
     VideoFrame,
 };
 use oxideav_core::{Decoder, Encoder};
@@ -41,11 +41,7 @@ fn make_test_frame(w: u32, h: u32, seed: u8) -> VideoFrame {
     let cb = vec![cb_val; cw * ch];
     let cr = vec![128u8; cw * ch];
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w,
-        height: h,
         pts: Some(seed as i64),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w as usize,
@@ -124,11 +120,13 @@ fn encode_decode_p_with_annex_j_stays_in_sync() {
         _ => panic!("not video P"),
     };
 
-    // Two outputs decoded; dimensions sane.
-    assert_eq!(dec_f0.width, w);
-    assert_eq!(dec_f0.height, h);
-    assert_eq!(dec_f1.width, w);
-    assert_eq!(dec_f1.height, h);
+    // Two outputs decoded; dimensions sane (derive from luma plane geometry).
+    let f0_luma = &dec_f0.planes[0];
+    let f1_luma = &dec_f1.planes[0];
+    assert_eq!(f0_luma.stride as u32, w);
+    assert_eq!((f0_luma.data.len() / f0_luma.stride) as u32, h);
+    assert_eq!(f1_luma.stride as u32, w);
+    assert_eq!((f1_luma.data.len() / f1_luma.stride) as u32, h);
 
     // Sanity: the P-frame decoded output is not all-zero (a drifting
     // reference would often produce obviously wrong values because the P
@@ -198,6 +196,7 @@ fn baseline_stream_decodes_without_annex_j() {
         Frame::Video(v) => v,
         _ => panic!(),
     };
-    assert_eq!(out.width, w);
-    assert_eq!(out.height, h);
+    let luma = &out.planes[0];
+    assert_eq!(luma.stride as u32, w);
+    assert_eq!((luma.data.len() / luma.stride) as u32, h);
 }

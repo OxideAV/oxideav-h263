@@ -148,9 +148,13 @@ fn build_params(w: u32, h: u32) -> oxideav_core::CodecParameters {
 }
 
 fn psnr(a: &VideoFrame, b: &VideoFrame) -> f64 {
-    assert_eq!(a.width, b.width);
-    assert_eq!(a.height, b.height);
-    let (w, h) = (a.width as usize, a.height as usize);
+    // Geometry now lives on the stream's CodecParameters; both frames in
+    // these tests are built against the same dims, so derive from luma.
+    let luma = &a.planes[0];
+    let w = luma.stride;
+    let h = luma.data.len() / luma.stride;
+    assert_eq!(b.planes[0].stride, w);
+    assert_eq!(b.planes[0].data.len() / b.planes[0].stride, h);
     let mut mse = 0f64;
     let mut n = 0u64;
     for (plane, (pa, pb)) in a.planes.iter().zip(b.planes.iter()).enumerate() {
@@ -181,7 +185,6 @@ fn psnr(a: &VideoFrame, b: &VideoFrame) -> f64 {
 /// reference.
 fn read_yuv420p_frame(bytes: &[u8], w: u32, h: u32, frame_idx: usize) -> VideoFrame {
     use oxideav_core::frame::VideoPlane;
-    use oxideav_core::PixelFormat;
     let y_size = (w * h) as usize;
     let cw = w.div_ceil(2) as usize;
     let ch = h.div_ceil(2) as usize;
@@ -192,11 +195,7 @@ fn read_yuv420p_frame(bytes: &[u8], w: u32, h: u32, frame_idx: usize) -> VideoFr
     let cb = bytes[base + y_size..base + y_size + c_size].to_vec();
     let cr = bytes[base + y_size + c_size..base + frame_size].to_vec();
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w,
-        height: h,
         pts: Some(frame_idx as i64),
-        time_base: TimeBase::new(1, 15),
         planes: vec![
             VideoPlane {
                 stride: w as usize,
@@ -337,7 +336,8 @@ fn ffmpeg_mv4_h263_stream_decodes_within_psnr() {
     );
     eprintln!("decoded {} frames with Annex F", frames.len());
 
-    let (w, h) = (frames[0].width, frames[0].height);
+    let luma0 = &frames[0].planes[0];
+    let (w, h) = (luma0.stride as u32, (luma0.data.len() / luma0.stride) as u32);
     let mut worst = f64::INFINITY;
     for (i, f) in frames.iter().enumerate() {
         let rf = read_yuv420p_frame(&ref_bytes, w, h, i);
@@ -447,7 +447,8 @@ fn ffmpeg_mv4_h263_stream_decodes_1s_clip_within_psnr() {
     }
     assert!(!frames.is_empty());
     eprintln!("1s clip: decoded {} Annex F frames", frames.len());
-    let (w, h) = (frames[0].width, frames[0].height);
+    let luma0 = &frames[0].planes[0];
+    let (w, h) = (luma0.stride as u32, (luma0.data.len() / luma0.stride) as u32);
     let mut worst = f64::INFINITY;
     for (i, f) in frames.iter().enumerate() {
         let rf = read_yuv420p_frame(&ref_bytes, w, h, i);

@@ -83,7 +83,8 @@ fn obmc_drift_per_frame_histogram() {
         }
     }
 
-    let (w, h) = (frames[0].width as usize, frames[0].height as usize);
+    let luma0 = &frames[0].planes[0];
+    let (w, h) = (luma0.stride, luma0.data.len() / luma0.stride);
     let y_size = w * h;
     let cw = w.div_ceil(2);
     let ch = h.div_ceil(2);

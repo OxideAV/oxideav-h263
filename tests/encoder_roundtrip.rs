@@ -44,11 +44,7 @@ fn yuv_to_frame(bytes: &[u8], w: u32, h: u32) -> VideoFrame {
     let cb = bytes[y_len..y_len + c_len].to_vec();
     let cr = bytes[y_len + c_len..y_len + 2 * c_len].to_vec();
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w,
-        height: h,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w as usize,
@@ -67,14 +63,14 @@ fn yuv_to_frame(bytes: &[u8], w: u32, h: u32) -> VideoFrame {
 }
 
 fn frame_to_packed_yuv(v: &VideoFrame) -> Vec<u8> {
-    let cw = v.width.div_ceil(2) as usize;
-    let ch = v.height.div_ceil(2) as usize;
-    let mut out = Vec::with_capacity((v.width * v.height) as usize + 2 * cw * ch);
-    for row in 0..v.height as usize {
-        out.extend_from_slice(
-            &v.planes[0].data
-                [row * v.planes[0].stride..row * v.planes[0].stride + v.width as usize],
-        );
+    // Decoder produces stride == width on luma; chroma stride == cw.
+    let lw = v.planes[0].stride;
+    let lh = v.planes[0].data.len() / v.planes[0].stride;
+    let cw = v.planes[1].stride;
+    let ch = v.planes[1].data.len() / v.planes[1].stride;
+    let mut out = Vec::with_capacity(lw * lh + 2 * cw * ch);
+    for row in 0..lh {
+        out.extend_from_slice(&v.planes[0].data[row * v.planes[0].stride..row * v.planes[0].stride + lw]);
     }
     for row in 0..ch {
         out.extend_from_slice(
@@ -137,11 +133,7 @@ fn smooth_ramp_frame(w: u32, h: u32) -> (Vec<u8>, VideoFrame) {
     packed.extend_from_slice(&cb);
     packed.extend_from_slice(&cr);
     let f = VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w,
-        height: h,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w as usize,

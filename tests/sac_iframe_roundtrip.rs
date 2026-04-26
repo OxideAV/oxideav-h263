@@ -15,7 +15,7 @@
 
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{
-    CodecId, CodecParameters, Decoder, Encoder, Frame, MediaType, PixelFormat, TimeBase, VideoFrame,
+    CodecId, CodecParameters, Decoder, Encoder, Frame, MediaType, PixelFormat, VideoFrame,
 };
 use oxideav_h263::decoder::H263Decoder;
 use oxideav_h263::encoder::H263Encoder;
@@ -47,11 +47,7 @@ fn make_qcif_synthetic(seed: u8) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w as u32,
-        height: h as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
@@ -111,20 +107,26 @@ fn sac_i_picture_self_roundtrip_qcif() {
         _ => panic!("expected video frame"),
     };
 
-    assert_eq!(v.width, 176);
-    assert_eq!(v.height, 144);
-    assert_eq!(v.format, PixelFormat::Yuv420P);
+    let yp = &v.planes[0];
+    let w = yp.stride;
+    let h = yp.data.len() / yp.stride;
+    assert_eq!(w, 176);
+    assert_eq!(h, 144);
+    // Pixel format (Yuv420P) is implied by the 3-plane layout the decoder
+    // writes; sanity check the chroma planes exist at half resolution.
+    assert_eq!(v.planes.len(), 3);
+    assert_eq!(v.planes[1].stride, w / 2);
+    assert_eq!(v.planes[2].stride, w / 2);
 
     // Compare luma — H.263 quantisation will smooth the gradient + HF, but
     // the average error against the source should be modest. We compute
     // PSNR and assert it's above the floor where SAC and VLC paths produce
     // the same bytes (both run the same DCT/quant/IDCT pipeline; only the
     // entropy coder differs).
-    let yp = &v.planes[0];
     let mut sse: u64 = 0;
-    let n = (v.width * v.height) as u64;
-    for j in 0..v.height as usize {
-        for i in 0..v.width as usize {
+    let n = (w * h) as u64;
+    for j in 0..h {
+        for i in 0..w {
             let s = frame.planes[0].data[j * frame.planes[0].stride + i] as i64;
             let d = yp.data[j * yp.stride + i] as i64;
             let e = s - d;
@@ -149,11 +151,7 @@ fn sac_i_picture_constant_frame_roundtrip() {
     let w = 176usize;
     let h = 144usize;
     let frame = VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w as u32,
-        height: h as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w,
@@ -189,16 +187,18 @@ fn sac_i_picture_constant_frame_roundtrip() {
         _ => panic!("video"),
     };
     let yp = &v.planes[0];
+    let w = yp.stride;
+    let h = yp.data.len() / yp.stride;
     let mut hits = 0usize;
-    for j in 0..v.height as usize {
-        for i in 0..v.width as usize {
+    for j in 0..h {
+        for i in 0..w {
             let p = yp.data[j * yp.stride + i] as i32;
             if (p - 100).abs() <= 2 {
                 hits += 1;
             }
         }
     }
-    let total = (v.width * v.height) as usize;
+    let total = w * h;
     let ratio = hits * 100 / total;
     assert!(
         ratio >= 99,

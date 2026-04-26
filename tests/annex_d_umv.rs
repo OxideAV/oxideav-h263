@@ -212,15 +212,18 @@ fn synthetic_umv_i_picture_decodes() {
     let Frame::Video(vf) = frame else {
         panic!("expected video frame");
     };
-    assert_eq!(vf.width, 128);
-    assert_eq!(vf.height, 96);
-    // Luma plane should be close to 128 (the target DC level) across the
-    // whole picture — ringing at block edges is OK.
+    // Width/height live on the stream's CodecParameters now; derive geometry
+    // from the luma plane (stride == width for the decoder's stride-packed
+    // output, height == data.len() / stride).
     let luma = &vf.planes[0];
+    let width = luma.stride;
+    let height = luma.data.len() / luma.stride;
+    assert_eq!(width, 128);
+    assert_eq!(height, 96);
     let mut total = 0u64;
     let mut ok = 0u64;
-    for j in 0..vf.height as usize {
-        for i in 0..vf.width as usize {
+    for j in 0..height {
+        for i in 0..width {
             let y = luma.data[j * luma.stride + i];
             total += 1;
             // INTRADC=0x40 (64) after ×8 dequant → DC coefficient 512, which
@@ -335,8 +338,9 @@ fn synthetic_plusptype_umv_i_picture_decodes() {
     let Frame::Video(vf) = frame else {
         panic!("expected video frame");
     };
-    assert_eq!(vf.width, 176);
-    assert_eq!(vf.height, 144);
+    let luma = &vf.planes[0];
+    assert_eq!(luma.stride, 176);
+    assert_eq!(luma.data.len() / luma.stride, 144);
 }
 
 /// Build a PLUSPTYPE+UMV P-picture for the QCIF I-picture above. Every MB
@@ -408,8 +412,9 @@ fn synthetic_plusptype_umv_p_picture_all_skipped_decodes() {
     let Frame::Video(pvf) = p else {
         panic!("expected video frame");
     };
-    assert_eq!(pvf.width, 176);
-    assert_eq!(pvf.height, 144);
+    let luma = &pvf.planes[0];
+    assert_eq!(luma.stride, 176);
+    assert_eq!(luma.data.len() / luma.stride, 144);
 }
 
 /// Build a PLUSPTYPE+UMV P-picture whose first MB is `Inter` with an

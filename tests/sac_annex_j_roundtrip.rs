@@ -64,11 +64,7 @@ fn make_qcif_blocky(seed: u8, dx: i32, dy: i32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w as u32,
-        height: h as u32,
         pts: Some(seed as i64),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
@@ -135,13 +131,15 @@ fn sac_annex_j_picture_self_roundtrip_qcif() {
             Frame::Video(v) => v,
             _ => panic!("video"),
         };
-        assert_eq!(v.width, 176);
-        assert_eq!(v.height, 144);
         let yp = &v.planes[0];
+        let w = yp.stride;
+        let h = yp.data.len() / yp.stride;
+        assert_eq!(w, 176);
+        assert_eq!(h, 144);
         let mut sse: u64 = 0;
-        let n = (v.width * v.height) as u64;
-        for j in 0..v.height as usize {
-            for ii in 0..v.width as usize {
+        let n = (w * h) as u64;
+        for j in 0..h {
+            for ii in 0..w {
                 let s = frames[i].planes[0].data[j * frames[i].planes[0].stride + ii] as i64;
                 let d = yp.data[j * yp.stride + ii] as i64;
                 let e = s - d;
@@ -320,13 +318,15 @@ fn sac_ap_picture_with_gob_resync_cif() {
             Frame::Video(v) => v,
             _ => panic!("video"),
         };
-        assert_eq!(v.width, 352);
-        assert_eq!(v.height, 288);
         let yp = &v.planes[0];
+        let w = yp.stride;
+        let h = yp.data.len() / yp.stride;
+        assert_eq!(w, 352);
+        assert_eq!(h, 288);
         let mut sse: u64 = 0;
-        let n = (v.width * v.height) as u64;
-        for j in 0..v.height as usize {
-            for ii in 0..v.width as usize {
+        let n = (w * h) as u64;
+        for j in 0..h {
+            for ii in 0..w {
                 let s = frames[fi].planes[0].data[j * frames[fi].planes[0].stride + ii] as i64;
                 let d = yp.data[j * yp.stride + ii] as i64;
                 let e = s - d;
@@ -366,11 +366,7 @@ fn make_cif_blocky(seed: u8, dx: i32, dy: i32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w as u32,
-        height: h as u32,
         pts: Some(seed as i64),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {

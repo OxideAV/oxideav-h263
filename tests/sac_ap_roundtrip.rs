@@ -56,11 +56,7 @@ fn make_qcif_panning(seed: u8, dx: i32, dy: i32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w as u32,
-        height: h as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
@@ -147,13 +143,17 @@ fn sac_ap_picture_self_roundtrip_qcif() {
             Frame::Video(v) => v,
             _ => panic!("video"),
         };
-        assert_eq!(v.width, 176);
-        assert_eq!(v.height, 144);
         let yp = &v.planes[0];
+        // Width/height now live on the stream's CodecParameters; derive them
+        // from the luma plane (decoder writes stride == width).
+        let w = yp.stride;
+        let h = yp.data.len() / yp.stride;
+        assert_eq!(w, 176);
+        assert_eq!(h, 144);
         let mut sse: u64 = 0;
-        let n = (v.width * v.height) as u64;
-        for j in 0..v.height as usize {
-            for ii in 0..v.width as usize {
+        let n = (w * h) as u64;
+        for j in 0..h {
+            for ii in 0..w {
                 let s = frames[i].planes[0].data[j * frames[i].planes[0].stride + ii] as i64;
                 let d = yp.data[j * yp.stride + ii] as i64;
                 let e = s - d;

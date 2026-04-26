@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{
-    CodecId, CodecParameters, Encoder, Frame, MediaType, PixelFormat, TimeBase, VideoFrame,
+    CodecId, CodecParameters, Encoder, Frame, MediaType, PixelFormat, VideoFrame,
 };
 use oxideav_h263::encoder::H263Encoder;
 
@@ -22,11 +22,7 @@ fn make_qcif_constant() -> VideoFrame {
     let w = 176usize;
     let h = 144usize;
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w as u32,
-        height: h as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w,

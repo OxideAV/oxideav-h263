@@ -81,8 +81,9 @@ fn decode_3gp_h263_iframe_via_decoder() {
     let Frame::Video(vf) = frame else {
         panic!("expected video");
     };
-    assert_eq!(vf.width, 128);
-    assert_eq!(vf.height, 96);
+    let luma = &vf.planes[0];
+    assert_eq!(luma.stride, 128);
+    assert_eq!(luma.data.len() / luma.stride, 96);
     assert_eq!(vf.planes.len(), 3);
     // Sanity check — the first pixel of the testsrc is a non-black colour.
     let any_nonzero = vf.planes[0].data.iter().any(|&p| p != 0);

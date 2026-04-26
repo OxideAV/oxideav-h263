@@ -59,13 +59,14 @@ fn decode_and_compare(es_path: &str, yuv_path: &str, w: u32, h: u32) {
     let Frame::Video(vf) = frame else {
         panic!("expected video frame");
     };
-    assert_eq!(vf.width, w);
-    assert_eq!(vf.height, h);
+    let luma = &vf.planes[0];
+    assert_eq!(luma.stride as u32, w);
+    assert_eq!((luma.data.len() / luma.stride) as u32, h);
 
     // Compare per-plane against the 4:2:0 reference. ffmpeg's reference is
     // packed Y, then Cb, then Cr.
-    let w = vf.width as usize;
-    let h = vf.height as usize;
+    let w = luma.stride;
+    let h = luma.data.len() / luma.stride;
     let cw = w / 2;
     let ch = h / 2;
     let y_ref = &ref_yuv[..w * h];

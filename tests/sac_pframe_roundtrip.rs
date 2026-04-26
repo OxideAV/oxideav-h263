@@ -46,11 +46,7 @@ fn make_qcif_synthetic(seed: u8, dx: i32, dy: i32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w as u32,
-        height: h as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
@@ -89,11 +85,7 @@ fn make_cif_synthetic(seed: u8, dx: i32, dy: i32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w as u32,
-        height: h as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
@@ -171,13 +163,15 @@ fn sac_p_picture_self_roundtrip_qcif() {
             Frame::Video(v) => v,
             _ => panic!("video"),
         };
-        assert_eq!(v.width, 176);
-        assert_eq!(v.height, 144);
         let yp = &v.planes[0];
+        let w = yp.stride;
+        let h = yp.data.len() / yp.stride;
+        assert_eq!(w, 176);
+        assert_eq!(h, 144);
         let mut sse: u64 = 0;
-        let n = (v.width * v.height) as u64;
-        for j in 0..v.height as usize {
-            for ii in 0..v.width as usize {
+        let n = (w * h) as u64;
+        for j in 0..h {
+            for ii in 0..w {
                 let s = frames[i].planes[0].data[j * frames[i].planes[0].stride + ii] as i64;
                 let d = yp.data[j * yp.stride + ii] as i64;
                 let e = s - d;
@@ -322,13 +316,15 @@ fn sac_p_picture_gob_resync_cif() {
             Frame::Video(v) => v,
             _ => panic!("video"),
         };
-        assert_eq!(v.width, 352);
-        assert_eq!(v.height, 288);
         let yp = &v.planes[0];
+        let w = yp.stride;
+        let h = yp.data.len() / yp.stride;
+        assert_eq!(w, 352);
+        assert_eq!(h, 288);
         let mut sse: u64 = 0;
-        let n = (v.width * v.height) as u64;
-        for j in 0..v.height as usize {
-            for ii in 0..v.width as usize {
+        let n = (w * h) as u64;
+        for j in 0..h {
+            for ii in 0..w {
                 let s = frames[i].planes[0].data[j * frames[i].planes[0].stride + ii] as i64;
                 let d = yp.data[j * yp.stride + ii] as i64;
                 let e = s - d;
@@ -352,11 +348,7 @@ fn sac_p_picture_constant_frame_uses_skip_path() {
     let w = 176usize;
     let h = 144usize;
     let frame = VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w as u32,
-        height: h as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w,
@@ -409,15 +401,17 @@ fn sac_p_picture_constant_frame_uses_skip_path() {
             _ => panic!("video"),
         };
         let yp = &v.planes[0];
+        let w = yp.stride;
+        let h = yp.data.len() / yp.stride;
         let mut hits = 0usize;
-        for j in 0..v.height as usize {
-            for ii in 0..v.width as usize {
+        for j in 0..h {
+            for ii in 0..w {
                 if (yp.data[j * yp.stride + ii] as i32 - 100).abs() <= 2 {
                     hits += 1;
                 }
             }
         }
-        let total = (v.width * v.height) as usize;
+        let total = w * h;
         assert!(
             hits * 100 / total >= 99,
             "constant-frame SAC roundtrip too many off pels: {hits}/{total}"
