@@ -13,9 +13,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use oxideav_core::frame::VideoPlane;
-use oxideav_core::{
-    CodecId, CodecParameters, Encoder, Frame, MediaType, PixelFormat, VideoFrame,
-};
+use oxideav_core::{CodecId, CodecParameters, Encoder, Frame, MediaType, PixelFormat, VideoFrame};
 use oxideav_h263::encoder::H263Encoder;
 
 fn make_qcif_constant() -> VideoFrame {

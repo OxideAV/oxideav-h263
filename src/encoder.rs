@@ -439,7 +439,9 @@ pub fn encode_i_picture_with_recon(
             write_gob_header(&mut bw, gn, pquant)?;
         }
         for mb_x in 0..mb_w {
-            encode_intra_mb(&mut bw, mb_x, mb_y, pquant, frame, width, height, &mut recon)?;
+            encode_intra_mb(
+                &mut bw, mb_x, mb_y, pquant, frame, width, height, &mut recon,
+            )?;
         }
     }
     // Trailing zero stuffing to ensure the encoder leaves a byte boundary

@@ -70,7 +70,9 @@ fn frame_to_packed_yuv(v: &VideoFrame) -> Vec<u8> {
     let ch = v.planes[1].data.len() / v.planes[1].stride;
     let mut out = Vec::with_capacity(lw * lh + 2 * cw * ch);
     for row in 0..lh {
-        out.extend_from_slice(&v.planes[0].data[row * v.planes[0].stride..row * v.planes[0].stride + lw]);
+        out.extend_from_slice(
+            &v.planes[0].data[row * v.planes[0].stride..row * v.planes[0].stride + lw],
+        );
     }
     for row in 0..ch {
         out.extend_from_slice(

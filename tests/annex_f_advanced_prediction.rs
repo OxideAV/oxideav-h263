@@ -337,7 +337,10 @@ fn ffmpeg_mv4_h263_stream_decodes_within_psnr() {
     eprintln!("decoded {} frames with Annex F", frames.len());
 
     let luma0 = &frames[0].planes[0];
-    let (w, h) = (luma0.stride as u32, (luma0.data.len() / luma0.stride) as u32);
+    let (w, h) = (
+        luma0.stride as u32,
+        (luma0.data.len() / luma0.stride) as u32,
+    );
     let mut worst = f64::INFINITY;
     for (i, f) in frames.iter().enumerate() {
         let rf = read_yuv420p_frame(&ref_bytes, w, h, i);
@@ -448,7 +451,10 @@ fn ffmpeg_mv4_h263_stream_decodes_1s_clip_within_psnr() {
     assert!(!frames.is_empty());
     eprintln!("1s clip: decoded {} Annex F frames", frames.len());
     let luma0 = &frames[0].planes[0];
-    let (w, h) = (luma0.stride as u32, (luma0.data.len() / luma0.stride) as u32);
+    let (w, h) = (
+        luma0.stride as u32,
+        (luma0.data.len() / luma0.stride) as u32,
+    );
     let mut worst = f64::INFINITY;
     for (i, f) in frames.iter().enumerate() {
         let rf = read_yuv420p_frame(&ref_bytes, w, h, i);
