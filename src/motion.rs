@@ -412,6 +412,95 @@ pub fn encode_mv_component(bw: &mut BitWriter, mv_half: i32, predictor_half: i32
     }
 }
 
+/// Encode one MV component under Annex D (Unrestricted Motion Vectors,
+/// baseline-PTYPE form). Selects the magnitude+sign whose decode through
+/// [`reconstruct_umv_component`] yields `mv_half`.
+///
+/// The reconstructed component lives in `[-63, +63]` halfpel units. The
+/// VLC magnitude itself is still bounded to 32 (Table 14), so the §D.2
+/// "{d, d+64, d-64}" cascade is what extends the reach; this function picks
+/// the candidate `(mag, sign)` whose decode matches `mv_half` and whose VLC
+/// codeword is shortest. When two candidates produce the same codeword
+/// length, the non-wrapped form (the one closest to `mv_half - predictor`)
+/// wins to mirror the encoder's `encode_mv_component` tie-break.
+///
+/// Caller is responsible for ensuring `mv_half ∈ [-63, +63]` and
+/// `predictor_half ∈ [-63, +63]` halfpel.
+pub fn encode_mv_component_umv(bw: &mut BitWriter, mv_half: i32, predictor_half: i32) {
+    debug_assert!((MV_RANGE_UMV_MIN_HALF..=MV_RANGE_UMV_MAX_HALF).contains(&mv_half));
+    debug_assert!((MV_RANGE_UMV_MIN_HALF..=MV_RANGE_UMV_MAX_HALF).contains(&predictor_half));
+    // Fast-path: when the predictor lies in the baseline range `[-31, +32]`
+    // halfpel, §D.2 explicitly says "only the first column" applies — i.e.
+    // the decoder uses the raw differential (no wrap, no sign cascade). In
+    // that regime the UMV encoder must match the baseline encoder byte-for-
+    // byte so streams without UMV-grade MVs round-trip identically.
+    if (-31..=32).contains(&predictor_half) {
+        let raw_diff = mv_half - predictor_half;
+        // Try the raw differential first (no wrap). If `|raw_diff| <= 32` it
+        // is a valid Table-14 magnitude and we emit it directly.
+        if (-32..=32).contains(&raw_diff) {
+            let mag = raw_diff.unsigned_abs() as usize;
+            let (bits, code) = MV_ENC_VLC[mag];
+            bw.write_bits(code, bits as u32);
+            if mag > 0 {
+                let sign_bit: u32 = if raw_diff < 0 { 1 } else { 0 };
+                bw.write_bits(sign_bit, 1);
+            }
+            return;
+        }
+        // Out-of-baseline mv with predictor in baseline range: §D.2 says the
+        // raw differential rule applies, so the magnitude *is* `|raw_diff|`
+        // even though it exceeds the table. This shouldn't happen because
+        // `raw_diff > 32` ↔ `mv_half > predictor_half + 32`, and with
+        // `predictor_half ≤ 32` and `mv_half ≤ 63` the max `raw_diff` is
+        // 63 - (-31) = 94, which is unreachable through the §D.2 candidate
+        // set. We fall through to the general enumerator just in case.
+    }
+    // General case: enumerate every legal (mag, sign) and find the shortest
+    // codeword whose decode reproduces `mv_half`. `mag == 0` yields
+    // `predictor_half` only.
+    let mut best: Option<(u8, i32, i32)> = None; // (codeword bits, mag, sign)
+    for mag in 0..=32i32 {
+        let signs: &[i32] = if mag == 0 { &[1] } else { &[1, -1] };
+        for &sign in signs {
+            let v = reconstruct_umv_component(predictor_half, mag, sign);
+            if v != mv_half {
+                continue;
+            }
+            // codeword length: VLC magnitude bits, plus 1 sign bit when mag > 0.
+            let len = MV_ENC_VLC[mag as usize].0 + if mag > 0 { 1 } else { 0 };
+            // Tie-break: prefer the candidate whose `mag * sign_dir` is
+            // closer to the raw `(mv_half - predictor_half)` modulo 64.
+            let diff_raw = mv_half - predictor_half;
+            let here_diff = mag * if sign == 1 { 1 } else { -1 };
+            let prefer = match best {
+                None => true,
+                Some((bl, bm, bs)) => {
+                    if len < bl {
+                        true
+                    } else if len > bl {
+                        false
+                    } else {
+                        let prev_diff = bm * if bs == 1 { 1 } else { -1 };
+                        (here_diff - diff_raw).abs() < (prev_diff - diff_raw).abs()
+                    }
+                }
+            };
+            if prefer {
+                best = Some((len, mag, sign));
+            }
+        }
+    }
+    let (_len, mag, sign) =
+        best.expect("encode_mv_component_umv: no codeword reproduces mv_half through §D.2");
+    let (bits, code) = MV_ENC_VLC[mag as usize];
+    bw.write_bits(code, bits as u32);
+    if mag > 0 {
+        let sign_bit: u32 = if sign == -1 { 1 } else { 0 };
+        bw.write_bits(sign_bit, 1);
+    }
+}
+
 /// Per-MB motion-vector slot (luma half-pel units). One vector per MB in 1MV
 /// mode — all four luma blocks share it. The value is also used for the
 /// median predictor of subsequent MBs.
@@ -1053,5 +1142,93 @@ mod tests {
         // matches predictor sign).
         let got = reconstruct_umv_component(-40, 30, -1);
         assert_eq!(got, -6);
+    }
+
+    /// Round 12 — `encode_mv_component_umv` round-trips through
+    /// `decode_mv_component_umv` for every reachable (pred, mv) pair across
+    /// the extended `[-63, +63]` halfpel range. The set of reachable MVs
+    /// from a given predictor is defined by §D.2: the encoder picks one of
+    /// `{d, d+64, d-64}` with `|d| ≤ 32`, decodes to `pred + d`.
+    #[test]
+    fn umv_encoder_round_trips_extended_range() {
+        for pred in [-63, -40, -32, -1, 0, 1, 16, 32, 40, 63] {
+            // Build the set of MVs we can actually encode. Then make sure
+            // every one decodes back to the same value.
+            let mut reachable: Vec<i32> = Vec::new();
+            for mag in 0..=32i32 {
+                for sign in [1i32, -1] {
+                    if mag == 0 && sign == -1 {
+                        continue;
+                    }
+                    let v = reconstruct_umv_component(pred, mag, sign);
+                    if (MV_RANGE_UMV_MIN_HALF..=MV_RANGE_UMV_MAX_HALF).contains(&v) {
+                        reachable.push(v);
+                    }
+                }
+            }
+            reachable.sort();
+            reachable.dedup();
+            for &mv in &reachable {
+                let mut bw = BitWriter::new();
+                encode_mv_component_umv(&mut bw, mv, pred);
+                let bytes = bw.finish();
+                let mut br = BitReader::new(&bytes);
+                let got = decode_mv_component_umv(&mut br, pred, true).unwrap();
+                assert_eq!(got, mv, "pred={pred}, mv={mv}: got {got}");
+            }
+        }
+    }
+
+    /// Round 12 — when the predictor is in the §D.2 baseline range
+    /// `[-31, +32]` halfpel AND the raw differential `mv - pred` already
+    /// fits in `[-32, +32]` (so the baseline encoder doesn't need to fold),
+    /// the UMV encoder produces the exact same bytes as the baseline
+    /// encoder. In other regimes the two encoders may legitimately differ
+    /// (baseline relies on the folded `wrap()` interpretation, which UMV
+    /// decoders don't apply).
+    #[test]
+    fn umv_encoder_matches_baseline_inside_baseline_range() {
+        for pred in [-31, -8, 0, 8, 31, 32] {
+            for mv in -32..=31i32 {
+                let raw = mv - pred;
+                // Baseline encoder folds raw to `[-32, +31]`; the UMV
+                // encoder can't take advantage of that fold (UMV decode
+                // would interpret the wrap differently). Skip the boundary
+                // case where folding would diverge.
+                if !(-32..=31).contains(&raw) {
+                    continue;
+                }
+                let mut a = BitWriter::new();
+                encode_mv_component(&mut a, mv, pred);
+                let mut b = BitWriter::new();
+                encode_mv_component_umv(&mut b, mv, pred);
+                assert_eq!(
+                    a.finish(),
+                    b.finish(),
+                    "UMV encoder must match baseline for pred={pred}, mv={mv}"
+                );
+            }
+        }
+    }
+
+    /// Round 12 — predictor at the extended-range boundary (`pred=40`):
+    /// the encoder must select the wrap that lands in `[-63, +63]` AND
+    /// matches the predictor's sign per §D.2.
+    #[test]
+    fn umv_encoder_handles_predictor_outside_baseline() {
+        // pred = 40 (outside `[-31, +32]`). MV = 6 is reachable via mag=30,
+        // sign_dir=-1 → raw_diff=-30; pred + (-30+64)=74 (out of range);
+        // pred + (-30) = 10 — wait that's mv=10. Let me pick a concrete
+        // (pred, mv) pair we know §D.2 makes reachable: pred=40, mv=6 is
+        // produced by mag=30 sign_dir=-1 with the d-64 candidate (=-34),
+        // pred+(-34)=6 (positive → same sign as 40, in range). Verified by
+        // the existing `umv_wraps_to_extended_range_when_out_of_bounds`
+        // test.
+        let mut bw = BitWriter::new();
+        encode_mv_component_umv(&mut bw, 6, 40);
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let got = decode_mv_component_umv(&mut br, 40, true).unwrap();
+        assert_eq!(got, 6);
     }
 }

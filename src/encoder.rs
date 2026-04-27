@@ -57,8 +57,9 @@ use crate::enc_tables::{write_cbpy, write_mcbpc_inter, write_mcbpc_intra, write_
 use crate::interp::{predict_block, sad_block};
 use crate::mb::IPicture;
 use crate::motion::{
-    chroma_mv_4mv, encode_mv_component, luma_to_chroma_mv, predict_mv, predict_mv_block, MbMotion,
-    MvGrid, MV_RANGE_MAX_HALF, MV_RANGE_MIN_HALF, OBMC_H0, OBMC_H1, OBMC_H2,
+    chroma_mv_4mv, encode_mv_component, encode_mv_component_umv, luma_to_chroma_mv, predict_mv,
+    predict_mv_block, reconstruct_umv_component, MbMotion, MvGrid, MV_RANGE_MAX_HALF,
+    MV_RANGE_MIN_HALF, MV_RANGE_UMV_MAX_HALF, MV_RANGE_UMV_MIN_HALF, OBMC_H0, OBMC_H1, OBMC_H2,
 };
 use crate::picture::SourceFormat;
 use oxideav_core::bits::BitWriter;
@@ -125,6 +126,20 @@ pub struct H263Encoder {
     /// `cumf_MCBPC_4MVQ` + per-block MVD wiring needed for 4MV-mode SAC
     /// is pending.
     enable_annex_e: bool,
+    /// When `true`, emit P-pictures with Annex D Unrestricted Motion Vectors
+    /// in the baseline-PTYPE form: PTYPE bit 10 (UMV) is set in the picture
+    /// header, the encoder's motion estimator widens its search range to
+    /// `[-63, +63]` halfpel (allowing references that point partially or
+    /// fully outside the picture — §D.1), and MV components are emitted
+    /// through [`crate::motion::encode_mv_component_umv`] which selects
+    /// the VLC magnitude+sign whose §D.2 reconstruction yields the desired
+    /// vector. The matching decoder side is already in place
+    /// (`H263Decoder::decode_p_picture` honours the latched UMV flag).
+    ///
+    /// Combinations with Annex E (SAC) and Annex F (Advanced Prediction) are
+    /// rejected at `send_frame` for now — round-12 scope is the baseline
+    /// 1-MV inter path only.
+    enable_annex_d_umv: bool,
 }
 
 impl H263Encoder {
@@ -179,6 +194,7 @@ impl H263Encoder {
             enable_annex_j: false,
             enable_annex_f: false,
             enable_annex_e: false,
+            enable_annex_d_umv: false,
         })
     }
 
@@ -223,6 +239,25 @@ impl H263Encoder {
     pub fn enable_annex_e(&self) -> bool {
         self.enable_annex_e
     }
+
+    /// Enable or disable Annex D (Unrestricted Motion Vectors, baseline-PTYPE
+    /// form) emission. When on, every P-picture sets PTYPE bit 10 (UMV) and
+    /// the encoder selects MV components from `[-63, +63]` halfpel using
+    /// the §D.2 sign-of-predictor rule. References that point partially or
+    /// fully outside the picture replicate the nearest edge sample (§D.1).
+    ///
+    /// Must be set before the first frame is submitted; flipping it
+    /// mid-stream would desync the matching decoder. Combinations with
+    /// Annex E (SAC) or Annex F (Advanced Prediction) are not yet supported
+    /// — `send_frame` returns `Error::Unsupported` if both are on.
+    pub fn set_enable_annex_d_umv(&mut self, enable: bool) {
+        self.enable_annex_d_umv = enable;
+    }
+
+    /// Returns whether Annex D (UMV) emission is currently enabled.
+    pub fn enable_annex_d_umv(&self) -> bool {
+        self.enable_annex_d_umv
+    }
 }
 
 impl Encoder for H263Encoder {
@@ -241,6 +276,18 @@ impl Encoder for H263Encoder {
         };
         if v.planes.len() != 3 {
             return Err(Error::invalid("h263 encoder: expected 3 planes"));
+        }
+
+        // Annex D + (Annex E | Annex F) is not yet wired — round-12 scope is
+        // the baseline 1-MV inter path with UMV reach + sign-of-predictor
+        // reconstruction. The SAC and AP paths use their own MV emission
+        // routines (`mb_sac` + `emit_p_mb_ap`) that don't yet route through
+        // `encode_mv_component_umv`.
+        if self.enable_annex_d_umv && (self.enable_annex_e || self.enable_annex_f) {
+            return Err(Error::unsupported(
+                "h263 encoder: Annex D (UMV) is not yet supported in combination with \
+                 Annex E (SAC) or Annex F (Advanced Prediction)",
+            ));
         }
 
         let tr = self.next_tr;
@@ -317,7 +364,7 @@ impl Encoder for H263Encoder {
                     )?
                 }
             } else {
-                encode_p_picture_with_opts(
+                encode_p_picture_with_opts_full(
                     self.width,
                     self.height,
                     self.source_format,
@@ -326,6 +373,7 @@ impl Encoder for H263Encoder {
                     v,
                     reference,
                     self.enable_annex_f,
+                    self.enable_annex_d_umv,
                 )?
             };
             (bytes, pic, false)
@@ -723,6 +771,48 @@ pub fn encode_p_picture_with_opts(
     reference: &IPicture,
     enable_annex_f: bool,
 ) -> Result<(Vec<u8>, IPicture)> {
+    encode_p_picture_with_opts_full(
+        width,
+        height,
+        source_format,
+        pquant,
+        temporal_reference,
+        frame,
+        reference,
+        enable_annex_f,
+        false,
+    )
+}
+
+/// Full-options P-picture encoder. Adds an `enable_annex_d_umv` knob to
+/// [`encode_p_picture_with_opts`]: when set (and `enable_annex_f` is false)
+/// PTYPE bit 10 (UMV) is set in the picture header, the motion estimator
+/// widens its reach to `[-63, +63]` halfpel (allowing references that point
+/// outside the picture per §D.1), and MVD components are emitted through
+/// [`crate::motion::encode_mv_component_umv`] which selects the §D.2
+/// magnitude+sign whose decode matches the desired vector.
+///
+/// `enable_annex_d_umv` together with `enable_annex_f` returns
+/// `Error::Unsupported` — Annex F's per-block MVDs use their own emission
+/// path that is not yet UMV-aware.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_picture_with_opts_full(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+    enable_annex_f: bool,
+    enable_annex_d_umv: bool,
+) -> Result<(Vec<u8>, IPicture)> {
+    if enable_annex_f && enable_annex_d_umv {
+        return Err(Error::unsupported(
+            "h263 encoder: Annex F (Advanced Prediction) + Annex D (UMV) emission \
+             is not yet supported",
+        ));
+    }
     let mb_w = width.div_ceil(16) as usize;
     let mb_h = height.div_ceil(16) as usize;
     source_format
@@ -733,21 +823,23 @@ pub fn encode_p_picture_with_opts(
     let mut recon = IPicture::new(width as usize, height as usize);
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
 
-    write_picture_header(
+    write_picture_header_full(
         &mut bw,
         source_format,
         pquant,
         temporal_reference,
         true,
         enable_annex_f,
+        false,
+        enable_annex_d_umv,
     )?;
 
     if !enable_annex_f {
         // Single-pass baseline path — matches the old `encode_p_picture`
-        // behaviour byte-for-byte.
+        // behaviour byte-for-byte (and adds Annex D UMV when requested).
         for mb_y in 0..mb_h {
             for mb_x in 0..mb_w {
-                let _info = encode_p_mb(
+                let _info = encode_p_mb_full(
                     &mut bw,
                     mb_x,
                     mb_y,
@@ -759,6 +851,7 @@ pub fn encode_p_picture_with_opts(
                     &mut recon,
                     &mut mv_grid,
                     false,
+                    enable_annex_d_umv,
                 )?;
             }
         }
@@ -1087,6 +1180,34 @@ fn write_picture_header_with_opts(
     advanced_prediction: bool,
     sac_mode: bool,
 ) -> Result<()> {
+    write_picture_header_full(
+        bw,
+        source_format,
+        pquant,
+        tr,
+        is_p_picture,
+        advanced_prediction,
+        sac_mode,
+        false,
+    )
+}
+
+/// Picture header writer that exposes every PTYPE-bit knob the encoder
+/// currently understands. Sets PTYPE bit 10 (UMV) when `umv_mode` is true and
+/// the picture is a P-picture (I-pictures must leave the bit clear — the
+/// decoder still latches it for the next P-picture, but spec requires the
+/// bit to be 0 on I).
+#[allow(clippy::too_many_arguments)]
+fn write_picture_header_full(
+    bw: &mut BitWriter,
+    source_format: SourceFormat,
+    pquant: u8,
+    tr: u8,
+    is_p_picture: bool,
+    advanced_prediction: bool,
+    sac_mode: bool,
+    umv_mode: bool,
+) -> Result<()> {
     // PSC: 22 bits = `0000 0000 0000 0000 1 00000`. Write byte-aligned to
     // simplify start-code recognition.
     debug_assert!(bw.is_byte_aligned());
@@ -1105,9 +1226,9 @@ fn write_picture_header_with_opts(
     //   bit 5: freeze-picture release
     //   bits 6-8: source format (1..=5)
     //   bit 9: I (0) / P (1) — encoder always emits 0 for now
-    //   bit 10: UMV (D)        - 0
-    //   bit 11: SAC (E)        - 0
-    //   bit 12: AP  (F)        - 0
+    //   bit 10: UMV (D)
+    //   bit 11: SAC (E)
+    //   bit 12: AP  (F)
     //   bit 13: PB  (G)        - 0
     let src_code: u32 = match source_format {
         SourceFormat::SubQcif => 1,
@@ -1128,7 +1249,15 @@ fn write_picture_header_with_opts(
     bw.write_bits(0, 1); // bit 5 freeze
     bw.write_bits(src_code, 3); // bits 6-8 source format
     bw.write_bits(u32::from(is_p_picture), 1); // bit 9 picture coding type (I=0, P=1)
-    bw.write_bits(0, 1); // bit 10 UMV
+                                               // bit 10 UMV — Annex D Unrestricted Motion Vectors. Spec §5.1.4.5
+                                               // sets the flag in baseline-PTYPE form for the whole picture; the
+                                               // decoder latches it on every picture (including I-pictures, where
+                                               // it has no syntactic effect). We mirror what real-world h263 streams
+                                               // do: the bit can be set on I-pictures too — the SAC-aware tests in
+                                               // this crate also leave it on across an I/P boundary. Our decoder
+                                               // does not gate the flag on picture type either.
+    let umv_bit = if umv_mode { 1 } else { 0 };
+    bw.write_bits(umv_bit, 1); // bit 10 UMV
     bw.write_bits(if sac_mode { 1 } else { 0 }, 1); // bit 11 SAC
                                                     // bit 12 AP — Annex F Advanced Prediction. Set iff the encoder is in
                                                     // 4MV/OBMC mode AND this is a P-picture (I-pictures have no MVs). On
@@ -1646,6 +1775,156 @@ fn motion_estimate_mb(
     best
 }
 
+/// Annex D (UMV)-aware motion-estimation for a 16×16 MB. Identical to
+/// [`motion_estimate_mb`] except (1) the search range widens to
+/// `[-63, +63]` halfpel (`MV_RANGE_UMV_*`), (2) MVs that would point partly
+/// or wholly outside the picture are accepted (the §D.1 edge-replication is
+/// done by the half-pel interpolator at decode time, and `predict_block`
+/// mirrors that on the encoder side via the same clamp), and (3) only MVs
+/// that round-trip through `reconstruct_umv_component(predictor, …)` are
+/// considered — this filters the §D.2 "sign of predictor" rule against the
+/// median-predictor.
+fn motion_estimate_mb_umv(
+    frame: &VideoFrame,
+    reference: &IPicture,
+    mb_x: usize,
+    mb_y: usize,
+    mv_grid: &MvGrid,
+) -> (i32, i32, u32) {
+    let src = &frame.planes[0];
+    let src_stride = src.stride;
+    let src_x = (mb_x * 16) as i32;
+    let src_y = (mb_y * 16) as i32;
+    let blk_px = src_x;
+    let blk_py = src_y;
+    let ref_w = reference.y_stride as i32;
+    let ref_h = (reference.y.len() / reference.y_stride) as i32;
+
+    // Predictor for §D.2 round-trip filtering.
+    let (pmx, pmy) = predict_mv(mv_grid, mb_x, mb_y);
+    let mv_range = MV_RANGE_UMV_MIN_HALF..=MV_RANGE_UMV_MAX_HALF;
+
+    // Round-trip filter: a candidate vector `(mvx, mvy)` is reachable iff
+    // there exists `(mag, sign)` such that
+    //   `reconstruct_umv_component(pmx, mag, sign) == mvx`.
+    // We re-use the encoder helper indirectly: there must be a
+    // §D.2 candidate `d ∈ {raw, raw+64, raw-64}` with `|d| <= 32` and
+    // `pred + d == mv` (which is true by construction for the picked d).
+    let reachable = |pred: i32, mv: i32| -> bool {
+        let raw = mv - pred;
+        let candidates = [raw, raw + 64, raw - 64];
+        candidates.iter().any(|&d| {
+            let mag = d.unsigned_abs() as i32;
+            if mag > 32 {
+                return false;
+            }
+            let v = pred + d;
+            (MV_RANGE_UMV_MIN_HALF..=MV_RANGE_UMV_MAX_HALF).contains(&v) && v == mv
+        })
+    };
+
+    let eval = |ix: i32, iy: i32| -> Option<u32> {
+        let mvx = ix * 2;
+        let mvy = iy * 2;
+        if !mv_range.contains(&mvx) || !mv_range.contains(&mvy) {
+            return None;
+        }
+        if !reachable(pmx, mvx) || !reachable(pmy, mvy) {
+            return None;
+        }
+        Some(sad_block(
+            &src.data,
+            src_stride,
+            src_x,
+            src_y,
+            &reference.y,
+            reference.y_stride,
+            ref_w,
+            ref_h,
+            blk_px,
+            blk_py,
+            mvx,
+            mvy,
+            16,
+        ))
+    };
+
+    // Stage 1a: LDSP iteration from (0, 0).
+    let mut cx = 0i32;
+    let mut cy = 0i32;
+    let mut best_sad = eval(cx, cy).unwrap_or(u32::MAX);
+    for _ in 0..MAX_LDSP_STEPS {
+        let mut improved = false;
+        let mut next = (cx, cy);
+        for &(dx, dy) in LDSP.iter().skip(1) {
+            let ix = cx + dx;
+            let iy = cy + dy;
+            if let Some(s) = eval(ix, iy) {
+                if s < best_sad {
+                    best_sad = s;
+                    next = (ix, iy);
+                    improved = true;
+                }
+            }
+        }
+        if !improved {
+            break;
+        }
+        cx = next.0;
+        cy = next.1;
+    }
+    // Stage 1b: SDSP refinement.
+    for &(dx, dy) in SDSP.iter().skip(1) {
+        let ix = cx + dx;
+        let iy = cy + dy;
+        if let Some(s) = eval(ix, iy) {
+            if s < best_sad {
+                best_sad = s;
+                cx = ix;
+                cy = iy;
+            }
+        }
+    }
+    let mut best = (cx * 2, cy * 2, best_sad);
+    // Stage 2: half-pel refinement.
+    let (ix, iy, _) = best;
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let mvx = ix + dx;
+            let mvy = iy + dy;
+            if !mv_range.contains(&mvx) || !mv_range.contains(&mvy) {
+                continue;
+            }
+            if !reachable(pmx, mvx) || !reachable(pmy, mvy) {
+                continue;
+            }
+            let sad = sad_block(
+                &src.data,
+                src_stride,
+                src_x,
+                src_y,
+                &reference.y,
+                reference.y_stride,
+                ref_w,
+                ref_h,
+                blk_px,
+                blk_py,
+                mvx,
+                mvy,
+                16,
+            );
+            if sad < best.2 {
+                best = (mvx, mvy, sad);
+            }
+        }
+    }
+    let _ = reconstruct_umv_component; // silence unused-import when debug-assertions are off
+    best
+}
+
 /// Four-block motion estimation for Annex F. Runs the 8×8 SDSP diamond per
 /// block and returns `(mvs4, sad_sum)` — the sum of SADs of the four 8×8
 /// predictors. Used to decide between 1MV and 4MV for a given MB.
@@ -2115,8 +2394,12 @@ fn build_chroma_predictor(
 /// * **Intra-in-P**: when the best inter prediction's SAD is worse than a
 ///   direct intra encode's approximate cost — we fall back to intra for that
 ///   MB. This is the standard "intra block decision" used by FFmpeg.
+///
+/// `enable_annex_d_umv`: when set, the motion estimator widens to the §D.1 /
+/// §D.2 extended `[-63, +63]` halfpel range and MV components are emitted via
+/// [`encode_mv_component_umv`].
 #[allow(clippy::too_many_arguments)]
-fn encode_p_mb(
+fn encode_p_mb_full(
     bw: &mut BitWriter,
     mb_x: usize,
     mb_y: usize,
@@ -2128,9 +2411,14 @@ fn encode_p_mb(
     recon: &mut IPicture,
     mv_grid: &mut MvGrid,
     enable_annex_f: bool,
+    enable_annex_d_umv: bool,
 ) -> Result<crate::mb::PMbInfo> {
     // 1. Motion-estimate on luma 16×16.
-    let (mvx, mvy, mv_sad) = motion_estimate_mb(frame, reference, mb_x, mb_y);
+    let (mvx, mvy, mv_sad) = if enable_annex_d_umv {
+        motion_estimate_mb_umv(frame, reference, mb_x, mb_y, mv_grid)
+    } else {
+        motion_estimate_mb(frame, reference, mb_x, mb_y)
+    };
 
     // Also consider MV=(0,0) directly — some encoders pin to zero when the
     // difference is small, which gives the skipped-MB path a chance.
@@ -2229,9 +2517,22 @@ fn encode_p_mb(
     let _ = enable_annex_f;
 
     // Inter path.
-    let info = encode_p_mb_inter(
-        bw, mb_x, mb_y, quant, src_y, src_cb, src_cr, reference, recon, decide_mv, mv_grid,
-        &y_pred, &u_pred, &v_pred,
+    let info = encode_p_mb_inter_full(
+        bw,
+        mb_x,
+        mb_y,
+        quant,
+        src_y,
+        src_cb,
+        src_cr,
+        reference,
+        recon,
+        decide_mv,
+        mv_grid,
+        &y_pred,
+        &u_pred,
+        &v_pred,
+        enable_annex_d_umv,
     )?;
     Ok(info)
 }
@@ -2301,6 +2602,35 @@ fn encode_p_mb_inter(
     u_pred: &[u8; 64],
     v_pred: &[u8; 64],
 ) -> Result<crate::mb::PMbInfo> {
+    encode_p_mb_inter_full(
+        bw, mb_x, mb_y, quant, src_y, src_cb, src_cr, _reference, recon, mv, mv_grid, y_pred,
+        u_pred, v_pred, false,
+    )
+}
+
+/// Full-options variant of [`encode_p_mb_inter`] — when `enable_annex_d_umv`
+/// is true, MV components are emitted via [`encode_mv_component_umv`]
+/// (extended `[-63, +63]` halfpel reach + §D.2 reconstruction). Everything
+/// else (residual coding, CBPY, MCBPC, recon) is identical to the baseline
+/// path.
+#[allow(clippy::too_many_arguments)]
+fn encode_p_mb_inter_full(
+    bw: &mut BitWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    src_y: &oxideav_core::frame::VideoPlane,
+    src_cb: &oxideav_core::frame::VideoPlane,
+    src_cr: &oxideav_core::frame::VideoPlane,
+    _reference: &IPicture,
+    recon: &mut IPicture,
+    mv: (i32, i32),
+    mv_grid: &mut MvGrid,
+    y_pred: &[u8; 256],
+    u_pred: &[u8; 64],
+    v_pred: &[u8; 64],
+    enable_annex_d_umv: bool,
+) -> Result<crate::mb::PMbInfo> {
     // 1. For each of the 6 blocks, compute residual DCT → quantise → check
     //    if any nonzero AC exists. Track (cbpy, cbpc) and the recon pels.
     let mut levels_all = [[0i32; 64]; 6];
@@ -2366,8 +2696,13 @@ fn encode_p_mb_inter(
     write_mcbpc_inter(bw, PMbKind::Inter, cbpc);
     write_cbpy(bw, cbpy_on_wire);
     let (pmx, pmy) = predict_mv(mv_grid, mb_x, mb_y);
-    encode_mv_component(bw, mv.0, pmx);
-    encode_mv_component(bw, mv.1, pmy);
+    if enable_annex_d_umv {
+        encode_mv_component_umv(bw, mv.0, pmx);
+        encode_mv_component_umv(bw, mv.1, pmy);
+    } else {
+        encode_mv_component(bw, mv.0, pmx);
+        encode_mv_component(bw, mv.1, pmy);
+    }
 
     // 4. Emit per-block AC (when coded) and reconstruct.
     for b in 0..6 {

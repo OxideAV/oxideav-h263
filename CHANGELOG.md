@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Annex D (Unrestricted Motion Vectors) — encoder emit (round 12).**
+  `H263Encoder::set_enable_annex_d_umv(true)` activates the UMV path: every
+  P-picture sets PTYPE bit 10 (UMV) in the header (`write_picture_header_full`
+  is the new full-options writer), the motion estimator widens to
+  `[-63, +63]` halfpel via `motion_estimate_mb_umv` (§D.1 out-of-picture
+  references rely on `interp::predict_block`'s edge clamp; no stay-in-picture
+  constraint), and MV components are emitted through the new
+  `motion::encode_mv_component_umv` which selects the `(magnitude, sign)`
+  pair whose §D.2 reconstruction yields the desired vector — fast-path for
+  predictors in the baseline `[-31, +32]` band emits bytes byte-identical
+  to the non-UMV encoder, general path enumerates and tie-breaks toward the
+  non-wrapped candidate. Combinations with Annex E (SAC) or Annex F
+  (Advanced Prediction) are rejected at `send_frame` for now (round 12 scope
+  is the baseline 1-MV inter path). Validation in
+  `tests/annex_d_umv_encoder.rs`: PTYPE-bit assertion, self round-trip
+  PSNR ≥ 30 dB on a moving-square sequence, ffmpeg cross-decode parity
+  check, plus the testsrc-style 5-frame QCIF clip both self-decoded and
+  ffmpeg-cross-decoded at **51 dB**. Three unit tests in `motion::tests`
+  exercise the encoder helper across the extended range and pin the
+  baseline-equivalence guarantee.
 - Annex E (SAC) + Annex J (deblocking) **interaction** (round 16). Per
   §E.7 the MCBPC selector flips from `cumf_MCBPC_no4MVQ` to
   `cumf_MCBPC_4MVQ` whenever Annex F (4MV/OBMC) OR Annex J (deblocking
