@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Annex I (Advanced INTRA Coding) — encoder + decoder (round 24).**
+  Opt-in via `H263Encoder::set_enable_annex_i_aic(true)`; auto-detected
+  on input via the parsed PLUSPTYPE OPPTYPE bit 8 (`PictureHeader::aic_mode`).
+  When AIC is in use, every INTRA macroblock writes:
+  * an `INTRA_MODE` codeword (Table I.1, 1-or-2 bits) between MCBPC and CBPY,
+  * every coefficient (DC + AC) coded via Table I.2 (different
+    `(LAST, RUN, |LEVEL|)` mapping than the standard inter TCOEF, identical
+    codeword shapes), starting at scan position 0 in the per-MB scan order
+    (zig-zag for mode 0, alternate-horizontal for mode 1, alternate-vertical
+    for mode 2),
+  * dequantisation drops the dead-zone (`RecC = 2 * QUANT * LEVEL` for every
+    coefficient — no INTRADC special-case),
+  * §I.3 AC prediction (DC-only / vertical / horizontal) folds in the
+    spatial-neighbour predictor with the `oddifyclipDC` IDCT-mismatch
+    mitigator on the DC slot.
+  The new `crate::aic` module owns the table data + AC-pred logic; the
+  decoder dispatches to `crate::mb::decode_intra_mb_aic` when `aic_mode`
+  is set; the encoder emits `encode_i_picture_aic_with_recon` (with a
+  PLUSPTYPE picture header carrying OPPTYPE bit 8 = 1). FFmpeg
+  cross-decodes the AIC stream cleanly (verified via the
+  `tests/aic_ffmpeg_interop.rs` `--ignored` probe). AIC currently
+  affects I-pictures only; intra-in-P MBs still use the baseline INTRADC
+  path. AIC + other PLUSPTYPE optional modes (UMV / SAC / AP / RPS / PB)
+  is rejected at `send_frame` for now. Bitrate delta on intra-rich
+  content (talking-head QCIF): ~21 % smaller than the baseline non-AIC
+  encoder for the same PQUANT; flat-DC content shrinks ~5×.
+
 - **`receive_arena_frame()` — zero-copy decode path.**
   Overrides the new `oxideav_core::Decoder::receive_arena_frame()`
   method (added in oxideav-core 0.2.0) to return an arena-backed

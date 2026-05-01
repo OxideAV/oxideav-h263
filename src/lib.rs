@@ -145,13 +145,31 @@
 //!   BQUANT and folds it into the §G.5 reconstruction. Output is two
 //!   `VideoFrame`s per PB picture (B first, then P — display order).
 //!
+//! * **Annex I — Advanced INTRA Coding (encoder + decoder, round 24)**:
+//!   opt-in via [`encoder::H263Encoder::set_enable_annex_i_aic`] on the
+//!   encoder side; auto-detected on input via the parsed PLUSPTYPE
+//!   OPPTYPE bit 8 (`PictureHeader::aic_mode`). When AIC is in use, every
+//!   INTRA macroblock writes an INTRA_MODE codeword (Table I.1) between
+//!   MCBPC and CBPY, every coefficient (DC + AC) is coded via Table I.2
+//!   (different `(LAST, RUN, |LEVEL|)` mapping than the standard inter
+//!   TCOEF, but identical codeword shapes), the dequantiser drops its
+//!   dead-zone (`RecC = 2 * QUANT * LEVEL` for every coefficient, no
+//!   INTRADC special-case), and §I.3 AC prediction (DC-only / vertical /
+//!   horizontal) folds in the spatial-neighbour predictor with the
+//!   `oddifyclipDC` IDCT-mismatch mitigator. The encoder always emits
+//!   Mode 0 (DC-only) which keeps INTRA_MODE at 1 bit; the decoder
+//!   accepts all three modes. AIC currently affects I-pictures only;
+//!   intra-in-P MBs continue to use the baseline INTRADC path. Combining
+//!   AIC with other PLUSPTYPE optional modes (UMV / SAC / AP / RPS / PB)
+//!   is rejected at `send_frame` for now. See [`aic`] for the table /
+//!   prediction / quant helpers.
+//!
 //! Out of scope (returns `Error::Unsupported`):
 //! * Annex M (Improved PB-frames). Annex G (legacy PB-frames) is wired in
 //!   round 14; Improved PB carries a 3-code MODB VLC and per-MB B-mode
 //!   selection that is still pending.
-//! * Annex I (Advanced Intra Coding), Annex K (Slice
-//!   Structured Mode — detected with a specific diagnostic since ffmpeg's
-//!   `h263p -umv 1` bundles it with Annex D), Annex P
+//! * Annex K (Slice Structured Mode — detected with a specific diagnostic
+//!   since ffmpeg's `h263p -umv 1` bundles it with Annex D), Annex P
 //!   (Reference Picture Resampling), Annex T (Modified Quantization).
 //! * Annex N back-channel-message body (BCM) — §N.4.2 BT/URF/TR/ELNUMI/
 //!   ELNUM/BCPM/BSBI/BEPB1/2/GN/MBA/RTR/BSTUF parsing is rejected with
@@ -166,6 +184,7 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
 
+pub mod aic;
 pub mod block;
 pub mod dct;
 pub mod deblock;

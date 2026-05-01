@@ -39,7 +39,7 @@ this crate does not activate any MPEG-4 decoding behaviour.
 | Annex E (SAC arithmetic coding) — P-pictures     | no     | no     |
 | Annex F (Advanced Prediction: 4MV / OBMC)        | no     | no     |
 | Annex G (PB-frames) — header + per-MB syntax     | yes    | yes    |
-| Annex I (Advanced Intra Coding)                  | no     | no     |
+| Annex I (AIC) — I-pictures                       | yes    | yes    |
 | Annex K (Slice Structured Mode)                  | no     | no     |
 | Annex N (RPS — picture header + multi-ref)       | yes    | yes    |
 | Annex P (Reference Picture Resampling)           | no     | no     |
@@ -58,8 +58,8 @@ only when all of the following hold:
 
 * UFEP = `001` (full OPPTYPE present) — cross-picture feature-flag
   inheritance (UFEP = `000`) is not yet tracked.
-* No Annex D / E / F / I / K / P / Q / R / S / T bits are set.
-  (Annex N — RPS — IS now accepted; see below.)
+* No Annex K / P / Q / R / S / T bits are set.
+  (Annex D / E / F / I — AIC — and N — RPS — ARE now accepted; see below.)
 * No custom picture clock frequency.
 * Any custom picture size in CPFMT happens to coincide with one of the
   standard source formats (sub-QCIF / QCIF / CIF / 4CIF / 16CIF).

@@ -171,6 +171,11 @@ pub struct H263Encoder {
     /// [`Self::enable_annex_g_pb`] is on. Defaults to `0b00` (BQUANT =
     /// 5*QUANT/4 — the spec's smallest BQUANT step). Valid values 0..=3.
     pb_dbquant: u8,
+    /// When `true`, emit I-pictures with H.263+ PLUSPTYPE block carrying
+    /// Annex I (Advanced INTRA Coding). Per-MB the encoder writes the
+    /// Table I.1 INTRA_MODE codeword and uses the §I.3 Table I.2 INTRA
+    /// TCOEF + AIC dequant + AC pred path.
+    enable_annex_i_aic: bool,
 }
 
 impl H263Encoder {
@@ -230,6 +235,7 @@ impl H263Encoder {
             enable_annex_g_pb: false,
             pb_trb: 1,
             pb_dbquant: 0,
+            enable_annex_i_aic: false,
         })
     }
 
@@ -345,6 +351,36 @@ impl H263Encoder {
     pub fn set_pb_dbquant(&mut self, dbquant: u8) {
         self.pb_dbquant = dbquant.min(3);
     }
+
+    /// Enable or disable Annex I (Advanced INTRA Coding) emission. Must be
+    /// set before the first frame is submitted; mid-stream changes desync
+    /// the matching decoder.
+    ///
+    /// When on, every I-picture is emitted with a PLUSPTYPE block carrying
+    /// OPPTYPE bit 8 (AIC) = 1, and per-MB the encoder writes:
+    ///   * INTRA_MODE field (Table I.1) immediately after MCBPC,
+    ///   * coefficients via the §I.3 INTRA TCOEF table (Table I.2 — same
+    ///     codeword shapes as the inter table, different `(LAST, RUN, |LEVEL|)`
+    ///     mapping) starting at scan position 0,
+    ///   * AIC dequantisation (`RecC = 2*Q*LEVEL`, no dead-zone) is used
+    ///     when forming the local reconstruction so the next picture's MC
+    ///     reference matches what the decoder produces,
+    ///   * AC prediction (DC + first row / first column from neighbours,
+    ///     §I.3 Mode 0/1/2) is folded into the residual the encoder
+    ///     subtracts before quantising.
+    ///
+    /// AIC currently only affects I-pictures. P-picture intra-in-P MBs
+    /// continue to use the baseline INTRADC + Table 16 path. AIC + SAC /
+    /// AP / UMV / RPS / PB are rejected at `send_frame` to keep the round
+    /// 24 scope tight.
+    pub fn set_enable_annex_i_aic(&mut self, enable: bool) {
+        self.enable_annex_i_aic = enable;
+    }
+
+    /// Returns whether Annex I (AIC) emission is currently enabled.
+    pub fn enable_annex_i_aic(&self) -> bool {
+        self.enable_annex_i_aic
+    }
 }
 
 impl Encoder for H263Encoder {
@@ -402,6 +438,25 @@ impl Encoder for H263Encoder {
                 "h263 encoder: Annex G (PB-frames) is not yet supported in combination \
                  with Annex D (UMV), Annex E (SAC), Annex F (Advanced Prediction), or \
                  Annex N (RPS)",
+            ));
+        }
+
+        // Annex I (AIC) round-24 scope: I-pictures only, no other PLUSPTYPE
+        // optional modes combined. The MB-layer additions (INTRA_MODE,
+        // Table I.2, AC pred) only apply to INTRA MBs and would still
+        // bit-stream-cleanly combine with most other modes once the
+        // P-picture intra-in-P path also routes through the AIC writer
+        // (follow-up).
+        if self.enable_annex_i_aic
+            && (self.enable_annex_d_umv
+                || self.enable_annex_e
+                || self.enable_annex_f
+                || self.enable_annex_n_rps
+                || self.enable_annex_g_pb)
+        {
+            return Err(Error::unsupported(
+                "h263 encoder: Annex I (AIC) is not yet supported in combination \
+                 with other PLUSPTYPE optional modes (UMV / SAC / AP / RPS / PB)",
             ));
         }
 
@@ -521,7 +576,16 @@ impl Encoder for H263Encoder {
         }
 
         let (data, mut recon, is_key) = if force_i {
-            let (bytes, pic) = if self.enable_annex_e {
+            let (bytes, pic) = if self.enable_annex_i_aic {
+                encode_i_picture_aic_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                )?
+            } else if self.enable_annex_e {
                 encode_i_picture_sac_with_recon(
                     self.width,
                     self.height,
@@ -2330,6 +2394,260 @@ fn write_plusptype_picture_header_rps(
 
     // PEI loop terminator.
     bw.write_bits(0, 1);
+    Ok(())
+}
+
+/// Round 24 — Annex I (Advanced INTRA Coding) PLUSPTYPE writer.
+///
+/// Emits a PLUSPTYPE-form picture header (source-format code `111`,
+/// UFEP=001, full OPPTYPE) with OPPTYPE bit 8 (AIC) = 1. All other
+/// optional-mode bits are off in this round (AIC + UMV / SAC / AP / RPS
+/// / PB combinations are gated at `send_frame` and rejected for now).
+/// MPPTYPE picture-type code is `000` for I, `001` for P; this writer
+/// always emits an I-picture (AIC currently only modifies the I path).
+fn write_plusptype_picture_header_aic(
+    bw: &mut BitWriter,
+    source_format: SourceFormat,
+    pquant: u8,
+    tr: u8,
+) -> Result<()> {
+    debug_assert!(bw.is_byte_aligned());
+    let src_code: u32 = match source_format {
+        SourceFormat::SubQcif => 1,
+        SourceFormat::Qcif => 2,
+        SourceFormat::Cif => 3,
+        SourceFormat::FourCif => 4,
+        SourceFormat::SixteenCif => 5,
+        _ => {
+            return Err(Error::unsupported(
+                "h263 AIC encoder: only standard source formats 1..=5 are supported",
+            ));
+        }
+    };
+
+    // PSC (22 bits).
+    #[allow(clippy::unusual_byte_groupings)]
+    let psc: u32 = 0b00_0000_0000_0000_0000_1_00000;
+    bw.write_bits(psc, 22);
+    // TR (8 bits).
+    bw.write_bits(tr as u32, 8);
+    // PTYPE prefix bits 1..=8: marker(1) | id(0) | split(0) | cam(0) |
+    // freeze(0) | source-format = "111" (extended PTYPE).
+    bw.write_bits(1, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0b111, 3);
+
+    // PLUSPTYPE: UFEP (3 bits) = 001 → full OPPTYPE present.
+    bw.write_bits(0b001, 3);
+
+    // OPPTYPE (18 bits, MSB-first, spec bit 1 = MSB).
+    //   bits 1-3 = source format code; bit 4 = custom PCF (0); bit 5 = UMV (0);
+    //   bit 6 = SAC (0); bit 7 = AP (0); bit 8 = AIC (1) — round 24's reason
+    //   for being; bit 9 = DF (0); bit 10 = SS (0); bit 11 = RPS (0);
+    //   bit 12 = ISD (0); bit 13 = AIV (0); bit 14 = MQ (0);
+    //   bit 15 = marker "1"; bits 16-18 = reserved 000.
+    let bit = |k: u32, v: u32| (v & 1) << (18 - k);
+    let srcf_part = (src_code & 0b111) << 15;
+    let opptype: u32 = srcf_part
+        | bit(8, 1)  // AIC
+        | bit(15, 1); // marker
+    bw.write_bits(opptype, 18);
+
+    // MPPTYPE (9 bits) for an I-picture: PCT=000 | RPR=0 | RRU=0 | RTYPE=0 |
+    // reserved(00) | marker(1) → low 9 bits = 0b0_0000_0001.
+    #[allow(clippy::unusual_byte_groupings)]
+    let mpp: u32 = 0b000_0_0_0_001;
+    bw.write_bits(mpp, 9);
+
+    // CPM = 0.
+    bw.write_bits(0, 1);
+
+    // PQUANT.
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::invalid(format!(
+            "h263 AIC encoder: pquant {pquant} out of range 1..=31"
+        )));
+    }
+    bw.write_bits(pquant as u32, 5);
+
+    // PEI loop terminator.
+    bw.write_bits(0, 1);
+    Ok(())
+}
+
+/// Round 24 — Annex I (AIC) I-picture encoder. Emits a PLUSPTYPE-form
+/// picture header with OPPTYPE bit 8 (AIC) = 1, then runs a per-MB AIC
+/// encoder that writes INTRA_MODE + Table I.2 codewords + AC-pred
+/// residuals.
+///
+/// AIC currently only affects I-pictures; the encoder's P-picture path
+/// is unchanged. The reconstruction is bit-identical to what
+/// [`crate::mb::decode_intra_mb_aic`] would produce when fed the
+/// returned byte stream — that round-trip parity is what makes the
+/// next P-picture's MC reference line up.
+pub fn encode_i_picture_aic_with_recon(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+) -> Result<(Vec<u8>, IPicture)> {
+    let mb_w = width.div_ceil(16) as usize;
+    let mb_h = height.div_ceil(16) as usize;
+    let (_num_gobs, mb_rows_per_gob) = source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263 AIC encoder: source format has no GOB layout"))?;
+    let mut bw = BitWriter::with_capacity(8192);
+    let mut recon = IPicture::new(width as usize, height as usize);
+    let mut cache = crate::aic::AicNeighbourCache::new(mb_w, mb_h);
+
+    write_plusptype_picture_header_aic(&mut bw, source_format, pquant, temporal_reference)?;
+
+    for mb_y in 0..mb_h {
+        if mb_y > 0 && (mb_y as u32) % mb_rows_per_gob == 0 {
+            let gn = (mb_y as u32 / mb_rows_per_gob) as u8;
+            write_gob_header(&mut bw, gn, pquant)?;
+            // §I.3 — GOB header inserts a video-picture-segment boundary;
+            // AIC predictors must reset (decoder mirrors this — see
+            // `decode_i_picture` AIC branch).
+            cache = crate::aic::AicNeighbourCache::new(mb_w, mb_h);
+        }
+        for mb_x in 0..mb_w {
+            encode_intra_mb_aic(
+                &mut bw, mb_x, mb_y, pquant, frame, width, height, &mut recon, &mut cache,
+            )?;
+        }
+    }
+    Ok((bw.finish(), recon))
+}
+
+/// Encode one Annex I (AIC) intra MB. Per §I.2 / §I.3:
+///   * MCBPC indicates Intra (mb_type 3, no DQUANT — we hold quant constant).
+///   * INTRA_MODE codeword (Table I.1) follows.
+///   * CBPY/CBPC bits are "block has any coefficient transmitted".
+///   * Per-block: scan order picked by INTRA_MODE; Table I.2 INTRA TCOEF
+///     for every coefficient; AIC dequant; AC-pred predictor pre-subtracted
+///     from raw target so the decoder lands on the same final RecC'.
+#[allow(clippy::too_many_arguments)]
+fn encode_intra_mb_aic(
+    bw: &mut BitWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    recon: &mut IPicture,
+    cache: &mut crate::aic::AicNeighbourCache,
+) -> Result<()> {
+    use crate::aic::{
+        ac_pred_predictor_for, apply_ac_prediction, dequantise_intra_block_aic,
+        quantise_intra_block_aic, scan_for, write_intra_tcoef, IntraMode,
+    };
+
+    // 1. For each block, run forward DCT to get raw coefficients.
+    let mut dctf_all = [[0.0f32; 64]; 6];
+    for b in 0..6 {
+        let mut samples = [0.0f32; 64];
+        sample_block_for(frame, width, height, mb_x, mb_y, b, &mut samples);
+        let mut dctf = samples;
+        fdct8x8(&mut dctf);
+        dctf_all[b] = dctf;
+    }
+
+    // 2. Pick the picture-INTRA_MODE per spec hint heuristic. We always emit
+    //    `DcOnly` (mode 0) — it's correct for any input and avoids the
+    //    extra encoder-side ME pass needed to pick between vertical and
+    //    horizontal AC pred. Mode 0 still gets the DC-pred coding-efficiency
+    //    win (the dominant gain on talking-head content) without the
+    //    bitstream cost of always emitting a 2-bit `10` / `11` codeword.
+    let intra_mode = IntraMode::DcOnly;
+
+    // 3. Per block: pre-compute predictor, subtract from raw DCT, quantise
+    //    the residual, dequantise to recover the decoder's RecC, apply
+    //    AC pred to recover RecC' and stash IMMEDIATELY into the cache
+    //    so subsequent blocks within the same MB (and the next MB to the
+    //    right) see the right predictor when they look up neighbours.
+    //
+    //    NOTE: this loop intentionally folds the encoder-side
+    //    "compute final coefficients" + "store to cache" steps together
+    //    so per-block neighbour ordering inside an MB is correct (block
+    //    1's left neighbour is block 0 of the same MB, block 2's above
+    //    neighbour is block 0 of the same MB, block 3's above is block 1
+    //    + left is block 2). A second loop below does the bitstream emit
+    //    + IDCT + recon write — at that point the cache is already
+    //    populated.
+    let mut levels_all = [[0i32; 64]; 6];
+    let mut final_coeffs_all = [[0i32; 64]; 6];
+    let mut block_has_any = [false; 6];
+
+    for b in 0..6 {
+        let pred = ac_pred_predictor_for(intra_mode, mb_x, mb_y, b, cache);
+        let mut residual_target = [0.0f32; 64];
+        for k in 0..64 {
+            residual_target[k] = dctf_all[b][k] - pred[k] as f32;
+        }
+        let (levels, any) = quantise_intra_block_aic(&residual_target, quant);
+        levels_all[b] = levels;
+        block_has_any[b] = any;
+
+        // Run the decoder-equivalent reconstruction so the cache holds the
+        // EXACT RecC' the decoder will compute. We do this *inside* the
+        // per-block loop so block 1's left neighbour (= block 0 of the
+        // same MB) sees the correct stored DC; otherwise within-MB
+        // predictors would all see "no neighbour" and use the 1024
+        // fall-back, which torpedoes the coding gain.
+        let rec_c_residual = dequantise_intra_block_aic(&levels, quant);
+        let final_coeffs = apply_ac_prediction(intra_mode, mb_x, mb_y, b, cache, &rec_c_residual);
+        cache.store(mb_x, mb_y, b, &final_coeffs);
+        final_coeffs_all[b] = final_coeffs;
+    }
+
+    // 4. Build CBPC / CBPY bit-patterns from `block_has_any`.
+    let cbpc: u8 = ((block_has_any[4] as u8) << 1) | (block_has_any[5] as u8);
+    let cbpy: u8 = ((block_has_any[0] as u8) << 3)
+        | ((block_has_any[1] as u8) << 2)
+        | ((block_has_any[2] as u8) << 1)
+        | (block_has_any[3] as u8);
+
+    // 5. Emit MB layer.
+    write_mcbpc_intra(bw, cbpc);
+    intra_mode.write(bw);
+    write_cbpy(bw, cbpy);
+    // No DQUANT — mb_type=3 (Intra), not 4 (IntraQ).
+
+    // 6. Per-block: emit Table I.2 codewords + IDCT into recon. The cache
+    //    is already populated above with the final RecC' values.
+    for b in 0..6 {
+        if block_has_any[b] {
+            let scan = scan_for(intra_mode);
+            let mut nonzero_scan: Vec<(usize, i32)> = Vec::with_capacity(8);
+            for (scan_idx, &nat_idx) in scan.iter().enumerate() {
+                let lv = levels_all[b][nat_idx];
+                if lv != 0 {
+                    nonzero_scan.push((scan_idx, lv));
+                }
+            }
+            debug_assert!(!nonzero_scan.is_empty());
+            let mut prev_scan: i32 = -1;
+            for (i, &(scan_idx, lv)) in nonzero_scan.iter().enumerate() {
+                let run = (scan_idx as i32 - prev_scan - 1) as u8;
+                let last = i == nonzero_scan.len() - 1;
+                write_intra_tcoef(bw, last, run, lv);
+                prev_scan = scan_idx as i32;
+            }
+        }
+        // IDCT the cached final coefficients and write into local recon.
+        let mut coeffs = final_coeffs_all[b];
+        let mut out = [0u8; 64];
+        crate::block::idct_and_clip(&mut coeffs, &mut out);
+        write_block_into(recon, b, mb_x, mb_y, &out);
+    }
+
     Ok(())
 }
 

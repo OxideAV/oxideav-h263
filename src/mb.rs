@@ -213,6 +213,176 @@ fn decode_one_intra_block(
     Ok(())
 }
 
+/// Decode one I-picture intra macroblock under Annex I (Advanced INTRA
+/// Coding). Differences from [`decode_intra_mb`] (§I.2 / §I.3):
+///
+/// 1. INTRA_MODE codeword (Table I.1, 1-or-2 bits) immediately follows
+///    MCBPC. Encoded as `IntraMode::DcOnly` / `Vertical` / `Horizontal`.
+/// 2. CBPY/CBPC bits now mean "block has *any* coefficient transmitted"
+///    (§I.3 paragraph 4) — DC is no longer separately signalled.
+/// 3. Coefficients are decoded via [`crate::aic::decode_intra_tcoef`]
+///    (Table I.2 — different `(LAST, RUN, |LEVEL|)` mapping than the
+///    inter table) starting from scan position 0; the scan order is
+///    selected per the INTRA_MODE field
+///    (zig-zag / alternate-horizontal / alternate-vertical).
+/// 4. Dequantisation uses the no-deadzone formula `RecC = 2*Q*LEVEL`
+///    (no INTRADC special-case).
+/// 5. AC pred reconstruction (§I.3 — Mode 0/1/2) folds in the
+///    DC predictor (and first row / first column for modes 1 / 2) from
+///    the spatial neighbours stored in `cache`.
+///
+/// Returns the (possibly updated) quantiser. The caller must keep `cache`
+/// alive across the whole picture so subsequent MBs see the reconstructed
+/// coefficients.
+pub fn decode_intra_mb_aic(
+    br: &mut BitReader<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    quant_in: u32,
+    pic: &mut IPicture,
+    cache: &mut crate::aic::AicNeighbourCache,
+) -> Result<u32> {
+    // 1. MCBPC — loop over stuffing.
+    let mcbpc_v = loop {
+        let v = vlc::decode(br, mcbpc::i_table())?;
+        if v != mcbpc::STUFFING {
+            break v;
+        }
+    };
+    let (is_intra_q, cbpc) = if mcbpc_v < 4 {
+        (false, mcbpc_v)
+    } else if mcbpc_v < 8 {
+        (true, mcbpc_v - 4)
+    } else {
+        return Err(Error::invalid("h263 AIC MB: invalid MCBPC value"));
+    };
+
+    // 2. INTRA_MODE field (Table I.1).
+    let intra_mode = crate::aic::IntraMode::read(br)?;
+
+    // 3. CBPY (intra variant — direct, no XOR; under AIC the bits cover
+    //    DC+AC).
+    let cbpy = vlc::decode(br, cbpy::table())?;
+
+    // 4. DQUANT.
+    let mut quant = quant_in;
+    if is_intra_q {
+        let d = br.read_u32(2)? as usize;
+        let new_q = (quant as i32) + DQUANT_DELTA[d];
+        quant = new_q.clamp(1, 31) as u32;
+    }
+
+    // 5. Per-block decode.
+    let luma_coded = [
+        (cbpy >> 3) & 1 != 0,
+        (cbpy >> 2) & 1 != 0,
+        (cbpy >> 1) & 1 != 0,
+        cbpy & 1 != 0,
+    ];
+    let chroma_coded = [(cbpc >> 1) & 1 != 0, cbpc & 1 != 0];
+
+    for block_idx in 0..6usize {
+        let coded = if block_idx < 4 {
+            luma_coded[block_idx]
+        } else {
+            chroma_coded[block_idx - 4]
+        };
+        decode_one_intra_block_aic(
+            br, block_idx, coded, mb_x, mb_y, quant, pic, intra_mode, cache,
+        )?;
+    }
+
+    Ok(quant)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_one_intra_block_aic(
+    br: &mut BitReader<'_>,
+    block_idx: usize,
+    has_any: bool,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u32,
+    pic: &mut IPicture,
+    mode: crate::aic::IntraMode,
+    cache: &mut crate::aic::AicNeighbourCache,
+) -> Result<()> {
+    let mut levels = [0i32; 64];
+
+    if has_any {
+        // §I.3 — every coefficient (DC + AC) goes through Table I.2 starting
+        // at scan position 0. Scan order picked from INTRA_MODE.
+        let scan = crate::aic::scan_for(mode);
+        let mut i: usize = 0;
+        loop {
+            if i > 63 {
+                return Err(Error::invalid("h263 AIC block: scan overrun"));
+            }
+            let sym = crate::aic::decode_intra_tcoef(br)?;
+            let (last, run, level_signed) = match sym {
+                crate::aic::IntraTcoefSym::RunLevel {
+                    last,
+                    run,
+                    level_abs,
+                } => {
+                    let sign = br.read_u1()? as i32;
+                    let l = if sign == 1 {
+                        -(level_abs as i32)
+                    } else {
+                        level_abs as i32
+                    };
+                    (last, run, l)
+                }
+                crate::aic::IntraTcoefSym::Escape => {
+                    let last = br.read_u1()? == 1;
+                    let run = br.read_u32(6)? as u8;
+                    let raw = br.read_u32(8)?;
+                    let level: i32 = if raw == 0 {
+                        return Err(Error::invalid("h263 AIC block: escape level == 0"));
+                    } else if raw == 0x80 {
+                        return Err(Error::invalid(
+                            "h263 AIC block: escape level == -128 forbidden",
+                        ));
+                    } else if raw & 0x80 != 0 {
+                        raw as i32 - 256
+                    } else {
+                        raw as i32
+                    };
+                    (last, run, level)
+                }
+            };
+            i = i.saturating_add(run as usize);
+            if i > 63 {
+                return Err(Error::invalid("h263 AIC block: scan run overflow"));
+            }
+            levels[scan[i]] = level_signed;
+            if last {
+                break;
+            }
+            i += 1;
+            if i > 63 {
+                break;
+            }
+        }
+    }
+
+    // 6. Dequantise: RecC = 2 * QUANT * LEVEL for every coefficient (§I.3).
+    let rec_c = crate::aic::dequantise_intra_block_aic(&levels, quant as u8);
+
+    // 7. Apply AC prediction (§I.3 Mode 0/1/2) to produce final RecC'.
+    let final_coeffs = crate::aic::apply_ac_prediction(mode, mb_x, mb_y, block_idx, cache, &rec_c);
+
+    // 8. Stash final RecC' for downstream neighbours.
+    cache.store(mb_x, mb_y, block_idx, &final_coeffs);
+
+    // 9. IDCT + clip → pels.
+    let mut coeffs = final_coeffs;
+    let mut out = [0u8; 64];
+    idct_and_clip(&mut coeffs, &mut out);
+    write_block_to_picture(pic, block_idx, mb_x, mb_y, &out);
+    Ok(())
+}
+
 /// Write the 8×8 reconstructed block into the picture buffer.
 fn write_block_to_picture(
     pic: &mut IPicture,

@@ -426,18 +426,46 @@ pub fn decode_i_picture(
     // sparsely).
     let gob_starts = collect_gob_offsets(bytes);
 
+    // Annex I (Advanced INTRA Coding) has its own MB body driver: the MCBPC
+    // VLC is the same but each MB carries an INTRA_MODE field (Table I.1)
+    // and every block uses Table I.2 + the AIC dequantisation + §I.3 AC
+    // prediction.
+    let mut aic_cache = if hdr.aic_mode {
+        Some(crate::aic::AicNeighbourCache::new(mb_w, mb_h))
+    } else {
+        None
+    };
+
     for mb_y in 0..mb_h {
         // GOB header check: GOBs start at MB rows (mb_y % mb_rows_per_gob)==0
         // and mb_y > 0 (the first GOB has no header — picture header serves).
         if mb_y > 0 && (mb_y as u32) % mb_rows_per_gob == 0 {
-            let _ = try_consume_gob_header(br, &gob_starts, hdr, &mut quant)?;
+            let consumed = try_consume_gob_header(br, &gob_starts, hdr, &mut quant)?;
+            if consumed {
+                // §I.3 — a GOB header inserts a "video picture segment"
+                // boundary; AIC predictors must not reach across it.
+                if let Some(ref mut c) = aic_cache {
+                    *c = crate::aic::AicNeighbourCache::new(mb_w, mb_h);
+                    let _ = c;
+                }
+            }
         }
         for mb_x in 0..mb_w {
-            quant = decode_intra_mb(br, mb_x, mb_y, quant, &mut pic).map_err(|e| {
-                Error::invalid(format!(
-                    "h263 I-picture MB ({mb_x},{mb_y}) (q={quant}): {e}"
-                ))
-            })?;
+            quant = if let Some(ref mut cache) = aic_cache {
+                crate::mb::decode_intra_mb_aic(br, mb_x, mb_y, quant, &mut pic, cache).map_err(
+                    |e| {
+                        Error::invalid(format!(
+                            "h263 I-picture AIC MB ({mb_x},{mb_y}) (q={quant}): {e}"
+                        ))
+                    },
+                )?
+            } else {
+                decode_intra_mb(br, mb_x, mb_y, quant, &mut pic).map_err(|e| {
+                    Error::invalid(format!(
+                        "h263 I-picture MB ({mb_x},{mb_y}) (q={quant}): {e}"
+                    ))
+                })?
+            };
         }
     }
     Ok(pic)
