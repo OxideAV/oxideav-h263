@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DoS-protection framework port (`oxideav-core` 0.1.8).** Wires the
+  decoder front-end into the new `DecoderLimits` + `ArenaPool` stack:
+  * `H263Decoder::with_limits(codec_id, DecoderLimits)` constructor and
+    `DecoderLimits`-aware `make_decoder` factory — server callers can
+    now hand a tightened `CodecParameters::with_limits(...)` and the
+    decoder honours the caps.
+  * Picture-header dimension check: every parsed `PictureHeader` is
+    validated against `limits.max_pixels_per_frame` **before** any
+    `IPicture::new` allocation, returning the new
+    `Error::ResourceExhausted` variant on a malicious oversize header.
+  * Per-decoder `ArenaPool` sized at construction from
+    `limits.max_arenas_in_flight × min(limits.max_alloc_bytes_per_frame,
+    DEFAULT_H263_ARENA_BYTES)` — the new constant clamps the per-arena
+    cap at 4 MiB (enough for 16CIF YUV420p, far smaller than the
+    `oxideav-core` default of 1 GiB so 8 idle arenas use ~32 MiB
+    instead of 8 GiB).
+  * New `pic_to_video_frame_arena` helper — every emitted frame stages
+    its YUV plane copy through a leased arena before memcpy'ing into
+    the existing `Frame::Video(VideoFrame)` (heap-owned `Vec<u8>`
+    planes). The `Decoder::receive_frame` API is **unchanged**, so
+    `oxideav-pipeline` consumers that move frames across `Send`
+    boundaries continue to work without modification — the arena's
+    contribution is to bound peak per-frame scratch RSS and to surface
+    pool exhaustion as natural `ResourceExhausted` backpressure.
+  * `H263Decoder::limits()` + `arena_pool()` accessors for tooling.
+  * New `tests/dos_limits.rs` with five fuzz fixtures covering the
+    pixel-cap rejection (with + without trip), pool-exhaustion lease,
+    per-arena byte cap, and the `make_decoder` factory plumbing.
+  * Encoder is unchanged — DoS protection only applies to the decoder
+    per the task spec.
+
 - **Annex G (PB-frames) — decoder + encoder (round 14).**
   Both sides now wire ITU-T Rec. H.263 (01/2005) §G.1 / §G.4 / §G.5
   for the legacy PB-frames mode (the H.263 baseline B-picture flavour
