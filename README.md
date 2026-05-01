@@ -38,7 +38,7 @@ this crate does not activate any MPEG-4 decoding behaviour.
 | Annex E (SAC arithmetic coding) — I-pictures     | yes    | yes    |
 | Annex E (SAC arithmetic coding) — P-pictures     | no     | no     |
 | Annex F (Advanced Prediction: 4MV / OBMC)        | no     | no     |
-| Annex G (PB-frames) and all B-pictures           | no     | no     |
+| Annex G (PB-frames) — header + per-MB syntax     | yes    | yes    |
 | Annex I (Advanced Intra Coding)                  | no     | no     |
 | Annex K (Slice Structured Mode)                  | no     | no     |
 | Annex N (RPS — picture header + multi-ref)       | yes    | yes    |
@@ -139,6 +139,52 @@ Round 13 wires Annex N (RPS) on both decoder and encoder sides:
   cleanly (~51 dB cross-decode on the testsrc clip — same as the
   non-RPS Annex-D UMV baseline); P-pictures get concealed by ffmpeg
   but our self-decoder reproduces the source at PSNR ≥ 30 dB.
+
+### Annex G — PB-frames
+
+Round 14 wires Annex G (PB-frames) on both decoder and encoder sides:
+
+* **Picture header** — `picture::parse_picture_header` accepts PTYPE
+  bit 13 (PBFR) and reads the §5.1.22 / §5.1.23 TRB (3 bits) +
+  DBQUANT (2 bits) tail after CPM/PSBI. Both fields surface on
+  `PictureHeader.pb_frames` / `trb` / `dbquant`.
+* **Per-MB syntax** (`mb::decode_p_mb_pb`) — between MCBPC and CBPY
+  (per §5.3 Figure 10) the decoder reads MODB (Table 11/H.263), then
+  optional CBPB (6 bits) and MVDB (Table 14 differential applied as
+  the §G.4 MVDB delta). MODB = `0` means "no CBPB, no MVDB"; `10`
+  means "MVDB only"; `11` means "CBPB + MVDB". The B-block residual
+  carried under CBPB is currently parsed-and-discarded — round-14
+  scope is the round-trip with our own encoder which always emits
+  MODB = 0.
+* **§G.4 / §G.5 reconstruction** ([`pb`] module) — given the
+  co-located P-MB's MV, MVDB delta, TRB, and TRD the helper derives
+  forward `MVF` and backward `MVB` (per-block + chroma via §F.2 sum
+  rounded by Table F.1). The §G.5 bidirectional region is computed
+  per-pixel from `MVB`'s footprint inside the freshly-reconstructed
+  P-MB; outside that region the prediction is forward-only.
+* **Encoder** opt-in via [`H263Encoder::set_enable_annex_g_pb`]. When
+  on, every P-picture sets PTYPE bit 13 and the MB layer emits MODB
+  = `0` after MCBPC. The B-half of each PB-frame is reconstructed by
+  the decoder via §G.4 / §G.5 with no MVDB and no residual — the
+  on-wire validation covers the picture-header tail (TRB / DBQUANT)
+  and the per-MB MODB position; the §G.4 / §G.5 derivation is
+  validated by the per-frame round-trip PSNR.
+* **Combination guards** — PB + UMV / SAC / AP / RPS returns
+  `Error::Unsupported` at `send_frame` (round-14 scope is baseline
+  1-MV inter only). PB + Annex F is also rejected on the decoder side.
+* **Decoded output** — every PB-frame produces TWO `VideoFrame`s in
+  display order: B first, then P. The B-frame is *not* stored as the
+  motion-compensation reference for subsequent pictures (per §G.1 /
+  §5.1.22) — only the P-half goes into the reference cache.
+* **Round-trip PSNR** — on a synthetic moving-square QCIF clip,
+  encode 5 frames as `[I, PB, PB, PB, PB]` and decode → I-frame +
+  every P-half lands at **68.1 dB** (essentially lossless thanks to
+  the small uniform regions); B-halves at **28.8 dB** vs the
+  midpoint-position source proxy (the bidirectional MC sits the
+  square at the geometric average of the two adjacent frames).
+* **ffmpeg interop** — purely informational. ffmpeg 8.1's H.263
+  decoder accepts our PB-frames stream without error logs but its
+  PB-frames support is partial; cross-decode parity is not asserted.
 
 ## Quick use
 

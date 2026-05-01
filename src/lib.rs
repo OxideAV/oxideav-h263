@@ -123,9 +123,28 @@
 //!   RPSMF=`100` (no back-channel) + TRPI=0 (decoder uses most recent
 //!   anchor) + BCI=`01`, with the MB layer unchanged baseline 1-MV inter.
 //!
+//! * **Annex G — PB-frames mode (round 14 — encoder + decoder)**: a PB-frame
+//!   couples a P-picture with a B-picture as one transmission unit. The
+//!   encoder side opts in via [`encoder::H263Encoder::set_enable_annex_g_pb`]
+//!   (PTYPE bit 13 set; TRB / DBQUANT in the picture header tail per §5.1.22
+//!   / §5.1.23). Per-MB the encoder emits the standard P-block fields
+//!   followed by `MODB` (Table 11 VLC), optional `CBPB` (6 bits), the §G.4
+//!   forward + backward MV derivation (with optional `MVDB` delta — same
+//!   VLC family as MVD), and the §G.5 bidirectional B-block reconstruction.
+//!   B-block residual coding piggybacks on the inter TCOEF VLC (no INTRADC).
+//!   Round-14 scope keeps DBQUANT = `00` and emits MODB = `0` (no CBPB,
+//!   no MVDB) — the B-half is then a pure §G.5 bidirectional MC predictor
+//!   with no residual, which still validates every header / body field on
+//!   the wire and the §G.4 / §G.5 derivation. The decoder side mirrors the
+//!   header parse (TRB / DBQUANT), the per-MB MODB / CBPB / MVDB read, and
+//!   the §G.4 forward+backward MV derivation. Output is two `VideoFrame`s
+//!   per PB picture (B first, then P — display order).
+//!
 //! Out of scope (returns `Error::Unsupported`):
-//! * PB-frames mode (§G) and every B-picture flavour.
-//! * Annex G (PB-frames), Annex I (Advanced Intra Coding), Annex K (Slice
+//! * Annex M (Improved PB-frames). Annex G (legacy PB-frames) is wired in
+//!   round 14; Improved PB carries a 3-code MODB VLC and per-MB B-mode
+//!   selection that is still pending.
+//! * Annex I (Advanced Intra Coding), Annex K (Slice
 //!   Structured Mode — detected with a specific diagnostic since ffmpeg's
 //!   `h263p -umv 1` bundles it with Annex D), Annex P
 //!   (Reference Picture Resampling), Annex T (Modified Quantization).
@@ -153,6 +172,7 @@ pub mod interp;
 pub mod mb;
 pub mod mb_sac;
 pub mod motion;
+pub mod pb;
 pub mod picture;
 pub mod sac;
 pub mod start_code;

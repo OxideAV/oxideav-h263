@@ -259,9 +259,16 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
     // PTYPE streams and handled by the P-MB decoder via `decode_p_mb`.
     // The PLUSPTYPE form is still rejected (Table D.3 intersection /
     // OPPTYPE AP bit still returns Unsupported in `parse_plusptype_tail`).
-    if pb_frames {
-        return Err(Error::unsupported(
-            "h263 Annex G PB-frames mode: follow-up (B-pictures)",
+    // Annex G (PB-frames) — accepted on baseline-PTYPE streams. The MB body
+    // additions (MODB / CBPB / MVDB / DBQUANT) are decoded by
+    // `decode_pb_picture`. The TRB / DBQUANT picture-header tail is read
+    // below after CPM/PSBI per Figure 8 / §5.1.22 / §5.1.23. Spec §G.1
+    // requires PB-frames pictures to be P-coded (the I half is the prior
+    // P-picture) — reject the syntactically-impossible I+PB combination.
+    if pb_frames && coding_type != PictureCodingType::Predicted {
+        return Err(Error::invalid(
+            "h263 PB-frames: I-coded picture cannot also signal PB (§G.1 — \
+             PB-frames mode is a P-picture extension)",
         ));
     }
 
@@ -278,9 +285,18 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
         ));
     }
 
-    // PB-frames extras would go here if pb_frames were set — already rejected.
-    let trb = 0u8;
-    let dbquant = 0u8;
+    // §5.1.22 / §5.1.23 — TRB (3 bits) + DBQUANT (2 bits) follow CPM/PSBI
+    // when PTYPE indicates "PB-frame". Standard CIF picture clock frequency
+    // (TRB is 3 bits); the 5-bit form requires custom PCF, which baseline
+    // PTYPE doesn't carry. DBQUANT codes (Table 6) are interpreted by the
+    // PB-frames MB body.
+    let (trb, dbquant) = if pb_frames {
+        let trb = br.read_u32(3)? as u8;
+        let dbquant = br.read_u32(2)? as u8;
+        (trb, dbquant)
+    } else {
+        (0u8, 0u8)
+    };
 
     // PEI / PSPARE loop.
     loop {

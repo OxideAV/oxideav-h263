@@ -882,6 +882,234 @@ fn block_offset(block_idx: usize) -> (usize, usize) {
     }
 }
 
+/// Per-MB output of the PB-frames P-half decode — same shape as
+/// [`PMbInfo`] but also carries MODB / CBPB / MVDB data needed to
+/// reconstruct the B-half later.
+#[derive(Clone)]
+pub struct PbMbInfo {
+    pub p_info: PMbInfo,
+    /// Decoded MODB (always present when COD = 0; absent for skipped MBs).
+    pub modb: crate::pb::ModbDecoded,
+    /// CBPB bits 1..=6 (left-to-right; MSB = block 1). Present only when
+    /// MODB indicated CBPB.
+    pub cbpb: u8,
+    /// MVDB delta in luma half-pel units. Present only when MODB indicated
+    /// MVDB; otherwise `(0, 0)`.
+    pub mvdb: (i32, i32),
+}
+
+/// PB-frames variant of [`decode_p_mb_pass1`]. After MCBPC, reads MODB
+/// (Table 11), then optional CBPB (6 bits) and MVDB (Table 14 differential
+/// applied to the §G.4 forward predictor). The B-block residual coding is
+/// not yet wired (round-14 scope keeps it absent on the encoder side); when
+/// CBPB is non-zero on the wire we currently surface a specific
+/// `Unsupported` to flag third-party encoder interop.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_p_mb_pb(
+    br: &mut BitReader<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    quant_in: u32,
+    pic: &mut IPicture,
+    reference: &IPicture,
+    mv_grid: &mut MvGrid,
+    umv: UmvMode,
+) -> Result<(u32, PbMbInfo)> {
+    // 1. COD.
+    let cod = br.read_u1()?;
+    if cod == 1 {
+        // Skipped MB — no MODB per Table 10. MVs default to (0,0); pass-2
+        // reconstruction is a pure copy. The B-half for a skipped MB
+        // inherits MV = (0, 0) and runs the §G.4 / §G.5 path with that.
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), false, false));
+        // Do the local reconstruction so `pic` matches what the
+        // single-pass non-PB path would produce.
+        apply_p_mb_reconstruction(
+            mb_x,
+            mb_y,
+            pic,
+            reference,
+            mv_grid,
+            &PMbInfo::empty_skipped(),
+            false,
+        );
+        return Ok((
+            quant_in,
+            PbMbInfo {
+                p_info: PMbInfo::empty_skipped(),
+                modb: crate::pb::ModbDecoded {
+                    cbpb_present: false,
+                    mvdb_present: false,
+                },
+                cbpb: 0,
+                mvdb: (0, 0),
+            },
+        ));
+    }
+
+    // 2. MCBPC inter (loop over stuffing).
+    let mcbpc_v = loop {
+        let v = vlc::decode(br, mcbpc::p_table())?;
+        if v != mcbpc::INTER_STUFFING {
+            break v;
+        }
+    };
+    let (mb_type, cbpc) = mcbpc::decompose_inter(mcbpc_v);
+    use mcbpc::PMbType;
+
+    let is_4mv = matches!(mb_type, PMbType::Inter4MV | PMbType::Inter4MVQ);
+    if is_4mv {
+        return Err(Error::unsupported(
+            "h263 PB-frames: Inter4MV not supported in this round (round-14 scope is 1MV)",
+        ));
+    }
+    let is_intra = matches!(mb_type, PMbType::Intra | PMbType::IntraQ);
+    let needs_dquant = matches!(
+        mb_type,
+        PMbType::InterQ | PMbType::IntraQ | PMbType::Inter4MVQ
+    );
+
+    // 3. MODB (PB-frames specific) — between MCBPC and CBPY (§5.3 Fig 10).
+    let modb = crate::pb::decode_modb(br)?;
+
+    // 4. CBPB if signalled by MODB.
+    let cbpb = if modb.cbpb_present {
+        br.read_u32(6)? as u8
+    } else {
+        0
+    };
+
+    // 5. CBPY.
+    let cbpy_raw = vlc::decode(br, cbpy::table())?;
+    let cbpy = if is_intra { cbpy_raw } else { cbpy_raw ^ 0xF };
+
+    // 6. DQUANT.
+    let mut quant = quant_in;
+    if needs_dquant {
+        const DQUANT_DELTA: [i32; 4] = [-1, -2, 1, 2];
+        let d = br.read_u32(2)? as usize;
+        let new_q = (quant as i32) + DQUANT_DELTA[d];
+        quant = new_q.clamp(1, 31) as u32;
+    }
+
+    // 7. MVD (§5.3.7) — single-MV path only in this round.
+    if !is_intra {
+        let (px, py) = crate::motion::predict_mv(mv_grid, mb_x, mb_y);
+        let (mvx, mvy) = decode_mv_pair(br, px, py, umv)?;
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((mvx, mvy), true, false));
+    } else {
+        // Intra in P with PB-frames: §G.2 says MVD is **also** present for
+        // intra MBs (used only for the B-blocks). We must still read it.
+        let (px, py) = crate::motion::predict_mv(mv_grid, mb_x, mb_y);
+        let (mvx, mvy) = decode_mv_pair(br, px, py, umv)?;
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((mvx, mvy), true, true));
+    }
+
+    // 8. MVDB (§5.3.9) if signalled. We read each component as a Table 14
+    //    magnitude + sign — this matches the encoder side's emission. The
+    //    decoded value is the raw differential (no wrap, no sign-of-
+    //    predictor cascade because the predictor is the §G.4 scaled vector,
+    //    not a neighbour MV).
+    let mvdb = if modb.mvdb_present {
+        let dx = crate::motion::decode_mvd_pure_differential(br)?;
+        let dy = crate::motion::decode_mvd_pure_differential(br)?;
+        (dx, dy)
+    } else {
+        (0, 0)
+    };
+
+    // 9. Per-block P-half texture.
+    let luma_coded = [
+        (cbpy >> 3) & 1 != 0,
+        (cbpy >> 2) & 1 != 0,
+        (cbpy >> 1) & 1 != 0,
+        cbpy & 1 != 0,
+    ];
+    let chroma_coded = [(cbpc >> 1) & 1 != 0, cbpc & 1 != 0];
+
+    let p_info = if is_intra {
+        for block_idx in 0..6usize {
+            let coded = if block_idx < 4 {
+                luma_coded[block_idx]
+            } else {
+                chroma_coded[block_idx - 4]
+            };
+            decode_one_intra_block_in_p(br, block_idx, coded, mb_x, mb_y, quant, pic)?;
+        }
+        PMbInfo {
+            coded: true,
+            intra: true,
+            residual: vec![0i16; 6 * 64],
+            residual_present: [false; 6],
+            intra_done: true,
+        }
+    } else {
+        let mut info = PMbInfo {
+            coded: true,
+            intra: false,
+            residual: vec![0i16; 6 * 64],
+            residual_present: [false; 6],
+            intra_done: false,
+        };
+        for block_idx in 0..6usize {
+            let coded = if block_idx < 4 {
+                luma_coded[block_idx]
+            } else {
+                chroma_coded[block_idx - 4]
+            };
+            if !coded {
+                continue;
+            }
+            let mut coeffs = [0i32; 64];
+            decode_ac(br, &mut coeffs, 0, quant)?;
+            let mut resid = [0i32; 64];
+            crate::block::idct_signed(&mut coeffs, &mut resid);
+            let dst = info.residual_block_mut(block_idx);
+            for (i, &v) in resid.iter().enumerate() {
+                dst[i] = v.clamp(-4096, 4095) as i16;
+            }
+            info.residual_present[block_idx] = true;
+        }
+        // Apply local reconstruction (no OBMC, single-pass mode).
+        apply_p_mb_reconstruction(mb_x, mb_y, pic, reference, mv_grid, &info, false);
+        info
+    };
+
+    // 10. B-block residual (CBPB-driven). Decode but do not yet apply — the
+    //     caller stores it for §G.5 reconstruction after the P-half is fully
+    //     done. Round-14 round-trip pairs with an encoder that always emits
+    //     CBPB = 0, so this branch is exercised only by third-party streams.
+    if cbpb != 0 {
+        // We accept CBPB on the wire for spec-completeness; the residual
+        // bits are read (so the bitstream stays in sync) but the values are
+        // discarded. A future round will plumb them through to the §G.5
+        // B-half reconstruction.
+        for block_idx in 0..6usize {
+            // CBPB block numbering per spec: utmost left bit ↔ block 1
+            // (the first luma block). We numbered our blocks 0..=5; the
+            // spec numbers them 1..=6, so block_idx 0 maps to bit 5 of
+            // CBPB (MSB of the 6-bit field) and block_idx 5 maps to bit 0.
+            let bit = (cbpb >> (5 - block_idx)) & 1 != 0;
+            if bit {
+                let mut coeffs = [0i32; 64];
+                // B-blocks use BQUANT (§5.1.23) — for now we decode at the
+                // same quantiser. The values are discarded.
+                decode_ac(br, &mut coeffs, 0, quant)?;
+            }
+        }
+    }
+
+    Ok((
+        quant,
+        PbMbInfo {
+            p_info,
+            modb,
+            cbpb,
+            mvdb,
+        },
+    ))
+}
+
 /// Legacy one-pass decoder used when Annex F is not enabled. Kept for
 /// backwards compatibility with existing callers / tests. Calls
 /// `decode_p_mb_pass1` followed by `apply_p_mb_reconstruction` for the

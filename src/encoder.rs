@@ -153,6 +153,24 @@ pub struct H263Encoder {
     /// Combinations with Annex D (UMV), Annex E (SAC), Annex F (AP) are
     /// rejected at `send_frame` for now to keep the round 13 scope tight.
     enable_annex_n_rps: bool,
+    /// When `true`, emit P-pictures as **PB-frames** per Annex G. Every
+    /// P-picture sets PTYPE bit 13 (PBFR), the picture-header tail carries
+    /// TRB (3 bits) + DBQUANT (2 bits) per §5.1.22 / §5.1.23, and every MB
+    /// emits MODB (Table 11) followed by optional CBPB / MVDB / B-block
+    /// residual. Round-14 scope: emit MODB = `0` per MB and DBQUANT = `00`
+    /// — the B-half is then a pure §G.4 / §G.5 bidirectional MC predictor
+    /// with no residual. Combinations with Annex D (UMV), Annex E (SAC),
+    /// Annex F (Advanced Prediction), or Annex N (RPS) are rejected at
+    /// `send_frame` for now.
+    enable_annex_g_pb: bool,
+    /// TRB value emitted in the picture header when [`Self::enable_annex_g_pb`]
+    /// is on. Defaults to 1 (B sits at the midpoint of the P→P gap when the
+    /// caller delivers frames at the natural cadence).
+    pb_trb: u8,
+    /// DBQUANT code emitted in the picture header when
+    /// [`Self::enable_annex_g_pb`] is on. Defaults to `0b00` (BQUANT =
+    /// 5*QUANT/4 — the spec's smallest BQUANT step). Valid values 0..=3.
+    pb_dbquant: u8,
 }
 
 impl H263Encoder {
@@ -209,6 +227,9 @@ impl H263Encoder {
             enable_annex_e: false,
             enable_annex_d_umv: false,
             enable_annex_n_rps: false,
+            enable_annex_g_pb: false,
+            pb_trb: 1,
+            pb_dbquant: 0,
         })
     }
 
@@ -293,6 +314,37 @@ impl H263Encoder {
     pub fn enable_annex_n_rps(&self) -> bool {
         self.enable_annex_n_rps
     }
+
+    /// Enable or disable Annex G (PB-frames) emission. When on, every
+    /// P-picture sets PTYPE bit 13 (PBFR), the picture header carries TRB +
+    /// DBQUANT (§5.1.22 / §5.1.23), and every MB carries MODB + optional
+    /// CBPB / MVDB / B-block residual.
+    ///
+    /// Round-14 scope keeps MODB = `0` per MB (no CBPB, no MVDB) and uses
+    /// the configured TRB / DBQUANT picture-level values. Combinations with
+    /// Annex D (UMV), Annex E (SAC), Annex F (Advanced Prediction), or
+    /// Annex N (RPS) are rejected at `send_frame`.
+    pub fn set_enable_annex_g_pb(&mut self, enable: bool) {
+        self.enable_annex_g_pb = enable;
+    }
+
+    /// Returns whether Annex G (PB-frames) emission is currently enabled.
+    pub fn enable_annex_g_pb(&self) -> bool {
+        self.enable_annex_g_pb
+    }
+
+    /// Set the picture-header TRB value emitted in PB-frames mode (§5.1.22).
+    /// Range `0..=7`. Larger values place the B closer to the new P; `1` is
+    /// the natural midpoint when frames arrive at the spec's default cadence.
+    pub fn set_pb_trb(&mut self, trb: u8) {
+        self.pb_trb = trb.min(7);
+    }
+
+    /// Set the picture-header DBQUANT code emitted in PB-frames mode
+    /// (§5.1.23 — Table 6 mapping). Range `0..=3`.
+    pub fn set_pb_dbquant(&mut self, dbquant: u8) {
+        self.pb_dbquant = dbquant.min(3);
+    }
 }
 
 impl Encoder for H263Encoder {
@@ -338,6 +390,21 @@ impl Encoder for H263Encoder {
             ));
         }
 
+        // Annex G (PB-frames) round-14 scope: baseline 1-MV inter only.
+        // Combinations with the other annex knobs are deferred.
+        if self.enable_annex_g_pb
+            && (self.enable_annex_d_umv
+                || self.enable_annex_e
+                || self.enable_annex_f
+                || self.enable_annex_n_rps)
+        {
+            return Err(Error::unsupported(
+                "h263 encoder: Annex G (PB-frames) is not yet supported in combination \
+                 with Annex D (UMV), Annex E (SAC), Annex F (Advanced Prediction), or \
+                 Annex N (RPS)",
+            ));
+        }
+
         let tr = self.next_tr;
         self.next_tr = self.next_tr.wrapping_add(1);
 
@@ -346,6 +413,62 @@ impl Encoder for H263Encoder {
         let force_i = self.reference.is_none()
             || self.gop_size <= 1
             || self.since_keyframe + 1 >= self.gop_size;
+
+        // Round 14 — Annex G (PB-frames) routing. PB-frames extend the P
+        // picture syntax with MODB / CBPB / MVDB / DBQUANT and pair every
+        // P-picture with a co-transmitted B-picture (reconstructed by §G.4
+        // / §G.5 bidirectional MC). The encoder still consumes one input
+        // frame per `send_frame` call; the B-half is synthesised from MC
+        // alone (round-14 scope keeps MODB = 0 / no B residual). The packet
+        // emitted carries the PB picture header + per-MB MODB stream.
+        if self.enable_annex_g_pb {
+            let (bytes, p_recon, is_key) = if force_i {
+                // PB-frames need a prior P-anchor — emit a baseline I-picture
+                // first to seed the reference. The PB bit stays clear here.
+                let (b, p) = encode_i_picture_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                )?;
+                (b, p, true)
+            } else {
+                let reference = self.reference.as_ref().expect("reference checked above");
+                let (b, p) = encode_pb_picture_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                    reference,
+                    self.pb_trb,
+                    self.pb_dbquant,
+                )?;
+                (b, p, false)
+            };
+            let mut recon = p_recon;
+            if self.enable_annex_j {
+                let mb_w = self.width.div_ceil(16) as usize;
+                let mb_h = self.height.div_ceil(16) as usize;
+                let qp = vec![self.pquant; mb_w * mb_h];
+                crate::deblock::deblock_picture(&mut recon, &qp);
+            }
+            self.reference = Some(recon);
+            if is_key {
+                self.since_keyframe = 1;
+            } else {
+                self.since_keyframe += 1;
+            }
+            let mut pkt = Packet::new(0, self.time_base, bytes);
+            pkt.pts = v.pts;
+            pkt.dts = v.pts;
+            pkt.flags.keyframe = is_key;
+            self.pending.push_back(pkt);
+            return Ok(());
+        }
 
         // Round 13 — Annex N (RPS) routing. RPS rewrites the picture header
         // to PLUSPTYPE form; the MB body underneath is the same baseline
@@ -1125,6 +1248,377 @@ pub fn encode_p_picture_rps_with_recon(
     Ok((bw.finish(), recon))
 }
 
+/// Round 14 — Annex G (PB-frames) P-picture encoder.
+///
+/// Emits a baseline-PTYPE picture header with PTYPE bit 13 (PBFR) set plus
+/// the §5.1.22 / §5.1.23 TRB / DBQUANT tail. Each MB body is the standard
+/// P-MB bitstream followed by **MODB** (Table 11/H.263) — round 14 always
+/// emits MODB = `0` (no CBPB, no MVDB) so the B-half is reconstructed by
+/// pure §G.4 / §G.5 bidirectional MC with zero residual. The MB layer is
+/// otherwise identical to the non-PB encoder; the only on-wire diff is the
+/// trailing 1-bit MODB.
+///
+/// Returns `(bytes, p_recon)` — `p_recon` is the freshly reconstructed
+/// **P-half** of the PB-frame, which becomes the next picture's MC
+/// reference.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_pb_picture_with_recon(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+    trb: u8,
+    dbquant: u8,
+) -> Result<(Vec<u8>, IPicture)> {
+    let mb_w = width.div_ceil(16) as usize;
+    let mb_h = height.div_ceil(16) as usize;
+    source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263 PB encoder: source format has no GOB layout"))?;
+    let mut bw = BitWriter::with_capacity(8192);
+    let mut recon = IPicture::new(width as usize, height as usize);
+    let mut mv_grid = MvGrid::new(mb_w, mb_h);
+
+    write_picture_header_pb(
+        &mut bw,
+        source_format,
+        pquant,
+        temporal_reference,
+        true,  // P-picture
+        false, // not Annex F
+        false, // not SAC
+        false, // not UMV
+        true,  // PB-frames on
+        trb,
+        dbquant,
+    )?;
+
+    // Per-MB emit using the PB-aware encoder which interleaves MODB at the
+    // spec-correct position (between MCBPC and CBPY per §5.3 Figure 10).
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            encode_p_mb_pb(
+                &mut bw,
+                mb_x,
+                mb_y,
+                pquant,
+                frame,
+                width,
+                height,
+                reference,
+                &mut recon,
+                &mut mv_grid,
+            )?;
+        }
+    }
+    Ok((bw.finish(), recon))
+}
+
+/// Round 14 — Annex G PB-frame P-MB encoder. Like [`encode_p_mb_full`] but
+/// emits the PB-mode `MODB` (Table 11) immediately after MCBPC, per
+/// §5.3 Figure 10. Round-14 scope emits MODB = `0` (no CBPB, no MVDB) for
+/// every MB; CBPB / MVDB / B-residual emission is the round-15 follow-up.
+///
+/// Skipped MBs (COD = 1) do **not** carry MODB per §5.3.3 ("MODB is present
+/// for MB-type 0..=4") — Table 10 explicitly excludes the not-coded MB type.
+/// We follow the spec; the matching decoder reads MODB only when COD = 0.
+#[allow(clippy::too_many_arguments)]
+fn encode_p_mb_pb(
+    bw: &mut BitWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    reference: &IPicture,
+    recon: &mut IPicture,
+    mv_grid: &mut MvGrid,
+) -> Result<crate::mb::PMbInfo> {
+    // The MB-decision logic mirrors `encode_p_mb_full` for the
+    // non-Annex-F path. We replicate the relevant bits here so we can
+    // interleave MODB at the spec-correct position.
+    let (mvx, mvy, mv_sad) = motion_estimate_mb(frame, reference, mb_x, mb_y);
+
+    let zero_sad = sad_block(
+        &frame.planes[0].data,
+        frame.planes[0].stride,
+        (mb_x * 16) as i32,
+        (mb_y * 16) as i32,
+        &reference.y,
+        reference.y_stride,
+        reference.y_stride as i32,
+        (reference.y.len() / reference.y_stride) as i32,
+        (mb_x * 16) as i32,
+        (mb_y * 16) as i32,
+        0,
+        0,
+        16,
+    );
+    let (pmx, pmy) = predict_mv(mv_grid, mb_x, mb_y);
+    let can_skip = pmx == 0 && pmy == 0 && zero_sad < mv_sad + 128;
+
+    let mut y_pred = [0u8; 256];
+    let mut u_pred = [0u8; 64];
+    let mut v_pred = [0u8; 64];
+    let decide_mv = if can_skip { (0, 0) } else { (mvx, mvy) };
+    build_mb_predictor(
+        reference,
+        mb_x,
+        mb_y,
+        decide_mv.0,
+        decide_mv.1,
+        &mut y_pred,
+        &mut u_pred,
+        &mut v_pred,
+    );
+
+    let src_y = &frame.planes[0];
+    let src_cb = &frame.planes[1];
+    let src_cr = &frame.planes[2];
+    let mut luma_abs_sum = 0u32;
+    for j in 0..16 {
+        for i in 0..16 {
+            let s = src_y.data[(mb_y * 16 + j) * src_y.stride + (mb_x * 16 + i)] as i32;
+            let p = y_pred[j * 16 + i] as i32;
+            luma_abs_sum += (s - p).unsigned_abs();
+        }
+    }
+
+    // Skipped MB: COD = 1, no MODB (Table 10), nothing else.
+    if can_skip && luma_abs_sum < (quant as u32) * 128 {
+        bw.write_bits(1, 1);
+        copy_predictor_to_recon(recon, mb_x, mb_y, &y_pred, &u_pred, &v_pred);
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), false, false));
+        return Ok(crate::mb::PMbInfo::empty_skipped());
+    }
+
+    // COD = 0 — MB is coded.
+    bw.write_bits(0, 1);
+
+    // Emit MCBPC + (Intra OR Inter MB body), splicing MODB between MCBPC
+    // and CBPY. We bypass `encode_p_mb_intra` / `encode_p_mb_inter_full`
+    // (which write MCBPC + CBPY in one go) by inlining the relevant parts.
+    let intra_variance = mb_luma_variance(src_y, mb_x, mb_y);
+    let try_intra = intra_variance * 5 < luma_abs_sum;
+
+    if try_intra {
+        encode_p_mb_pb_intra(bw, mb_x, mb_y, quant, frame, width, height, recon)?;
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), true, true));
+        return Ok(crate::mb::PMbInfo {
+            coded: true,
+            intra: true,
+            residual: vec![0i16; 6 * 64],
+            residual_present: [false; 6],
+            intra_done: true,
+        });
+    }
+
+    encode_p_mb_pb_inter(
+        bw, mb_x, mb_y, quant, src_y, src_cb, src_cr, recon, decide_mv, mv_grid, &y_pred, &u_pred,
+        &v_pred,
+    )
+}
+
+/// Intra encode of a P-MB block in PB-frames mode. Same fields as
+/// `encode_p_mb_intra` plus an MODB = `0` codeword between MCBPC and CBPY.
+#[allow(clippy::too_many_arguments)]
+fn encode_p_mb_pb_intra(
+    bw: &mut BitWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    recon: &mut IPicture,
+) -> Result<()> {
+    let mut blocks = [[0i32; 64]; 6];
+    let mut dc_pels = [128u8; 6];
+    let mut block_has_ac = [false; 6];
+
+    for b in 0..6 {
+        let mut samples = [0.0f32; 64];
+        sample_block_for(frame, width, height, mb_x, mb_y, b, &mut samples);
+        let mut dctf = samples;
+        fdct8x8(&mut dctf);
+        let (dc_byte, levels, any_ac) = quantise_intra_block(&dctf, quant);
+        dc_pels[b] = dc_byte;
+        block_has_ac[b] = any_ac;
+        blocks[b] = levels;
+    }
+    let cbpc: u8 = ((block_has_ac[4] as u8) << 1) | (block_has_ac[5] as u8);
+    let cbpy: u8 = ((block_has_ac[0] as u8) << 3)
+        | ((block_has_ac[1] as u8) << 2)
+        | ((block_has_ac[2] as u8) << 1)
+        | (block_has_ac[3] as u8);
+
+    write_mcbpc_inter(bw, PMbKind::Intra, cbpc);
+    // MODB after MCBPC (spec §5.3 Fig 10). Round-14 scope: always "0".
+    crate::pb::encode_modb(bw, false, false);
+    write_cbpy(bw, cbpy);
+    for b in 0..6 {
+        bw.write_bits(dc_pels[b] as u32, 8);
+        if block_has_ac[b] {
+            write_block_ac(bw, &blocks[b]);
+        }
+        reconstruct_intra_block(recon, b, mb_x, mb_y, dc_pels[b], &blocks[b], quant);
+    }
+    Ok(())
+}
+
+/// Inter encode of a P-MB in PB-frames mode. Same fields as
+/// `encode_p_mb_inter_full` plus an MODB = `0` codeword between MCBPC and
+/// CBPY (spec §5.3 Figure 10).
+#[allow(clippy::too_many_arguments)]
+fn encode_p_mb_pb_inter(
+    bw: &mut BitWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    src_y: &oxideav_core::frame::VideoPlane,
+    src_cb: &oxideav_core::frame::VideoPlane,
+    src_cr: &oxideav_core::frame::VideoPlane,
+    recon: &mut IPicture,
+    mv: (i32, i32),
+    mv_grid: &mut MvGrid,
+    y_pred: &[u8; 256],
+    u_pred: &[u8; 64],
+    v_pred: &[u8; 64],
+) -> Result<crate::mb::PMbInfo> {
+    let mut levels_all = [[0i32; 64]; 6];
+    let mut has_ac = [false; 6];
+
+    for b in 0..4 {
+        let (sub_x, sub_y) = match b {
+            0 => (0, 0),
+            1 => (8, 0),
+            2 => (0, 8),
+            3 => (8, 8),
+            _ => unreachable!(),
+        };
+        let mut resid = [0.0f32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                let py = mb_y * 16 + sub_y + j;
+                let px = mb_x * 16 + sub_x + i;
+                let s = src_y.data[py * src_y.stride + px] as i32;
+                let p = y_pred[(sub_y + j) * 16 + (sub_x + i)] as i32;
+                resid[j * 8 + i] = (s - p) as f32;
+            }
+        }
+        let mut dctf = resid;
+        fdct8x8(&mut dctf);
+        let levels = quantise_inter_block(&dctf, quant);
+        has_ac[b] = levels.iter().any(|&l| l != 0);
+        levels_all[b] = levels;
+    }
+    for (ci, plane) in [(0, src_cb), (1, src_cr)].iter() {
+        let pred = if *ci == 0 { u_pred } else { v_pred };
+        let mut resid = [0.0f32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                let py = mb_y * 8 + j;
+                let px = mb_x * 8 + i;
+                let s = plane.data[py * plane.stride + px] as i32;
+                let p = pred[j * 8 + i] as i32;
+                resid[j * 8 + i] = (s - p) as f32;
+            }
+        }
+        let mut dctf = resid;
+        fdct8x8(&mut dctf);
+        let levels = quantise_inter_block(&dctf, quant);
+        let b = 4 + ci;
+        has_ac[b] = levels.iter().any(|&l| l != 0);
+        levels_all[b] = levels;
+    }
+
+    let cbpc: u8 = ((has_ac[4] as u8) << 1) | (has_ac[5] as u8);
+    let cbpy_true: u8 = ((has_ac[0] as u8) << 3)
+        | ((has_ac[1] as u8) << 2)
+        | ((has_ac[2] as u8) << 1)
+        | (has_ac[3] as u8);
+    let cbpy_on_wire = cbpy_true ^ 0xF;
+
+    write_mcbpc_inter(bw, PMbKind::Inter, cbpc);
+    // MODB after MCBPC (spec §5.3 Fig 10). Round-14 scope: always "0".
+    crate::pb::encode_modb(bw, false, false);
+    write_cbpy(bw, cbpy_on_wire);
+    let (pmx, pmy) = predict_mv(mv_grid, mb_x, mb_y);
+    encode_mv_component(bw, mv.0, pmx);
+    encode_mv_component(bw, mv.1, pmy);
+
+    for b in 0..6 {
+        if has_ac[b] {
+            write_block_ac_inter(bw, &levels_all[b]);
+        }
+    }
+
+    let mut info = crate::mb::PMbInfo {
+        coded: true,
+        intra: false,
+        residual: vec![0i16; 6 * 64],
+        residual_present: [false; 6],
+        intra_done: false,
+    };
+    for b in 0..4 {
+        let (sub_x, sub_y) = match b {
+            0 => (0, 0),
+            1 => (8, 0),
+            2 => (0, 8),
+            3 => (8, 8),
+            _ => unreachable!(),
+        };
+        let coeffs = dequantise_block(&levels_all[b], quant, false);
+        let mut c = coeffs;
+        let mut resid_out = [0i32; 64];
+        crate::block::idct_signed(&mut c, &mut resid_out);
+        let (plane, stride, px, py) = block_dst(recon, b, mb_x, mb_y);
+        for j in 0..8 {
+            for i in 0..8 {
+                let p = y_pred[(sub_y + j) * 16 + (sub_x + i)] as i32;
+                let r = resid_out[j * 8 + i];
+                plane[(py + j) * stride + (px + i)] = (p + r).clamp(0, 255) as u8;
+            }
+        }
+        if has_ac[b] {
+            let dst = info.residual_block_mut(b);
+            for (i, &v) in resid_out.iter().enumerate() {
+                dst[i] = v.clamp(-4096, 4095) as i16;
+            }
+            info.residual_present[b] = true;
+        }
+    }
+    for ci in 0..2usize {
+        let b = 4 + ci;
+        let pred = if ci == 0 { u_pred } else { v_pred };
+        let coeffs = dequantise_block(&levels_all[b], quant, false);
+        let mut c = coeffs;
+        let mut resid_out = [0i32; 64];
+        crate::block::idct_signed(&mut c, &mut resid_out);
+        let (plane, stride, px, py) = block_dst(recon, b, mb_x, mb_y);
+        for j in 0..8 {
+            for i in 0..8 {
+                let p = pred[j * 8 + i] as i32;
+                let r = resid_out[j * 8 + i];
+                plane[(py + j) * stride + (px + i)] = (p + r).clamp(0, 255) as u8;
+            }
+        }
+        if has_ac[b] {
+            let dst = info.residual_block_mut(b);
+            for (i, &v) in resid_out.iter().enumerate() {
+                dst[i] = v.clamp(-4096, 4095) as i16;
+            }
+            info.residual_present[b] = true;
+        }
+    }
+    mv_grid.set(mb_x, mb_y, MbMotion::mv1(mv, true, false));
+    Ok(info)
+}
+
 /// Copy one MB (Y + Cb + Cr) from `src` to `dst`. Used to preserve intra
 /// MBs during the Annex F pass 2.
 fn copy_mb_from_to(src: &IPicture, dst: &mut IPicture, mb_x: usize, mb_y: usize) {
@@ -1411,6 +1905,39 @@ fn write_picture_header_full(
     sac_mode: bool,
     umv_mode: bool,
 ) -> Result<()> {
+    write_picture_header_pb(
+        bw,
+        source_format,
+        pquant,
+        tr,
+        is_p_picture,
+        advanced_prediction,
+        sac_mode,
+        umv_mode,
+        false, // pb_frames off
+        0,     // trb (unused when pb=0)
+        0,     // dbquant (unused when pb=0)
+    )
+}
+
+/// Picture header writer with full PTYPE knobs **plus** the Annex G PB-frames
+/// extras (TRB / DBQUANT — see §5.1.22 / §5.1.23). When `pb_frames` is
+/// false, behaves identically to [`write_picture_header_full`] and TRB /
+/// DBQUANT bits are not emitted.
+#[allow(clippy::too_many_arguments)]
+fn write_picture_header_pb(
+    bw: &mut BitWriter,
+    source_format: SourceFormat,
+    pquant: u8,
+    tr: u8,
+    is_p_picture: bool,
+    advanced_prediction: bool,
+    sac_mode: bool,
+    umv_mode: bool,
+    pb_frames: bool,
+    trb: u8,
+    dbquant: u8,
+) -> Result<()> {
     // PSC: 22 bits = `0000 0000 0000 0000 1 00000`. Write byte-aligned to
     // simplify start-code recognition.
     debug_assert!(bw.is_byte_aligned());
@@ -1471,7 +1998,10 @@ fn write_picture_header_full(
         0
     };
     bw.write_bits(ap_bit, 1); // bit 12 AP
-    bw.write_bits(0, 1); // bit 13 PB
+                              // bit 13 PB — Annex G PB-frames mode. Set iff `pb_frames` is on AND
+                              // this is a P-picture. The spec requires the bit to be 0 on I.
+    let pb_bit = if is_p_picture && pb_frames { 1 } else { 0 };
+    bw.write_bits(pb_bit, 1);
 
     // PQUANT (5 bits).
     if pquant == 0 || pquant > 31 {
@@ -1484,6 +2014,23 @@ fn write_picture_header_full(
 
     // CPM (0) and no PSBI follows.
     bw.write_bits(0, 1);
+
+    // §5.1.22 / §5.1.23 — TRB (3 bits) + DBQUANT (2 bits) when PB-frames mode
+    // is active. Standard CIF picture-clock-frequency variant (3-bit TRB).
+    if pb_bit == 1 {
+        if trb > 7 {
+            return Err(Error::invalid(format!(
+                "h263 encoder: TRB {trb} out of 3-bit range (0..=7)"
+            )));
+        }
+        if dbquant > 3 {
+            return Err(Error::invalid(format!(
+                "h263 encoder: DBQUANT {dbquant} out of 2-bit range (0..=3)"
+            )));
+        }
+        bw.write_bits(trb as u32, 3);
+        bw.write_bits(dbquant as u32, 2);
+    }
 
     // PEI loop terminator.
     bw.write_bits(0, 1);

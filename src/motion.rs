@@ -325,6 +325,36 @@ pub fn decode_mv_component_plusptype_umv(
     Ok(mv)
 }
 
+/// Decode one MVD component as a **pure differential** (Table 14 magnitude +
+/// sign, no wrap, no sign-of-predictor cascade). Used by the Annex G
+/// PB-frames `MVDB` decode (§5.3.9 / §G.4) where the predictor is the
+/// scaled forward vector and the codeword carries the offset directly.
+///
+/// Returns the signed differential in half-pel units in `[-32, +32]`.
+pub fn decode_mvd_pure_differential(br: &mut BitReader<'_>) -> Result<i32> {
+    let magnitude = vlc::decode(br, mv_tab::table())? as i32;
+    if magnitude == 0 {
+        return Ok(0);
+    }
+    let sign_bit = br.read_u1()? as i32;
+    let sign_dir = if sign_bit == 1 { -1 } else { 1 };
+    Ok(magnitude * sign_dir)
+}
+
+/// Emit one MVD component as a pure differential — Table 14 magnitude +
+/// sign with no wrap. Mirrors [`decode_mvd_pure_differential`] and is used
+/// by the Annex G PB-frames `MVDB` encode path.
+pub fn encode_mvd_pure_differential(bw: &mut BitWriter, diff: i32) {
+    let mag = diff.unsigned_abs() as usize;
+    debug_assert!(mag <= 32, "MVDB differential out of range");
+    let (bits, code) = MV_ENC_VLC[mag];
+    bw.write_bits(code, bits as u32);
+    if mag > 0 {
+        let sign: u32 = if diff < 0 { 1 } else { 0 };
+        bw.write_bits(sign, 1);
+    }
+}
+
 /// Decode the MVD-pair start-code-emulation-prevention bit (§D.2 last
 /// paragraph): "if a pair equals (0.5, 0.5) six consecutive zeros are
 /// produced. To prevent start code emulation, this occurrence shall be

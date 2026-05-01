@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Annex G (PB-frames) — decoder + encoder (round 14).**
+  Both sides now wire ITU-T Rec. H.263 (01/2005) §G.1 / §G.4 / §G.5
+  for the legacy PB-frames mode (the H.263 baseline B-picture flavour
+  that pairs each transmitted P with one bidirectionally-predicted B
+  reconstructed from §G.4-scaled forward + backward MVs).
+  * `picture::parse_picture_header` accepts PTYPE bit 13 (PBFR), reads
+    the §5.1.22 / §5.1.23 TRB (3 bits) + DBQUANT (2 bits) tail after
+    CPM/PSBI, and surfaces the parsed values on `PictureHeader.pb_frames`
+    / `trb` / `dbquant`. The header-tail layout matches the standard
+    (CIF) picture-clock-frequency variant (custom-PCF would extend TRB
+    to 5 bits, which baseline PTYPE doesn't carry).
+  * New [`pb`] module hosting the §G.4 / §G.5 math: `derive_b_block_mvs`
+    (forward `MVF` + backward `MVB` from the P-MB's MV plus an optional
+    `MVDB` delta, with the §G.4 sign-of-MVDB switch between
+    `MVB = ((TRB-TRD)*MV)/TRD` and `MVB = MVF - MV`), `derive_b_mb_mvs`
+    (per-MB four-luma + chroma derivation with §F.2 sum-of-4 + Table F.1
+    rounding), `reconstruct_b_block` (§G.5 bidirectional MC with the
+    spec's per-pixel "is `MVB` inside the freshly-reconstructed P-MB
+    region?" test), `reconstruct_b_picture` (per-MB driver), and the
+    `MODB` Table 11 VLC (encode + decode). The Table 6 BQUANT mapping
+    (§5.1.23) lives here too as `bquant_from_quant`.
+  * `mb::decode_p_mb_pb` reads the per-MB syntax in spec order (§5.3
+    Figure 10): COD → MCBPC → **MODB** → optional CBPB (6 bits) →
+    CBPY → DQUANT → MVD → MVDB. CBPB-driven B-residual bytes are
+    parsed-and-discarded for round-14 scope (the round-trip with our
+    own encoder always emits MODB = 0); MVDB uses a Table 14 pure
+    differential (new `motion::decode_mvd_pure_differential` /
+    `encode_mvd_pure_differential` helpers).
+  * `decoder::decode_pb_picture` runs the per-MB PB decode then calls
+    [`pb::reconstruct_b_picture`] with TRB from the picture header and
+    `TRD = TRB + 1` (round-14 default). The decoder front-end emits two
+    `VideoFrame`s per PB packet: B first, then P (display order). Only
+    the P-half is stored as the MC reference for subsequent pictures
+    (per §G.1 / §5.1.22).
+  * `H263Encoder::set_enable_annex_g_pb` opts in to PB emission. The
+    new `write_picture_header_pb` writer + `encode_pb_picture_with_recon`
+    + `encode_p_mb_pb` + `encode_p_mb_pb_intra` / `encode_p_mb_pb_inter`
+    write the picture header with the PB bit + TRB/DBQUANT and emit
+    the per-MB stream with MODB at the spec-correct position. TRB /
+    DBQUANT are tunable via `set_pb_trb` / `set_pb_dbquant` (defaults
+    1 / `00`). Combinations with Annex D (UMV), Annex E (SAC), Annex F
+    (Advanced Prediction), or Annex N (RPS) are rejected at
+    `send_frame` for round 14.
+  * Validation in `tests/annex_g_pb_frames.rs` (6 new tests + 1 ignored
+    ffmpeg interop probe): PTYPE-bit + TRB/DBQUANT round-trip, 5-frame
+    `[I, PB, PB, PB, PB]` self-roundtrip with PSNR ≥ 30 dB on the
+    I-frame and every P-half (lands at **68.1 dB** for both the I and
+    every P-half on the moving-square QCIF clip; B-halves at **28.8 dB**
+    vs the midpoint-position source proxy, well above the ≥ 18 dB floor
+    the bidirectional MC sets without B-residual), MODB Table 11 VLC
+    bit-pattern check, MODB = 0 wire round-trip, B-picture dimension
+    sanity, combination-guard rejection, ffmpeg cross-decode probe
+    (informational — exit 0 with no error logs on ffmpeg 8.1, no
+    interop assertion). 5 unit tests in `pb::tests` exercise the §G.4
+    derivation at the midpoint + with MVDB delta, MODB round-trip,
+    Table 6 BQUANT mapping, and Table F.1 chroma rounding.
 - **Annex N (Reference Picture Selection) — decoder + encoder (round 13).**
   Both sides now wire ITU-T Rec. H.263 (01/2005) §5.1.13–§5.1.16 / Annex N
   for the picture-header path:

@@ -22,10 +22,10 @@ use oxideav_core::{
 
 use crate::gob::parse_gob_header;
 use crate::mb::{
-    apply_p_mb_reconstruction, decode_intra_mb, decode_p_mb, decode_p_mb_pass1, IPicture, PMbInfo,
-    UmvMode,
+    apply_p_mb_reconstruction, decode_intra_mb, decode_p_mb, decode_p_mb_pass1, decode_p_mb_pb,
+    IPicture, PMbInfo, UmvMode,
 };
-use crate::motion::MvGrid;
+use crate::motion::{MbMotion, MvGrid};
 use crate::picture::{parse_picture_header, PictureCodingType, PictureHeader};
 use crate::start_code::{find_next_start_code, StartCode, GN_EOS, GN_PICTURE};
 
@@ -208,6 +208,26 @@ impl H263Decoder {
                     return Err(Error::invalid(
                         "h263 P-picture: dimension change without I-picture",
                     ));
+                }
+                // Round 14 — Annex G PB-frames branch. PB-frames pair the
+                // P-half (decoded just like a regular P-picture but with
+                // MODB / CBPB / MVDB woven in per MB) with a B-half
+                // reconstructed from §G.4 / §G.5 bidirectional MC. We emit
+                // the B frame first (display order), then the P frame.
+                if hdr.pb_frames {
+                    let reference = reference.clone();
+                    let (p_pic, b_pic) = decode_pb_picture(&mut br, &hdr, bytes, &reference)?;
+                    let mut p_pic = p_pic;
+                    self.maybe_deblock(&mut p_pic, &hdr);
+                    // B-frame is **not** stored as MC reference (§G.1 / §5.1.22);
+                    // only the P-half goes into the cache.
+                    let b_frame = pic_to_video_frame(&b_pic, self.pending_pts, self.pending_tb);
+                    let p_frame = pic_to_video_frame(&p_pic, self.pending_pts, self.pending_tb);
+                    self.push_rps_cache(hdr.temporal_reference as u16, p_pic.clone());
+                    self.reference = Some(p_pic);
+                    self.ready_frames.push_back(b_frame);
+                    self.ready_frames.push_back(p_frame);
+                    return Ok(());
                 }
                 let mut pic = if hdr.sac_mode {
                     // Round 14 — SAC P-picture body driver.
@@ -427,6 +447,101 @@ pub fn decode_p_picture(
     }
 
     Ok(pic)
+}
+
+/// Decode the PB-frame body (Annex G). Returns `(p_recon, b_recon)` where
+/// `p_recon` is the freshly reconstructed P-half and `b_recon` is the
+/// §G.4 / §G.5 bidirectional B-half. The B-half is **display-order
+/// preceding** the P-half (the spec interleaves them for compression but the
+/// caller emits them as B then P).
+pub fn decode_pb_picture(
+    br: &mut BitReader<'_>,
+    hdr: &PictureHeader,
+    bytes: &[u8],
+    reference: &IPicture,
+) -> Result<(IPicture, IPicture)> {
+    let mb_w = hdr.width.div_ceil(16) as usize;
+    let mb_h = hdr.height.div_ceil(16) as usize;
+    let (_num_gobs, mb_rows_per_gob) = hdr
+        .source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263: source format has no GOB layout"))?;
+    let mut p_pic = IPicture::new(hdr.width as usize, hdr.height as usize);
+    let mut quant = hdr.pquant as u32;
+    let gob_starts = collect_gob_offsets(bytes);
+
+    let mut mv_grid = MvGrid::new(mb_w, mb_h);
+    let umv_mode = UmvMode::from_header(hdr);
+
+    // PB-frames don't combine with Annex F in our scope — single-pass.
+    if hdr.advanced_prediction {
+        return Err(Error::unsupported(
+            "h263 PB-frames + Annex F (Advanced Prediction): not yet supported",
+        ));
+    }
+    if hdr.sac_mode {
+        return Err(Error::unsupported(
+            "h263 PB-frames + Annex E (SAC): not yet supported",
+        ));
+    }
+
+    // Per-MB MVDB deltas (zero when MODB indicated no MVDB). Used by §G.4.
+    let mut mb_mvdbs: Vec<(i32, i32)> = vec![(0, 0); mb_w * mb_h];
+
+    for mb_y in 0..mb_h {
+        if mb_y > 0 && (mb_y as u32) % mb_rows_per_gob == 0 {
+            let consumed = try_consume_gob_header(br, &gob_starts, hdr, &mut quant)?;
+            if consumed {
+                mv_grid = MvGrid::new(mb_w, mb_h);
+            }
+        }
+        for mb_x in 0..mb_w {
+            let (new_q, info) = decode_p_mb_pb(
+                br,
+                mb_x,
+                mb_y,
+                quant,
+                &mut p_pic,
+                reference,
+                &mut mv_grid,
+                umv_mode,
+            )
+            .map_err(|e| {
+                Error::invalid(format!(
+                    "h263 PB-picture MB ({mb_x},{mb_y}) (q={quant}): {e}"
+                ))
+            })?;
+            quant = new_q;
+            mb_mvdbs[mb_y * mb_w + mb_x] = info.mvdb;
+        }
+    }
+
+    // §G.4 / §G.5 — reconstruct the B-half. TRD = 1 by spec when the encoder
+    // emits successive PB pictures; we use a constant TRD = 2 (matching the
+    // common "B sits at the midpoint of the P→P gap"). TRB comes from the
+    // picture header.
+    let trb = hdr.trb.max(1) as i32;
+    // TRD = TRB + 1 in the simplest case (one B between two Ps); the spec
+    // §G.4 derives it from the picture-header TR delta but baseline H.263
+    // doesn't carry that explicitly here. Round-14 picks TRD = TRB + 1 so
+    // the B sits proportionally where the encoder placed it.
+    let trd = (trb + 1).max(1);
+
+    let mb_motions: Vec<MbMotion> = (0..(mb_w * mb_h)).map(|i| mv_grid.mvs[i]).collect();
+    let b_residuals = vec![0i16; mb_w * mb_h * 6 * 64];
+    let b_pic = crate::pb::reconstruct_b_picture(
+        hdr.width as usize,
+        hdr.height as usize,
+        reference,
+        &p_pic,
+        &mb_motions,
+        &mb_mvdbs,
+        &b_residuals,
+        trb,
+        trd,
+    );
+
+    Ok((p_pic, b_pic))
 }
 
 /// Collect byte offsets of every GBSC marker in the picture body. Used by
