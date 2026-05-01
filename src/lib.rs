@@ -108,12 +108,30 @@
 //!   AP-mode predictors to reach across segments outside Slice
 //!   Structured / ISD).
 //!
+//! * **Annex N — Reference Picture Selection** (round 13). Both decode +
+//!   encode emit the picture-header path: PLUSPTYPE OPPTYPE bit 11 (RPS),
+//!   RPSMF (5.1.13 — `100`/`101`/`110`/`111`), TRPI (5.1.14), TRP (5.1.15),
+//!   and BCI (5.1.16 — `01` accepted; `1` + BCM is rejected as round-14
+//!   follow-up). The decoder maintains an LRU picture-memory cache keyed
+//!   by TR (default capacity 4, tunable via
+//!   [`decoder::H263Decoder::set_rps_cache_capacity`]); when a P-picture's
+//!   parsed `trpi` is set, [`decoder::H263Decoder`] looks up `trp` in the
+//!   cache and uses that picture as the motion-compensation reference,
+//!   degrading gracefully to "most recent anchor" on cache miss
+//!   (mirrors §N.5 fall-back). The encoder opts in via
+//!   [`encoder::H263Encoder::set_enable_annex_n_rps`]; round-13 emits
+//!   RPSMF=`100` (no back-channel) + TRPI=0 (decoder uses most recent
+//!   anchor) + BCI=`01`, with the MB layer unchanged baseline 1-MV inter.
+//!
 //! Out of scope (returns `Error::Unsupported`):
 //! * PB-frames mode (§G) and every B-picture flavour.
 //! * Annex G (PB-frames), Annex I (Advanced Intra Coding), Annex K (Slice
 //!   Structured Mode — detected with a specific diagnostic since ffmpeg's
-//!   `h263p -umv 1` bundles it with Annex D), Annex N (RPS), Annex P
+//!   `h263p -umv 1` bundles it with Annex D), Annex P
 //!   (Reference Picture Resampling), Annex T (Modified Quantization).
+//! * Annex N back-channel-message body (BCM) — §N.4.2 BT/URF/TR/ELNUMI/
+//!   ELNUM/BCPM/BSBI/BEPB1/2/GN/MBA/RTR/BSTUF parsing is rejected with
+//!   a specific `Unsupported` diagnostic when BCI = "1".
 //! * H.263+ custom picture clock frequency / custom picture sizes that don't
 //!   match one of the standard source formats (sub-QCIF/QCIF/CIF/4CIF/16CIF).
 //! * CPM continuous-presence multipoint mode.

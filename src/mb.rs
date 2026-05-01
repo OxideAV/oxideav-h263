@@ -92,6 +92,7 @@ impl UmvMode {
 
 /// Reconstructed I-picture: three pel planes (Y, Cb, Cr), MB-aligned, stride
 /// equal to MB-aligned width.
+#[derive(Clone)]
 pub struct IPicture {
     pub width: usize,
     pub height: usize,

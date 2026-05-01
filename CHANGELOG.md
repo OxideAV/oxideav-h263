@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Annex N (Reference Picture Selection) — decoder + encoder (round 13).**
+  Both sides now wire ITU-T Rec. H.263 (01/2005) §5.1.13–§5.1.16 / Annex N
+  for the picture-header path:
+  * `picture::parse_picture_header` accepts PLUSPTYPE OPPTYPE bit 11
+    (RPS) instead of returning `Unsupported`. The new fields RPSMF
+    (3 bits, only when UFEP=001), TRPI (1 bit, mandatory when RPS in
+    use), TRP (10 bits, only when TRPI=1), and BCI ("1" + BCM follows
+    or "01" for no BCM) surface on the parsed `PictureHeader` as
+    `rps_mode` / `rpsmf` / `trpi` / `trp` / `bci_present`. BCI = "1"
+    is rejected with a specific `Unsupported` diagnostic citing
+    §N.4.2 (the BCM body parse — BT/URF/TR/ELNUMI/ELNUM/BCPM/BSBI/
+    BEPB1/2/GN/MBA/RTR/BSTUF — is out of round-13 scope).
+  * `H263Decoder` gained an LRU picture-memory cache keyed by TR
+    (default capacity 4, tunable via `set_rps_cache_capacity`).
+    Every successfully decoded picture is pushed into the cache, and
+    when a parsed P-picture has `rps_mode && trpi`, the decoder looks
+    up `trp` in the cache and uses that picture as the
+    motion-compensation reference. Cache misses degrade gracefully to
+    "most recent anchor" (matches §N.5's fall-back). `IPicture` gained
+    `#[derive(Clone)]` so the cache can hold owning copies.
+  * `H263Encoder::set_enable_annex_n_rps` opts in to RPS emission.
+    The new `write_plusptype_picture_header_rps` writer emits a
+    PLUSPTYPE-form picture header (source-format `111`, UFEP=001,
+    full OPPTYPE with RPS bit) with RPSMF=`100` (NEITHER — no
+    back-channel signals), TRPI=0 (decoder uses most recent anchor),
+    BCI=`01` (no BCM). The MB layer underneath is unchanged baseline
+    1-MV inter — bit-identical to the non-RPS encoder for the same
+    DCT/quant/MV pipeline. Combinations with Annex D / E / F return
+    `Error::Unsupported` at `send_frame`.
+  * Validation in `tests/annex_n_rps.rs` (7 new tests):
+    PLUSPTYPE wire format check (PSC + TR + PTYPE prefix + UFEP + OPPTYPE
+    bit 11 = 1), header parse round-trip of all RPS fields, self-roundtrip
+    PSNR ≥ 30 dB on the moving-square QCIF clip, hand-rolled TRPI=1+TRP
+    rewrite test (multi-reference cache lookup), combination-guard
+    rejection for UMV/SAC/AP, ffmpeg cross-decode probe (ffmpeg 8.1
+    logs "Reference Picture Selection not supported" and concealment
+    decodes — frame 0 / I-picture lands at **51 dB**, P-pictures get
+    concealed by ffmpeg's best-effort path), testsrc 5-frame QCIF
+    PSNR (self ≥ 30 dB across the clip; ffmpeg I-picture floor 30 dB).
 - **Annex D (Unrestricted Motion Vectors) — encoder emit (round 12).**
   `H263Encoder::set_enable_annex_d_umv(true)` activates the UMV path: every
   P-picture sets PTYPE bit 10 (UMV) in the header (`write_picture_header_full`

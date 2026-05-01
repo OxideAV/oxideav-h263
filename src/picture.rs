@@ -155,6 +155,32 @@ pub struct PictureHeader {
     /// in a PLUSPTYPE header. `false` means "UUI = 1" (range limited per
     /// Tables D.1/D.2) or UMV off.
     pub uui_unlimited: bool,
+    /// Annex N (Reference Picture Selection) mode — only meaningful when
+    /// [`Self::plusptype`] is set. Mirrors OPPTYPE bit 11.
+    pub rps_mode: bool,
+    /// Annex N RPSMF (5.1.13). When `Some`, encodes the back-channel mode:
+    ///
+    /// * `0b100` = neither ACK nor NACK signals needed;
+    /// * `0b101` = ACK signals;
+    /// * `0b110` = NACK signals;
+    /// * `0b111` = both ACK and NACK.
+    ///
+    /// Only present when RPS is in use AND UFEP=001; otherwise `None` and
+    /// the previous-picture value is implicitly latched (§5.1.13).
+    pub rpsmf: Option<u8>,
+    /// Annex N TRPI (5.1.14). When `true`, the bitstream carried a TRP
+    /// field selecting a non-default reference picture for prediction.
+    /// `false` for I-pictures (spec mandates), or P-pictures that fall back
+    /// to "most recent anchor" (§5.1.15).
+    pub trpi: bool,
+    /// Annex N TRP (5.1.15). 10-bit temporal reference of the chosen
+    /// reference picture. Only meaningful when [`Self::trpi`] is set.
+    pub trp: u16,
+    /// Annex N BCI (5.1.16). When RPS is in use, BCI is the 1- or 2-bit
+    /// back-channel-message indicator. We store the parsed presence flag
+    /// here. The actual BCM bytes (variable-length, §N.4.2) are skipped at
+    /// parse time; round 13 only validates presence/absence.
+    pub bci_present: bool,
 }
 
 /// Parse the picture header that follows the 22-bit PSC.
@@ -290,6 +316,11 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
         plusptype: false,
         deblocking_filter: false,
         uui_unlimited: false,
+        rps_mode: false,
+        rpsmf: None,
+        trpi: false,
+        trp: 0,
+        bci_present: false,
     })
 }
 
@@ -362,7 +393,7 @@ fn parse_plusptype_tail(
     //   Bit 14:   MQ  (Annex T modified quantization).
     //   Bit 15:   Marker, must be "1".
     //   Bits 16-18: Reserved, must be "000".
-    let (opptype_src_format, custom_src_format, custom_pcf, umv_mode, df_mode, ap_mode) =
+    let (opptype_src_format, custom_src_format, custom_pcf, umv_mode, df_mode, ap_mode, rps_mode) =
         if ufep == 0b001 {
             let opptype = br.read_u32(18)?;
             // MSB-first helpers: `bit(k)` returns the k-th spec bit
@@ -422,11 +453,12 @@ fn parse_plusptype_tail(
                  slice headers replace GOB headers per §K.2)",
                 ));
             }
-            if rps {
-                return Err(Error::unsupported(
-                    "h263 Annex N reference picture selection: follow-up",
-                ));
-            }
+            // Annex N (Reference Picture Selection) is now accepted on
+            // PLUSPTYPE input. The RPSMF / TRPI / TRP / BCI fields below
+            // are read in the body parse, after CPM / CPFMT / EPAR /
+            // CPCFC / ETR / UUI / SSS / ELNUM / RLNUM (Figure 6 / part
+            // 2). Encoder-side opt-in is on `H263Encoder` via
+            // `set_enable_annex_n_rps`.
             if isd {
                 return Err(Error::unsupported(
                     "h263 Annex R independent segment decoding: follow-up",
@@ -447,7 +479,7 @@ fn parse_plusptype_tail(
             // encode and decode paths are in `crate::motion`; wired into
             // `decode_p_mb` / `decode_p_mb_pass1` below via the `umv_plusptype`
             // flag on `PictureHeader`.
-            (src_fmt_code as u8, custom_src, custom_pcf, umv, df, ap)
+            (src_fmt_code as u8, custom_src, custom_pcf, umv, df, ap, rps)
         } else if ufep == 0b000 {
             // Inherit previous-picture OPPTYPE state. Since we do not yet retain
             // OPPTYPE across pictures, we treat the inherited state as "baseline
@@ -459,7 +491,7 @@ fn parse_plusptype_tail(
             // bit that actually matters. `opptype_src_format = 0` signals
             // "no OPPTYPE, dimensions must be inferable from later CPFMT (which
             // in turn will not be present for UFEP==000)".
-            (0, false, false, false, false, false)
+            (0, false, false, false, false, false, false)
         } else {
             return Err(Error::invalid(format!(
                 "h263 PLUSPTYPE: invalid UFEP {ufep:03b}"
@@ -607,6 +639,71 @@ fn parse_plusptype_tail(
 
     // SSS (Annex K) — only if slice structured was signalled (rejected above).
 
+    // ELNUM / RLNUM (Annex O) — only present if the scalability mode is in
+    // use. Annex O is rejected at the OPPTYPE check above (well, scalability
+    // is gated on PCT picture-coding-type values 100/101 which are rejected
+    // at MPPTYPE), so these fields are never present when we reach here.
+
+    // RPSMF / TRPI / TRP / BCI (Annex N — Reference Picture Selection).
+    // Per §5.1.13 / §5.1.14 / §5.1.15 / §5.1.16, only present when the RPS
+    // bit (OPPTYPE bit 11) is set:
+    //   * RPSMF — 3 bits, only when UFEP=001. If RPS is in use but UFEP=000
+    //     the previous picture's RPSMF latches (we don't track cross-picture
+    //     RPSMF state — caller must opt in to RPS via a fresh OPPTYPE).
+    //   * TRPI — 1 bit, present whenever RPS is in use (regardless of UFEP).
+    //     Spec mandates TRPI=0 on I-pictures (no TRP needed for intra).
+    //   * TRP — 10 bits, only present when TRPI=1.
+    //   * BCI — 1 or 2 bits. "1" → BCM follows; "01" → no BCM. The spec
+    //     forbids BCI != "01" outside videomux mode; we accept "01" cleanly
+    //     and reject "1" with a specific Unsupported diagnostic since BCM
+    //     parsing (Figure N.4) is round-13's follow-up.
+    let (rpsmf, trpi, trp, bci_present) = if rps_mode {
+        let rpsmf = if ufep == 0b001 {
+            let v = br.read_u32(3)? as u8;
+            // Spec §5.1.13: 100/101/110/111 are valid. 000-011 reserved.
+            if v < 0b100 {
+                return Err(Error::invalid(format!(
+                    "h263 PLUSPTYPE RPSMF: reserved value {v:03b}"
+                )));
+            }
+            Some(v)
+        } else {
+            None
+        };
+        let trpi_bit = br.read_u1()? == 1;
+        if trpi_bit && matches!(coding_type, PictureCodingType::Intra) {
+            return Err(Error::invalid(
+                "h263 PLUSPTYPE RPS: TRPI must be 0 on I-pictures (§5.1.14)",
+            ));
+        }
+        let trp_val = if trpi_bit {
+            br.read_u32(10)? as u16
+        } else {
+            0u16
+        };
+        // BCI: "1" → BCM follows (round-13 unsupported); "01" → no BCM.
+        let bci_first = br.read_u1()?;
+        let bci_present_v = if bci_first == 1 {
+            // BCM follows. Round-13 declines to parse the BCM body — this
+            // requires §N.4.2 syntax (BT, URF, TR, ELNUMI, ELNUM, BCPM,
+            // BSBI, BEPB1/2, GN/MBA, RTR, BSTUF) which is out of scope.
+            return Err(Error::unsupported(
+                "h263 Annex N back-channel message body (BCM): \
+                 follow-up — videomux-only path not yet wired (§N.4.2)",
+            ));
+        } else {
+            // "01" — second bit must be 1.
+            let second = br.read_u1()?;
+            if second != 1 {
+                return Err(Error::invalid("h263 PLUSPTYPE RPS: invalid BCI prefix"));
+            }
+            false
+        };
+        (rpsmf, trpi_bit, trp_val, bci_present_v)
+    } else {
+        (None, false, 0u16, false)
+    };
+
     // PQUANT
     let pquant = br.read_u32(5)? as u8;
     if pquant == 0 {
@@ -645,6 +742,11 @@ fn parse_plusptype_tail(
         plusptype: true,
         deblocking_filter: df_mode,
         uui_unlimited,
+        rps_mode,
+        rpsmf,
+        trpi,
+        trp,
+        bci_present,
     })
 }
 

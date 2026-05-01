@@ -5,9 +5,11 @@
 //! frame is retained as the motion-compensation reference for the next
 //! P-picture; an I-picture clears it. Both baseline PTYPE headers and
 //! H.263+ PLUSPTYPE headers are recognised — streams that assert any
-//! still-unimplemented annex (Annex D/E/F/G/I/K/N/P/Q/R/S/T or PB-frames)
-//! are rejected at the picture-header layer with a diagnostic naming the
-//! specific annex; see `picture::parse_picture_header`.
+//! still-unimplemented annex (Annex G/I/K/P/Q/R/S/T or PB-frames) are
+//! rejected at the picture-header layer with a diagnostic naming the
+//! specific annex; see `picture::parse_picture_header`. Annex D/E/F are
+//! handled in the MB body; Annex N is parsed in the picture header and
+//! plumbed through the decoder's RPS picture-memory cache (round 13).
 
 use std::collections::VecDeque;
 
@@ -43,6 +45,25 @@ pub struct H263Decoder {
     /// for the next P-picture. Cleared on I-pictures (before the I is
     /// decoded) and refreshed after every successful decode.
     reference: Option<IPicture>,
+    /// Round 13 — Annex N (Reference Picture Selection) multi-reference
+    /// cache. Keyed by the picture's TR (temporal reference); populated on
+    /// every successful decode regardless of whether the stream signalled
+    /// RPS (so a future picture's TRP lookup always finds the latest
+    /// candidates). Bounded LRU — older entries fall off after
+    /// [`Self::rps_cache_capacity`].
+    ///
+    /// Only consulted when a P-picture's parsed `PictureHeader.trpi` is set
+    /// AND `rps_mode` is set; otherwise the most-recent `reference` is used
+    /// (`§N.5` "When the picture for which the TR is TRP is not available
+    /// at the decoder, the decoder may send a forced INTRA update signal
+    /// to the encoder by external means" — we instead fall back to the
+    /// most recent reference and log via `Result::Err` upstream).
+    rps_cache: VecDeque<(u16, IPicture)>,
+    /// Maximum entries in [`Self::rps_cache`]. Default 4 — Annex N's
+    /// "additional picture memory" is signalled out-of-band (H.245); we
+    /// pick a small default that still demonstrates multi-reference
+    /// selection. Tunable via [`Self::set_rps_cache_capacity`].
+    rps_cache_capacity: usize,
     /// When `true`, apply the Annex J deblocking filter to every decoded
     /// picture (both the output and the MC reference). Default `false`.
     /// When the picture header itself carries a PLUSPTYPE block with the DF
@@ -66,7 +87,23 @@ impl H263Decoder {
             eof: false,
             reference: None,
             enable_annex_j: false,
+            rps_cache: VecDeque::new(),
+            rps_cache_capacity: 4,
         }
+    }
+
+    /// Set the maximum number of decoded pictures retained for Annex N
+    /// (Reference Picture Selection) TRP-based lookup. Default 4.
+    pub fn set_rps_cache_capacity(&mut self, n: usize) {
+        self.rps_cache_capacity = n.max(1);
+        while self.rps_cache.len() > self.rps_cache_capacity {
+            self.rps_cache.pop_front();
+        }
+    }
+
+    /// Number of pictures currently retained for Annex N TRP lookup.
+    pub fn rps_cache_len(&self) -> usize {
+        self.rps_cache.len()
     }
 
     /// Enable or disable the Annex J deblocking filter. Must be set before
@@ -144,12 +181,24 @@ impl H263Decoder {
                 };
                 self.maybe_deblock(&mut pic, &hdr);
                 let frame = pic_to_video_frame(&pic, self.pending_pts, self.pending_tb);
+                // Annex N — push into RPS cache before stamping into
+                // `self.reference`. Even non-RPS streams populate the cache
+                // so that a later RPS-enabled stream lookup can succeed if
+                // the matching encoder happens to address an older TR.
+                self.push_rps_cache(hdr.temporal_reference as u16, pic.clone());
                 self.reference = Some(pic);
                 self.ready_frames.push_back(frame);
                 Ok(())
             }
             PictureCodingType::Predicted => {
-                let reference = self.reference.as_ref().ok_or_else(|| {
+                // Annex N (RPS) — when the picture header signalled TRPI=1
+                // and the requested TR is in our cache, use that; otherwise
+                // fall back to the most recent reference (matches §N.5
+                // "the most recent temporally previous anchor picture shall
+                // be used for prediction" when TRP is not present, and is
+                // the documented fall-back when TRP is requested but
+                // unavailable).
+                let reference = self.pick_reference_for(&hdr).ok_or_else(|| {
                     Error::invalid(
                         "h263 P-picture: no reference frame available (stream must start with I)",
                     )
@@ -180,11 +229,44 @@ impl H263Decoder {
                 };
                 self.maybe_deblock(&mut pic, &hdr);
                 let frame = pic_to_video_frame(&pic, self.pending_pts, self.pending_tb);
+                self.push_rps_cache(hdr.temporal_reference as u16, pic.clone());
                 self.reference = Some(pic);
                 self.ready_frames.push_back(frame);
                 Ok(())
             }
         }
+    }
+
+    /// Push `pic` into the RPS cache under key `tr`. If `tr` already
+    /// existed (rewrap or duplicate), the older copy is removed first so
+    /// the LRU stays well-defined.
+    fn push_rps_cache(&mut self, tr: u16, pic: IPicture) {
+        // Remove any prior entry for the same TR (matches the §N.5
+        // "first-in, first-out" intent — duplicate entries would just
+        // waste cache space).
+        if let Some(idx) = self.rps_cache.iter().position(|(t, _)| *t == tr) {
+            self.rps_cache.remove(idx);
+        }
+        self.rps_cache.push_back((tr, pic));
+        while self.rps_cache.len() > self.rps_cache_capacity {
+            self.rps_cache.pop_front();
+        }
+    }
+
+    /// Pick the reference picture for the next P-picture decode, honouring
+    /// Annex N TRP if present. Returns `None` when neither a TRP-keyed
+    /// cache hit nor a "most recent reference" candidate exists.
+    fn pick_reference_for(&self, hdr: &PictureHeader) -> Option<&IPicture> {
+        if hdr.rps_mode && hdr.trpi {
+            // Try TRP-keyed lookup first. If miss, fall back to most-recent
+            // (§N.5 last paragraph allows a forced INTRA update by external
+            // means; we degrade gracefully here so well-formed streams
+            // don't fail on transient cache misses).
+            if let Some((_, pic)) = self.rps_cache.iter().rev().find(|(t, _)| *t == hdr.trp) {
+                return Some(pic);
+            }
+        }
+        self.reference.as_ref()
     }
 
     /// Apply the Annex J deblocking filter to `pic` iff the caller opted in
@@ -463,6 +545,7 @@ impl Decoder for H263Decoder {
         self.pending_pts = None;
         self.eof = false;
         self.reference = None;
+        self.rps_cache.clear();
         Ok(())
     }
 

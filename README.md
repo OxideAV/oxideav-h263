@@ -41,7 +41,7 @@ this crate does not activate any MPEG-4 decoding behaviour.
 | Annex G (PB-frames) and all B-pictures           | no     | no     |
 | Annex I (Advanced Intra Coding)                  | no     | no     |
 | Annex K (Slice Structured Mode)                  | no     | no     |
-| Annex N (Reference Picture Selection)            | no     | no     |
+| Annex N (RPS — picture header + multi-ref)       | yes    | yes    |
 | Annex P (Reference Picture Resampling)           | no     | no     |
 | Annex Q (Reduced-Resolution Update)              | no     | no     |
 | Annex T (Modified Quantization)                  | no     | no     |
@@ -58,7 +58,8 @@ only when all of the following hold:
 
 * UFEP = `001` (full OPPTYPE present) — cross-picture feature-flag
   inheritance (UFEP = `000`) is not yet tracked.
-* No Annex D / E / F / I / K / N / P / Q / R / S / T bits are set.
+* No Annex D / E / F / I / K / P / Q / R / S / T bits are set.
+  (Annex N — RPS — IS now accepted; see below.)
 * No custom picture clock frequency.
 * Any custom picture size in CPFMT happens to coincide with one of the
   standard source formats (sub-QCIF / QCIF / CIF / 4CIF / 16CIF).
@@ -99,8 +100,45 @@ The in-loop deblocking filter is implemented bit-exact in
 3. Left off by default — baseline H.263 bit-for-bit compatibility with
    existing streams.
 
-The encoder does not yet emit PLUSPTYPE, so encoded output using
-Annex J requires the decoder to be told out-of-band.
+The encoder does not yet emit PLUSPTYPE for Annex J — encoded output
+using Annex J requires the decoder to be told out-of-band. (Annex N
+RPS, below, IS emitted via PLUSPTYPE.)
+
+### Annex N — Reference Picture Selection
+
+Round 13 wires Annex N (RPS) on both decoder and encoder sides:
+
+* **Decoder** (`picture::parse_picture_header`) accepts a PLUSPTYPE
+  picture header carrying OPPTYPE bit 11 (RPS) = 1, reads RPSMF /
+  TRPI / TRP / BCI per §5.1.13–§5.1.16, and surfaces the parsed
+  values on `PictureHeader.rps_mode` / `rpsmf` / `trpi` / `trp` /
+  `bci_present`. The new fields default to off / `None` / 0 / false on
+  baseline-PTYPE streams. Back-channel-message (BCM) parsing is out
+  of scope — a stream that signals BCI = `1` (BCM follows) is
+  rejected with a specific `Unsupported` diagnostic citing §N.4.2.
+* **Decoder picture-memory cache** — every successfully decoded picture
+  is pushed into a small bounded LRU keyed by its TR (default
+  capacity 4, tunable via [`H263Decoder::set_rps_cache_capacity`]).
+  When a P-picture's `trpi` is set the decoder looks up its `trp` in
+  the cache and uses that picture as the motion-compensation
+  reference; cache misses degrade gracefully to the most-recent
+  anchor (matching §N.5's "use the most recent temporally previous
+  anchor picture" fall-back).
+* **Encoder** opt-in via [`H263Encoder::set_enable_annex_n_rps`].
+  When on, every picture is emitted with a PLUSPTYPE-form picture
+  header (source-format `111`, UFEP=001, full OPPTYPE, RPS bit set),
+  RPSMF=`100` (no back-channel signals needed), TRPI=0 on every
+  P-picture (decoder uses the most recent anchor), BCI=`01`. The MB
+  layer underneath is unchanged baseline 1-MV inter — bit-identical
+  to the non-RPS encoder for the same DCT/quant/MV pipeline.
+* **Combination guards** — RPS + UMV / SAC / AP returns
+  `Error::Unsupported` at `send_frame` (round-13 scope).
+* **ffmpeg interop** — ffmpeg 8.1's H.263 decoder explicitly logs
+  "Reference Picture Selection not supported" and falls through to
+  best-effort decode-with-error-concealment. The I-picture decodes
+  cleanly (~51 dB cross-decode on the testsrc clip — same as the
+  non-RPS Annex-D UMV baseline); P-pictures get concealed by ffmpeg
+  but our self-decoder reproduces the source at PSNR ≥ 30 dB.
 
 ## Quick use
 

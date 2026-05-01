@@ -140,6 +140,19 @@ pub struct H263Encoder {
     /// rejected at `send_frame` for now — round-12 scope is the baseline
     /// 1-MV inter path only.
     enable_annex_d_umv: bool,
+    /// When `true`, emit pictures with the H.263+ PLUSPTYPE block carrying
+    /// Annex N (Reference Picture Selection — see §5.1.13/§5.1.14/§5.1.15).
+    /// The picture header sets source-format `111` (extended PTYPE), UFEP=001,
+    /// OPPTYPE bit 11 (RPS) = 1; the RPS body fields RPSMF / TRPI / TRP / BCI
+    /// follow per Figure 8.
+    ///
+    /// Round-13 scope: emit RPSMF = "100" (NEITHER ACK nor NACK — no
+    /// back-channel), TRPI = 0 on every P-picture (TRP omitted; the decoder
+    /// uses the most recent anchor), BCI = "01" (no BCM, videomux-mode not
+    /// used). The MB layer underneath is unchanged baseline 1-MV inter.
+    /// Combinations with Annex D (UMV), Annex E (SAC), Annex F (AP) are
+    /// rejected at `send_frame` for now to keep the round 13 scope tight.
+    enable_annex_n_rps: bool,
 }
 
 impl H263Encoder {
@@ -195,6 +208,7 @@ impl H263Encoder {
             enable_annex_f: false,
             enable_annex_e: false,
             enable_annex_d_umv: false,
+            enable_annex_n_rps: false,
         })
     }
 
@@ -258,6 +272,27 @@ impl H263Encoder {
     pub fn enable_annex_d_umv(&self) -> bool {
         self.enable_annex_d_umv
     }
+
+    /// Enable or disable Annex N (Reference Picture Selection) emission.
+    /// When on, every picture is emitted with a PLUSPTYPE block carrying
+    /// OPPTYPE bit 11 (RPS) = 1. The round-13 scope emits RPSMF = "100"
+    /// (no back-channel), TRPI = 0 on every P-picture (no TRP — decoder
+    /// uses the most recent anchor), and BCI = "01" (no BCM). The MB layer
+    /// underneath is unchanged baseline 1-MV inter.
+    ///
+    /// Must be set before the first frame is submitted; flipping it
+    /// mid-stream would desync the matching decoder. Combinations with
+    /// Annex D (UMV), Annex E (SAC), or Annex F (Advanced Prediction)
+    /// return `Error::Unsupported` at `send_frame` — RPS round 13 covers
+    /// the baseline path only.
+    pub fn set_enable_annex_n_rps(&mut self, enable: bool) {
+        self.enable_annex_n_rps = enable;
+    }
+
+    /// Returns whether Annex N (RPS) emission is currently enabled.
+    pub fn enable_annex_n_rps(&self) -> bool {
+        self.enable_annex_n_rps
+    }
 }
 
 impl Encoder for H263Encoder {
@@ -290,6 +325,19 @@ impl Encoder for H263Encoder {
             ));
         }
 
+        // Annex N (RPS) round-13 scope: baseline 1-MV inter only. Combined
+        // with UMV / SAC / AP would either need a different PLUSPTYPE writer
+        // (UMV needs UUI, SAC needs OPPTYPE bit 6, AP needs OPPTYPE bit 7)
+        // or a hybrid PLUSPTYPE/baseline path; both deferred.
+        if self.enable_annex_n_rps
+            && (self.enable_annex_d_umv || self.enable_annex_e || self.enable_annex_f)
+        {
+            return Err(Error::unsupported(
+                "h263 encoder: Annex N (RPS) is not yet supported in combination with \
+                 Annex D (UMV), Annex E (SAC), or Annex F (Advanced Prediction)",
+            ));
+        }
+
         let tr = self.next_tr;
         self.next_tr = self.next_tr.wrapping_add(1);
 
@@ -298,6 +346,56 @@ impl Encoder for H263Encoder {
         let force_i = self.reference.is_none()
             || self.gop_size <= 1
             || self.since_keyframe + 1 >= self.gop_size;
+
+        // Round 13 — Annex N (RPS) routing. RPS rewrites the picture header
+        // to PLUSPTYPE form; the MB body underneath is the same baseline
+        // 1-MV inter path the non-RPS branch uses. We dispatch first so RPS
+        // pre-empts the SAC / Annex F branches below (which also start by
+        // checking `enable_annex_e`/`enable_annex_f`).
+        if self.enable_annex_n_rps {
+            let (bytes, pic, is_key) = if force_i {
+                let (b, p) = encode_i_picture_rps_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                )?;
+                (b, p, true)
+            } else {
+                let reference = self.reference.as_ref().expect("reference checked above");
+                let (b, p) = encode_p_picture_rps_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                    reference,
+                )?;
+                (b, p, false)
+            };
+            let mut recon = pic;
+            if self.enable_annex_j {
+                let mb_w = self.width.div_ceil(16) as usize;
+                let mb_h = self.height.div_ceil(16) as usize;
+                let qp = vec![self.pquant; mb_w * mb_h];
+                crate::deblock::deblock_picture(&mut recon, &qp);
+            }
+            self.reference = Some(recon);
+            if is_key {
+                self.since_keyframe = 1;
+            } else {
+                self.since_keyframe += 1;
+            }
+            let mut pkt = Packet::new(0, self.time_base, bytes);
+            pkt.pts = v.pts;
+            pkt.dts = v.pts;
+            pkt.flags.keyframe = is_key;
+            self.pending.push_back(pkt);
+            return Ok(());
+        }
 
         let (data, mut recon, is_key) = if force_i {
             let (bytes, pic) = if self.enable_annex_e {
@@ -922,6 +1020,111 @@ pub fn encode_p_picture_with_opts_full(
     Ok((bw.finish(), recon))
 }
 
+/// Round 13 — Annex N (RPS) I-picture encoder. Emits a PLUSPTYPE-form
+/// picture header carrying OPPTYPE bit 11 (RPS) = 1, then runs the same
+/// I-MB body the baseline encoder uses (`encode_intra_mb` per MB).
+///
+/// RPS round-13 scope: TRPI = 0 (forced for I-pictures by §5.1.14),
+/// RPSMF = `100` (no back-channel needed), BCI = `01` (no BCM).
+pub fn encode_i_picture_rps_with_recon(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+) -> Result<(Vec<u8>, IPicture)> {
+    let mb_w = width.div_ceil(16) as usize;
+    let mb_h = height.div_ceil(16) as usize;
+    let (_num_gobs, mb_rows_per_gob) = source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263 RPS encoder: source format has no GOB layout"))?;
+    let mut bw = BitWriter::with_capacity(8192);
+    let mut recon = IPicture::new(width as usize, height as usize);
+
+    write_plusptype_picture_header_rps(
+        &mut bw,
+        source_format,
+        pquant,
+        temporal_reference,
+        false, // I-picture
+        0b100, // RPSMF = NEITHER
+        false, // TRPI = 0 (mandatory on I)
+        0,     // TRP unused
+    )?;
+
+    for mb_y in 0..mb_h {
+        if mb_y > 0 && (mb_y as u32) % mb_rows_per_gob == 0 {
+            let gn = (mb_y as u32 / mb_rows_per_gob) as u8;
+            write_gob_header(&mut bw, gn, pquant)?;
+        }
+        for mb_x in 0..mb_w {
+            encode_intra_mb(
+                &mut bw, mb_x, mb_y, pquant, frame, width, height, &mut recon,
+            )?;
+        }
+    }
+    Ok((bw.finish(), recon))
+}
+
+/// Round 13 — Annex N (RPS) P-picture encoder. Emits a PLUSPTYPE-form
+/// picture header with the RPS bit set, then runs the same baseline
+/// 1-MV inter MB body the non-RPS encoder uses (`encode_p_mb_full` with
+/// `enable_annex_d_umv = false`). TRPI is always 0 in this round (the
+/// decoder falls back to "most recent anchor" — same MV-grid +
+/// reconstruction as the non-RPS path). TRP-driven multi-reference
+/// emission is the encoder-side follow-up; the decoder already supports
+/// looking up by TR via [`crate::decoder::H263Decoder`]'s reference cache.
+pub fn encode_p_picture_rps_with_recon(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+) -> Result<(Vec<u8>, IPicture)> {
+    let mb_w = width.div_ceil(16) as usize;
+    let mb_h = height.div_ceil(16) as usize;
+    source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263 RPS encoder: source format has no GOB layout"))?;
+    let mut bw = BitWriter::with_capacity(8192);
+    let mut recon = IPicture::new(width as usize, height as usize);
+    let mut mv_grid = MvGrid::new(mb_w, mb_h);
+
+    write_plusptype_picture_header_rps(
+        &mut bw,
+        source_format,
+        pquant,
+        temporal_reference,
+        true,  // P-picture
+        0b100, // RPSMF = NEITHER (no back-channel signalling)
+        false, // TRPI = 0 — decoder uses most recent anchor
+        0,
+    )?;
+
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            let _info = encode_p_mb_full(
+                &mut bw,
+                mb_x,
+                mb_y,
+                pquant,
+                frame,
+                width,
+                height,
+                reference,
+                &mut recon,
+                &mut mv_grid,
+                false, // not Annex F
+                false, // not Annex D UMV
+            )?;
+        }
+    }
+    Ok((bw.finish(), recon))
+}
+
 /// Copy one MB (Y + Cb + Cr) from `src` to `dst`. Used to preserve intra
 /// MBs during the Annex F pass 2.
 fn copy_mb_from_to(src: &IPicture, dst: &mut IPicture, mb_x: usize, mb_y: usize) {
@@ -1281,6 +1484,136 @@ fn write_picture_header_full(
 
     // CPM (0) and no PSBI follows.
     bw.write_bits(0, 1);
+
+    // PEI loop terminator.
+    bw.write_bits(0, 1);
+    Ok(())
+}
+
+/// Round 13 — Annex N (Reference Picture Selection) PLUSPTYPE writer.
+///
+/// Emits a PLUSPTYPE-form picture header (source-format code `111`, UFEP=001,
+/// full OPPTYPE) with the RPS optional-mode bit (OPPTYPE bit 11) set. The
+/// MPPTYPE picture-type code is `000` for I-pictures or `001` for P-pictures.
+/// The RPS body fields are written per §5.1.13 / §5.1.14 / §5.1.15 / §5.1.16:
+///
+///   * RPSMF (3 bits, only when UFEP=001 — always emitted by this writer);
+///   * TRPI (1 bit, mandatory when RPS is in use; spec mandates 0 for I);
+///   * TRP (10 bits, only when TRPI=1);
+///   * BCI (always "01" — videomux mode is not used by this encoder; spec
+///     §5.1.16 requires BCI = "01" outside videomux).
+///
+/// The non-RPS PLUSPTYPE-related fields (CPM, CPFMT/EPAR/CPCFC/ETR, UUI,
+/// SSS, ELNUM/RLNUM) are all left at their off-defaults — this round emits
+/// the RPS bit only on top of an otherwise-baseline H.263+ header.
+///
+/// Note: per §5.1.4.6, RPS does not interact restrictively with any other
+/// optional mode the encoder currently emits. RPS + UMV is allowed; the
+/// matching encoder path only emits 1-MV inter (§D.2 / Table 14) so RPS
+/// streams here are baseline 1-MV inter under the hood.
+#[allow(clippy::too_many_arguments)]
+fn write_plusptype_picture_header_rps(
+    bw: &mut BitWriter,
+    source_format: SourceFormat,
+    pquant: u8,
+    tr: u8,
+    is_p_picture: bool,
+    rpsmf: u8,
+    trpi: bool,
+    trp: u16,
+) -> Result<()> {
+    debug_assert!(bw.is_byte_aligned());
+    // Validate RPSMF — §5.1.13: 100/101/110/111. 000-011 reserved.
+    if rpsmf < 0b100 {
+        return Err(Error::invalid(format!(
+            "h263 encoder: RPSMF {rpsmf:03b} reserved (only 100/101/110/111 allowed)"
+        )));
+    }
+    if !is_p_picture && trpi {
+        return Err(Error::invalid(
+            "h263 encoder: TRPI=1 forbidden on I-pictures (§5.1.14)",
+        ));
+    }
+    let src_code: u32 = match source_format {
+        SourceFormat::SubQcif => 1,
+        SourceFormat::Qcif => 2,
+        SourceFormat::Cif => 3,
+        SourceFormat::FourCif => 4,
+        SourceFormat::SixteenCif => 5,
+        _ => {
+            return Err(Error::unsupported(
+                "h263 RPS encoder: only standard source formats 1..=5 are supported",
+            ));
+        }
+    };
+
+    // PSC (22 bits).
+    #[allow(clippy::unusual_byte_groupings)]
+    let psc: u32 = 0b00_0000_0000_0000_0000_1_00000;
+    bw.write_bits(psc, 22);
+    // TR (8 bits).
+    bw.write_bits(tr as u32, 8);
+    // PTYPE prefix bits 1..=8: marker(1) | id(0) | split(0) | cam(0) |
+    // freeze(0) | source-format = "111" (extended PTYPE).
+    bw.write_bits(1, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0b111, 3);
+
+    // PLUSPTYPE: UFEP (3 bits) = 001 → full OPPTYPE present.
+    bw.write_bits(0b001, 3);
+
+    // OPPTYPE (18 bits, MSB-first, spec bit 1 = MSB).
+    //   bits 1-3 = source format code (same encoding as baseline);
+    //   bit 4 = custom PCF (0); bit 5 = UMV (0); bit 6 = SAC (0);
+    //   bit 7 = AP (0); bit 8 = AIC (0); bit 9 = DF (0); bit 10 = SS (0);
+    //   bit 11 = RPS (1) — this writer's reason for being;
+    //   bit 12 = ISD (0); bit 13 = AIV (0); bit 14 = MQ (0);
+    //   bit 15 = marker "1"; bits 16-18 = reserved 000.
+    let bit = |k: u32, v: u32| (v & 1) << (18 - k);
+    let srcf_part = (src_code & 0b111) << 15;
+    let opptype: u32 = srcf_part
+        | bit(11, 1)  // RPS
+        | bit(15, 1); // marker
+    bw.write_bits(opptype, 18);
+
+    // MPPTYPE (9 bits): PCT(3) | RPR(1) | RRU(1) | RTYPE(1) | reserved(00) | marker(1)
+    // RTYPE handling: spec §5.1.4.3 says the encoder should toggle this between
+    // a P-picture and its reference. We emit 0 for I and 1 for P uniformly
+    // (matches what `write_picture_header_full` would do for a baseline
+    // header — the rounding-control behaviour is not exercised by our tests).
+    let pct: u32 = if is_p_picture { 0b001 } else { 0b000 };
+    // Bits laid out as PCT(3) | RPR(1) | RRU(1) | RTYPE(1) | reserved(2) | marker(1).
+    // RPR=0, RRU=0, RTYPE=0, reserved=00, marker=1 → low 6 bits = 0b000001.
+    let mpptype: u32 = (pct << 6) | 0b000_001;
+    bw.write_bits(mpptype, 9);
+
+    // CPM (1 bit, located after PLUSPTYPE per §5.1.4.7).
+    bw.write_bits(0, 1);
+
+    // (No CPFMT — std source format. No EPAR/CPCFC/ETR/UUI/SSS/ELNUM/RLNUM.)
+
+    // RPSMF (3 bits — UFEP=001 → present).
+    bw.write_bits(rpsmf as u32 & 0b111, 3);
+
+    // TRPI (1 bit — mandatory when RPS in use).
+    bw.write_bits(if trpi { 1 } else { 0 }, 1);
+    if trpi {
+        bw.write_bits(trp as u32 & 0x3FF, 10);
+    }
+    // BCI: "01" (no BCM, videomux-mode not in use).
+    bw.write_bits(0, 1);
+    bw.write_bits(1, 1);
+
+    // PQUANT (5 bits).
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::invalid(format!(
+            "h263 RPS encoder: pquant {pquant} out of range 1..=31"
+        )));
+    }
+    bw.write_bits(pquant as u32, 5);
 
     // PEI loop terminator.
     bw.write_bits(0, 1);
