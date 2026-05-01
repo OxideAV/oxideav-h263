@@ -14,8 +14,9 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use oxideav_core::arena::ArenaPool;
+use oxideav_core::arena::sync::{ArenaPool, FrameHeader, FrameInner};
 use oxideav_core::bits::BitReader;
+use oxideav_core::format::PixelFormat;
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::Decoder;
 use oxideav_core::{
@@ -46,7 +47,19 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 pub struct H263Decoder {
     codec_id: CodecId,
     buffer: Vec<u8>,
-    ready_frames: VecDeque<VideoFrame>,
+    /// Decoded pictures awaiting `receive_frame` / `receive_arena_frame`.
+    /// Stored as raw `IPicture`s plus the pts the picture was tagged
+    /// with. Each drain materialises one of two output forms on
+    /// demand: `receive_frame` builds a heap-backed `VideoFrame` (no
+    /// arena involved); `receive_arena_frame` leases an arena from
+    /// the pool and builds an `arena::sync::Frame` whose plane bytes
+    /// live inside the leased buffer. Deferring the arena lease to
+    /// drain time keeps the pool short-lived (one slot held for at
+    /// most the time between `receive_arena_frame` and the caller
+    /// dropping the last `Arc` clone), so `send_packet` calls that
+    /// decode multiple pictures before the consumer drains do not
+    /// exhaust the pool.
+    ready_frames: VecDeque<(IPicture, Option<i64>)>,
     pending_pts: Option<i64>,
     pending_tb: TimeBase,
     eof: bool,
@@ -88,35 +101,33 @@ pub struct H263Decoder {
     /// whose declared `width × height` exceeds
     /// [`DecoderLimits::max_pixels_per_frame`] before any allocation.
     limits: DecoderLimits,
-    /// Bounded buffer pool used as scratch space for the YUV plane
-    /// memcpy inside [`pic_to_video_frame_arena`]. Sized at
+    /// Bounded buffer pool used as scratch space for arena-backed
+    /// frames returned via [`Decoder::receive_arena_frame`]. Sized at
     /// construction from `limits.max_arenas_in_flight ×
-    /// min(max_alloc_bytes_per_frame, DEFAULT_H263_ARENA_BYTES)`. When
-    /// every slot is checked out, [`ArenaPool::lease`] returns
+    /// min(max_alloc_bytes_per_frame, DEFAULT_H263_ARENA_BYTES)`.
+    /// When every slot is checked out, [`ArenaPool::lease`] returns
     /// [`Error::ResourceExhausted`] — the decoder propagates that to
     /// its caller as natural backpressure.
     ///
-    /// Round-1 port note: H.263 keeps the existing
-    /// `Decoder::receive_frame -> Frame::Video(VideoFrame)` API
-    /// (Send-able heap-owned planes) so downstream `oxideav-pipeline`
-    /// consumers don't break. The arena buffer is leased per picture,
-    /// the YUV planes are decoded into it, then memcpy'd out into the
-    /// returned `VideoFrame`'s heap-owned `Vec<u8>` planes and the
-    /// arena is dropped immediately. This bounds peak per-frame RSS
-    /// by `max_arenas × cap_per_arena` even under a malformed stream
-    /// that would otherwise allocate huge intermediate buffers.
+    /// Round 2 (oxideav-core 0.2 wiring): the arena lease is deferred
+    /// until `receive_arena_frame` is called rather than being taken
+    /// at decode time. This keeps the pool slot held for at most the
+    /// time between drain and the caller dropping the last `Arc`
+    /// clone. The legacy `Decoder::receive_frame` path returns a
+    /// heap-backed `VideoFrame` built straight from the queued
+    /// `IPicture` and never touches the pool at all.
     arena_pool: Arc<ArenaPool>,
 }
 
-/// Per-arena byte cap. The largest standard H.263 source format is
-/// 16CIF (1408×1152 = ~1.62M luma pels; ~2.43 MB once chroma is
-/// included as 4:2:0). 4 MiB leaves room for stride padding
-/// (MB-aligned strides) plus a small fudge factor — enough for every
-/// standard format including 16CIF, but small enough that 8 in-flight
-/// arenas (the [`DecoderLimits::default`] value) max out at 32 MiB
-/// even when a malicious stream tries to wedge huge CPFMT dimensions
-/// through the parser (the parser also rejects non-standard sizes,
-/// but defense in depth).
+/// Cap the per-arena byte size at 2 MiB by default. The largest
+/// standard H.263 source format is 16CIF (1408×1152 = ~1.62M luma
+/// pels; ~2.43 MB once chroma is included as 4:2:0). We round up to
+/// 4 MiB to leave room for stride padding (MB-aligned strides) plus
+/// a small fudge factor — enough for every standard format including
+/// 16CIF, but small enough that 8 in-flight arenas (the default) max
+/// out at 32 MiB even when a malicious stream tries to wedge huge
+/// CPFMT dimensions through the parser (the parser also rejects
+/// non-standard sizes, but defense in depth).
 pub const DEFAULT_H263_ARENA_BYTES: u64 = 4 * 1024 * 1024;
 
 impl H263Decoder {
@@ -125,10 +136,9 @@ impl H263Decoder {
     }
 
     /// Construct a decoder with explicit DoS-protection caps. Use this
-    /// when wiring a server / sandbox: tighter
-    /// `limits.max_pixels_per_frame` rejects malformed pictures
-    /// earlier; tighter `limits.max_arenas_in_flight` provides earlier
-    /// backpressure.
+    /// when wiring a server / sandbox: tighter `limits.max_pixels_per_frame`
+    /// rejects malformed pictures earlier; tighter
+    /// `limits.max_arenas_in_flight` provides earlier backpressure.
     pub fn with_limits(codec_id: CodecId, limits: DecoderLimits) -> Self {
         // Per-arena byte cap: the smaller of the configured global
         // cap and our per-codec ceiling. The global default of 1 GiB
@@ -271,14 +281,13 @@ impl H263Decoder {
                     decode_i_picture(&mut br, &hdr, bytes)?
                 };
                 self.maybe_deblock(&mut pic, &hdr);
-                let frame = self.pic_to_frame_arena_backed(&pic)?;
                 // Annex N — push into RPS cache before stamping into
                 // `self.reference`. Even non-RPS streams populate the cache
                 // so that a later RPS-enabled stream lookup can succeed if
                 // the matching encoder happens to address an older TR.
                 self.push_rps_cache(hdr.temporal_reference as u16, pic.clone());
+                self.ready_frames.push_back((pic.clone(), self.pending_pts));
                 self.reference = Some(pic);
-                self.ready_frames.push_back(frame);
                 Ok(())
             }
             PictureCodingType::Predicted => {
@@ -312,12 +321,11 @@ impl H263Decoder {
                     self.maybe_deblock(&mut p_pic, &hdr);
                     // B-frame is **not** stored as MC reference (§G.1 / §5.1.22);
                     // only the P-half goes into the cache.
-                    let b_frame = self.pic_to_frame_arena_backed(&b_pic)?;
-                    let p_frame = self.pic_to_frame_arena_backed(&p_pic)?;
                     self.push_rps_cache(hdr.temporal_reference as u16, p_pic.clone());
+                    self.ready_frames.push_back((b_pic, self.pending_pts));
+                    self.ready_frames
+                        .push_back((p_pic.clone(), self.pending_pts));
                     self.reference = Some(p_pic);
-                    self.ready_frames.push_back(b_frame);
-                    self.ready_frames.push_back(p_frame);
                     return Ok(());
                 }
                 let mut pic = if hdr.sac_mode {
@@ -339,27 +347,12 @@ impl H263Decoder {
                     decode_p_picture(&mut br, &hdr, bytes, reference)?
                 };
                 self.maybe_deblock(&mut pic, &hdr);
-                let frame = self.pic_to_frame_arena_backed(&pic)?;
                 self.push_rps_cache(hdr.temporal_reference as u16, pic.clone());
+                self.ready_frames.push_back((pic.clone(), self.pending_pts));
                 self.reference = Some(pic);
-                self.ready_frames.push_back(frame);
                 Ok(())
             }
         }
-    }
-
-    /// Build the outgoing `VideoFrame` for `pic` via the arena pool.
-    ///
-    /// The arena is leased per picture, used as scratch space for the
-    /// stride-packed YUV plane copy, and dropped at the end of the
-    /// helper — its slot returns to the pool immediately because the
-    /// outgoing `VideoFrame` carries owned `Vec<u8>` planes (existing
-    /// API contract that downstream `oxideav-pipeline` consumes
-    /// across `Send` boundaries). The lease itself is the
-    /// backpressure mechanism: when the pool is exhausted the call
-    /// fails with [`Error::ResourceExhausted`].
-    fn pic_to_frame_arena_backed(&self, pic: &IPicture) -> Result<VideoFrame> {
-        pic_to_video_frame_arena(pic, self.pending_pts, self.pending_tb, &self.arena_pool)
     }
 
     /// Push `pic` into the RPS cache under key `tr`. If `tr` already
@@ -592,6 +585,10 @@ pub fn decode_pb_picture(
 
     // Per-MB MVDB deltas (zero when MODB indicated no MVDB). Used by §G.4.
     let mut mb_mvdbs: Vec<(i32, i32)> = vec![(0, 0); mb_w * mb_h];
+    // Per-MB B-block residual buffer. Filled by `decode_p_mb_pb` when CBPB
+    // is non-zero; left zero otherwise (the §G.5 reconstruction then uses
+    // pure bidirectional MC for that block).
+    let mut b_residuals = vec![0i16; mb_w * mb_h * 6 * 64];
 
     for mb_y in 0..mb_h {
         if mb_y > 0 && (mb_y as u32) % mb_rows_per_gob == 0 {
@@ -610,6 +607,7 @@ pub fn decode_pb_picture(
                 reference,
                 &mut mv_grid,
                 umv_mode,
+                hdr.dbquant,
             )
             .map_err(|e| {
                 Error::invalid(format!(
@@ -617,7 +615,11 @@ pub fn decode_pb_picture(
                 ))
             })?;
             quant = new_q;
-            mb_mvdbs[mb_y * mb_w + mb_x] = info.mvdb;
+            let mb_idx = mb_y * mb_w + mb_x;
+            mb_mvdbs[mb_idx] = info.mvdb;
+            // Splice the per-MB B-residual into the picture-wide buffer.
+            let base = mb_idx * 6 * 64;
+            b_residuals[base..base + 6 * 64].copy_from_slice(&info.b_residual);
         }
     }
 
@@ -633,7 +635,6 @@ pub fn decode_pb_picture(
     let trd = (trb + 1).max(1);
 
     let mb_motions: Vec<MbMotion> = (0..(mb_w * mb_h)).map(|i| mv_grid.mvs[i]).collect();
-    let b_residuals = vec![0i16; mb_w * mb_h * 6 * 64];
     let b_pic = crate::pb::reconstruct_b_picture(
         hdr.width as usize,
         hdr.height as usize,
@@ -695,27 +696,29 @@ fn try_consume_gob_header(
     Ok(true)
 }
 
-/// Build a stride-packed YUV420P `VideoFrame` from an `IPicture`,
-/// staging the per-plane copy through an arena leased from `pool`.
+/// Build an arena-backed [`oxideav_core::arena::sync::Frame`] from an
+/// `IPicture` by leasing one arena from `pool` and copying the three
+/// stride-packed YUV 4:2:0 planes into it.
 ///
 /// Returns [`Error::ResourceExhausted`] when the pool is full
 /// (back-pressure: a slow downstream consumer must drop a previously-
 /// emitted frame before we can lease again — at the
-/// `Decoder::receive_frame` API level this surfaces as the same
-/// error variant the caller would already match on).
+/// `Decoder::receive_frame` / `receive_arena_frame` API level this
+/// surfaces as the same error variant the caller would already match
+/// on).
 ///
-/// The arena is dropped before this function returns. Planes inside
-/// the returned `VideoFrame` are heap-owned (`Vec<u8>`), preserving
-/// the existing `Frame::Video` API across `Send` boundaries used by
-/// `oxideav-pipeline` consumers. The arena therefore acts as a hard
-/// upper bound on peak per-frame scratch RSS rather than as a
-/// zero-copy plane carrier.
-pub fn pic_to_video_frame_arena(
+/// The returned `Frame` keeps the arena alive via its single
+/// `Arc<FrameInner>` owner; drop the `Frame` (and any clones) to
+/// return the buffer to the pool. Both [`Decoder::receive_frame`]
+/// (legacy heap-owned path) and [`Decoder::receive_arena_frame`]
+/// (zero-copy path) consume the same arena `Frame` — the difference
+/// is whether the caller sees the bytes through an extra memcpy or
+/// straight out of the arena buffer.
+pub fn pic_to_arena_frame(
     pic: &IPicture,
     pts: Option<i64>,
-    _tb: TimeBase,
     pool: &Arc<ArenaPool>,
-) -> Result<VideoFrame> {
+) -> Result<oxideav_core::arena::sync::Frame> {
     let w = pic.width;
     let h = pic.height;
     let cw = w.div_ceil(2);
@@ -724,10 +727,15 @@ pub fn pic_to_video_frame_arena(
     // bounded by the pixel-cap check at the picture-header layer, but
     // re-checked here so the arena-cap error message names the actual
     // figures rather than letting the bump allocator phrase it).
-    let plane_bytes = w
+    let y_bytes = w
         .checked_mul(h)
-        .and_then(|n| n.checked_add(cw.checked_mul(ch)?))
-        .and_then(|n| n.checked_add(cw.checked_mul(ch)?))
+        .ok_or_else(|| Error::resource_exhausted("h263 luma size overflow".to_string()))?;
+    let c_bytes = cw
+        .checked_mul(ch)
+        .ok_or_else(|| Error::resource_exhausted("h263 chroma size overflow".to_string()))?;
+    let plane_bytes = y_bytes
+        .checked_add(c_bytes)
+        .and_then(|n| n.checked_add(c_bytes))
         .ok_or_else(|| Error::resource_exhausted("h263 frame size overflow".to_string()))?;
     if plane_bytes > pool.cap_per_arena() {
         return Err(Error::resource_exhausted(format!(
@@ -740,46 +748,87 @@ pub fn pic_to_video_frame_arena(
     }
 
     let arena = pool.lease()?;
-    // Single bump alloc for the whole frame keeps the alloc-count
-    // pressure minimal (3 small allocs would hit the per-arena
-    // alloc-count cap only in pathological configurations).
-    let scratch: &mut [u8] = arena.alloc::<u8>(plane_bytes)?;
-    let (y_buf, rest) = scratch.split_at_mut(w * h);
-    let (cb_buf, cr_buf) = rest.split_at_mut(cw * ch);
-
+    // Three small allocs (Y, Cb, Cr) so each plane gets its own
+    // contiguous range inside the arena — that's what
+    // `arena::sync::FrameInner::plane(i)` will hand back to a caller
+    // walking the plane table. Allocation-count pressure is minimal
+    // (3 vs. the configured cap of >= max_alloc_count_per_frame).
+    let y_off = arena.used();
+    let y_buf = arena.alloc::<u8>(y_bytes)?;
     for row in 0..h {
         y_buf[row * w..row * w + w]
             .copy_from_slice(&pic.y[row * pic.y_stride..row * pic.y_stride + w]);
     }
+    let cb_off = arena.used();
+    let cb_buf = arena.alloc::<u8>(c_bytes)?;
     for row in 0..ch {
         cb_buf[row * cw..row * cw + cw]
             .copy_from_slice(&pic.cb[row * pic.c_stride..row * pic.c_stride + cw]);
+    }
+    let cr_off = arena.used();
+    let cr_buf = arena.alloc::<u8>(c_bytes)?;
+    for row in 0..ch {
         cr_buf[row * cw..row * cw + cw]
             .copy_from_slice(&pic.cr[row * pic.c_stride..row * pic.c_stride + cw]);
     }
+    let header = FrameHeader::new(w as u32, h as u32, PixelFormat::Yuv420P, pts);
+    FrameInner::new(
+        arena,
+        &[(y_off, y_bytes), (cb_off, c_bytes), (cr_off, c_bytes)],
+        header,
+    )
+}
 
-    // memcpy out into Vec-backed planes so the returned frame is Send
-    // and can be carried through oxideav-pipeline. Arena drops at end
-    // of scope.
-    let y = y_buf.to_vec();
-    let cb = cb_buf.to_vec();
-    let cr = cr_buf.to_vec();
-    drop(arena);
-
-    Ok(VideoFrame {
+/// Materialise a stride-packed YUV420P `VideoFrame` from an
+/// arena-backed `Frame` by `to_vec()`'ing each plane. Used by
+/// [`Decoder::receive_frame`] for callers that want the legacy
+/// heap-owned `VideoFrame` API across `Send` boundaries.
+fn arena_frame_to_video_frame(
+    af: &oxideav_core::arena::sync::Frame,
+    pts: Option<i64>,
+) -> VideoFrame {
+    let hdr = af.header();
+    let w = hdr.width as usize;
+    let cw = w.div_ceil(2);
+    let y_plane = af.plane(0).expect("plane 0 (Y) must exist");
+    let cb_plane = af.plane(1).expect("plane 1 (Cb) must exist");
+    let cr_plane = af.plane(2).expect("plane 2 (Cr) must exist");
+    VideoFrame {
         pts,
         planes: vec![
-            VideoPlane { stride: w, data: y },
             VideoPlane {
-                stride: cw,
-                data: cb,
+                stride: w,
+                data: y_plane.to_vec(),
             },
             VideoPlane {
                 stride: cw,
-                data: cr,
+                data: cb_plane.to_vec(),
+            },
+            VideoPlane {
+                stride: cw,
+                data: cr_plane.to_vec(),
             },
         ],
-    })
+    }
+}
+
+/// Backwards-compat shim: build a heap-backed `VideoFrame` from an
+/// `IPicture` while still going through the arena pool for the
+/// per-plane scratch copy. Kept for callers that imported
+/// `pic_to_video_frame_arena` directly (tests, encoder roundtrips).
+/// Internally builds an arena `Frame` then materialises a `VideoFrame`
+/// from it; the arena handle drops at end of scope so the buffer
+/// returns to the pool immediately.
+pub fn pic_to_video_frame_arena(
+    pic: &IPicture,
+    pts: Option<i64>,
+    _tb: TimeBase,
+    pool: &Arc<ArenaPool>,
+) -> Result<VideoFrame> {
+    let af = pic_to_arena_frame(pic, pts, pool)?;
+    let video = arena_frame_to_video_frame(&af, pts);
+    drop(af);
+    Ok(video)
 }
 
 /// Build a stride-packed YUV420P `VideoFrame` from an `IPicture`.
@@ -838,8 +887,28 @@ impl Decoder for H263Decoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(f) = self.ready_frames.pop_front() {
-            return Ok(Frame::Video(f));
+        if let Some((pic, pts)) = self.ready_frames.pop_front() {
+            // Build a heap-backed VideoFrame for the legacy enum.
+            // Straight Picture → Vec<u8> per plane; the arena pool is
+            // not touched.
+            let video = pic_to_video_frame(&pic, pts, self.pending_tb);
+            return Ok(Frame::Video(video));
+        }
+        if self.eof {
+            Err(Error::Eof)
+        } else {
+            Err(Error::NeedMore)
+        }
+    }
+
+    fn receive_arena_frame(&mut self) -> Result<oxideav_core::arena::sync::Frame> {
+        if let Some((pic, pts)) = self.ready_frames.pop_front() {
+            // Lease one arena and copy the YUV planes in. The arena
+            // slot stays checked out until the caller drops the last
+            // `Arc` clone of the returned frame; pool exhaustion
+            // surfaces as `Error::ResourceExhausted` (natural
+            // backpressure).
+            return pic_to_arena_frame(&pic, pts, &self.arena_pool);
         }
         if self.eof {
             Err(Error::Eof)

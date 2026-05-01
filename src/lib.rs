@@ -123,22 +123,27 @@
 //!   RPSMF=`100` (no back-channel) + TRPI=0 (decoder uses most recent
 //!   anchor) + BCI=`01`, with the MB layer unchanged baseline 1-MV inter.
 //!
-//! * **Annex G — PB-frames mode (round 14 — encoder + decoder)**: a PB-frame
-//!   couples a P-picture with a B-picture as one transmission unit. The
-//!   encoder side opts in via [`encoder::H263Encoder::set_enable_annex_g_pb`]
-//!   (PTYPE bit 13 set; TRB / DBQUANT in the picture header tail per §5.1.22
-//!   / §5.1.23). Per-MB the encoder emits the standard P-block fields
-//!   followed by `MODB` (Table 11 VLC), optional `CBPB` (6 bits), the §G.4
+//! * **Annex G — PB-frames mode (rounds 14-15 — encoder + decoder)**: a PB-
+//!   frame couples a P-picture with a B-picture as one transmission unit.
+//!   The encoder side opts in via
+//!   [`encoder::H263Encoder::set_enable_annex_g_pb`] (PTYPE bit 13 set;
+//!   TRB / DBQUANT in the picture header tail per §5.1.22 / §5.1.23).
+//!   Per-MB the encoder emits the standard P-block fields followed by
+//!   `MODB` (Table 11 VLC), optional `CBPB` (6 bits), the §G.4
 //!   forward + backward MV derivation (with optional `MVDB` delta — same
 //!   VLC family as MVD), and the §G.5 bidirectional B-block reconstruction.
-//!   B-block residual coding piggybacks on the inter TCOEF VLC (no INTRADC).
-//!   Round-14 scope keeps DBQUANT = `00` and emits MODB = `0` (no CBPB,
-//!   no MVDB) — the B-half is then a pure §G.5 bidirectional MC predictor
-//!   with no residual, which still validates every header / body field on
-//!   the wire and the §G.4 / §G.5 derivation. The decoder side mirrors the
-//!   header parse (TRB / DBQUANT), the per-MB MODB / CBPB / MVDB read, and
-//!   the §G.4 forward+backward MV derivation. Output is two `VideoFrame`s
-//!   per PB picture (B first, then P — display order).
+//!   Round 15 wires the B-block residual coding: per-MB the encoder
+//!   computes the §G.5 prediction against the freshly-reconstructed
+//!   P-MB, subtracts from the **input frame** pels to form a residual,
+//!   forward-DCTs and quantises at `BQUANT = bquant_from_quant(quant,
+//!   dbquant)` (§5.1.23 / Table 6), and picks CBPB bits from per-block
+//!   any-nonzero. MODB = `11` then carries CBPB + MVDB (MVDB = `(0, 0)`
+//!   pure differential); MODB = `0` is emitted when no B-block has any
+//!   residual. The decoder side mirrors the header parse (TRB / DBQUANT),
+//!   the per-MB MODB / CBPB / MVDB read, and the §G.4 forward+backward
+//!   MV derivation, then dequantises + IDCTs the per-CBPB B-residual at
+//!   BQUANT and folds it into the §G.5 reconstruction. Output is two
+//!   `VideoFrame`s per PB picture (B first, then P — display order).
 //!
 //! Out of scope (returns `Error::Unsupported`):
 //! * Annex M (Improved PB-frames). Annex G (legacy PB-frames) is wired in

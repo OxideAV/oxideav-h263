@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`receive_arena_frame()` — zero-copy decode path.**
+  Overrides the new `oxideav_core::Decoder::receive_arena_frame()`
+  method (added in oxideav-core 0.2.0) to return an arena-backed
+  `oxideav_core::arena::sync::Frame` directly, skipping the per-plane
+  memcpy that the legacy `receive_frame() -> Frame::Video(VideoFrame)`
+  path requires for `Send`. The arena `ArenaPool` is now a `sync`
+  variant whose `Frame = Arc<FrameInner>` is itself `Send + Sync`
+  — callers can move the returned frame across thread boundaries
+  for parallel render / encode / network sinks.
+- New `tests/arena_frame.rs` exercising the zero-copy contract:
+  encode an I-picture, decode via `receive_arena_frame`, verify
+  (a) plane bytes match the legacy `receive_frame` output, (b) the
+  arena pool stays exhausted while the returned frame is held
+  (proves the planes really live inside the arena), and (c) the
+  pool slot returns when the frame's last `Arc` clone drops.
+- New `pic_to_arena_frame` public helper — the arena-building
+  counterpart to the existing `pic_to_video_frame` heap helper.
+
+### Changed
+
+- **Bumped `oxideav-core` dep from `0.1` to `0.2`** to pick up the
+  new `Decoder::receive_arena_frame` trait method (additive; default
+  impl preserves backwards compatibility for every other
+  `oxideav-h263` consumer).
+- Internal queueing reorganised: decoded pictures are now queued as
+  raw `IPicture`s rather than pre-built `VideoFrame`s. `receive_frame`
+  builds a heap-backed `VideoFrame` on demand; `receive_arena_frame`
+  leases an arena and builds an arena `Frame` on demand. This keeps
+  the pool short-lived (one slot held only between drain and the
+  caller dropping the `Arc<FrameInner>`) so a `send_packet` call
+  that decodes many pictures before the consumer drains no longer
+  exhausts the pool.
+
 - **DoS-protection framework port (`oxideav-core` 0.1.8).** Wires the
   decoder front-end into the new `DecoderLimits` + `ArenaPool` stack:
   * `H263Decoder::with_limits(codec_id, DecoderLimits)` constructor and
@@ -40,6 +73,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Encoder is unchanged — DoS protection only applies to the decoder
     per the task spec.
 
+  Total tests: 142 → 147 (+5 dos-limits fixtures).
+
+- **Annex G (PB-frames) — B-block residual emission (round 15).**
+  Round 14 wired the PB-frames framing (MODB / CBPB / MVDB / DBQUANT
+  picture-header tail and per-MB syntax) but kept MODB = `0` per MB on
+  the encoder side, so every B-half was a pure §G.5 bidirectional MC
+  predictor with zero residual — landing at **28.8 dB** PSNR vs the
+  midpoint-position source proxy on the moving-square QCIF clip.
+  Round 15 wires the encoder + decoder paths to actually carry a
+  per-block B-residual at BQUANT (§5.1.23):
+  * Encoder — `pb::predict_b_block` extracted from `reconstruct_b_block`
+    (signed-i16 prediction so the encoder can do `source - prediction`
+    without saturating). `encode_p_mb_pb_inter` rebuilt with a 2-stage
+    flow: (1) quantise + reconstruct the P-half blocks into `recon`
+    *before* writing any bits, (2) compute the §G.5 prediction for each
+    of the 6 B-blocks against the freshly-reconstructed P-MB, subtract
+    from the **input frame** pels (the streaming 1-input-per-PB-pair
+    model uses the input as the B-source), forward-DCT, quantise at
+    `bquant_from_quant(quant, dbquant)`, and pick CBPB bits from the
+    per-block any-nonzero check. Then emit MCBPC, MODB (`11` when CBPB
+    is non-zero / `0` when not), CBPB (6 bits, MSB = block 1), CBPY,
+    MVD, MVDB = `(0, 0)` (pure differential, two `encode_mvd_pure_diff
+    erential` codewords), the six P-block TCOEF runs, and the per-CBPB
+    B-block TCOEF runs — exactly the §5.4 / §5.3 Figure 10 order. The
+    intra-in-PB path (`encode_p_mb_pb_intra`) also gained the §G.2 MVD
+    write that the round-14 path was missing (latent bug — the
+    moving-square test never trips intra-in-PB but a third-party clip
+    with intra-in-P MBs would have desynced the decoder).
+  * Decoder — `mb::decode_p_mb_pb` now takes `dbquant` and decodes the
+    per-CBPB B-block residual: `decode_ac` at BQUANT, `idct_signed` to
+    get residual pels, surfaced on a new `PbMbInfo.b_residual` field.
+    `decoder::decode_pb_picture` collects per-MB residuals into the
+    picture-wide buffer it already passes into `pb::reconstruct_b_pictur
+    e`, replacing the previous all-zero placeholder.
+  * Tests — `pb_self_roundtrip_psnr` floor lifted from ≥ 18 dB to
+    ≥ 40 dB on the B-half (lands at **55.4-57.1 dB** with residual
+    emission at PQUANT = 5 / DBQUANT = 0 / BQUANT = 6); new
+    `pb_b_residual_emission_psnr_jumps_with_finer_bquant` test checks
+    the BQUANT relationship (DBQUANT = 0 → average B PSNR 56.2 dB,
+    DBQUANT = 3 → 51.6 dB; the finer BQUANT consistently produces the
+    cleaner reconstruction).
+  * I-frame and P-half PSNR stay at **68.1 dB** (unchanged from round
+    14 — the P-half encoder code path is byte-identical to before).
+  * ffmpeg interop — informational probe still exits 0 with no error
+    logs on ffmpeg 8.1; we don't assert pixel-level cross-decode parity
+    because ffmpeg's PB-frames decoder is partial.
+
+  Pending r16+: MVDB selection on the encoder side (currently always
+  `(0, 0)` — picking a non-zero MVDB per MB requires a search), intra-
+  in-P MVD selection (currently fixed at `(0, 0)`), Annex M Improved
+  PB-frames, and the §G.2 chroma MVDB sign in 4MV mode (we're 1MV
+  only).
 - **Annex G (PB-frames) — decoder + encoder (round 14).**
   Both sides now wire ITU-T Rec. H.263 (01/2005) §G.1 / §G.4 / §G.5
   for the legacy PB-frames mode (the H.263 baseline B-picture flavour

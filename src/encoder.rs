@@ -1311,6 +1311,8 @@ pub fn encode_pb_picture_with_recon(
                 reference,
                 &mut recon,
                 &mut mv_grid,
+                trb,
+                dbquant,
             )?;
         }
     }
@@ -1337,6 +1339,8 @@ fn encode_p_mb_pb(
     reference: &IPicture,
     recon: &mut IPicture,
     mv_grid: &mut MvGrid,
+    trb: u8,
+    dbquant: u8,
 ) -> Result<crate::mb::PMbInfo> {
     // The MB-decision logic mirrors `encode_p_mb_full` for the
     // non-Annex-F path. We replicate the relevant bits here so we can
@@ -1406,8 +1410,12 @@ fn encode_p_mb_pb(
     let try_intra = intra_variance * 5 < luma_abs_sum;
 
     if try_intra {
-        encode_p_mb_pb_intra(bw, mb_x, mb_y, quant, frame, width, height, recon)?;
-        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), true, true));
+        encode_p_mb_pb_intra(
+            bw, mb_x, mb_y, quant, frame, width, height, reference, recon, mv_grid, trb, dbquant,
+        )?;
+        // §G.2 — for an intra MB in PB mode the spec requires MV to also be
+        // present (used by the B-half §G.4). We've already written it inside
+        // `_pb_intra` (after MVDB-implying MODB). The mv_grid is set there.
         return Ok(crate::mb::PMbInfo {
             coded: true,
             intra: true,
@@ -1418,13 +1426,22 @@ fn encode_p_mb_pb(
     }
 
     encode_p_mb_pb_inter(
-        bw, mb_x, mb_y, quant, src_y, src_cb, src_cr, recon, decide_mv, mv_grid, &y_pred, &u_pred,
-        &v_pred,
+        bw, mb_x, mb_y, quant, src_y, src_cb, src_cr, reference, recon, decide_mv, mv_grid,
+        &y_pred, &u_pred, &v_pred, trb, dbquant,
     )
 }
 
 /// Intra encode of a P-MB block in PB-frames mode. Same fields as
-/// `encode_p_mb_intra` plus an MODB = `0` codeword between MCBPC and CBPY.
+/// `encode_p_mb_intra` plus an MODB codeword between MCBPC and CBPY plus
+/// — per §G.2 — the MVD field that the B-half §G.4 derivation needs (the
+/// B-block MVs derive from the co-located P-MB's MV, which for intra-in-PB
+/// defaults to a coded MVD that the encoder is free to set to `(0, 0)`).
+///
+/// Round-15 still emits MODB = `0` (no CBPB, no MVDB) for the intra-in-PB
+/// path — the moving-square test never picks intra-in-PB, so this branch
+/// stays a thin extension of the round-14 path. The `_reference` /
+/// `_trb` / `_dbquant` parameters are accepted for parity with the inter
+/// path so a future refactor can wire B-residual emission here too.
 #[allow(clippy::too_many_arguments)]
 fn encode_p_mb_pb_intra(
     bw: &mut BitWriter,
@@ -1434,7 +1451,11 @@ fn encode_p_mb_pb_intra(
     frame: &VideoFrame,
     width: u32,
     height: u32,
+    _reference: &IPicture,
     recon: &mut IPicture,
+    mv_grid: &mut MvGrid,
+    _trb: u8,
+    _dbquant: u8,
 ) -> Result<()> {
     let mut blocks = [[0i32; 64]; 6];
     let mut dc_pels = [128u8; 6];
@@ -1457,9 +1478,18 @@ fn encode_p_mb_pb_intra(
         | (block_has_ac[3] as u8);
 
     write_mcbpc_inter(bw, PMbKind::Intra, cbpc);
-    // MODB after MCBPC (spec §5.3 Fig 10). Round-14 scope: always "0".
+    // MODB after MCBPC (spec §5.3 Fig 10). Round-15 intra-in-PB scope: "0".
     crate::pb::encode_modb(bw, false, false);
     write_cbpy(bw, cbpy);
+    // §G.2 — MVD is present on intra-in-PB MBs as well. We pick a (0, 0)
+    // MV (the B-half §G.4 derivation will use this), so the predictor
+    // becomes the median of neighbours and we emit the differential
+    // matching that. The decoder reads this MVD via `decode_mv_pair`,
+    // matching the inter MB path.
+    let (pmx, pmy) = predict_mv(mv_grid, mb_x, mb_y);
+    encode_mv_component(bw, 0, pmx);
+    encode_mv_component(bw, 0, pmy);
+    mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), true, true));
     for b in 0..6 {
         bw.write_bits(dc_pels[b] as u32, 8);
         if block_has_ac[b] {
@@ -1471,8 +1501,19 @@ fn encode_p_mb_pb_intra(
 }
 
 /// Inter encode of a P-MB in PB-frames mode. Same fields as
-/// `encode_p_mb_inter_full` plus an MODB = `0` codeword between MCBPC and
-/// CBPY (spec §5.3 Figure 10).
+/// `encode_p_mb_inter_full` plus an MODB codeword between MCBPC and CBPY
+/// (spec §5.3 Figure 10) and — when CBPB is non-zero — a 6-bit CBPB
+/// immediately after MODB plus the per-block B-residual TCOEF stream
+/// appended after the P-half block coefficients.
+///
+/// Round-15 enables MODB / CBPB / B-residual emission: the §G.5 prediction
+/// is computed using `reference` (forward — the previous P-recon) and
+/// `recon` (backward — the just-built P-half), then subtracted from the
+/// **input frame** pels to form a residual that's DCT/quantised at BQUANT
+/// and emitted under TCOEF. Per-block CBPB bits are set whenever the
+/// quantised residual has any non-zero coefficient; if any are set we emit
+/// MODB = `11` (CBPB present + MVDB present, MVDB = 0). Otherwise MODB = `0`
+/// (no CBPB, no MVDB) — cheaper on the wire when MC alone already matches.
 #[allow(clippy::too_many_arguments)]
 fn encode_p_mb_pb_inter(
     bw: &mut BitWriter,
@@ -1482,13 +1523,20 @@ fn encode_p_mb_pb_inter(
     src_y: &oxideav_core::frame::VideoPlane,
     src_cb: &oxideav_core::frame::VideoPlane,
     src_cr: &oxideav_core::frame::VideoPlane,
+    reference: &IPicture,
     recon: &mut IPicture,
     mv: (i32, i32),
     mv_grid: &mut MvGrid,
     y_pred: &[u8; 256],
     u_pred: &[u8; 64],
     v_pred: &[u8; 64],
+    trb: u8,
+    dbquant: u8,
 ) -> Result<crate::mb::PMbInfo> {
+    // ------------------------------------------------------------------
+    // P-half: quantise + reconstruct *in-memory* before emitting bits, so
+    // MODB / CBPB can be decided after we know the B-residual outcome.
+    // ------------------------------------------------------------------
     let mut levels_all = [[0i32; 64]; 6];
     let mut has_ac = [false; 6];
 
@@ -1536,27 +1584,8 @@ fn encode_p_mb_pb_inter(
         levels_all[b] = levels;
     }
 
-    let cbpc: u8 = ((has_ac[4] as u8) << 1) | (has_ac[5] as u8);
-    let cbpy_true: u8 = ((has_ac[0] as u8) << 3)
-        | ((has_ac[1] as u8) << 2)
-        | ((has_ac[2] as u8) << 1)
-        | (has_ac[3] as u8);
-    let cbpy_on_wire = cbpy_true ^ 0xF;
-
-    write_mcbpc_inter(bw, PMbKind::Inter, cbpc);
-    // MODB after MCBPC (spec §5.3 Fig 10). Round-14 scope: always "0".
-    crate::pb::encode_modb(bw, false, false);
-    write_cbpy(bw, cbpy_on_wire);
-    let (pmx, pmy) = predict_mv(mv_grid, mb_x, mb_y);
-    encode_mv_component(bw, mv.0, pmx);
-    encode_mv_component(bw, mv.1, pmy);
-
-    for b in 0..6 {
-        if has_ac[b] {
-            write_block_ac_inter(bw, &levels_all[b]);
-        }
-    }
-
+    // Reconstruct the P-half into `recon` first — the §G.5 backward
+    // predictor needs the freshly reconstructed P-MB.
     let mut info = crate::mb::PMbInfo {
         coded: true,
         intra: false,
@@ -1615,8 +1644,145 @@ fn encode_p_mb_pb_inter(
             info.residual_present[b] = true;
         }
     }
+    // The MV is needed by the §G.4 derivation below.
     mv_grid.set(mb_x, mb_y, MbMotion::mv1(mv, true, false));
+
+    // ------------------------------------------------------------------
+    // B-half residual: §G.4 derive forward + backward MVs (with MVDB =
+    // (0,0) — the spec allows any MVDB but our round-15 scope keeps it
+    // zero so the encoder doesn't have to pick one), §G.5 compute the
+    // bidirectional prediction, subtract from the **input frame** pels
+    // (the encoder uses the input frame as the B-source for the streaming
+    // 1-input-per-PB-pair model), forward-DCT, quantise at BQUANT, and
+    // collect the per-block coefficients + CBPB bits.
+    // ------------------------------------------------------------------
+    let mvd_b = (0i32, 0i32);
+    let trd = (trb as i32 + 1).max(1);
+    let bquant = crate::pb::bquant_from_quant(quant, dbquant);
+    let p_motion = crate::motion::MbMotion::mv1(mv, true, false);
+    let b_mvs = crate::pb::derive_b_mb_mvs(&p_motion, mvd_b, trb as i32, trd);
+
+    let mut b_levels = [[0i32; 64]; 6];
+    let mut b_has_ac = [false; 6];
+    let block_mvs = [
+        b_mvs.luma[0],
+        b_mvs.luma[1],
+        b_mvs.luma[2],
+        b_mvs.luma[3],
+        b_mvs.chroma,
+        b_mvs.chroma,
+    ];
+    for b in 0..6usize {
+        // §G.5 prediction (forward + backward) for this block.
+        let mut pred = [0i16; 64];
+        crate::pb::predict_b_block(&mut pred, b, mb_x, mb_y, reference, recon, block_mvs[b]);
+        // Source pels (input frame) at this block's destination position.
+        let src_pels = sample_input_block_pels(src_y, src_cb, src_cr, mb_x, mb_y, b);
+        let mut resid = [0.0f32; 64];
+        for k in 0..64 {
+            resid[k] = (src_pels[k] as i32 - pred[k] as i32) as f32;
+        }
+        let mut dctf = resid;
+        fdct8x8(&mut dctf);
+        let levels = quantise_inter_block(&dctf, bquant);
+        b_has_ac[b] = levels.iter().any(|&l| l != 0);
+        b_levels[b] = levels;
+    }
+    let cbpb: u8 = ((b_has_ac[0] as u8) << 5)
+        | ((b_has_ac[1] as u8) << 4)
+        | ((b_has_ac[2] as u8) << 3)
+        | ((b_has_ac[3] as u8) << 2)
+        | ((b_has_ac[4] as u8) << 1)
+        | (b_has_ac[5] as u8);
+    let cbpb_present = cbpb != 0;
+
+    // ------------------------------------------------------------------
+    // Now emit the bitstream in the spec-correct order.
+    // ------------------------------------------------------------------
+    let cbpc: u8 = ((has_ac[4] as u8) << 1) | (has_ac[5] as u8);
+    let cbpy_true: u8 = ((has_ac[0] as u8) << 3)
+        | ((has_ac[1] as u8) << 2)
+        | ((has_ac[2] as u8) << 1)
+        | (has_ac[3] as u8);
+    let cbpy_on_wire = cbpy_true ^ 0xF;
+
+    write_mcbpc_inter(bw, PMbKind::Inter, cbpc);
+    // MODB after MCBPC (§5.3 Fig 10). When CBPB is non-zero we emit `11`
+    // (CBPB + MVDB present); MVDB is then written as the (0, 0) pure
+    // differential, so there's no hidden MV cost. When CBPB is zero we
+    // emit `0` (1 bit) to keep the wire compact.
+    crate::pb::encode_modb(bw, cbpb_present, cbpb_present);
+    if cbpb_present {
+        bw.write_bits(cbpb as u32, 6);
+    }
+    write_cbpy(bw, cbpy_on_wire);
+    // `mv_grid[mb_x, mb_y]` was already updated to `mv` above so the §G.4
+    // derivation could run, but `predict_mv` reads strictly from the
+    // LEFT / ABOVE / ABOVE-RIGHT neighbours (never the cell itself) — so
+    // updating early doesn't poison the MV-coding predictor.
+    let (pmx, pmy) = predict_mv(mv_grid, mb_x, mb_y);
+    encode_mv_component(bw, mv.0, pmx);
+    encode_mv_component(bw, mv.1, pmy);
+    if cbpb_present {
+        // MVDB = (0, 0) — pure differential VLC, 2 codewords.
+        crate::motion::encode_mvd_pure_differential(bw, mvd_b.0);
+        crate::motion::encode_mvd_pure_differential(bw, mvd_b.1);
+    }
+
+    // P-block coefficients (§5.4 — first the six P-blocks).
+    for b in 0..6 {
+        if has_ac[b] {
+            write_block_ac_inter(bw, &levels_all[b]);
+        }
+    }
+
+    // B-block coefficients — TCOEF only (no INTRADC for B-blocks per §5.4),
+    // ordering per the CBPB bit positions (block 1..=6 = our 0..=5).
+    if cbpb_present {
+        for b in 0..6 {
+            if b_has_ac[b] {
+                write_block_ac_inter(bw, &b_levels[b]);
+            }
+        }
+    }
+
     Ok(info)
+}
+
+/// Pull an 8×8 block worth of pels from the **input frame** for block
+/// position `b` of the given MB. Used by the PB-encoder when computing the
+/// B-half residual against the §G.5 prediction.
+///
+/// `b` is `0..=3` for the four luma sub-blocks (top-left, top-right,
+/// bottom-left, bottom-right) and `4`/`5` for Cb/Cr.
+fn sample_input_block_pels(
+    src_y: &oxideav_core::frame::VideoPlane,
+    src_cb: &oxideav_core::frame::VideoPlane,
+    src_cr: &oxideav_core::frame::VideoPlane,
+    mb_x: usize,
+    mb_y: usize,
+    b: usize,
+) -> [u8; 64] {
+    let (plane, stride, base_x, base_y) = match b {
+        0 => (&src_y.data, src_y.stride, mb_x * 16, mb_y * 16),
+        1 => (&src_y.data, src_y.stride, mb_x * 16 + 8, mb_y * 16),
+        2 => (&src_y.data, src_y.stride, mb_x * 16, mb_y * 16 + 8),
+        3 => (&src_y.data, src_y.stride, mb_x * 16 + 8, mb_y * 16 + 8),
+        4 => (&src_cb.data, src_cb.stride, mb_x * 8, mb_y * 8),
+        5 => (&src_cr.data, src_cr.stride, mb_x * 8, mb_y * 8),
+        _ => unreachable!(),
+    };
+    let h = plane.len() / stride;
+    let w = stride;
+    let mut out = [0u8; 64];
+    for j in 0..8 {
+        let yy = (base_y + j).min(h.saturating_sub(1));
+        for i in 0..8 {
+            let xx = (base_x + i).min(w.saturating_sub(1));
+            out[j * 8 + i] = plane[yy * stride + xx];
+        }
+    }
+    out
 }
 
 /// Copy one MB (Y + Cb + Cr) from `src` to `dst`. Used to preserve intra

@@ -1,4 +1,5 @@
-//! End-to-end tests for Annex G (PB-frames) emission + decode (round 14).
+//! End-to-end tests for Annex G (PB-frames) emission + decode (rounds
+//! 14-15).
 //!
 //! Coverage:
 //! * `pb_picture_header_carries_pb_bit_and_trb_dbquant` — bit-level check
@@ -7,6 +8,10 @@
 //! * `pb_self_roundtrip_psnr` — encode 5 frames as `[I, PB, PB, PB, PB]`,
 //!   decode with our decoder, assert PSNR ≥ 30 dB on every emitted frame
 //!   (the decoder produces both the B and the P for each PB picture).
+//!   The B-half floor is ≥ 40 dB after round-15's residual emission.
+//! * `pb_b_residual_emission_psnr_jumps_with_finer_bquant` — round-15
+//!   regression check: the B-half PSNR follows the BQUANT relationship
+//!   (DBQUANT = 0 → finer quant → cleaner reconstruction).
 //! * `pb_combined_with_other_annex_rejected` — sanity-check the
 //!   "combinations not supported" guard.
 //! * `pb_modb_zero_round_trips` — wire-level round trip for an MB with
@@ -197,16 +202,16 @@ fn pb_self_roundtrip_psnr() {
     );
 
     // The I-frame and every P-half should match its source frame to ≥ 30 dB.
-    // The B-half is reconstructed from MC alone (round-14 scope keeps the
-    // B-residual at zero) — its PSNR depends on how well bidirectional MC
-    // happens to predict the synthetic moving-square scene. We assert a
-    // looser ≥ 18 dB floor for the B frames, which is enough to confirm the
-    // §G.4 / §G.5 derivation produces sensible pels rather than garbage.
+    // The B-half is reconstructed by §G.4 / §G.5 bidirectional MC plus the
+    // round-15 B-residual emission. The encoder uses the **input frame** as
+    // the B-source (the streaming 1-input-per-PB-pair model has no separate
+    // B-source available), so the decoded B-half should match the current
+    // input frame at ≥ 40 dB once the residual lands.
     //
     // Output ordering: I (frame 0), B0 P1, B1 P2, B2 P3, B3 P4
     //                  → indices    0,    1  2,   3  4,   5  6,   7  8
-    // The B at index 2k+1 corresponds (in source time) to source frame k
-    // (the previously-encoded one), and the P at 2k+2 to source frame k+1.
+    // The B at index 2k+1 corresponds (in source time) to source frame k+1
+    // (the input that became the P-source), and the P at 2k+2 to the same.
     let i_psnr = psnr(&frames[0], &decoded[0]);
     eprintln!("PB roundtrip — I-frame PSNR = {i_psnr:.1} dB");
     assert!(
@@ -227,7 +232,8 @@ fn pb_self_roundtrip_psnr() {
 
     for k in 0..4usize {
         // B-half "expected" frame is somewhere between source frames k and
-        // k+1. We compare to the prior source as a coarse proxy.
+        // k+1. The encoder picked source frame k+1 as the B-source, so the
+        // decoded B-half should be close to that frame.
         let b_psnr_prev = psnr(&frames[k], &decoded[2 * k + 1]);
         let b_psnr_next = psnr(&frames[k + 1], &decoded[2 * k + 1]);
         let best = b_psnr_prev.max(b_psnr_next);
@@ -236,13 +242,61 @@ fn pb_self_roundtrip_psnr() {
             k, b_psnr_prev, b_psnr_next, best
         );
         assert!(
-            best >= 18.0,
-            "B-half PSNR for PB pair {} = max({:.1}, {:.1}) dB (must be ≥ 18 dB)",
+            best >= 40.0,
+            "B-half PSNR for PB pair {} = max({:.1}, {:.1}) dB (must be ≥ 40 dB \
+             with round-15 B-residual emission)",
             k,
             b_psnr_prev,
             b_psnr_next
         );
     }
+}
+
+/// Round 15 — verify the B-half residual emission at non-default DBQUANT.
+/// At DBQUANT = `00` the B-block quantiser BQUANT = 5*QUANT/4 = 5 (since
+/// PQUANT defaults to 5 → 5*5/4 = 6, clipped to 6). At DBQUANT = `11` we get
+/// BQUANT = 8*QUANT/4 = 10. Higher BQUANT → coarser residual → lower PSNR.
+/// We assert the relationship rather than a hard PSNR value.
+#[test]
+fn pb_b_residual_emission_psnr_jumps_with_finer_bquant() {
+    fn run_at_dbquant(dbq: u8) -> f64 {
+        let mut enc = make_pb_encoder();
+        enc.set_pb_dbquant(dbq);
+        let frames: Vec<VideoFrame> = (0..3)
+            .map(|i| moving_square_frame(40 + i * 4, 60, i as i64))
+            .collect();
+        let pkts = collect_packets(enc.as_mut(), &frames).expect("encode");
+        let mut dec = H263Decoder::new(CodecId::new(oxideav_h263::CODEC_ID_STR));
+        let decoded = decode_packets(&mut dec, &pkts).expect("decode");
+        // 1 (I) + 2 (PBs) * 2 = 5 frames.
+        assert_eq!(decoded.len(), 5);
+        // Compare each B-half to its corresponding source (current input).
+        let mut psnrs = Vec::new();
+        for k in 0..2usize {
+            let p = psnr(&frames[k + 1], &decoded[2 * k + 1]);
+            psnrs.push(p);
+        }
+        psnrs.iter().sum::<f64>() / (psnrs.len() as f64)
+    }
+    let avg00 = run_at_dbquant(0b00);
+    let avg11 = run_at_dbquant(0b11);
+    eprintln!("PB B-residual avg PSNR — DBQUANT=00: {avg00:.1} dB, DBQUANT=11: {avg11:.1} dB");
+    // Both must clear the round-15 floor (which the per-frame test already
+    // checks at DBQUANT=00); the finer quant must produce at least as good
+    // a PSNR as the coarser one (modulo rounding, allow 0.5 dB slack).
+    assert!(
+        avg00 >= 40.0,
+        "DBQUANT=00 average B PSNR {avg00:.1} dB < 40"
+    );
+    assert!(
+        avg11 >= 30.0,
+        "DBQUANT=11 average B PSNR {avg11:.1} dB < 30"
+    );
+    assert!(
+        avg00 + 0.5 >= avg11,
+        "DBQUANT=00 (BQUANT smaller) should reconstruct B-half at >= the \
+         quality of DBQUANT=11; got 00={avg00:.1} dB vs 11={avg11:.1} dB"
+    );
 }
 
 #[test]

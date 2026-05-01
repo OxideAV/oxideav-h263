@@ -149,6 +149,35 @@ pub fn reconstruct_b_block(
     mvs: BBlockMvs,
     residual: &[i16; 64],
 ) {
+    let mut pred = [0i16; 64];
+    predict_b_block(&mut pred, block_idx, mb_x, mb_y, forward_ref, p_recon, mvs);
+    for k in 0..64 {
+        let p = pred[k] as i32;
+        let r = residual[k] as i32;
+        dst[k] = (p + r).clamp(0, 255) as u8;
+    }
+}
+
+/// §G.5 — compute the **prediction-only** (forward + backward bidirectional
+/// average inside the §G.5 region, forward-only outside) for one B-block.
+///
+/// This is the building block for both:
+///   * the decoder's [`reconstruct_b_block`] (which adds the parsed residual);
+///   * the encoder's B-residual computation (subtracts this prediction from
+///     the source pels to get the residual that will be DCT/quantised at
+///     BQUANT and emitted under CBPB).
+///
+/// Output is signed (i16) so the encoder can compute `source - prediction`
+/// without saturating at 0 or 255.
+pub fn predict_b_block(
+    dst: &mut [i16; 64],
+    block_idx: usize,
+    mb_x: usize,
+    mb_y: usize,
+    forward_ref: &IPicture,
+    p_recon: &IPicture,
+    mvs: BBlockMvs,
+) {
     debug_assert!(block_idx < 6);
     let is_chroma = block_idx >= 4;
 
@@ -271,8 +300,7 @@ pub fn reconstruct_b_block(
             } else {
                 f
             };
-            let r = residual[j * 8 + i] as i32;
-            dst[j * 8 + i] = (pred + r).clamp(0, 255) as u8;
+            dst[j * 8 + i] = pred as i16;
         }
     }
 }

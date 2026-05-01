@@ -142,7 +142,9 @@ Round 13 wires Annex N (RPS) on both decoder and encoder sides:
 
 ### Annex G — PB-frames
 
-Round 14 wires Annex G (PB-frames) on both decoder and encoder sides:
+Round 14 wired the Annex G framing on both sides; round 15 added the
+B-block residual emission so the B-half is no longer a pure MC
+predictor:
 
 * **Picture header** — `picture::parse_picture_header` accepts PTYPE
   bit 13 (PBFR) and reads the §5.1.22 / §5.1.23 TRB (3 bits) +
@@ -152,26 +154,35 @@ Round 14 wires Annex G (PB-frames) on both decoder and encoder sides:
   (per §5.3 Figure 10) the decoder reads MODB (Table 11/H.263), then
   optional CBPB (6 bits) and MVDB (Table 14 differential applied as
   the §G.4 MVDB delta). MODB = `0` means "no CBPB, no MVDB"; `10`
-  means "MVDB only"; `11` means "CBPB + MVDB". The B-block residual
-  carried under CBPB is currently parsed-and-discarded — round-14
-  scope is the round-trip with our own encoder which always emits
-  MODB = 0.
+  means "MVDB only"; `11` means "CBPB + MVDB". When CBPB is
+  non-zero, the per-block B-residual (TCOEF dequantised at BQUANT =
+  `bquant_from_quant(quant, dbquant)` — Table 6 / §5.1.23) is
+  decoded after the six P-block coefficients, IDCT'd, and stored on
+  `PbMbInfo.b_residual` for the §G.5 reconstruction.
 * **§G.4 / §G.5 reconstruction** ([`pb`] module) — given the
   co-located P-MB's MV, MVDB delta, TRB, and TRD the helper derives
   forward `MVF` and backward `MVB` (per-block + chroma via §F.2 sum
-  rounded by Table F.1). The §G.5 bidirectional region is computed
-  per-pixel from `MVB`'s footprint inside the freshly-reconstructed
-  P-MB; outside that region the prediction is forward-only.
+  rounded by Table F.1). `predict_b_block` returns the §G.5
+  bidirectional prediction (forward + backward average inside the
+  region where `MVB` maps into the freshly-reconstructed P-MB,
+  forward-only outside); `reconstruct_b_block` then adds the
+  per-block residual and clips to `[0, 255]`.
 * **Encoder** opt-in via [`H263Encoder::set_enable_annex_g_pb`]. When
-  on, every P-picture sets PTYPE bit 13 and the MB layer emits MODB
-  = `0` after MCBPC. The B-half of each PB-frame is reconstructed by
-  the decoder via §G.4 / §G.5 with no MVDB and no residual — the
-  on-wire validation covers the picture-header tail (TRB / DBQUANT)
-  and the per-MB MODB position; the §G.4 / §G.5 derivation is
-  validated by the per-frame round-trip PSNR.
+  on, every P-picture sets PTYPE bit 13 and the MB layer emits the
+  full MODB / CBPB / MVDB / B-residual stream. For each MB the
+  encoder (1) quantises + reconstructs the P-half blocks into the
+  `recon` picture, (2) computes the §G.5 prediction for each of the
+  6 B-blocks against the freshly-reconstructed P-MB, (3) subtracts
+  from the **input frame** pels (the streaming 1-input-per-PB-pair
+  model uses the input as the B-source), forward-DCTs, quantises at
+  BQUANT, and picks CBPB bits from per-block any-nonzero. MODB = `11`
+  carries CBPB + MVDB (MVDB = `(0, 0)` pure differential); MODB = `0`
+  is emitted only when no B-block has any residual. TRB / DBQUANT
+  are tunable via `set_pb_trb` / `set_pb_dbquant`.
 * **Combination guards** — PB + UMV / SAC / AP / RPS returns
-  `Error::Unsupported` at `send_frame` (round-14 scope is baseline
-  1-MV inter only). PB + Annex F is also rejected on the decoder side.
+  `Error::Unsupported` at `send_frame` (round-15 scope is still
+  baseline 1-MV inter only). PB + Annex F is also rejected on the
+  decoder side.
 * **Decoded output** — every PB-frame produces TWO `VideoFrame`s in
   display order: B first, then P. The B-frame is *not* stored as the
   motion-compensation reference for subsequent pictures (per §G.1 /
@@ -179,9 +190,11 @@ Round 14 wires Annex G (PB-frames) on both decoder and encoder sides:
 * **Round-trip PSNR** — on a synthetic moving-square QCIF clip,
   encode 5 frames as `[I, PB, PB, PB, PB]` and decode → I-frame +
   every P-half lands at **68.1 dB** (essentially lossless thanks to
-  the small uniform regions); B-halves at **28.8 dB** vs the
-  midpoint-position source proxy (the bidirectional MC sits the
-  square at the geometric average of the two adjacent frames).
+  the small uniform regions); B-halves at **55.4-57.1 dB** with
+  round-15 residual emission at PQUANT = 5 / DBQUANT = 0 (BQUANT =
+  6) — a +27 dB jump from round-14's 28.8 dB MC-only baseline. At
+  DBQUANT = 3 (BQUANT = 10) the B-half drops to 51.6 dB, as expected
+  from the coarser quant.
 * **ffmpeg interop** — purely informational. ffmpeg 8.1's H.263
   decoder accepts our PB-frames stream without error logs but its
   PB-frames support is partial; cross-decode parity is not asserted.

@@ -896,14 +896,25 @@ pub struct PbMbInfo {
     /// MVDB delta in luma half-pel units. Present only when MODB indicated
     /// MVDB; otherwise `(0, 0)`.
     pub mvdb: (i32, i32),
+    /// Per-block B-residual pels (signed, IDCT output) for each of the 6
+    /// B-blocks. Zero when the corresponding CBPB bit is 0. Used by the
+    /// §G.5 B-half reconstruction.
+    pub b_residual: Vec<i16>,
+}
+
+impl PbMbInfo {
+    /// Borrow the B-residual block `k` (0..6) as an `[i16; 64]` slice.
+    pub fn b_residual_block(&self, k: usize) -> &[i16] {
+        &self.b_residual[k * 64..(k + 1) * 64]
+    }
 }
 
 /// PB-frames variant of [`decode_p_mb_pass1`]. After MCBPC, reads MODB
 /// (Table 11), then optional CBPB (6 bits) and MVDB (Table 14 differential
-/// applied to the §G.4 forward predictor). The B-block residual coding is
-/// not yet wired (round-14 scope keeps it absent on the encoder side); when
-/// CBPB is non-zero on the wire we currently surface a specific
-/// `Unsupported` to flag third-party encoder interop.
+/// applied to the §G.4 forward predictor). When CBPB is non-zero, the
+/// per-block B-residual TCOEF coefficients are dequantised at BQUANT
+/// (§5.1.23 = `bquant_from_quant(quant, dbquant)`), inverse-DCT'd, and
+/// surfaced on `PbMbInfo.b_residual` for the §G.5 reconstruction.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_p_mb_pb(
     br: &mut BitReader<'_>,
@@ -914,6 +925,7 @@ pub fn decode_p_mb_pb(
     reference: &IPicture,
     mv_grid: &mut MvGrid,
     umv: UmvMode,
+    dbquant: u8,
 ) -> Result<(u32, PbMbInfo)> {
     // 1. COD.
     let cod = br.read_u1()?;
@@ -943,6 +955,7 @@ pub fn decode_p_mb_pb(
                 },
                 cbpb: 0,
                 mvdb: (0, 0),
+                b_residual: vec![0i16; 6 * 64],
             },
         ));
     }
@@ -1075,15 +1088,12 @@ pub fn decode_p_mb_pb(
         info
     };
 
-    // 10. B-block residual (CBPB-driven). Decode but do not yet apply — the
-    //     caller stores it for §G.5 reconstruction after the P-half is fully
-    //     done. Round-14 round-trip pairs with an encoder that always emits
-    //     CBPB = 0, so this branch is exercised only by third-party streams.
+    // 10. B-block residual (CBPB-driven). Decode TCOEF at BQUANT and store
+    //     the IDCT'd pels on `b_residual` so the picture-level driver can
+    //     fold them into the §G.5 reconstruction.
+    let mut b_residual = vec![0i16; 6 * 64];
     if cbpb != 0 {
-        // We accept CBPB on the wire for spec-completeness; the residual
-        // bits are read (so the bitstream stays in sync) but the values are
-        // discarded. A future round will plumb them through to the §G.5
-        // B-half reconstruction.
+        let bquant = crate::pb::bquant_from_quant(quant as u8, dbquant) as u32;
         for block_idx in 0..6usize {
             // CBPB block numbering per spec: utmost left bit ↔ block 1
             // (the first luma block). We numbered our blocks 0..=5; the
@@ -1092,9 +1102,13 @@ pub fn decode_p_mb_pb(
             let bit = (cbpb >> (5 - block_idx)) & 1 != 0;
             if bit {
                 let mut coeffs = [0i32; 64];
-                // B-blocks use BQUANT (§5.1.23) — for now we decode at the
-                // same quantiser. The values are discarded.
-                decode_ac(br, &mut coeffs, 0, quant)?;
+                decode_ac(br, &mut coeffs, 0, bquant)?;
+                let mut resid_out = [0i32; 64];
+                crate::block::idct_signed(&mut coeffs, &mut resid_out);
+                let dst = &mut b_residual[block_idx * 64..(block_idx + 1) * 64];
+                for (i, &v) in resid_out.iter().enumerate() {
+                    dst[i] = v.clamp(-4096, 4095) as i16;
+                }
             }
         }
     }
@@ -1106,6 +1120,7 @@ pub fn decode_p_mb_pb(
             modb,
             cbpb,
             mvdb,
+            b_residual,
         },
     ))
 }
