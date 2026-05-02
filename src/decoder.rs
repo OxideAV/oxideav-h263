@@ -96,6 +96,16 @@ pub struct H263Decoder {
     ///
     /// [`maybe_deblock`]: Self::maybe_deblock
     enable_annex_j: bool,
+    /// When `true`, treat PB-frames pictures as **Annex M** Improved
+    /// PB-frames: the per-MB MODB code is interpreted via Table M.1 (six
+    /// codewords selecting bidir / fwd / bwd, optional CBPB, optional MVDB)
+    /// instead of Annex G's Table 11 (three codewords, always bidir). Annex
+    /// M is signalled out-of-band per §M.1 (the spec lists ITU-T Rec. H.245
+    /// as the canonical signal); on baseline-PTYPE streams there is no
+    /// in-band differentiation, so the caller must opt in via
+    /// [`Self::set_enable_annex_m_impb`] to match whatever the encoder did.
+    /// Default `false` (legacy Annex G behaviour preserved).
+    enable_annex_m_impb: bool,
     /// DoS-protection caps threaded from the stream's
     /// [`CodecParameters::limits`]. Header-parse code rejects pictures
     /// whose declared `width × height` exceeds
@@ -162,6 +172,7 @@ impl H263Decoder {
             eof: false,
             reference: None,
             enable_annex_j: false,
+            enable_annex_m_impb: false,
             rps_cache: VecDeque::new(),
             rps_cache_capacity: 4,
             limits,
@@ -205,6 +216,23 @@ impl H263Decoder {
     /// Returns whether Annex J deblocking is currently enabled.
     pub fn enable_annex_j(&self) -> bool {
         self.enable_annex_j
+    }
+
+    /// Enable or disable **Annex M** (Improved PB-frames) decoding. When on,
+    /// every PB-frames picture (PTYPE bit 13 set) is parsed using the Table
+    /// M.1 MODB VLC and the §M.2 per-MB B-mode dispatch (bidir / fwd / bwd).
+    /// When off (default), the legacy Annex G Table 11 path runs unchanged.
+    /// Must be set before the first packet is submitted; mid-stream changes
+    /// would desync the matching encoder. See
+    /// [`encoder::H263Encoder::set_enable_annex_m_impb`] for the encoder-side
+    /// counterpart.
+    pub fn set_enable_annex_m_impb(&mut self, enable: bool) {
+        self.enable_annex_m_impb = enable;
+    }
+
+    /// Returns whether Annex M (Improved PB-frames) decoding is enabled.
+    pub fn enable_annex_m_impb(&self) -> bool {
+        self.enable_annex_m_impb
     }
 
     /// Walk the buffer for picture start codes and process each picture
@@ -316,7 +344,13 @@ impl H263Decoder {
                 // the B frame first (display order), then the P frame.
                 if hdr.pb_frames {
                     let reference = reference.clone();
-                    let (p_pic, b_pic) = decode_pb_picture(&mut br, &hdr, bytes, &reference)?;
+                    let (p_pic, b_pic) = decode_pb_picture(
+                        &mut br,
+                        &hdr,
+                        bytes,
+                        &reference,
+                        self.enable_annex_m_impb,
+                    )?;
                     let mut p_pic = p_pic;
                     self.maybe_deblock(&mut p_pic, &hdr);
                     // B-frame is **not** stored as MC reference (§G.1 / §5.1.22);
@@ -575,16 +609,22 @@ pub fn decode_p_picture(
     Ok(pic)
 }
 
-/// Decode the PB-frame body (Annex G). Returns `(p_recon, b_recon)` where
-/// `p_recon` is the freshly reconstructed P-half and `b_recon` is the
-/// §G.4 / §G.5 bidirectional B-half. The B-half is **display-order
-/// preceding** the P-half (the spec interleaves them for compression but the
-/// caller emits them as B then P).
+/// Decode the PB-frame body (Annex G or Annex M Improved PB-frames).
+/// Returns `(p_recon, b_recon)` where `p_recon` is the freshly reconstructed
+/// P-half and `b_recon` is the §G.5 (Annex G — always bidirectional) /
+/// §M.2 (Annex M — per-MB selection across {bidir, fwd, bwd}) B-half.
+/// The B-half is **display-order preceding** the P-half (the spec
+/// interleaves them for compression but the caller emits them as B then P).
+///
+/// `annex_m` selects the MODB table and the per-MB B-block prediction
+/// derivation. When `false`, this function reproduces the original Annex G
+/// behaviour bit-for-bit.
 pub fn decode_pb_picture(
     br: &mut BitReader<'_>,
     hdr: &PictureHeader,
     bytes: &[u8],
     reference: &IPicture,
+    annex_m: bool,
 ) -> Result<(IPicture, IPicture)> {
     let mb_w = hdr.width.div_ceil(16) as usize;
     let mb_h = hdr.height.div_ceil(16) as usize;
@@ -611,8 +651,11 @@ pub fn decode_pb_picture(
         ));
     }
 
-    // Per-MB MVDB deltas (zero when MODB indicated no MVDB). Used by §G.4.
+    // Per-MB MVDB deltas (Annex G semantic) / forward MVs (Annex M
+    // Forward-mode). Used by §G.4 / §M.2 reconstruction below.
     let mut mb_mvdbs: Vec<(i32, i32)> = vec![(0, 0); mb_w * mb_h];
+    // Per-MB B-mode (Annex M only — Annex G is implicitly all-Bidirectional).
+    let mut mb_bmodes: Vec<crate::pb::BMode> = vec![crate::pb::BMode::Bidirectional; mb_w * mb_h];
     // Per-MB B-block residual buffer. Filled by `decode_p_mb_pb` when CBPB
     // is non-zero; left zero otherwise (the §G.5 reconstruction then uses
     // pure bidirectional MC for that block).
@@ -625,6 +668,10 @@ pub fn decode_pb_picture(
                 mv_grid = MvGrid::new(mb_w, mb_h);
             }
         }
+        // §M.2.2 left-forward-MV predictor: resets to (0, 0) at the start of
+        // each MB row (matching the §F.2 Figure F.1 row-start convention for
+        // the standard MV predictor).
+        let mut fwd_mv_left = (0i32, 0i32);
         for mb_x in 0..mb_w {
             let (new_q, info) = decode_p_mb_pb(
                 br,
@@ -636,6 +683,8 @@ pub fn decode_pb_picture(
                 &mut mv_grid,
                 umv_mode,
                 hdr.dbquant,
+                annex_m,
+                &mut fwd_mv_left,
             )
             .map_err(|e| {
                 Error::invalid(format!(
@@ -645,6 +694,7 @@ pub fn decode_pb_picture(
             quant = new_q;
             let mb_idx = mb_y * mb_w + mb_x;
             mb_mvdbs[mb_idx] = info.mvdb;
+            mb_bmodes[mb_idx] = info.bmode;
             // Splice the per-MB B-residual into the picture-wide buffer.
             let base = mb_idx * 6 * 64;
             b_residuals[base..base + 6 * 64].copy_from_slice(&info.b_residual);
@@ -663,17 +713,35 @@ pub fn decode_pb_picture(
     let trd = (trb + 1).max(1);
 
     let mb_motions: Vec<MbMotion> = (0..(mb_w * mb_h)).map(|i| mv_grid.mvs[i]).collect();
-    let b_pic = crate::pb::reconstruct_b_picture(
-        hdr.width as usize,
-        hdr.height as usize,
-        reference,
-        &p_pic,
-        &mb_motions,
-        &mb_mvdbs,
-        &b_residuals,
-        trb,
-        trd,
-    );
+    let b_pic = if annex_m {
+        // Annex M (Improved PB-frames) — per-MB selection across {bidir, fwd,
+        // bwd}. The reconstructor reads `mb_bmodes` and dispatches to the
+        // matching §M.2 predictor, then folds in the per-CBPB B-residual.
+        crate::pb::reconstruct_b_picture_m(
+            hdr.width as usize,
+            hdr.height as usize,
+            reference,
+            &p_pic,
+            &mb_motions,
+            &mb_mvdbs,
+            &mb_bmodes,
+            &b_residuals,
+            trb,
+            trd,
+        )
+    } else {
+        crate::pb::reconstruct_b_picture(
+            hdr.width as usize,
+            hdr.height as usize,
+            reference,
+            &p_pic,
+            &mb_motions,
+            &mb_mvdbs,
+            &b_residuals,
+            trb,
+            trd,
+        )
+    };
 
     Ok((p_pic, b_pic))
 }

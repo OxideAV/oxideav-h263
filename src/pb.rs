@@ -494,11 +494,189 @@ pub fn reconstruct_b_picture(
     b_pic
 }
 
+/// Annex M version of [`reconstruct_b_picture`]. Differs from the Annex G
+/// path on three points:
+///
+/// 1. Per-MB the B-mode is read from `mb_bmodes` and the predictor follows
+///    §M.2 (bidir → §G.5 — same as Annex G; forward → §M.2.2 fwd MV from
+///    `mb_mvfs`; backward → §M.2.3 PREC pels).
+/// 2. The MVDB slot in Annex M carries a *forward MV* (luma half-pel) rather
+///    than a perturbing delta — the caller passes that vector unchanged in
+///    `mb_mvfs` and the bidir / backward paths ignore it.
+/// 3. Chroma vectors for the forward path use the §M.2.2 simple predictor
+///    (same as the §G.4 chroma rounding via Table F.1, applied to the per-MB
+///    forward MV scaled to chroma sixteenths).
+///
+/// `b_residuals` layout matches Annex G: per-MB-per-block i16[64], 6 blocks
+/// per MB. MBs whose CBPB is zero use all-zero residuals.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_b_picture_m(
+    width: usize,
+    height: usize,
+    forward_ref: &IPicture,
+    p_recon: &IPicture,
+    mb_motions: &[MbMotion],
+    mb_mvfs: &[(i32, i32)],
+    mb_bmodes: &[BMode],
+    b_residuals: &[i16],
+    trb: i32,
+    trd: i32,
+) -> IPicture {
+    let mut b_pic = IPicture::new(width, height);
+    let mb_w = b_pic.mb_width;
+    let mb_h = b_pic.mb_height;
+    debug_assert_eq!(mb_motions.len(), mb_w * mb_h);
+    debug_assert_eq!(mb_mvfs.len(), mb_w * mb_h);
+    debug_assert_eq!(mb_bmodes.len(), mb_w * mb_h);
+    debug_assert_eq!(b_residuals.len(), mb_w * mb_h * 6 * 64);
+
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            let mb_idx = mb_y * mb_w + mb_x;
+            let bmode = mb_bmodes[mb_idx];
+            let motion = mb_motions[mb_idx];
+            let p_mv = if motion.intra {
+                MbMotion::mv1((0, 0), true, false)
+            } else {
+                motion
+            };
+
+            // For each block, build a signed predictor matching §M.2 dispatch.
+            for b in 0..6usize {
+                let mut pred = [0i16; 64];
+                match bmode {
+                    BMode::Bidirectional => {
+                        // §M.2.1 → §G.5 path with MVDB = 0 (Annex M's MVDB is
+                        // a forward-mode MV, not a §G.4 delta — bidirectional
+                        // mode in Annex M is "the prediction defined in
+                        // Annex G when MVD = 0").
+                        let mvs = if b < 4 {
+                            derive_b_block_mvs(p_mv.mvs4[b], (0, 0), trb, trd)
+                        } else {
+                            // Chroma uses the chroma MV — derived from the
+                            // Annex G chroma path inside `derive_b_mb_mvs`.
+                            let m = derive_b_mb_mvs(&p_mv, (0, 0), trb, trd);
+                            m.chroma
+                        };
+                        predict_b_block(&mut pred, b, mb_x, mb_y, forward_ref, p_recon, mvs);
+                    }
+                    BMode::Forward => {
+                        // §M.2.2 — single 16×16 forward MV from `mb_mvfs`.
+                        // Chroma vectors use the Table F.1 chroma rounding
+                        // applied to the per-MB forward MV (same as the §F.2
+                        // chroma derivation but with one MV instead of four).
+                        let mvf = mb_mvfs[mb_idx];
+                        let block_mvf = if b < 4 {
+                            mvf
+                        } else {
+                            // 1MV chroma derivation per §F.2 / Table F.1 NOTE 1:
+                            // chroma half-pel = round(luma_halfpel / 2).
+                            (
+                                crate::motion::luma_to_chroma_mv(mvf.0),
+                                crate::motion::luma_to_chroma_mv(mvf.1),
+                            )
+                        };
+                        predict_b_block_forward(&mut pred, b, mb_x, mb_y, forward_ref, block_mvf);
+                    }
+                    BMode::Backward => {
+                        // §M.2.3 — PREC = freshly reconstructed P-MB pels.
+                        predict_b_block_backward(&mut pred, b, mb_x, mb_y, p_recon);
+                    }
+                }
+
+                // Add the per-block B-residual (zero outside CBPB), clip to
+                // [0, 255], and write into `b_pic` at this block's
+                // destination position.
+                let resid_slice = &b_residuals[(mb_idx * 6 + b) * 64..(mb_idx * 6 + b + 1) * 64];
+                let mut dst = [0u8; 64];
+                for k in 0..64 {
+                    let v = pred[k] as i32 + resid_slice[k] as i32;
+                    dst[k] = v.clamp(0, 255) as u8;
+                }
+                write_block_into_picture(&mut b_pic, b, mb_x, mb_y, &dst);
+            }
+        }
+    }
+    b_pic
+}
+
+/// Helper: copy an 8×8 reconstructed block into `pic` at the destination
+/// position implied by `(block_idx, mb_x, mb_y)`.
+fn write_block_into_picture(
+    pic: &mut IPicture,
+    block_idx: usize,
+    mb_x: usize,
+    mb_y: usize,
+    block: &[u8; 64],
+) {
+    let is_chroma = block_idx >= 4;
+    if is_chroma {
+        let plane = match block_idx {
+            4 => &mut pic.cb,
+            5 => &mut pic.cr,
+            _ => unreachable!(),
+        };
+        let stride = pic.c_stride;
+        let bx = mb_x * 8;
+        let by = mb_y * 8;
+        for j in 0..8 {
+            let off = (by + j) * stride + bx;
+            plane[off..off + 8].copy_from_slice(&block[j * 8..j * 8 + 8]);
+        }
+    } else {
+        let (sub_x, sub_y) = match block_idx {
+            0 => (0, 0),
+            1 => (8, 0),
+            2 => (0, 8),
+            3 => (8, 8),
+            _ => unreachable!(),
+        };
+        let bx = mb_x * 16 + sub_x;
+        let by = mb_y * 16 + sub_y;
+        let stride = pic.y_stride;
+        for j in 0..8 {
+            let off = (by + j) * stride + bx;
+            pic.y[off..off + 8].copy_from_slice(&block[j * 8..j * 8 + 8]);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// MODB VLC (Table 11/H.263)
+// MODB VLC (Table 11/H.263 — Annex G; Table M.1/H.263 — Annex M)
 // ---------------------------------------------------------------------------
 
+/// Per-MB BPB-block prediction mode for the **Annex M** (Improved PB-frames)
+/// path. Annex G's MODB table only encodes one prediction shape (always
+/// bidirectional, optionally tweaked by an MVDB delta); Annex M widens that
+/// to three shapes per §M.2:
+///
+/// * [`BMode::Bidirectional`] — same predictor as Annex G (forward from prior
+///   P, backward from new P, averaged inside the §G.5 region). The optional
+///   forward MV delta is **not** present (Annex G's MVDB-as-delta semantic
+///   does not survive into Annex M; instead Annex M reuses the MVDB slot for
+///   a forward MV in the forward-prediction mode).
+/// * [`BMode::Forward`] — single 16×16 forward MV from MVDB used to fetch a
+///   forward predictor from the prior P. No backward fetch, no §G.5 region
+///   averaging. This is the win on a B macroblock where the new P-half is a
+///   poor match (e.g. occluded / new content not present in the prior P
+///   either, so bidirectional averaging only adds noise).
+/// * [`BMode::Backward`] — predictor is the freshly reconstructed co-located
+///   P-MB pels (`PREC`). No MV data on the wire. This is the win when the
+///   B-frame's content is essentially the new P (small camera pan, B sits
+///   close to P in time and the prior-P MC predictor is worse than copying
+///   the new P).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BMode {
+    Bidirectional,
+    Forward,
+    Backward,
+}
+
 /// Decoded MODB code — pair of `(cbpb_present, mvdb_present)`.
+///
+/// For Annex M this is augmented with the [`BMode`] selection (see
+/// [`ModbMDecoded`]); the legacy Annex G path keeps the simpler shape
+/// because its MODB table always implies `BMode::Bidirectional`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModbDecoded {
     pub cbpb_present: bool,
@@ -542,6 +720,202 @@ pub fn encode_modb(bw: &mut oxideav_core::bits::BitWriter, cbpb_present: bool, m
         bw.write_bits(0b11, 2); // "11"
     } else {
         bw.write_bits(0b10, 2); // "10"
+    }
+}
+
+/// Decoded MODB code (Annex M flavour) — selection of B-mode plus the
+/// presence flags for CBPB and MVDB. See [`decode_modb_m`] / [`encode_modb_m`].
+///
+/// Per Table M.1/H.263 the (mode, cbpb, mvdb) triple takes one of six values:
+///
+/// | Index | CBPB | MVDB | Code   | Mode          |
+/// |-------|------|------|--------|---------------|
+/// |   0   |  -   |  -   | `0`    | Bidirectional |
+/// |   1   |  x   |  -   | `10`   | Bidirectional |
+/// |   2   |  -   |  x   | `110`  | Forward       |
+/// |   3   |  x   |  x   | `1110` | Forward       |
+/// |   4   |  -   |  -   | `11110`| Backward      |
+/// |   5   |  x   |  -   | `11111`| Backward      |
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModbMDecoded {
+    pub mode: BMode,
+    pub cbpb_present: bool,
+    pub mvdb_present: bool,
+}
+
+/// Decode one MODB code from the bitstream using the **Annex M** Table M.1
+/// VLC (Improved PB-frames). The reader consumes 1..=5 bits.
+pub fn decode_modb_m(
+    br: &mut oxideav_core::bits::BitReader<'_>,
+) -> oxideav_core::Result<ModbMDecoded> {
+    // Walk the Table M.1 prefix tree:
+    //   "0"     → bidir, no cbpb, no mvdb
+    //   "10"    → bidir, cbpb, no mvdb
+    //   "110"   → forward, no cbpb, mvdb
+    //   "1110"  → forward, cbpb, mvdb
+    //   "11110" → backward, no cbpb, no mvdb
+    //   "11111" → backward, cbpb, no mvdb
+    if br.read_u1()? == 0 {
+        return Ok(ModbMDecoded {
+            mode: BMode::Bidirectional,
+            cbpb_present: false,
+            mvdb_present: false,
+        });
+    }
+    if br.read_u1()? == 0 {
+        return Ok(ModbMDecoded {
+            mode: BMode::Bidirectional,
+            cbpb_present: true,
+            mvdb_present: false,
+        });
+    }
+    if br.read_u1()? == 0 {
+        return Ok(ModbMDecoded {
+            mode: BMode::Forward,
+            cbpb_present: false,
+            mvdb_present: true,
+        });
+    }
+    if br.read_u1()? == 0 {
+        return Ok(ModbMDecoded {
+            mode: BMode::Forward,
+            cbpb_present: true,
+            mvdb_present: true,
+        });
+    }
+    // Prefix is "1111" — last bit picks index 4 (no CBPB) vs 5 (CBPB).
+    let last = br.read_u1()?;
+    Ok(ModbMDecoded {
+        mode: BMode::Backward,
+        cbpb_present: last == 1,
+        mvdb_present: false,
+    })
+}
+
+/// Emit the Annex M Table M.1 MODB code matching `(mode, cbpb)`.
+///
+/// MVDB presence is implied by `mode` per Table M.1: it is present iff
+/// `mode == BMode::Forward`. The caller does not pass `mvdb_present`
+/// separately to make illegal combinations unrepresentable.
+pub fn encode_modb_m(bw: &mut oxideav_core::bits::BitWriter, mode: BMode, cbpb_present: bool) {
+    match (mode, cbpb_present) {
+        (BMode::Bidirectional, false) => bw.write_bits(0b0, 1),
+        (BMode::Bidirectional, true) => bw.write_bits(0b10, 2),
+        (BMode::Forward, false) => bw.write_bits(0b110, 3),
+        (BMode::Forward, true) => bw.write_bits(0b1110, 4),
+        (BMode::Backward, false) => bw.write_bits(0b11110, 5),
+        (BMode::Backward, true) => bw.write_bits(0b11111, 5),
+    }
+}
+
+/// Annex M §M.2.3 — backward-only prediction. The predictor is the
+/// freshly-reconstructed P-MB pels (`PREC`) at the same destination position
+/// in the new P, with no MV data on the wire. Output is signed `i16` so the
+/// encoder can compute `source - prediction` without saturating at 0/255.
+///
+/// `block_idx` selects the BPB-block within the MB (luma 0..=3, chroma 4/5);
+/// `(mb_x, mb_y)` is the MB position. The destination block is sampled at
+/// the same (`(mb_x, mb_y)` + sub-block offset) coordinates of `p_recon`,
+/// matching what §M.2.3 calls "PREC defined in G.5" (i.e. the backward
+/// prediction of §G.5 with the backward MV pinned to (0, 0)).
+pub fn predict_b_block_backward(
+    dst: &mut [i16; 64],
+    block_idx: usize,
+    mb_x: usize,
+    mb_y: usize,
+    p_recon: &IPicture,
+) {
+    debug_assert!(block_idx < 6);
+    let is_chroma = block_idx >= 4;
+    if is_chroma {
+        let plane = match block_idx {
+            4 => &p_recon.cb,
+            5 => &p_recon.cr,
+            _ => unreachable!(),
+        };
+        let stride = p_recon.c_stride;
+        let bx = mb_x * 8;
+        let by = mb_y * 8;
+        for j in 0..8 {
+            for i in 0..8 {
+                dst[j * 8 + i] = plane[(by + j) * stride + (bx + i)] as i16;
+            }
+        }
+    } else {
+        let (sub_x, sub_y) = match block_idx {
+            0 => (0, 0),
+            1 => (8, 0),
+            2 => (0, 8),
+            3 => (8, 8),
+            _ => unreachable!(),
+        };
+        let bx = mb_x * 16 + sub_x;
+        let by = mb_y * 16 + sub_y;
+        let stride = p_recon.y_stride;
+        for j in 0..8 {
+            for i in 0..8 {
+                dst[j * 8 + i] = p_recon.y[(by + j) * stride + (bx + i)] as i16;
+            }
+        }
+    }
+}
+
+/// Annex M §M.2.2 — forward-only prediction. The forward MV from MVDB
+/// (luma half-pel units) selects an 8×8 patch from the **prior P**
+/// (`forward_ref`) at this block's destination position offset by the MV.
+///
+/// `block_idx` is the same as for [`predict_b_block`]; `mvf` is the per-block
+/// forward MV (chroma blocks pass the chroma-rounded MV — see
+/// [`luma_to_chroma_mv`] / Table F.1).
+pub fn predict_b_block_forward(
+    dst: &mut [i16; 64],
+    block_idx: usize,
+    mb_x: usize,
+    mb_y: usize,
+    forward_ref: &IPicture,
+    mvf: (i32, i32),
+) {
+    debug_assert!(block_idx < 6);
+    let is_chroma = block_idx >= 4;
+    let (plane, stride, bx, by, w, h) = if is_chroma {
+        let stride = forward_ref.c_stride;
+        let plane: &[u8] = match block_idx {
+            4 => forward_ref.cb.as_slice(),
+            5 => forward_ref.cr.as_slice(),
+            _ => unreachable!(),
+        };
+        let h = (forward_ref.cb.len() / forward_ref.c_stride.max(1)) as i32;
+        (
+            plane,
+            stride,
+            (mb_x * 8) as i32,
+            (mb_y * 8) as i32,
+            stride as i32,
+            h,
+        )
+    } else {
+        let (sub_x, sub_y) = match block_idx {
+            0 => (0, 0),
+            1 => (8, 0),
+            2 => (0, 8),
+            3 => (8, 8),
+            _ => unreachable!(),
+        };
+        let stride = forward_ref.y_stride;
+        let h = (forward_ref.y.len() / forward_ref.y_stride.max(1)) as i32;
+        (
+            forward_ref.y.as_slice(),
+            stride,
+            (mb_x * 16 + sub_x) as i32,
+            (mb_y * 16 + sub_y) as i32,
+            stride as i32,
+            h,
+        )
+    };
+    let mut out = [0u8; 64];
+    crate::interp::predict_block(plane, stride, w, h, bx, by, mvf.0, mvf.1, 8, &mut out, 8);
+    for k in 0..64 {
+        dst[k] = out[k] as i16;
     }
 }
 
@@ -599,6 +973,97 @@ mod tests {
             // MVDB present is implied by cbpb (per encoder note above).
             let expected_mvdb = mvdb || cbpb;
             assert_eq!(d.mvdb_present, expected_mvdb);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unusual_byte_groupings)]
+    fn modb_m_table_round_trip() {
+        // Spec Table M.1/H.263 — verify each of the 6 codewords is emitted
+        // and decoded exactly as specified. The unusual byte groupings
+        // intentionally separate the codeword bits from the trailing
+        // zero-padding so the prefix is human-readable against the spec.
+        let cases: &[(BMode, bool, bool, &[u8], u32)] = &[
+            // (mode, cbpb, mvdb, byte-prefix, codeword bit length)
+            (BMode::Bidirectional, false, false, &[0b0_0000000], 1),
+            (BMode::Bidirectional, true, false, &[0b10_000000], 2),
+            (BMode::Forward, false, true, &[0b110_00000], 3),
+            (BMode::Forward, true, true, &[0b1110_0000], 4),
+            (BMode::Backward, false, false, &[0b11110_000], 5),
+            (BMode::Backward, true, false, &[0b11111_000], 5),
+        ];
+        for &(mode, cbpb, mvdb, expected, _) in cases {
+            let mut bw = BitWriter::with_capacity(8);
+            encode_modb_m(&mut bw, mode, cbpb);
+            let buf = bw.finish();
+            assert_eq!(
+                buf, expected,
+                "MODB-M emission for ({mode:?}, cbpb={cbpb}) should match Table M.1"
+            );
+            let mut br = BitReader::new(&buf);
+            let d = decode_modb_m(&mut br).unwrap();
+            assert_eq!(d.mode, mode);
+            assert_eq!(d.cbpb_present, cbpb);
+            assert_eq!(d.mvdb_present, mvdb);
+        }
+    }
+
+    #[test]
+    fn modb_m_distinguishes_from_g() {
+        // The Annex G "10" code maps to bidir+MVDB (no CBPB); the Annex M
+        // "10" code maps to bidir+CBPB (no MVDB). Asserting they don't
+        // alias is the regression check.
+        let mut bw_g = BitWriter::with_capacity(8);
+        encode_modb(&mut bw_g, false, true);
+        let mut bw_m = BitWriter::with_capacity(8);
+        encode_modb_m(&mut bw_m, BMode::Bidirectional, true);
+        // Both codecs emit the same 2 bits "10" but interpret them differently.
+        assert_eq!(bw_g.finish(), bw_m.finish());
+
+        // Decoding "10" through M gives bidir+cbpb (MVDB absent).
+        let bytes = vec![0b10_000000u8];
+        let mut br = BitReader::new(&bytes);
+        let d = decode_modb_m(&mut br).unwrap();
+        assert_eq!(d.mode, BMode::Bidirectional);
+        assert!(d.cbpb_present);
+        assert!(!d.mvdb_present);
+    }
+
+    #[test]
+    fn predict_backward_copies_p_recon() {
+        // §M.2.3 backward prediction is just a copy of the freshly-
+        // reconstructed P-MB pels at the same destination position.
+        let mut p_recon = IPicture::new(16, 16);
+        for j in 0..8 {
+            for i in 0..8 {
+                p_recon.y[j * 16 + i] = ((j * 16 + i) as u8).wrapping_mul(3);
+            }
+        }
+        let mut dst = [0i16; 64];
+        predict_b_block_backward(&mut dst, 0, 0, 0, &p_recon);
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(dst[j * 8 + i], p_recon.y[j * 16 + i] as i16);
+            }
+        }
+    }
+
+    #[test]
+    fn predict_forward_zero_mv_copies_ref() {
+        // Forward prediction with MVDB = (0, 0) is just a copy of the prior
+        // P at the same position.
+        let mut fwd = IPicture::new(16, 16);
+        for j in 0..16 {
+            for i in 0..16 {
+                fwd.y[j * 16 + i] = ((i * 3 + j) % 256) as u8;
+            }
+        }
+        let mut dst = [0i16; 64];
+        predict_b_block_forward(&mut dst, 0, 0, 0, &fwd, (0, 0));
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(dst[j * 8 + i], fwd.y[j * 16 + i] as i16);
+            }
         }
     }
 

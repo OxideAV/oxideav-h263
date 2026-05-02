@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Annex M — Improved PB-frames mode (encoder + decoder).** Extends the
+  existing Annex G PB-frames path with per-MB selection across three
+  BPB-block prediction shapes per §M.2:
+  * **Bidirectional** — same predictor as Annex G with MVD = 0
+    (forward from prior P, backward from new P, averaged inside the §G.5
+    region).
+  * **Forward** — single 16×16 forward MV from MVDB, predictor = prior P
+    at the destination position offset by MVDB. The MVDB predictor follows
+    §M.2.2 ("the left MB's forward MV, or 0 if absent"), VLC-coded via the
+    same Table 14 + sign + sign-of-predictor cascade as the §5.3.7 P-MVD.
+  * **Backward** — predictor = freshly-reconstructed P-MB pels (§M.2.3
+    PREC), no MV data on the wire.
+  Opt-in via `H263Encoder::set_enable_annex_m_impb(true)` (requires
+  `set_enable_annex_g_pb(true)`); the matching decoder must also opt in
+  via `H263Decoder::set_enable_annex_m_impb(true)` to read the Table M.1
+  MODB codes correctly. The encoder runs a per-MB Lagrangian RDO over
+  `SAD + lambda * R` with `lambda = QP * 4`, where the rate proxy counts
+  the mode-discriminating bits of MODB + MVDB + CBPB; the cheapest of
+  {bidir, forward, backward} wins. New helpers in `crate::pb`:
+  `encode_modb_m` / `decode_modb_m` (Table M.1 VLC), `predict_b_block_forward`
+  (§M.2.2), `predict_b_block_backward` (§M.2.3), `reconstruct_b_picture_m`
+  (per-MB B-mode dispatch). New helper in `crate::motion`:
+  `mvd_pure_differential_bits` (rate proxy for the RDO loop).
+  New integration tests in `tests/annex_m_improved_pb.rs`. On the bundled
+  mixed-motion fixture the Annex M output is ~52 % smaller than the
+  matching Annex G output at the same QP — well above the ~5–10 %
+  acceptance criterion. Annex M is signalled out-of-band per §M.1
+  (ITU-T Rec. H.245 in the spec); ffmpeg cross-decode is informational
+  only since ffmpeg has no in-band signal to switch to Table M.1.
+
 - **Annex I (Advanced INTRA Coding) — encoder + decoder (round 24).**
   Opt-in via `H263Encoder::set_enable_annex_i_aic(true)`; auto-detected
   on input via the parsed PLUSPTYPE OPPTYPE bit 8 (`PictureHeader::aic_mode`).

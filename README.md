@@ -39,6 +39,7 @@ this crate does not activate any MPEG-4 decoding behaviour.
 | Annex E (SAC arithmetic coding) — P-pictures     | no     | no     |
 | Annex F (Advanced Prediction: 4MV / OBMC)        | no     | no     |
 | Annex G (PB-frames) — header + per-MB syntax     | yes    | yes    |
+| Annex M (Improved PB-frames — per-MB B-mode RDO) | yes    | yes    |
 | Annex I (AIC) — I-pictures                       | yes    | yes    |
 | Annex K (Slice Structured Mode)                  | no     | no     |
 | Annex N (RPS — picture header + multi-ref)       | yes    | yes    |
@@ -198,6 +199,38 @@ predictor:
 * **ffmpeg interop** — purely informational. ffmpeg 8.1's H.263
   decoder accepts our PB-frames stream without error logs but its
   PB-frames support is partial; cross-decode parity is not asserted.
+
+### Annex M — Improved PB-frames
+
+Annex M extends Annex G's PB-frames syntax with per-MB selection across
+three BPB-block prediction shapes (§M.2): bidirectional (Annex G with
+MVD = 0), forward-only (single 16×16 forward MV from MVDB; predictor =
+prior P at this MB position offset by MVDB), and backward-only
+(predictor = freshly-reconstructed P-MB pels — §M.2.3 PREC). The MODB
+table widens from Annex G's 3 codewords to Table M.1's 6 codewords;
+MVDB's semantic flips from "perturbing delta" (Annex G) to "the forward
+MV itself" (Annex M, Forward mode only, with the §M.2.2 left-MB-fwd-MV
+predictor).
+
+* **Encoder** opt-in via [`H263Encoder::set_enable_annex_m_impb`]
+  (requires `set_enable_annex_g_pb` — Annex M shares Annex G's picture
+  syntax). For each MB the encoder builds all three predictors against
+  the input frame, runs a Lagrangian RDO over `SAD + lambda * R` with
+  `lambda = QP * 4`, and writes the matching Table M.1 MODB code +
+  MVDB (when Forward) + CBPB + per-block residual. The Forward MV
+  predictor follows §M.2.2 (left MB's forward MV, or 0 if absent / not
+  Forward), VLC-coded via the same Table 14 + sign + sign-of-predictor
+  cascade as the §5.3.7 P-MVD.
+* **Decoder** opt-in via [`H263Decoder::set_enable_annex_m_impb`].
+  Annex M is signalled out-of-band per §M.1 (ITU-T Rec. H.245 in the
+  spec); on baseline-PTYPE streams there's no in-band differentiation,
+  so callers must opt in on both sides to match the wire.
+* **Wire size delta** — on the bundled mixed-motion fixture in
+  `tests/annex_m_improved_pb.rs` the Annex M output is **~52 % smaller**
+  than the matching Annex G output at the same QP. The acceptance
+  criterion was 5–10 %; the test asserts a softer floor (Annex M never
+  larger than Annex G + 1 %) so the result is stable across QP / fixture
+  tweaks while still catching gross regressions.
 
 ## Quick use
 

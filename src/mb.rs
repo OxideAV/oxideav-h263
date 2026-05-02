@@ -1063,13 +1063,22 @@ pub struct PbMbInfo {
     /// CBPB bits 1..=6 (left-to-right; MSB = block 1). Present only when
     /// MODB indicated CBPB.
     pub cbpb: u8,
-    /// MVDB delta in luma half-pel units. Present only when MODB indicated
-    /// MVDB; otherwise `(0, 0)`.
+    /// In Annex G mode (`bmode == BMode::Bidirectional` always): the MVDB
+    /// delta in luma half-pel units that perturbs the §G.4 forward predictor.
+    /// In Annex M `BMode::Forward` mode: the *forward MV itself* in luma
+    /// half-pel units (the §M.2.2 rule for the forward MV predictor is
+    /// applied at picture level — see [`MvGrid::forward_mv_predictor_m`]).
+    /// `(0, 0)` when MVDB is absent (which Annex M allows for `Bidirectional`
+    /// and `Backward`).
     pub mvdb: (i32, i32),
     /// Per-block B-residual pels (signed, IDCT output) for each of the 6
     /// B-blocks. Zero when the corresponding CBPB bit is 0. Used by the
-    /// §G.5 B-half reconstruction.
+    /// §G.5 / §M.2 B-half reconstruction.
     pub b_residual: Vec<i16>,
+    /// Annex M per-MB B-mode (§M.2). Always [`crate::pb::BMode::Bidirectional`]
+    /// for the legacy Annex G path; takes one of the three values
+    /// from Table M.1 in the Annex M (Improved PB-frames) path.
+    pub bmode: crate::pb::BMode,
 }
 
 impl PbMbInfo {
@@ -1080,11 +1089,17 @@ impl PbMbInfo {
 }
 
 /// PB-frames variant of [`decode_p_mb_pass1`]. After MCBPC, reads MODB
-/// (Table 11), then optional CBPB (6 bits) and MVDB (Table 14 differential
-/// applied to the §G.4 forward predictor). When CBPB is non-zero, the
-/// per-block B-residual TCOEF coefficients are dequantised at BQUANT
-/// (§5.1.23 = `bquant_from_quant(quant, dbquant)`), inverse-DCT'd, and
-/// surfaced on `PbMbInfo.b_residual` for the §G.5 reconstruction.
+/// (Table 11 — Annex G; Table M.1 — Annex M), then optional CBPB (6 bits)
+/// and MVDB (Table 14 differential applied to the §G.4 forward predictor in
+/// Annex G, or — in Annex M `BMode::Forward` — a forward MV with predictor
+/// derived from the left MB's forward MV per §M.2.2). When CBPB is
+/// non-zero, the per-block B-residual TCOEF coefficients are dequantised at
+/// BQUANT (§5.1.23 = `bquant_from_quant(quant, dbquant)`), inverse-DCT'd,
+/// and surfaced on `PbMbInfo.b_residual` for the §G.5 / §M.2 reconstruction.
+///
+/// `annex_m` selects the MODB table: `false` → Table 11 (Annex G — every MB
+/// is bidirectional, optional MVDB-as-delta); `true` → Table M.1 (Annex M
+/// — per-MB B-mode selection across {bidir, fwd, bwd}).
 #[allow(clippy::too_many_arguments)]
 pub fn decode_p_mb_pb(
     br: &mut BitReader<'_>,
@@ -1096,6 +1111,8 @@ pub fn decode_p_mb_pb(
     mv_grid: &mut MvGrid,
     umv: UmvMode,
     dbquant: u8,
+    annex_m: bool,
+    fwd_mv_left: &mut (i32, i32),
 ) -> Result<(u32, PbMbInfo)> {
     // 1. COD.
     let cod = br.read_u1()?;
@@ -1115,6 +1132,10 @@ pub fn decode_p_mb_pb(
             &PMbInfo::empty_skipped(),
             false,
         );
+        // Skipped MBs reset the §M.2.2 "left forward MV" predictor to (0, 0)
+        // — same rule as the standard P-MB MVD predictor at picture-segment
+        // boundaries (§F.2 Figure F.1 Note: missing predictors collapse to 0).
+        *fwd_mv_left = (0, 0);
         return Ok((
             quant_in,
             PbMbInfo {
@@ -1126,6 +1147,7 @@ pub fn decode_p_mb_pb(
                 cbpb: 0,
                 mvdb: (0, 0),
                 b_residual: vec![0i16; 6 * 64],
+                bmode: crate::pb::BMode::Bidirectional,
             },
         ));
     }
@@ -1152,8 +1174,21 @@ pub fn decode_p_mb_pb(
         PMbType::InterQ | PMbType::IntraQ | PMbType::Inter4MVQ
     );
 
-    // 3. MODB (PB-frames specific) — between MCBPC and CBPY (§5.3 Fig 10).
-    let modb = crate::pb::decode_modb(br)?;
+    // 3. MODB — between MCBPC and CBPY (§5.3 Fig 10). Annex G uses Table 11
+    //    (always bidirectional); Annex M uses Table M.1 (per-MB selection
+    //    across {bidir, fwd, bwd}).
+    let (modb, bmode) = if annex_m {
+        let m = crate::pb::decode_modb_m(br)?;
+        (
+            crate::pb::ModbDecoded {
+                cbpb_present: m.cbpb_present,
+                mvdb_present: m.mvdb_present,
+            },
+            m.mode,
+        )
+    } else {
+        (crate::pb::decode_modb(br)?, crate::pb::BMode::Bidirectional)
+    };
 
     // 4. CBPB if signalled by MODB.
     let cbpb = if modb.cbpb_present {
@@ -1188,18 +1223,46 @@ pub fn decode_p_mb_pb(
         mv_grid.set(mb_x, mb_y, MbMotion::mv1((mvx, mvy), true, true));
     }
 
-    // 8. MVDB (§5.3.9) if signalled. We read each component as a Table 14
-    //    magnitude + sign — this matches the encoder side's emission. The
-    //    decoded value is the raw differential (no wrap, no sign-of-
-    //    predictor cascade because the predictor is the §G.4 scaled vector,
-    //    not a neighbour MV).
+    // 8. MVDB (§5.3.9 — Annex G) or §M.2.2 forward MV (Annex M).
+    //
+    //    Annex G semantics: MVDB is the raw differential perturbing the §G.4
+    //    forward predictor. Predictor is the scaled forward vector — no
+    //    neighbour-MV cascade — so the codeword is decoded as Table 14
+    //    magnitude + sign without sign-of-predictor wrap.
+    //
+    //    Annex M semantics: MVDB carries the BPB-MB's forward MV. The
+    //    predictor for the codeword is the **left MB's forward MV** (or 0
+    //    when the left MB has no forward MV — i.e. far-left edge, slice
+    //    boundary, or non-Forward bmode). We use the same Table 14 + sign VLC
+    //    family — matches §M.2.2 "VLC coded in the same way as vector data
+    //    to be used for the P-picture (MVD)" and the codec_id stays compact
+    //    when the left MB has a similar forward MV.
     let mvdb = if modb.mvdb_present {
-        let dx = crate::motion::decode_mvd_pure_differential(br)?;
-        let dy = crate::motion::decode_mvd_pure_differential(br)?;
-        (dx, dy)
+        if annex_m && bmode == crate::pb::BMode::Forward {
+            // §M.2.2 forward MV — predictor is the left-MB forward MV.
+            let (px, py) = *fwd_mv_left;
+            let (mvx, mvy) = decode_mv_pair(br, px, py, umv)?;
+            (mvx, mvy)
+        } else {
+            let dx = crate::motion::decode_mvd_pure_differential(br)?;
+            let dy = crate::motion::decode_mvd_pure_differential(br)?;
+            (dx, dy)
+        }
     } else {
         (0, 0)
     };
+
+    // §M.2.2 left-MV predictor maintenance: only Forward MBs propagate a
+    // forward MV; every other MB resets the predictor for the MB immediately
+    // to its right ("if the macroblock to the left has a forward motion
+    // vector, then the predictor … otherwise, the predictor is set to zero").
+    if annex_m {
+        *fwd_mv_left = if bmode == crate::pb::BMode::Forward {
+            mvdb
+        } else {
+            (0, 0)
+        };
+    }
 
     // 9. Per-block P-half texture.
     let luma_coded = [
@@ -1291,6 +1354,7 @@ pub fn decode_p_mb_pb(
             cbpb,
             mvdb,
             b_residual,
+            bmode,
         },
     ))
 }

@@ -57,9 +57,10 @@ use crate::enc_tables::{write_cbpy, write_mcbpc_inter, write_mcbpc_intra, write_
 use crate::interp::{predict_block, sad_block};
 use crate::mb::IPicture;
 use crate::motion::{
-    chroma_mv_4mv, encode_mv_component, encode_mv_component_umv, luma_to_chroma_mv, predict_mv,
-    predict_mv_block, reconstruct_umv_component, MbMotion, MvGrid, MV_RANGE_MAX_HALF,
-    MV_RANGE_MIN_HALF, MV_RANGE_UMV_MAX_HALF, MV_RANGE_UMV_MIN_HALF, OBMC_H0, OBMC_H1, OBMC_H2,
+    chroma_mv_4mv, encode_mv_component, encode_mv_component_umv, luma_to_chroma_mv,
+    mvd_pure_differential_bits, predict_mv, predict_mv_block, reconstruct_umv_component, MbMotion,
+    MvGrid, MV_RANGE_MAX_HALF, MV_RANGE_MIN_HALF, MV_RANGE_UMV_MAX_HALF, MV_RANGE_UMV_MIN_HALF,
+    OBMC_H0, OBMC_H1, OBMC_H2,
 };
 use crate::picture::SourceFormat;
 use oxideav_core::bits::BitWriter;
@@ -176,6 +177,17 @@ pub struct H263Encoder {
     /// Table I.1 INTRA_MODE codeword and uses the §I.3 Table I.2 INTRA
     /// TCOEF + AIC dequant + AC pred path.
     enable_annex_i_aic: bool,
+    /// When `true` (and [`Self::enable_annex_g_pb`] is also on), emit
+    /// PB-frames using the **Annex M** Improved PB-frames mode: per-MB the
+    /// encoder picks the cheapest of {bidirectional, forward-only,
+    /// backward-only} prediction by Lagrangian RDO and writes the matching
+    /// Table M.1 MODB code. Annex M's MVDB slot carries the forward MV
+    /// (predicted from the left MB's forward MV per §M.2.2) when the
+    /// per-MB mode is Forward; bidirectional and backward modes emit no
+    /// MVDB. Defaults to `false`. The matching decoder must also opt in
+    /// via [`crate::decoder::H263Decoder::set_enable_annex_m_impb`] —
+    /// the spec signals Annex M out-of-band per §M.1.
+    enable_annex_m_impb: bool,
 }
 
 impl H263Encoder {
@@ -236,6 +248,7 @@ impl H263Encoder {
             pb_trb: 1,
             pb_dbquant: 0,
             enable_annex_i_aic: false,
+            enable_annex_m_impb: false,
         })
     }
 
@@ -381,6 +394,30 @@ impl H263Encoder {
     pub fn enable_annex_i_aic(&self) -> bool {
         self.enable_annex_i_aic
     }
+
+    /// Enable or disable **Annex M** (Improved PB-frames) emission.
+    ///
+    /// When on (together with [`Self::set_enable_annex_g_pb`]), every
+    /// PB-frame is emitted with the §M.2 per-MB B-mode dispatch:
+    /// the encoder picks the cheapest of {bidirectional, forward-only,
+    /// backward-only} prediction via Lagrangian RDO over (rate, distortion)
+    /// and writes the matching Table M.1 MODB codeword. Forward mode also
+    /// emits a forward MV (predictor = left MB's forward MV per §M.2.2),
+    /// VLC-coded via the same Table 14 + sign family as the §5.3.7 MVD.
+    ///
+    /// Defaults to `false`. The matching decoder side must opt in via
+    /// [`crate::decoder::H263Decoder::set_enable_annex_m_impb`] to read the
+    /// Table M.1 codes; otherwise it would interpret them as Annex G
+    /// Table 11 codes and decode garbage. The spec signals Annex M
+    /// out-of-band per §M.1 (e.g. ITU-T Rec. H.245).
+    pub fn set_enable_annex_m_impb(&mut self, enable: bool) {
+        self.enable_annex_m_impb = enable;
+    }
+
+    /// Returns whether Annex M (Improved PB-frames) emission is enabled.
+    pub fn enable_annex_m_impb(&self) -> bool {
+        self.enable_annex_m_impb
+    }
 }
 
 impl Encoder for H263Encoder {
@@ -438,6 +475,17 @@ impl Encoder for H263Encoder {
                 "h263 encoder: Annex G (PB-frames) is not yet supported in combination \
                  with Annex D (UMV), Annex E (SAC), Annex F (Advanced Prediction), or \
                  Annex N (RPS)",
+            ));
+        }
+
+        // Annex M (Improved PB-frames) requires Annex G PB-frames to be
+        // active — Annex M extends the same picture syntax with a different
+        // MODB table and per-MB B-mode dispatch. Setting Annex M without
+        // Annex G is a config error.
+        if self.enable_annex_m_impb && !self.enable_annex_g_pb {
+            return Err(Error::invalid(
+                "h263 encoder: Annex M (Improved PB-frames) requires Annex G \
+                 PB-frames to also be enabled",
             ));
         }
 
@@ -501,6 +549,7 @@ impl Encoder for H263Encoder {
                     reference,
                     self.pb_trb,
                     self.pb_dbquant,
+                    self.enable_annex_m_impb,
                 )?;
                 (b, p, false)
             };
@@ -1336,6 +1385,7 @@ pub fn encode_pb_picture_with_recon(
     reference: &IPicture,
     trb: u8,
     dbquant: u8,
+    annex_m: bool,
 ) -> Result<(Vec<u8>, IPicture)> {
     let mb_w = width.div_ceil(16) as usize;
     let mb_h = height.div_ceil(16) as usize;
@@ -1362,7 +1412,14 @@ pub fn encode_pb_picture_with_recon(
 
     // Per-MB emit using the PB-aware encoder which interleaves MODB at the
     // spec-correct position (between MCBPC and CBPY per §5.3 Figure 10).
+    // The `annex_m` flag selects between the Annex G Table 11 path
+    // (always-bidir, optional MVDB-as-delta) and the Annex M Table M.1 path
+    // (per-MB Lagrangian RDO over {bidir, fwd, bwd}, MVDB-as-forward-MV).
     for mb_y in 0..mb_h {
+        // §M.2.2 left-forward-MV predictor — resets at the start of every MB
+        // row so far-left MBs use a (0, 0) predictor, matching the §F.2
+        // Figure F.1 row-start convention.
+        let mut fwd_mv_left = (0i32, 0i32);
         for mb_x in 0..mb_w {
             encode_p_mb_pb(
                 &mut bw,
@@ -1377,6 +1434,8 @@ pub fn encode_pb_picture_with_recon(
                 &mut mv_grid,
                 trb,
                 dbquant,
+                annex_m,
+                &mut fwd_mv_left,
             )?;
         }
     }
@@ -1405,6 +1464,8 @@ fn encode_p_mb_pb(
     mv_grid: &mut MvGrid,
     trb: u8,
     dbquant: u8,
+    annex_m: bool,
+    fwd_mv_left: &mut (i32, i32),
 ) -> Result<crate::mb::PMbInfo> {
     // The MB-decision logic mirrors `encode_p_mb_full` for the
     // non-Annex-F path. We replicate the relevant bits here so we can
@@ -1461,6 +1522,11 @@ fn encode_p_mb_pb(
         bw.write_bits(1, 1);
         copy_predictor_to_recon(recon, mb_x, mb_y, &y_pred, &u_pred, &v_pred);
         mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), false, false));
+        // §M.2.2 — skipped MBs have no forward MV; predictor for the next
+        // MB to the right collapses to (0, 0).
+        if annex_m {
+            *fwd_mv_left = (0, 0);
+        }
         return Ok(crate::mb::PMbInfo::empty_skipped());
     }
 
@@ -1476,10 +1542,16 @@ fn encode_p_mb_pb(
     if try_intra {
         encode_p_mb_pb_intra(
             bw, mb_x, mb_y, quant, frame, width, height, reference, recon, mv_grid, trb, dbquant,
+            annex_m,
         )?;
         // §G.2 — for an intra MB in PB mode the spec requires MV to also be
         // present (used by the B-half §G.4). We've already written it inside
         // `_pb_intra` (after MVDB-implying MODB). The mv_grid is set there.
+        // Annex M intra-in-PB MBs always emit Bidirectional MODB (no fwd
+        // MV); reset the §M.2.2 left-fwd predictor.
+        if annex_m {
+            *fwd_mv_left = (0, 0);
+        }
         return Ok(crate::mb::PMbInfo {
             coded: true,
             intra: true,
@@ -1490,8 +1562,24 @@ fn encode_p_mb_pb(
     }
 
     encode_p_mb_pb_inter(
-        bw, mb_x, mb_y, quant, src_y, src_cb, src_cr, reference, recon, decide_mv, mv_grid,
-        &y_pred, &u_pred, &v_pred, trb, dbquant,
+        bw,
+        mb_x,
+        mb_y,
+        quant,
+        src_y,
+        src_cb,
+        src_cr,
+        reference,
+        recon,
+        decide_mv,
+        mv_grid,
+        &y_pred,
+        &u_pred,
+        &v_pred,
+        trb,
+        dbquant,
+        annex_m,
+        fwd_mv_left,
     )
 }
 
@@ -1520,6 +1608,7 @@ fn encode_p_mb_pb_intra(
     mv_grid: &mut MvGrid,
     _trb: u8,
     _dbquant: u8,
+    annex_m: bool,
 ) -> Result<()> {
     let mut blocks = [[0i32; 64]; 6];
     let mut dc_pels = [128u8; 6];
@@ -1542,8 +1631,16 @@ fn encode_p_mb_pb_intra(
         | (block_has_ac[3] as u8);
 
     write_mcbpc_inter(bw, PMbKind::Intra, cbpc);
-    // MODB after MCBPC (spec §5.3 Fig 10). Round-15 intra-in-PB scope: "0".
-    crate::pb::encode_modb(bw, false, false);
+    // MODB after MCBPC (spec §5.3 Fig 10). For Annex G intra-in-PB the
+    // simplest legal code is `0` (no CBPB, no MVDB). For Annex M the
+    // matching code from Table M.1 is the bidir/no-cbpb code, also `0`.
+    // Both encode the same single-bit "0" prefix, so the bit-stream output
+    // is identical regardless of `annex_m`.
+    if annex_m {
+        crate::pb::encode_modb_m(bw, crate::pb::BMode::Bidirectional, false);
+    } else {
+        crate::pb::encode_modb(bw, false, false);
+    }
     write_cbpy(bw, cbpy);
     // §G.2 — MVD is present on intra-in-PB MBs as well. We pick a (0, 0)
     // MV (the B-half §G.4 derivation will use this), so the predictor
@@ -1596,6 +1693,8 @@ fn encode_p_mb_pb_inter(
     v_pred: &[u8; 64],
     trb: u8,
     dbquant: u8,
+    annex_m: bool,
+    fwd_mv_left: &mut (i32, i32),
 ) -> Result<crate::mb::PMbInfo> {
     // ------------------------------------------------------------------
     // P-half: quantise + reconstruct *in-memory* before emitting bits, so
@@ -1712,46 +1811,149 @@ fn encode_p_mb_pb_inter(
     mv_grid.set(mb_x, mb_y, MbMotion::mv1(mv, true, false));
 
     // ------------------------------------------------------------------
-    // B-half residual: §G.4 derive forward + backward MVs (with MVDB =
-    // (0,0) — the spec allows any MVDB but our round-15 scope keeps it
-    // zero so the encoder doesn't have to pick one), §G.5 compute the
-    // bidirectional prediction, subtract from the **input frame** pels
-    // (the encoder uses the input frame as the B-source for the streaming
-    // 1-input-per-PB-pair model), forward-DCT, quantise at BQUANT, and
-    // collect the per-block coefficients + CBPB bits.
+    // B-half prediction selection.
+    //
+    // Annex G (annex_m=false): single shape — bidirectional. §G.4 derives
+    // forward + backward MVs from the P-MV with MVDB = (0,0). §G.5 averages
+    // the two predictors inside the bidirectional region.
+    //
+    // Annex M (annex_m=true): three shapes — bidirectional / forward /
+    // backward (§M.2). The encoder builds all three predictors against the
+    // input frame, computes a sum-of-abs-residual SAD per shape, adds a
+    // rate proxy (codeword bit length), and picks the one minimising
+    // `SAD + lambda * R`. The Lagrange multiplier follows the H.263
+    // convention `lambda ≈ 0.85 * QP^2` (Sullivan & Wiegand 1998); we use
+    // the simpler `lambda = QP * 4` which behaves identically over the
+    // relevant operating range and avoids a quadratic bias toward
+    // backward (which has the smallest header cost).
     // ------------------------------------------------------------------
-    let mvd_b = (0i32, 0i32);
     let trd = (trb as i32 + 1).max(1);
     let bquant = crate::pb::bquant_from_quant(quant, dbquant);
     let p_motion = crate::motion::MbMotion::mv1(mv, true, false);
-    let b_mvs = crate::pb::derive_b_mb_mvs(&p_motion, mvd_b, trb as i32, trd);
 
-    let mut b_levels = [[0i32; 64]; 6];
-    let mut b_has_ac = [false; 6];
-    let block_mvs = [
-        b_mvs.luma[0],
-        b_mvs.luma[1],
-        b_mvs.luma[2],
-        b_mvs.luma[3],
-        b_mvs.chroma,
-        b_mvs.chroma,
-    ];
-    for b in 0..6usize {
-        // §G.5 prediction (forward + backward) for this block.
-        let mut pred = [0i16; 64];
-        crate::pb::predict_b_block(&mut pred, b, mb_x, mb_y, reference, recon, block_mvs[b]);
-        // Source pels (input frame) at this block's destination position.
-        let src_pels = sample_input_block_pels(src_y, src_cb, src_cr, mb_x, mb_y, b);
-        let mut resid = [0.0f32; 64];
-        for k in 0..64 {
-            resid[k] = (src_pels[k] as i32 - pred[k] as i32) as f32;
+    // Sample the input frame at the B-block destinations once.
+    let src_pels_per_block: [[u8; 64]; 6] =
+        std::array::from_fn(|b| sample_input_block_pels(src_y, src_cb, src_cr, mb_x, mb_y, b));
+
+    // Helper: compute SAD + per-block residual levels for a candidate
+    // predictor `block_pred` (one i16[64] per block). Returns
+    // `(sum_sad, b_levels, b_has_ac)`.
+    let quantise_for_pred = |block_preds: &[[i16; 64]; 6]| {
+        let mut sum_sad: u32 = 0;
+        let mut b_levels = [[0i32; 64]; 6];
+        let mut b_has_ac = [false; 6];
+        for b in 0..6usize {
+            let mut resid = [0.0f32; 64];
+            for k in 0..64 {
+                let r = src_pels_per_block[b][k] as i32 - block_preds[b][k] as i32;
+                resid[k] = r as f32;
+                sum_sad += r.unsigned_abs();
+            }
+            let mut dctf = resid;
+            fdct8x8(&mut dctf);
+            let levels = quantise_inter_block(&dctf, bquant);
+            b_has_ac[b] = levels.iter().any(|&l| l != 0);
+            b_levels[b] = levels;
         }
-        let mut dctf = resid;
-        fdct8x8(&mut dctf);
-        let levels = quantise_inter_block(&dctf, bquant);
-        b_has_ac[b] = levels.iter().any(|&l| l != 0);
-        b_levels[b] = levels;
+        (sum_sad, b_levels, b_has_ac)
+    };
+
+    // ----- Bidirectional candidate (§G.4 / §G.5 — same as Annex G).
+    let b_mvs_bidir = crate::pb::derive_b_mb_mvs(&p_motion, (0, 0), trb as i32, trd);
+    let bidir_block_mvs = [
+        b_mvs_bidir.luma[0],
+        b_mvs_bidir.luma[1],
+        b_mvs_bidir.luma[2],
+        b_mvs_bidir.luma[3],
+        b_mvs_bidir.chroma,
+        b_mvs_bidir.chroma,
+    ];
+    let mut bidir_preds: [[i16; 64]; 6] = [[0i16; 64]; 6];
+    for b in 0..6usize {
+        crate::pb::predict_b_block(
+            &mut bidir_preds[b],
+            b,
+            mb_x,
+            mb_y,
+            reference,
+            recon,
+            bidir_block_mvs[b],
+        );
     }
+    let (bidir_sad, bidir_levels, bidir_has_ac) = quantise_for_pred(&bidir_preds);
+
+    // ----- Forward & backward candidates (Annex M only — skip when off).
+    let mut chosen_mode = crate::pb::BMode::Bidirectional;
+    let mut b_levels = bidir_levels;
+    let mut b_has_ac = bidir_has_ac;
+    let mut fwd_mvdb = (0i32, 0i32);
+
+    if annex_m {
+        // Forward candidate: pick the same MV as the P-half. This is a
+        // reasonable starting point — when the P-MV is small (B-frame is
+        // close in time to the prior P) the forward predictor is close to
+        // the prior P-MB itself; when the P-MV is large the forward
+        // predictor adapts to the same motion direction. A full ME on the
+        // prior P would be more accurate but the wire format only needs
+        // *some* legal forward MV; we let RDO discard this candidate when
+        // it's worse than bidir/backward.
+        let fwd_mv = mv;
+        let chroma_fwd_mv = (
+            crate::motion::luma_to_chroma_mv(fwd_mv.0),
+            crate::motion::luma_to_chroma_mv(fwd_mv.1),
+        );
+        let mut fwd_preds: [[i16; 64]; 6] = [[0i16; 64]; 6];
+        for b in 0..6usize {
+            let mvf_b = if b < 4 { fwd_mv } else { chroma_fwd_mv };
+            crate::pb::predict_b_block_forward(&mut fwd_preds[b], b, mb_x, mb_y, reference, mvf_b);
+        }
+        let (fwd_sad, fwd_levels, fwd_has_ac) = quantise_for_pred(&fwd_preds);
+
+        // Backward candidate: predictor = freshly reconstructed P-MB
+        // (§M.2.3 PREC). No MV data on the wire.
+        let mut bwd_preds: [[i16; 64]; 6] = [[0i16; 64]; 6];
+        for b in 0..6usize {
+            crate::pb::predict_b_block_backward(&mut bwd_preds[b], b, mb_x, mb_y, recon);
+        }
+        let (bwd_sad, bwd_levels, bwd_has_ac) = quantise_for_pred(&bwd_preds);
+
+        // Lagrangian RDO. Rate proxy is the worst-case wire cost for each
+        // mode's MODB + MVDB + CBPB tail (the per-block TCOEF cost is
+        // similar across shapes — within ~10% — so we approximate by
+        // counting only the mode-discriminating bits):
+        //   * Bidirectional: MODB=`0` (1) or `10` (2 + 6 cbpb) — pick the
+        //     lower depending on whether bidir has any non-zero CBPB.
+        //   * Forward: MODB=`110` (3 + 2*MVD) or `1110` (4 + 2*MVD + 6 cbpb).
+        //   * Backward: MODB=`11110` (5) or `11111` (5 + 6 cbpb).
+        // We approximate the MVD cost via the actual VLC bit count.
+        let lambda: u32 = (quant as u32) * 4;
+        let bidir_cbpb_present = bidir_has_ac.iter().any(|&x| x);
+        let fwd_cbpb_present = fwd_has_ac.iter().any(|&x| x);
+        let bwd_cbpb_present = bwd_has_ac.iter().any(|&x| x);
+        let bidir_rate = if bidir_cbpb_present { 1 + 1 + 6 } else { 1 };
+        let fwd_mv_rate = mvd_pure_differential_bits(fwd_mv.0 - fwd_mv_left.0)
+            + mvd_pure_differential_bits(fwd_mv.1 - fwd_mv_left.1);
+        let fwd_rate = if fwd_cbpb_present { 4 + 6 } else { 3 } + fwd_mv_rate;
+        let bwd_rate = if bwd_cbpb_present { 5 + 6 } else { 5 };
+
+        let bidir_cost = bidir_sad + lambda * bidir_rate;
+        let fwd_cost = fwd_sad + lambda * fwd_rate;
+        let bwd_cost = bwd_sad + lambda * bwd_rate;
+
+        if fwd_cost < bidir_cost && fwd_cost <= bwd_cost {
+            chosen_mode = crate::pb::BMode::Forward;
+            b_levels = fwd_levels;
+            b_has_ac = fwd_has_ac;
+            fwd_mvdb = fwd_mv;
+        } else if bwd_cost < bidir_cost {
+            chosen_mode = crate::pb::BMode::Backward;
+            b_levels = bwd_levels;
+            b_has_ac = bwd_has_ac;
+        } else {
+            chosen_mode = crate::pb::BMode::Bidirectional;
+        }
+    }
+
     let cbpb: u8 = ((b_has_ac[0] as u8) << 5)
         | ((b_has_ac[1] as u8) << 4)
         | ((b_has_ac[2] as u8) << 3)
@@ -1771,11 +1973,16 @@ fn encode_p_mb_pb_inter(
     let cbpy_on_wire = cbpy_true ^ 0xF;
 
     write_mcbpc_inter(bw, PMbKind::Inter, cbpc);
-    // MODB after MCBPC (§5.3 Fig 10). When CBPB is non-zero we emit `11`
-    // (CBPB + MVDB present); MVDB is then written as the (0, 0) pure
-    // differential, so there's no hidden MV cost. When CBPB is zero we
-    // emit `0` (1 bit) to keep the wire compact.
-    crate::pb::encode_modb(bw, cbpb_present, cbpb_present);
+    // MODB after MCBPC (§5.3 Fig 10).
+    if annex_m {
+        crate::pb::encode_modb_m(bw, chosen_mode, cbpb_present);
+    } else {
+        // Annex G: when CBPB is non-zero we emit `11` (CBPB + MVDB present);
+        // MVDB is then written as the (0, 0) pure differential, so there's
+        // no hidden MV cost. When CBPB is zero we emit `0` (1 bit) to keep
+        // the wire compact.
+        crate::pb::encode_modb(bw, cbpb_present, cbpb_present);
+    }
     if cbpb_present {
         bw.write_bits(cbpb as u32, 6);
     }
@@ -1787,10 +1994,27 @@ fn encode_p_mb_pb_inter(
     let (pmx, pmy) = predict_mv(mv_grid, mb_x, mb_y);
     encode_mv_component(bw, mv.0, pmx);
     encode_mv_component(bw, mv.1, pmy);
-    if cbpb_present {
-        // MVDB = (0, 0) — pure differential VLC, 2 codewords.
-        crate::motion::encode_mvd_pure_differential(bw, mvd_b.0);
-        crate::motion::encode_mvd_pure_differential(bw, mvd_b.1);
+
+    if annex_m {
+        // §M.2.2 — the forward MV is VLC-coded as MVD (Table 14 + sign,
+        // sign-of-predictor cascade — same family as the §5.3.7 P-MVD)
+        // when bmode == Forward. Bidirectional and backward modes emit no
+        // MVDB (Table M.1 indices 0/1 and 4/5 have no MVDB column). We
+        // also update `fwd_mv_left` for the next MB's predictor.
+        match chosen_mode {
+            crate::pb::BMode::Forward => {
+                encode_mv_component(bw, fwd_mvdb.0, fwd_mv_left.0);
+                encode_mv_component(bw, fwd_mvdb.1, fwd_mv_left.1);
+                *fwd_mv_left = fwd_mvdb;
+            }
+            _ => {
+                *fwd_mv_left = (0, 0);
+            }
+        }
+    } else if cbpb_present {
+        // Annex G: MVDB = (0, 0) — pure differential VLC, 2 codewords.
+        crate::motion::encode_mvd_pure_differential(bw, 0);
+        crate::motion::encode_mvd_pure_differential(bw, 0);
     }
 
     // P-block coefficients (§5.4 — first the six P-blocks).

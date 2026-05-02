@@ -355,6 +355,22 @@ pub fn encode_mvd_pure_differential(bw: &mut BitWriter, diff: i32) {
     }
 }
 
+/// Number of bits the [`encode_mvd_pure_differential`] codeword for `diff`
+/// would occupy on the wire. Used by encoders that need a rate proxy to
+/// drive Lagrangian RDO over candidate motion vectors (e.g. the Annex M
+/// per-MB B-mode selector). Returns 0 when `|diff|` exceeds the 32-halfpel
+/// Table 14 range so the caller can detect / discard infeasible deltas.
+#[inline]
+pub fn mvd_pure_differential_bits(diff: i32) -> u32 {
+    let mag = diff.unsigned_abs() as usize;
+    if mag > 32 {
+        return u32::MAX / 2; // forbidden — caller will discard via RDO
+    }
+    let (bits, _code) = MV_ENC_VLC[mag];
+    let sign_bit = if mag > 0 { 1 } else { 0 };
+    bits as u32 + sign_bit
+}
+
 /// Decode the MVD-pair start-code-emulation-prevention bit (§D.2 last
 /// paragraph): "if a pair equals (0.5, 0.5) six consecutive zeros are
 /// produced. To prevent start code emulation, this occurrence shall be

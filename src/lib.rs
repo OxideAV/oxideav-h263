@@ -164,10 +164,22 @@
 //!   is rejected at `send_frame` for now. See [`aic`] for the table /
 //!   prediction / quant helpers.
 //!
+//! * **Annex M — Improved PB-frames mode (encoder + decoder).** Extends the
+//!   Annex G PB-frames path with per-MB selection across three BPB-block
+//!   prediction shapes (§M.2): bidirectional (same as Annex G with MVD = 0),
+//!   forward-only (single 16×16 forward MV from MVDB, predictor = prior P
+//!   offset by MVDB; §M.2.2 left-MB-forward-MV predictor for the MVDB VLC
+//!   itself), and backward-only (predictor = freshly-reconstructed P-MB
+//!   pels — §M.2.3 PREC). Opt-in via
+//!   [`encoder::H263Encoder::set_enable_annex_m_impb`] (requires
+//!   `set_enable_annex_g_pb` — Annex M extends the same picture syntax)
+//!   and the matching [`decoder::H263Decoder::set_enable_annex_m_impb`].
+//!   The encoder runs a per-MB Lagrangian RDO over `SAD + lambda * R` with
+//!   `lambda = QP * 4`. Annex M is signalled out-of-band per §M.1 (ITU-T
+//!   Rec. H.245 in the spec); on baseline-PTYPE streams there's no in-band
+//!   differentiation so caller must opt in on both sides to match.
+//!
 //! Out of scope (returns `Error::Unsupported`):
-//! * Annex M (Improved PB-frames). Annex G (legacy PB-frames) is wired in
-//!   round 14; Improved PB carries a 3-code MODB VLC and per-MB B-mode
-//!   selection that is still pending.
 //! * Annex K (Slice Structured Mode — detected with a specific diagnostic
 //!   since ffmpeg's `h263p -umv 1` bundles it with Annex D), Annex P
 //!   (Reference Picture Resampling), Annex T (Modified Quantization).
