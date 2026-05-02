@@ -179,10 +179,18 @@
 //!   Rec. H.245 in the spec); on baseline-PTYPE streams there's no in-band
 //!   differentiation so caller must opt in on both sides to match.
 //!
+//! * **Annex K — Slice Structured mode (encoder + decoder).** Replaces
+//!   the GOB layer with the §K.2 slice layer (per-slice resync headers
+//!   carrying SSC + MBA + SQUANT + GFID). Encoder opt-in via
+//!   [`encoder::H263Encoder::set_enable_annex_k_slice`]; the decoder
+//!   auto-detects via PLUSPTYPE OPPTYPE bit 10 and switches its MB-walk
+//!   driver to a slice-aware variant that try-parses candidate
+//!   boundaries (snapshot + SSC/SEPB validation) to dodge the false
+//!   positives skipped-P-MB zero runs would otherwise produce. MV
+//!   prediction is reset at every slice boundary (§K.1 rule 1).
+//!
 //! Out of scope (returns `Error::Unsupported`):
-//! * Annex K (Slice Structured Mode — detected with a specific diagnostic
-//!   since ffmpeg's `h263p -umv 1` bundles it with Annex D), Annex P
-//!   (Reference Picture Resampling), Annex T (Modified Quantization).
+//! * Annex P (Reference Picture Resampling), Annex T (Modified Quantization).
 //! * Annex N back-channel-message body (BCM) — §N.4.2 BT/URF/TR/ELNUMI/
 //!   ELNUM/BCPM/BSBI/BEPB1/2/GN/MBA/RTR/BSTUF parsing is rejected with
 //!   a specific `Unsupported` diagnostic when BCI = "1".
@@ -211,6 +219,7 @@ pub mod motion;
 pub mod pb;
 pub mod picture;
 pub mod sac;
+pub mod slice;
 pub mod start_code;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};

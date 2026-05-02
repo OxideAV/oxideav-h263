@@ -31,6 +31,7 @@ use crate::mb::{
 };
 use crate::motion::{MbMotion, MvGrid};
 use crate::picture::{parse_picture_header, PictureCodingType, PictureHeader};
+use crate::slice::{parse_slice_header_body, SSC_BITS};
 use crate::start_code::{find_next_start_code, StartCode, GN_EOS, GN_PICTURE};
 
 /// Factory for the registry. Honours [`CodecParameters::limits`] — the
@@ -447,17 +448,13 @@ pub fn decode_i_picture(
 ) -> Result<IPicture> {
     let mb_w = hdr.width.div_ceil(16) as usize;
     let mb_h = hdr.height.div_ceil(16) as usize;
-    let (num_gobs, mb_rows_per_gob) = hdr
-        .source_format
-        .gob_layout()
-        .ok_or_else(|| Error::invalid("h263: source format has no GOB layout"))?;
-    let _ = num_gobs;
+    let total_mbs = mb_w * mb_h;
     let mut pic = IPicture::new(hdr.width as usize, hdr.height as usize);
     let mut quant = hdr.pquant as u32;
 
     // Pre-compute byte offsets of every GBSC in the picture body so we can
-    // realign the bitstream at GOB boundaries (encoders may emit GOB headers
-    // sparsely).
+    // realign the bitstream at GOB / slice boundaries (encoders may emit
+    // GOB headers sparsely; in Annex K mode every entry is a slice start).
     let gob_starts = collect_gob_offsets(bytes);
 
     // Annex I (Advanced INTRA Coding) has its own MB body driver: the MCBPC
@@ -469,6 +466,90 @@ pub fn decode_i_picture(
     } else {
         None
     };
+
+    if hdr.slice_structured {
+        // Annex K — first slice has only the trailing fields (SEPB1 + MBA +
+        // SEPB3 + GFID; no SSC, no SQUANT). Consume them now from the
+        // current bit position.
+        let _ = parse_slice_header_body(br, hdr.source_format, hdr.sss, hdr.cpm, true)?;
+
+        let mut mb_idx: usize = 0;
+        let mut next_slice_start_at_byte: Option<usize> = next_slice_byte_after(&gob_starts, br);
+        while mb_idx < total_mbs {
+            // Check if a new slice begins here. Many `find_next_start_code`
+            // hits are false positives in P-frames (skipped MBs leave long
+            // zero runs that incidentally look like start codes); we
+            // **try-parse** the candidate at every MB boundary while
+            // `cur_byte` is at or just past `byte_pos - 1`, snapshotting
+            // the bit reader so a failed validate can be undone.
+            //
+            // We only mark a candidate as "consumed" (advance to the next
+            // start-code hint) once the actual bit-reader position passes
+            // that byte position — so a failed validate at MB N stays a
+            // candidate for MB N+1 and N+2 etc. (byte distance grows by
+            // about 1 byte per ~8 1-bit-COD-skipped MBs).
+            if let Some(byte_pos) = next_slice_start_at_byte {
+                let cur_byte = (br.bit_position() / 8) as usize;
+                if cur_byte > byte_pos {
+                    // We've already decoded past this candidate without
+                    // landing on a valid slice header — drop it.
+                    next_slice_start_at_byte = gob_starts
+                        .iter()
+                        .find(|s| s.byte_pos > byte_pos && s.gn != GN_PICTURE && s.gn != GN_EOS)
+                        .map(|s| s.byte_pos);
+                } else if cur_byte == byte_pos
+                    || (cur_byte + 1 == byte_pos
+                        && (br.bit_position() % 8 != 0 || cur_byte == byte_pos - 1))
+                {
+                    let saved = *br;
+                    if let Ok((sh, new_quant)) =
+                        try_consume_slice_header(br, hdr, mb_idx as u32, total_mbs as u32)
+                    {
+                        quant = new_quant;
+                        mb_idx = sh.mba as usize;
+                        if let Some(ref mut c) = aic_cache {
+                            *c = crate::aic::AicNeighbourCache::new(mb_w, mb_h);
+                            let _ = c;
+                        }
+                        next_slice_start_at_byte = next_slice_byte_after(&gob_starts, br);
+                        continue;
+                    } else {
+                        // Restore and keep this candidate alive — a later MB
+                        // might be the actual one that lands us on the
+                        // boundary. Only after `cur_byte > byte_pos` will
+                        // we move to the next candidate.
+                        *br = saved;
+                    }
+                }
+            }
+
+            let mb_x = mb_idx % mb_w;
+            let mb_y = mb_idx / mb_w;
+            quant = if let Some(ref mut cache) = aic_cache {
+                crate::mb::decode_intra_mb_aic(br, mb_x, mb_y, quant, &mut pic, cache).map_err(
+                    |e| {
+                        Error::invalid(format!(
+                            "h263 Annex K I-picture AIC MB ({mb_x},{mb_y}) (q={quant}): {e}"
+                        ))
+                    },
+                )?
+            } else {
+                decode_intra_mb(br, mb_x, mb_y, quant, &mut pic).map_err(|e| {
+                    Error::invalid(format!(
+                        "h263 Annex K I-picture MB ({mb_x},{mb_y}) (q={quant}): {e}"
+                    ))
+                })?
+            };
+            mb_idx += 1;
+        }
+        return Ok(pic);
+    }
+
+    let (num_gobs, mb_rows_per_gob) = hdr
+        .source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263: source format has no GOB layout"))?;
+    let _ = num_gobs;
 
     for mb_y in 0..mb_h {
         // GOB header check: GOBs start at MB rows (mb_y % mb_rows_per_gob)==0
@@ -505,6 +586,69 @@ pub fn decode_i_picture(
     Ok(pic)
 }
 
+/// Return the byte offset of the next slice start code at or after the
+/// current bit-reader position. Slice start codes share the GBSC bit
+/// pattern; in Annex K mode all entries returned by
+/// [`collect_gob_offsets`] (other than picture / EOS markers) are
+/// candidate SSCs (which the caller validates via
+/// [`try_consume_slice_header`]).
+fn next_slice_byte_after(starts: &[StartCode], br: &BitReader<'_>) -> Option<usize> {
+    let cur_byte = (br.bit_position() / 8) as usize;
+    starts
+        .iter()
+        .find(|s| s.byte_pos >= cur_byte && s.gn != GN_PICTURE && s.gn != GN_EOS)
+        .map(|s| s.byte_pos)
+}
+
+/// Attempt to consume a slice header at the current bit-reader position.
+/// Used by the Annex K decoder to validate a candidate hit from
+/// [`next_slice_byte_after`] — false positives in P-frame MB bodies
+/// (long zero runs from skipped MBs) are common, so we try-parse the
+/// candidate and let the caller restore the bit-reader on failure.
+///
+/// Returns `(SliceHeader, new_quant)` on success. Validates SSC pattern,
+/// SEPB1=1, SEPB3=1, MBA monotonicity (must be > current MB index when
+/// ASO is off), and MBA in range. The caller is responsible for
+/// snapshotting the bit reader before calling this and restoring it on
+/// `Err`.
+fn try_consume_slice_header(
+    br: &mut BitReader<'_>,
+    hdr: &PictureHeader,
+    cur_mb: u32,
+    total_mbs: u32,
+) -> Result<(crate::slice::SliceHeader, u32)> {
+    while !br.is_byte_aligned() {
+        let bit = br.read_u1()?;
+        if bit != 0 {
+            return Err(Error::invalid(
+                "h263 Annex K: SSTUF must be all-zero stuffing",
+            ));
+        }
+    }
+    let ssc = br.read_u32(SSC_BITS)?;
+    if ssc != crate::slice::SSC_VALUE {
+        return Err(Error::invalid(format!("h263 Annex K: bad SSC 0x{ssc:05x}")));
+    }
+    let sh = parse_slice_header_body(br, hdr.source_format, hdr.sss, hdr.cpm, false)?;
+    if sh.mba >= total_mbs {
+        return Err(Error::invalid(format!(
+            "h263 Annex K: slice MBA {} >= total {}",
+            sh.mba, total_mbs
+        )));
+    }
+    // ASO off: MBA refers to the first MB of the next slice and must be
+    // at the current decode position (we incremented `cur_mb` past the
+    // last decoded MB) or further into the picture; reject MBAs that
+    // would rewind decoding.
+    if !hdr.sss.arbitrary_order && sh.mba < cur_mb {
+        return Err(Error::invalid(format!(
+            "h263 Annex K: slice MBA {} would rewind decode past current MB index {}",
+            sh.mba, cur_mb
+        )));
+    }
+    Ok((sh, sh.squant as u32))
+}
+
 /// Decode a P-picture body. `reference` is the previous reconstructed picture
 /// (used for motion compensation). The output picture has the same MB-aligned
 /// dimensions as `reference`.
@@ -516,16 +660,80 @@ pub fn decode_p_picture(
 ) -> Result<IPicture> {
     let mb_w = hdr.width.div_ceil(16) as usize;
     let mb_h = hdr.height.div_ceil(16) as usize;
-    let (_num_gobs, mb_rows_per_gob) = hdr
-        .source_format
-        .gob_layout()
-        .ok_or_else(|| Error::invalid("h263: source format has no GOB layout"))?;
+    let total_mbs = mb_w * mb_h;
     let mut pic = IPicture::new(hdr.width as usize, hdr.height as usize);
     let mut quant = hdr.pquant as u32;
     let gob_starts = collect_gob_offsets(bytes);
 
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
     let umv_mode = UmvMode::from_header(hdr);
+
+    if hdr.slice_structured {
+        if hdr.advanced_prediction {
+            return Err(Error::unsupported(
+                "h263 Annex K + Annex F (Advanced Prediction): combination not yet supported",
+            ));
+        }
+        // First-slice trailing fields (no SSC, no SQUANT).
+        let _ = parse_slice_header_body(br, hdr.source_format, hdr.sss, hdr.cpm, true)?;
+        let mut mb_idx: usize = 0;
+        let mut next_slice_start_at_byte: Option<usize> = next_slice_byte_after(&gob_starts, br);
+        while mb_idx < total_mbs {
+            if let Some(byte_pos) = next_slice_start_at_byte {
+                let cur_byte = (br.bit_position() / 8) as usize;
+                if cur_byte > byte_pos {
+                    // Already decoded past this candidate without landing on
+                    // a valid slice header — drop it.
+                    next_slice_start_at_byte = gob_starts
+                        .iter()
+                        .find(|s| s.byte_pos > byte_pos && s.gn != GN_PICTURE && s.gn != GN_EOS)
+                        .map(|s| s.byte_pos);
+                } else if cur_byte == byte_pos
+                    || (cur_byte + 1 == byte_pos
+                        && (br.bit_position() % 8 != 0 || cur_byte == byte_pos - 1))
+                {
+                    let saved = *br;
+                    if let Ok((sh, new_quant)) =
+                        try_consume_slice_header(br, hdr, mb_idx as u32, total_mbs as u32)
+                    {
+                        quant = new_quant;
+                        mb_idx = sh.mba as usize;
+                        // §K.1 rule 1 — MV prediction is reset at every slice
+                        // boundary as if a GOB header were present.
+                        mv_grid = MvGrid::new(mb_w, mb_h);
+                        next_slice_start_at_byte = next_slice_byte_after(&gob_starts, br);
+                        continue;
+                    } else {
+                        *br = saved;
+                    }
+                }
+            }
+            let mb_x = mb_idx % mb_w;
+            let mb_y = mb_idx / mb_w;
+            quant = decode_p_mb(
+                br,
+                mb_x,
+                mb_y,
+                quant,
+                &mut pic,
+                reference,
+                &mut mv_grid,
+                umv_mode,
+            )
+            .map_err(|e| {
+                Error::invalid(format!(
+                    "h263 Annex K P-picture MB ({mb_x},{mb_y}) (q={quant}): {e}"
+                ))
+            })?;
+            mb_idx += 1;
+        }
+        return Ok(pic);
+    }
+
+    let (_num_gobs, mb_rows_per_gob) = hdr
+        .source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263: source format has no GOB layout"))?;
 
     if !hdr.advanced_prediction {
         // Fast single-pass path: MC is a strict function of the current MB's

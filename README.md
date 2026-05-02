@@ -41,7 +41,7 @@ this crate does not activate any MPEG-4 decoding behaviour.
 | Annex G (PB-frames) — header + per-MB syntax     | yes    | yes    |
 | Annex M (Improved PB-frames — per-MB B-mode RDO) | yes    | yes    |
 | Annex I (AIC) — I-pictures                       | yes    | yes    |
-| Annex K (Slice Structured Mode)                  | no     | no     |
+| Annex K (Slice Structured Mode)                  | yes    | yes    |
 | Annex N (RPS — picture header + multi-ref)       | yes    | yes    |
 | Annex P (Reference Picture Resampling)           | no     | no     |
 | Annex Q (Reduced-Resolution Update)              | no     | no     |
@@ -59,8 +59,9 @@ only when all of the following hold:
 
 * UFEP = `001` (full OPPTYPE present) — cross-picture feature-flag
   inheritance (UFEP = `000`) is not yet tracked.
-* No Annex K / P / Q / R / S / T bits are set.
-  (Annex D / E / F / I — AIC — and N — RPS — ARE now accepted; see below.)
+* No Annex P / Q / R / S / T bits are set.
+  (Annex D / E / F / I — AIC — and N — RPS — and K — Slice
+  Structured — ARE now accepted; see below.)
 * No custom picture clock frequency.
 * Any custom picture size in CPFMT happens to coincide with one of the
   standard source formats (sub-QCIF / QCIF / CIF / 4CIF / 16CIF).
@@ -199,6 +200,50 @@ predictor:
 * **ffmpeg interop** — purely informational. ffmpeg 8.1's H.263
   decoder accepts our PB-frames stream without error logs but its
   PB-frames support is partial; cross-decode parity is not asserted.
+
+### Annex K — Slice Structured mode
+
+Annex K replaces the GOB layer with a *slice* layer. Each slice carries
+its own header (§K.2 Figure K.1: `SSTUF | SSC(17) | SEPB1 | (SSBI if
+CPM) | MBA(N) | (SEPB2 if needed) | SQUANT(5) | (SWI if RS) | SEPB3 |
+GFID(2)`) which acts as a resync point under bit-error / packet-loss
+conditions: a corrupted slice can be discarded and the decoder can
+resume cleanly at the next slice header.
+
+* **Encoder** opt-in via [`H263Encoder::set_enable_annex_k_slice`].
+  When on, every picture is emitted with a PLUSPTYPE-form picture
+  header (source-format `111`, UFEP=001, full OPPTYPE) carrying
+  OPPTYPE bit 10 (SS) = 1 and a 2-bit SSS body of `00` (round-23
+  always emits "no RS, no ASO" — slices are arbitrary contiguous MB
+  ranges in raster order). Slice size in macroblocks is tunable via
+  [`H263Encoder::set_slice_mb_size`] (default 22). Per §K.1 rule 1
+  the encoder resets MV prediction at every slice boundary
+  (matching the GOB-boundary `MvGrid::new` reset already used by
+  the existing GOB-emit path).
+* **Decoder** auto-detects SS via the parsed `PictureHeader`
+  (`slice_structured` / `sss` fields) and switches its body driver
+  to a slice-aware MB walker. Because long zero runs in skipped
+  P-MBs frequently emulate the start-code pattern, the decoder
+  *try-parses* every candidate slice boundary returned by the
+  start-code scanner: it snapshots the bit reader, consumes SSTUF +
+  SSC + the slice-header body, and on validation failure (bad SSC,
+  SEPB1≠1, SEPB3≠1, MBA out of range, MBA rewinds decode) restores
+  the snapshot and continues decoding the MB body. Once the actual
+  slice header is consumed the MV grid is reset (§K.1 rule 1) and
+  the new SQUANT becomes the picture quantiser.
+* **Combination guards** — Annex K + UMV/SAC/AP/RPS/PB/AIC returns
+  `Error::Unsupported` at `send_frame` (round-23 scope is the
+  baseline 1-MV inter / I-picture body only). The Rectangular Slice
+  (RS) and Arbitrary Slice Ordering (ASO) submodes are not yet
+  emitted; the picture-header SSS body is always `00`.
+* **Error recovery delta** — corrupting a few bytes mid-slice in a
+  multi-slice Annex K stream lets the decoder recover at the next
+  slice header rather than losing the whole picture (matching the
+  spec's design intent for §K.2). The integration test in
+  `tests/annex_k_slice.rs` exercises this behaviour.
+* **ffmpeg interop** — best-effort cross-decode (ffmpeg 8.1's H.263
+  decoder may or may not implement the full Annex K syntax; the
+  test accepts both clean decode and controlled rejection).
 
 ### Annex M — Improved PB-frames
 

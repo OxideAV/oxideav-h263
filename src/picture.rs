@@ -187,6 +187,15 @@ pub struct PictureHeader {
     /// AIC dequantisation formula instead of the baseline INTRADC + Table 16
     /// AC TCOEF path.
     pub aic_mode: bool,
+    /// Annex K (Slice Structured) — only meaningful when [`Self::plusptype`]
+    /// is set. Mirrors OPPTYPE bit 10 (SS). When `true`, the GOB layer is
+    /// replaced by a slice layer with per-slice resync headers (`SSC` start
+    /// codes plus the §K.2 slice-header fields).
+    pub slice_structured: bool,
+    /// Annex K SSS submode bits (§5.1.4.6). Only present when SS is in use
+    /// AND `UFEP=001` (an OPPTYPE block was carried). Encodes `RS` +
+    /// `ASO` per [`crate::slice::SssMode`].
+    pub sss: crate::slice::SssMode,
 }
 
 /// Parse the picture header that follows the 22-bit PSC.
@@ -344,6 +353,8 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
         trp: 0,
         bci_present: false,
         aic_mode: false,
+        slice_structured: false,
+        sss: crate::slice::SssMode::default(),
     })
 }
 
@@ -425,6 +436,7 @@ fn parse_plusptype_tail(
         ap_mode,
         rps_mode,
         aic_mode,
+        ss_mode,
     ) = if ufep == 0b001 {
         let opptype = br.read_u32(18)?;
         // MSB-first helpers: `bit(k)` returns the k-th spec bit
@@ -472,17 +484,12 @@ fn parse_plusptype_tail(
         // alterations (INTRA_MODE field, Table I.2 INTRA TCOEF VLC, AC
         // pred + dequant variant) live in `crate::aic` and are dispatched
         // by the I-MB decoder when `hdr.aic_mode` is set.
-        // Annex K (Slice Structured mode) is detected here with a specific
-        // diagnostic. ffmpeg's `h263p -umv 1` bundles this with Annex D+UMV,
-        // so decoders that want to reach the MVD VLC layer need to bail out
-        // at the picture header rather than silently misread slice headers
-        // as GOB headers.
-        if sss {
-            return Err(Error::unsupported(
-                "h263 Annex K slice structured mode: follow-up (bit 10 of OPPTYPE; \
-                 slice headers replace GOB headers per §K.2)",
-            ));
-        }
+        // Annex K (Slice Structured mode) — accepted. The SSS submode bits
+        // (RS / ASO) live further down in the picture-header tail and are
+        // read after CPFMT / EPAR / CPCFC / ETR / UUI per Figure 6 (part 2).
+        // The slice-layer parsing itself happens in [`crate::decoder`] when
+        // it walks the picture body — slice start codes share the GBSC bit
+        // pattern but are interpreted differently when this flag is set.
         // Annex N (Reference Picture Selection) is now accepted on
         // PLUSPTYPE input. The RPSMF / TRPI / TRP / BCI fields below
         // are read in the body parse, after CPM / CPFMT / EPAR /
@@ -518,6 +525,7 @@ fn parse_plusptype_tail(
             ap,
             rps,
             aic,
+            sss,
         )
     } else if ufep == 0b000 {
         // Inherit previous-picture OPPTYPE state. Since we do not yet retain
@@ -530,7 +538,7 @@ fn parse_plusptype_tail(
         // bit that actually matters. `opptype_src_format = 0` signals
         // "no OPPTYPE, dimensions must be inferable from later CPFMT (which
         // in turn will not be present for UFEP==000)".
-        (0, false, false, false, false, false, false, false)
+        (0, false, false, false, false, false, false, false, false)
     } else {
         return Err(Error::invalid(format!(
             "h263 PLUSPTYPE: invalid UFEP {ufep:03b}"
@@ -676,7 +684,14 @@ fn parse_plusptype_tail(
         false
     };
 
-    // SSS (Annex K) — only if slice structured was signalled (rejected above).
+    // SSS (Annex K, §5.1.4.6) — 2-bit submode signal present when the SS bit
+    // (OPPTYPE bit 10) is set AND UFEP=001. Bit 1 = RS (Rectangular Slice),
+    // bit 2 = ASO (Arbitrary Slice Ordering). When SS is on but UFEP=000, the
+    // previous picture's SSS latches; we don't track cross-picture SSS state
+    // (the UFEP=000 branch above rejects with `Unsupported`), so by the time
+    // we get here `ufep == 001` is guaranteed when `ss_mode` is true.
+    let sss_bits = if ss_mode { br.read_u32(2)? as u8 } else { 0 };
+    let sss_mode = crate::slice::SssMode::from_bits(sss_bits);
 
     // ELNUM / RLNUM (Annex O) — only present if the scalability mode is in
     // use. Annex O is rejected at the OPPTYPE check above (well, scalability
@@ -787,6 +802,8 @@ fn parse_plusptype_tail(
         trp,
         bci_present,
         aic_mode,
+        slice_structured: ss_mode,
+        sss: sss_mode,
     })
 }
 
@@ -1016,11 +1033,13 @@ mod tests {
         assert!(p.uui_unlimited);
     }
 
-    /// Annex K (slice structured) in PLUSPTYPE must still surface a specific
-    /// diagnostic naming the annex — the slice layer syntax replaces GOB
-    /// headers with SSC start codes, and we don't yet track that.
+    /// Annex K (slice structured) in PLUSPTYPE is now accepted. The 2-bit
+    /// SSS submode field follows the picture-header tail (after CPM, no
+    /// CPFMT, no UUI). We assert that the parser:
+    ///   * latches `slice_structured = true`,
+    ///   * reads the 2-bit SSS body and round-trips RS / ASO flags.
     #[test]
-    fn plusptype_slice_structured_rejected() {
+    fn plusptype_slice_structured_accepted() {
         let mut w = BitBuf::new();
         w.put(0b00_0000_0000_0000_0000_1_00000, 22);
         w.put(0, 8);
@@ -1036,11 +1055,24 @@ mod tests {
             0b010, false, false, false, false, false, false, true, false, false, false, false,
         );
         w.put(opptype, 18);
+        // MPPTYPE: PCT=000 (I) | RPR=0 | RRU=0 | RTYPE=0 | marker=001
+        w.put(0b000_0_0_0_001, 9);
+        // CPM = 0
+        w.put(0, 1);
+        // SSS body (2 bits): RS=1, ASO=0 → 0b10
+        w.put(0b10, 2);
+        // PQUANT = 5
+        w.put(5, 5);
+        // PEI = 0
+        w.put(0, 1);
         let data = w.finish();
         let mut br = BitReader::new(&data);
-        let err = parse_picture_header(&mut br).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("Annex K"), "got {msg}");
+        let p = parse_picture_header(&mut br).expect("PLUSPTYPE+SS must parse");
+        assert!(p.plusptype);
+        assert!(p.slice_structured);
+        assert!(p.sss.rectangular_slice);
+        assert!(!p.sss.arbitrary_order);
+        assert_eq!(p.source_format, SourceFormat::Qcif);
     }
 
     /// Baseline PTYPE (no PLUSPTYPE) with UMV enabled should now parse — the

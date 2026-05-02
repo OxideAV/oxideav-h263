@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Annex K — Slice Structured mode (encoder + decoder).** Replaces the
+  GOB layer with the slice layer per §K.2 (Figure K.1):
+  `SSTUF | SSC(17) | SEPB1 | (SSBI if CPM) | MBA(N) | (SEPB2 if needed) |
+  SQUANT(5) | (SWI if RS) | SEPB3 | GFID(2)`, each slice acting as a
+  resync point for bit-error / packet-loss recovery. The encoder opts in
+  via `H263Encoder::set_enable_annex_k_slice(true)` and accepts a slice
+  size in macroblocks via `set_slice_mb_size(n)` (default 22). Pictures
+  are emitted with a PLUSPTYPE block carrying OPPTYPE bit 10 (SS) = 1
+  and a 2-bit SSS submode field (round-23 always emits `00` — neither
+  Rectangular Slice (RS) nor Arbitrary Slice Ordering (ASO) is
+  generated). The decoder auto-detects SS via the parsed picture header
+  and switches its body driver to a slice-based MB walker that
+  *try-parses* candidate slice boundaries (snapshotted bit reader +
+  SSC + SEPB1=1 + SEPB3=1 validation), guarding against the false
+  positives long zero runs in skipped P-MBs would otherwise produce.
+  MV prediction is reset at every slice boundary per §K.1 rule 1
+  (matching the existing GOB-boundary behaviour). New helpers in
+  `crate::slice`: `SliceHeader` / `SssMode` / `parse_slice_header_body`
+  / `write_slice_header` / `mba_field_width` (Table K.2) /
+  `swi_field_width` (Table K.3); new encoder entry-points
+  `encode_i_picture_slice_with_recon` / `encode_p_picture_slice_with_recon`.
+  New integration tests in `tests/annex_k_slice.rs`. Annex K +
+  UMV/SAC/AP/RPS/PB/AIC return `Error::Unsupported` at `send_frame`
+  for the round-23 scope.
+
 - **Annex M — Improved PB-frames mode (encoder + decoder).** Extends the
   existing Annex G PB-frames path with per-MB selection across three
   BPB-block prediction shapes per §M.2:

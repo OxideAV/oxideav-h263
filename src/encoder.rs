@@ -188,6 +188,27 @@ pub struct H263Encoder {
     /// via [`crate::decoder::H263Decoder::set_enable_annex_m_impb`] —
     /// the spec signals Annex M out-of-band per §M.1.
     enable_annex_m_impb: bool,
+    /// When `true`, emit pictures using the H.263+ **Annex K** Slice
+    /// Structured mode: PLUSPTYPE picture header carries OPPTYPE bit 10
+    /// (SS) = 1, the GOB layer is replaced by the slice layer (per-slice
+    /// SSC + slice header per §K.2), and MV prediction is reset at every
+    /// slice boundary (§K.1 rule 1). The matching decoder must also opt
+    /// in via [`crate::decoder::H263Decoder`] which already auto-detects
+    /// the SS bit in the parsed picture header.
+    ///
+    /// Round-23 scope is the baseline 1-MV inter / I-picture body —
+    /// combinations with UMV / SAC / AP / PB / RPS are rejected at
+    /// `send_frame`. AIC is also gated off (the AIC encoder doesn't yet
+    /// share the slice-emit path).
+    enable_annex_k_slice: bool,
+    /// Approximate number of macroblocks per slice when Annex K Slice
+    /// Structured mode is in use. The encoder rounds the picture's MB
+    /// count to obtain integer-MB slices and starts a fresh slice
+    /// (with its own SSC + slice header) every `slice_mb_size`
+    /// macroblocks. Defaults to 22 (one CIF MB row); a lower value
+    /// gives more resync points at the cost of bitstream overhead.
+    /// Always at least 1.
+    slice_mb_size: u32,
 }
 
 impl H263Encoder {
@@ -249,6 +270,8 @@ impl H263Encoder {
             pb_dbquant: 0,
             enable_annex_i_aic: false,
             enable_annex_m_impb: false,
+            enable_annex_k_slice: false,
+            slice_mb_size: 22,
         })
     }
 
@@ -418,6 +441,39 @@ impl H263Encoder {
     pub fn enable_annex_m_impb(&self) -> bool {
         self.enable_annex_m_impb
     }
+
+    /// Enable or disable **Annex K** (Slice Structured) emission. When on,
+    /// every picture is emitted with a PLUSPTYPE block carrying OPPTYPE
+    /// bit 10 (SS) = 1, the GOB layer is replaced by per-slice resync
+    /// headers (§K.2 — SSC start codes + the slice-header MBA / SQUANT /
+    /// GFID fields), and the encoder resets MV prediction at every slice
+    /// boundary (§K.1 rule 1).
+    ///
+    /// Round-23 scope: baseline 1-MV inter / I-picture only — combinations
+    /// with UMV / SAC / AP / PB / RPS / AIC are rejected at `send_frame`.
+    /// The Rectangular Slice (RS) and Arbitrary Slice Ordering (ASO)
+    /// submodes are not yet emitted; both SSS bits are zero in the
+    /// picture header.
+    pub fn set_enable_annex_k_slice(&mut self, enable: bool) {
+        self.enable_annex_k_slice = enable;
+    }
+
+    /// Returns whether Annex K (Slice Structured) emission is enabled.
+    pub fn enable_annex_k_slice(&self) -> bool {
+        self.enable_annex_k_slice
+    }
+
+    /// Set the target number of macroblocks per slice when Annex K is in
+    /// use. Smaller values give more resync points at the cost of slice
+    /// header overhead. Always clamped to at least 1.
+    pub fn set_slice_mb_size(&mut self, n: u32) {
+        self.slice_mb_size = n.max(1);
+    }
+
+    /// Returns the target slice size in macroblocks.
+    pub fn slice_mb_size(&self) -> u32 {
+        self.slice_mb_size
+    }
 }
 
 impl Encoder for H263Encoder {
@@ -508,6 +564,27 @@ impl Encoder for H263Encoder {
             ));
         }
 
+        // Annex K (Slice Structured) round scope: baseline 1-MV inter only.
+        // Combinations with UMV / SAC / AP / RPS / PB / AIC need shared
+        // PLUSPTYPE writers and per-slice resets in those code paths
+        // (slice MV-grid reset already lines up with what AP / SAC do at
+        // GOB boundaries, but the bitstream layout would need a unified
+        // emitter — deferred).
+        if self.enable_annex_k_slice
+            && (self.enable_annex_d_umv
+                || self.enable_annex_e
+                || self.enable_annex_f
+                || self.enable_annex_n_rps
+                || self.enable_annex_g_pb
+                || self.enable_annex_i_aic)
+        {
+            return Err(Error::unsupported(
+                "h263 encoder: Annex K (Slice Structured) is not yet supported in \
+                 combination with other PLUSPTYPE optional modes (UMV / SAC / AP / \
+                 RPS / PB / AIC)",
+            ));
+        }
+
         let tr = self.next_tr;
         self.next_tr = self.next_tr.wrapping_add(1);
 
@@ -554,6 +631,56 @@ impl Encoder for H263Encoder {
                 (b, p, false)
             };
             let mut recon = p_recon;
+            if self.enable_annex_j {
+                let mb_w = self.width.div_ceil(16) as usize;
+                let mb_h = self.height.div_ceil(16) as usize;
+                let qp = vec![self.pquant; mb_w * mb_h];
+                crate::deblock::deblock_picture(&mut recon, &qp);
+            }
+            self.reference = Some(recon);
+            if is_key {
+                self.since_keyframe = 1;
+            } else {
+                self.since_keyframe += 1;
+            }
+            let mut pkt = Packet::new(0, self.time_base, bytes);
+            pkt.pts = v.pts;
+            pkt.dts = v.pts;
+            pkt.flags.keyframe = is_key;
+            self.pending.push_back(pkt);
+            return Ok(());
+        }
+
+        // Annex K (Slice Structured) routing. Replaces the GOB layer with
+        // per-slice resync headers; the MB body itself is unchanged
+        // baseline 1-MV inter.
+        if self.enable_annex_k_slice {
+            let (bytes, pic, is_key) = if force_i {
+                let (b, p) = encode_i_picture_slice_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                    self.slice_mb_size,
+                )?;
+                (b, p, true)
+            } else {
+                let reference = self.reference.as_ref().expect("reference checked above");
+                let (b, p) = encode_p_picture_slice_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                    reference,
+                    self.slice_mb_size,
+                )?;
+                (b, p, false)
+            };
+            let mut recon = pic;
             if self.enable_annex_j {
                 let mb_w = self.width.div_ceil(16) as usize;
                 let mb_h = self.height.div_ceil(16) as usize;
@@ -2699,6 +2826,255 @@ fn write_plusptype_picture_header_aic(
 
     // PEI loop terminator.
     bw.write_bits(0, 1);
+    Ok(())
+}
+
+/// Annex K (Slice Structured) PLUSPTYPE picture header writer. Emits a
+/// PLUSPTYPE-form picture header (source-format code `111`, UFEP=001,
+/// full OPPTYPE) with OPPTYPE bit 10 (SS) = 1 and a 2-bit SSS submode
+/// field carrying RS/ASO. Round-23 always emits SSS=`00` (no RS, no
+/// ASO — slices are arbitrary contiguous MB ranges in raster order).
+/// All other optional-mode bits are off.
+fn write_plusptype_picture_header_slice(
+    bw: &mut BitWriter,
+    source_format: SourceFormat,
+    pquant: u8,
+    tr: u8,
+    is_p_picture: bool,
+) -> Result<()> {
+    debug_assert!(bw.is_byte_aligned());
+    let src_code: u32 = match source_format {
+        SourceFormat::SubQcif => 1,
+        SourceFormat::Qcif => 2,
+        SourceFormat::Cif => 3,
+        SourceFormat::FourCif => 4,
+        SourceFormat::SixteenCif => 5,
+        _ => {
+            return Err(Error::unsupported(
+                "h263 Annex K encoder: only standard source formats 1..=5 are supported",
+            ));
+        }
+    };
+
+    // PSC (22 bits).
+    #[allow(clippy::unusual_byte_groupings)]
+    let psc: u32 = 0b00_0000_0000_0000_0000_1_00000;
+    bw.write_bits(psc, 22);
+    // TR.
+    bw.write_bits(tr as u32, 8);
+    // PTYPE prefix bits 1..=8: marker(1) | id(0) | split(0) | cam(0) |
+    // freeze(0) | source-format = "111" (extended PTYPE).
+    bw.write_bits(1, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0b111, 3);
+    // PLUSPTYPE: UFEP=001 — full OPPTYPE present.
+    bw.write_bits(0b001, 3);
+    // OPPTYPE (18 bits, MSB-first):
+    //   bits 1-3 = source format; bit 4 = custom PCF (0); bit 5 = UMV (0);
+    //   bit 6 = SAC (0); bit 7 = AP (0); bit 8 = AIC (0); bit 9 = DF (0);
+    //   bit 10 = SS (1) — round 23's reason for being;
+    //   bit 11 = RPS (0); bit 12 = ISD (0); bit 13 = AIV (0); bit 14 = MQ (0);
+    //   bit 15 = marker "1"; bits 16-18 = reserved 000.
+    let bit = |k: u32, v: u32| (v & 1) << (18 - k);
+    let srcf_part = (src_code & 0b111) << 15;
+    let opptype: u32 = srcf_part | bit(10, 1) /* SS */ | bit(15, 1) /* marker */;
+    bw.write_bits(opptype, 18);
+
+    // MPPTYPE (9 bits): PCT(3) | RPR(1) | RRU(1) | RTYPE(1) | reserved(00) | marker(1).
+    let pct: u32 = if is_p_picture { 0b001 } else { 0b000 };
+    let mpptype: u32 = (pct << 6) | 0b000_001;
+    bw.write_bits(mpptype, 9);
+
+    // CPM (1 bit).
+    bw.write_bits(0, 1);
+
+    // SSS body (2 bits) — RS=0, ASO=0 in the round-23 scope.
+    bw.write_bits(0b00, 2);
+
+    // PQUANT.
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::invalid(format!(
+            "h263 Annex K encoder: pquant {pquant} out of range 1..=31"
+        )));
+    }
+    bw.write_bits(pquant as u32, 5);
+
+    // PEI loop terminator.
+    bw.write_bits(0, 1);
+    Ok(())
+}
+
+/// Annex K (Slice Structured) — encode a single I-picture, replacing the
+/// GOB layer with the slice layer (§K.2 Figure K.1). The first slice
+/// inherits PQUANT and starts at MB 0, but only emits the trailing
+/// fields (SEPB1 | MBA=0 | SEPB3 | GFID); subsequent slices begin with
+/// SSC + slice header. `slice_mb_size` controls how many MBs each
+/// slice covers.
+pub fn encode_i_picture_slice_with_recon(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    slice_mb_size: u32,
+) -> Result<(Vec<u8>, IPicture)> {
+    let mb_w = width.div_ceil(16) as usize;
+    let mb_h = height.div_ceil(16) as usize;
+    let total_mbs = (mb_w * mb_h) as u32;
+    let slice_size = slice_mb_size.max(1).min(total_mbs);
+
+    let mut bw = BitWriter::with_capacity(8192);
+    let mut recon = IPicture::new(width as usize, height as usize);
+
+    write_plusptype_picture_header_slice(
+        &mut bw,
+        source_format,
+        pquant,
+        temporal_reference,
+        false,
+    )?;
+
+    let sss = crate::slice::SssMode::default();
+
+    // First slice — only the trailing fields (no SSC, no SQUANT).
+    write_first_slice_header(&mut bw, source_format, sss, false, 0, /* gfid = */ 0)?;
+
+    let mut next_slice_at = slice_size;
+    let mut mb_idx: u32 = 0;
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            // Insert a slice header before this MB if it is the first MB of
+            // a new slice (and not MB 0 — that one is owned by the picture
+            // header's first-slice tail above).
+            if mb_idx == next_slice_at && mb_idx < total_mbs {
+                crate::slice::align_for_ssc(&mut bw);
+                crate::slice::write_slice_header(
+                    &mut bw,
+                    source_format,
+                    sss,
+                    false, // CPM off
+                    mb_idx,
+                    pquant,
+                    None, // SWI (RS off)
+                    0,    // GFID
+                    None, // SSBI
+                )?;
+                next_slice_at = next_slice_at.saturating_add(slice_size);
+            }
+            encode_intra_mb(
+                &mut bw, mb_x, mb_y, pquant, frame, width, height, &mut recon,
+            )?;
+            mb_idx += 1;
+        }
+    }
+
+    Ok((bw.finish(), recon))
+}
+
+/// Annex K (Slice Structured) — encode a single P-picture, replacing the
+/// GOB layer with the slice layer. MV prediction is reset at every slice
+/// boundary per §K.1 rule 1 ("the prediction of motion vector values
+/// are the same as if a GOB header were present").
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_picture_slice_with_recon(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+    slice_mb_size: u32,
+) -> Result<(Vec<u8>, IPicture)> {
+    let mb_w = width.div_ceil(16) as usize;
+    let mb_h = height.div_ceil(16) as usize;
+    let total_mbs = (mb_w * mb_h) as u32;
+    let slice_size = slice_mb_size.max(1).min(total_mbs);
+
+    let mut bw = BitWriter::with_capacity(8192);
+    let mut recon = IPicture::new(width as usize, height as usize);
+    let mut mv_grid = MvGrid::new(mb_w, mb_h);
+
+    write_plusptype_picture_header_slice(&mut bw, source_format, pquant, temporal_reference, true)?;
+    let sss = crate::slice::SssMode::default();
+    write_first_slice_header(&mut bw, source_format, sss, false, 0, 0)?;
+
+    let mut next_slice_at = slice_size;
+    let mut mb_idx: u32 = 0;
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            if mb_idx == next_slice_at && mb_idx < total_mbs {
+                crate::slice::align_for_ssc(&mut bw);
+                crate::slice::write_slice_header(
+                    &mut bw,
+                    source_format,
+                    sss,
+                    false,
+                    mb_idx,
+                    pquant,
+                    None,
+                    0,
+                    None,
+                )?;
+                // §K.1 rule 1 — slice boundary resets MV prediction.
+                mv_grid = MvGrid::new(mb_w, mb_h);
+                next_slice_at = next_slice_at.saturating_add(slice_size);
+            }
+            let _info = encode_p_mb_full(
+                &mut bw,
+                mb_x,
+                mb_y,
+                pquant,
+                frame,
+                width,
+                height,
+                reference,
+                &mut recon,
+                &mut mv_grid,
+                false, // not Annex F
+                false, // not Annex D UMV
+            )?;
+            mb_idx += 1;
+        }
+    }
+    Ok((bw.finish(), recon))
+}
+
+/// Emit the first-slice header — SEPB1 + (SSBI if CPM) + MBA + (SEPB2 if
+/// needed, only when RS is on per §K.2.6) + (SWI if RS) + SEPB3 + GFID.
+/// The first slice has no SSC and no SQUANT (PQUANT applies). MBA must
+/// be `0` for the first slice when ASO is off.
+fn write_first_slice_header(
+    bw: &mut BitWriter,
+    format: SourceFormat,
+    sss: crate::slice::SssMode,
+    cpm: bool,
+    mba: u32,
+    gfid: u8,
+) -> Result<()> {
+    bw.write_bits(1, 1); // SEPB1
+    if cpm {
+        return Err(Error::unsupported(
+            "h263 Annex K encoder: CPM (with SSBI) is not yet supported",
+        ));
+    }
+    let mba_w = crate::slice::mba_field_width(format, false)?;
+    bw.write_bits(mba & ((1u32 << mba_w) - 1), mba_w);
+    if sss.rectangular_slice {
+        bw.write_bits(1, 1); // SEPB2 (first-slice + RS)
+    }
+    if sss.rectangular_slice {
+        let _ = crate::slice::swi_field_width(format, false)?;
+        return Err(Error::unsupported(
+            "h263 Annex K encoder: Rectangular Slice (RS) submode is not yet emitted",
+        ));
+    }
+    bw.write_bits(1, 1); // SEPB3
+    bw.write_bits(gfid as u32 & 0x3, 2);
     Ok(())
 }
 
