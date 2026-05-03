@@ -422,7 +422,8 @@ fn evaluate_results(case: &CorpusCase, results: Vec<FrameResult>) {
             let total = agg.y_total + agg.uv_total;
             let exact = agg.y_exact + agg.uv_exact;
             assert_eq!(
-                exact, total,
+                exact,
+                total,
                 "{}: not bit-exact (Y max diff {}, UV max diff {}; {:.4}% match)",
                 case.name,
                 agg.y_max,
@@ -700,14 +701,22 @@ fn corpus_containerless_elementary_vs_3gp_mp4() {
     let mp4 = match fs::read(&mp4_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("skip {} (3gp): missing {} ({e})", case.name, mp4_path.display());
+            eprintln!(
+                "skip {} (3gp): missing {} ({e})",
+                case.name,
+                mp4_path.display()
+            );
             return;
         }
     };
     let yuv_ref = match fs::read(&yuv_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("skip {} (3gp): missing {} ({e})", case.name, yuv_path.display());
+            eprintln!(
+                "skip {} (3gp): missing {} ({e})",
+                case.name,
+                yuv_path.display()
+            );
             return;
         }
     };
