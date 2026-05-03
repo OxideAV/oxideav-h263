@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-h263/compare/v0.0.6...v0.0.7) - 2026-05-03
+
+### Other
+
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- Annex K (Slice Structured mode) — encoder + decoder
+- Annex M (Improved PB-frames) — encoder + decoder
+- Annex I (Advanced INTRA Coding) — encoder + decoder
+- oxideav-core ^0.2 -> ^0.1 (0.2.0 was yanked)
+- implement receive_arena_frame() for true zero-copy
+- port to oxideav-core 0.1.8 DoS framework (DecoderLimits + ArenaPool)
+- Annex G (PB-frames) — encoder + decoder
+- Annex N (Reference Picture Selection) — picture header + multi-ref cache
+- Annex D (UMV) encoder emission
+- cargo fmt cleanups
+- adopt slim VideoFrame shape
+- adopt slim VideoFrame/AudioFrame shape
+- Annex E SAC + Annex J (deblocking) interaction; SAC+AP per-GOB resync
+- Annex E SAC + Annex F (4MV/OBMC) — combined emit + decode
+- Annex E SAC — P-picture MB-layer VLC→SAC swap
+- Annex E SAC — I-picture MB-layer VLC→SAC swap
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - **Annex K — Slice Structured mode (encoder + decoder).** Replaces the
