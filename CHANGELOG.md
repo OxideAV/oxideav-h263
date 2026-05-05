@@ -90,9 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AIV / MQ) that previously returned `Error::Unsupported` now parse
   cleanly and surface on these fields.
 
-  Total tests: 147 → 248 (+101 new tests covering Annex L PSUPP parser,
-  Annex T helpers + I-picture body, Annex R/S header recognition +
-  guards, plus the integration tests above).
+  Total tests: 215 → 248 (+33 new tests covering Annex L PSUPP parser
+  (11 unit + 5 integration), Annex T helpers + I-picture body (6 unit +
+  5 integration), Annex R/S header recognition + guards (3+3
+  integration each)).
 
 
 ## [0.0.7](https://github.com/OxideAV/oxideav-h263/compare/v0.0.6...v0.0.7) - 2026-05-03
