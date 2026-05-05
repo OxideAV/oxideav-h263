@@ -908,18 +908,16 @@ impl Encoder for H263Encoder {
         }
 
         // Annex R (ISD) — requires Annex K with RS submode (§R.3.1).
-        if self.enable_annex_r_isd {
-            if !self.enable_annex_k_slice {
-                return Err(Error::unsupported(
-                    "h263 encoder: Annex R (ISD) requires Annex K Slice \
-                     Structured mode to also be enabled (§R.3.1)",
-                ));
-            }
-            // RS (Rectangular Slice) submode is not directly tracked on the
-            // encoder struct; the ISD + K combination is accepted and the
-            // PLUSPTYPE header writer sets both SS + ISD bits. The decoder
-            // enforces the RS submode constraint on its side.
+        if self.enable_annex_r_isd && !self.enable_annex_k_slice {
+            return Err(Error::unsupported(
+                "h263 encoder: Annex R (ISD) requires Annex K Slice \
+                 Structured mode to also be enabled (§R.3.1)",
+            ));
         }
+        // RS (Rectangular Slice) submode is not directly tracked on the
+        // encoder struct; the ISD + K combination is accepted and the
+        // PLUSPTYPE header writer sets both SS + ISD bits. The decoder
+        // enforces the RS submode constraint on its side.
 
         // Annex S (AIV) — PLUSPTYPE-only; incompatible with other PLUSPTYPE
         // annexes that have separate writers in this round.
