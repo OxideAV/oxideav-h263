@@ -567,8 +567,5 @@ fn annex_t_mq_p_picture_header_bits() {
     assert!(phdr.plusptype, "P-picture must use PLUSPTYPE");
 
     // The I-picture should decode cleanly (MQ I body is fully wired).
-    let i_recon = decode_one_packet(i_data);
-    match i_recon {
-        VideoFrame { .. } => {} // OK
-    }
+    let _i_recon = decode_one_packet(i_data);
 }
