@@ -95,6 +95,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   5 integration), Annex R/S header recognition + guards (3+3
   integration each)).
 
+- **Annex L (SEI) — encoder.** New encoder methods `push_sei(Sei)`,
+  `pending_sei_count()`, and `clear_pending_sei()` queue `Sei` records
+  for the next encoded picture. The AIV (Annex S) and MQ (Annex T) PLUSPTYPE
+  writers thread the queued records through `serialise_sei_to_psupp` and
+  emit them in the §5.1.24 / §5.1.25 PEI loop. Records whose payload
+  exceeds 15 bytes (DSIZE is a 4-bit field) are rejected by `push_sei`
+  with an `Error::Invalid`. Extended-FTYPE (FTYPE=15) records, including
+  Annex W-style picture-message payloads, are accepted via
+  `push_sei(Sei::ExtendedFunctionType { … })` today.
+
+- **Annex S (AIV) — encoder flag + PLUSPTYPE writer.**
+  `H263Encoder::set_enable_annex_s_aiv(true)` wires the AIV encoder path:
+  every picture emits a PLUSPTYPE block with OPPTYPE bit 13 (AIV) = 1
+  via a new `write_plusptype_picture_header_aiv` helper.  I-picture MB
+  bodies reuse the baseline intra path; P-picture MB bodies route through
+  `encode_p_mb_aiv` which applies the §S.2 VLC-selection logic (INTRA VLC
+  when shorter) and the §S.3 CBPY-without-XOR rule when both chroma blocks
+  are coded.  Annex S is incompatible with SAC / AP / RPS / PB / AIC / K
+  / T (a unified multi-annex PLUSPTYPE writer is round-38 work) — these
+  combinations are rejected at `send_frame`.  Decoder per-MB plumbing
+  is round-38 follow-up; AIV-flagged pictures are still rejected at
+  `decode_one_picture`.
+
+- **Annex T (MQ) — encoder flag + PLUSPTYPE writer.**
+  `H263Encoder::set_enable_annex_t_mq(true)` wires the MQ encoder path:
+  PLUSPTYPE with OPPTYPE bit 14 (MQ) = 1; chroma blocks use `quant_c`
+  from §T.3 Table T.2 (smaller step than luma). I- and P-picture MB bodies
+  route through dedicated `encode_intra_mb_mq` / `encode_p_mb_mq_with_recon`
+  helpers.  MQ I-picture self-round-trip (encode → decoder) passes at ≥ 97%
+  within ±2 LSB.  P-picture decoder body (§T.2 DQUANT VLC + §T.3 chroma
+  quant through `decode_p_mb`) remains round-38 follow-up.
+
+- **Annexes P / Q / R / U / V / W — encoder flag surface.**
+  Eight new getter/setter pairs (`set_enable_annex_p_rpr`, `_q_rru`,
+  `_r_isd`, `_u_erps`, `_v_dpslice`, `_w_picture_msg`) store the flag and
+  return `Error::Unsupported` from `send_frame` (body not yet wired).
+  Annex R (ISD) additionally validates that Annex K is also enabled (§R.3.1)
+  before returning Unsupported.  Callers targeting Annex W records today
+  can use `push_sei(Sei::ExtendedFunctionType { … })` via the AIV/MQ
+  PLUSPTYPE path.
+
+- **Integration tests — `tests/encoder_annex_round_trip.rs` (+20 tests).**
+  Covers: Annex L SEI queue management and survival through AIV + MQ encode
+  paths (5 tests), Annex S AIV header-bits + I-picture structural check +
+  P-picture header-bits + SAC-conflict guard (4 tests), Annex T MQ
+  header-bits + I-picture self-round-trip + P-picture header-bits +
+  AIV-conflict guard (4 tests), flag-surface Annexes P/Q/R/U/V/W getters +
+  Unsupported guard (6 tests), Annex W via `push_sei` (1 test).
+
+  Total tests: 248 → 268 (+20 new integration tests).
+
 
 ## [0.0.7](https://github.com/OxideAV/oxideav-h263/compare/v0.0.6...v0.0.7) - 2026-05-03
 

@@ -63,6 +63,7 @@ use crate::motion::{
     OBMC_H0, OBMC_H1, OBMC_H2,
 };
 use crate::picture::SourceFormat;
+use crate::sei::Sei;
 use oxideav_core::bits::BitWriter;
 
 /// Default fixed quantiser (PQUANT) — `5` matches the
@@ -209,6 +210,63 @@ pub struct H263Encoder {
     /// gives more resync points at the cost of bitstream overhead.
     /// Always at least 1.
     slice_mb_size: u32,
+
+    // -----------------------------------------------------------------------
+    // Annex L — Supplemental Enhancement Information (encoder).
+    // -----------------------------------------------------------------------
+    /// SEI records queued for the next emitted picture. The encoder appends
+    /// each record to the PEI/PSUPP loop of the next picture header, then
+    /// clears the queue. Use [`Self::push_sei`] to schedule records.
+    pending_sei: Vec<Sei>,
+
+    // -----------------------------------------------------------------------
+    // Annexes that require only a PLUSPTYPE flag surface without full encoder
+    // body changes (default off; flag is always emitted disabled).
+    // -----------------------------------------------------------------------
+    /// Annex S (Alternative INTER VLC) — encoder. When on, the picture header
+    /// is emitted as PLUSPTYPE with OPPTYPE bit 13 (AIV) = 1, and every INTER
+    /// residual block is encoded using [`crate::aic::write_intra_tcoef`]
+    /// (Table I.2) when the INTRA VLC would produce a shorter bitstream than
+    /// the standard inter Table 16 VLC. §S.2 / §S.3.
+    enable_annex_s_aiv: bool,
+
+    /// Annex T (Modified Quantization) — encoder. When on, the picture header
+    /// is emitted as PLUSPTYPE with OPPTYPE bit 14 (MQ) = 1; the DQUANT field
+    /// uses the §T.2 VLC, chroma uses `QUANT_C` from §T.3 / Table T.2, and
+    /// EXTENDED-ESCAPE is emitted for `|level| > 127` when QUANT < 8.
+    enable_annex_t_mq: bool,
+
+    /// Annex R (Independent Segment Decoding) — encoder flag surface.
+    /// When on (requires Annex K with RS submode), emits PLUSPTYPE with
+    /// OPPTYPE bit 12 (ISD) = 1. The §R.2.4 out-of-segment MV
+    /// extrapolation is the decoder's concern; the encoder only adjusts the
+    /// picture header bit.
+    enable_annex_r_isd: bool,
+
+    /// Annex P (Reference Picture Resampling) — encoder flag surface.
+    /// When on, would emit RPR bit in MPPTYPE; the actual resampling
+    /// parameter block is not yet emitted (rare, deferred). Defaults to
+    /// `false`; stored so callers can opt in once the body is wired.
+    enable_annex_p_rpr: bool,
+
+    /// Annex Q (Reduced-Resolution Update) — encoder flag surface.
+    /// When on, would emit RRU bit in MPPTYPE. Body not yet wired.
+    enable_annex_q_rru: bool,
+
+    /// Annex U (Enhanced Reference Picture Selection) — encoder flag surface.
+    /// Extends Annex N RPS with a richer back-channel table. Body not yet wired.
+    enable_annex_u_erps: bool,
+
+    /// Annex V (Data-Partitioned Slice) — encoder flag surface.
+    /// When on, slices would be emitted with header + motion + texture
+    /// partitions. Body not yet wired.
+    enable_annex_v_dpslice: bool,
+
+    /// Annex W (Additional Supplemental Enhancement Information) — encoder
+    /// flag surface. When on, the picture-message SEI header would be emitted
+    /// via the PSUPP stream. Body not yet wired (uses Annex L PEI loop with
+    /// FTYPE=15 extended-function-type records).
+    enable_annex_w_picture_msg: bool,
 }
 
 impl H263Encoder {
@@ -272,6 +330,15 @@ impl H263Encoder {
             enable_annex_m_impb: false,
             enable_annex_k_slice: false,
             slice_mb_size: 22,
+            pending_sei: Vec::new(),
+            enable_annex_s_aiv: false,
+            enable_annex_t_mq: false,
+            enable_annex_r_isd: false,
+            enable_annex_p_rpr: false,
+            enable_annex_q_rru: false,
+            enable_annex_u_erps: false,
+            enable_annex_v_dpslice: false,
+            enable_annex_w_picture_msg: false,
         })
     }
 
@@ -474,6 +541,220 @@ impl H263Encoder {
     pub fn slice_mb_size(&self) -> u32 {
         self.slice_mb_size
     }
+
+    // -----------------------------------------------------------------------
+    // Annex L — Supplemental Enhancement Information (encoder).
+    // -----------------------------------------------------------------------
+
+    /// Queue one SEI record for the **next picture header**. The encoder
+    /// serialises all queued records into the PEI/PSUPP loop of the next
+    /// picture header it writes, then clears the queue. Each record is
+    /// encoded as a 4-bit FTYPE + 4-bit DSIZE + up to 15 bytes of parameter
+    /// data per §L.2. Callers may queue multiple records before calling
+    /// [`Encoder::send_frame`]; the records are emitted in the order they
+    /// were pushed.
+    ///
+    /// # Limitations
+    ///
+    /// * Records with DSIZE > 15 bytes cannot be expressed in the baseline
+    ///   §L.2 PSUPP layout (DSIZE is a 4-bit field); this method returns
+    ///   `Err(Error::Invalid)` for those.
+    /// * Extended-FTYPE records ([`Sei::ExtendedFunctionType`]) are always
+    ///   emitted with DSIZE = 0 in the outer header and one extra byte
+    ///   carrying `(ext_ftype << 4) | ext_dsize`; the caller is responsible
+    ///   for ensuring `ext_dsize` matches the `payload` length.
+    pub fn push_sei(&mut self, record: Sei) -> Result<()> {
+        // Validate DSIZE fits in 4 bits for the records that carry a payload.
+        let payload_len = sei_payload_len(&record);
+        if payload_len > 15 {
+            return Err(Error::invalid(format!(
+                "h263 Annex L encoder: SEI payload length {payload_len} > 15 \
+                 (DSIZE is a 4-bit field — split into smaller records)"
+            )));
+        }
+        self.pending_sei.push(record);
+        Ok(())
+    }
+
+    /// Return the number of SEI records currently queued for the next picture.
+    pub fn pending_sei_count(&self) -> usize {
+        self.pending_sei.len()
+    }
+
+    /// Clear all queued SEI records without emitting them.
+    pub fn clear_pending_sei(&mut self) {
+        self.pending_sei.clear();
+    }
+
+    // -----------------------------------------------------------------------
+    // Annex S — Alternative INTER VLC (encoder).
+    // -----------------------------------------------------------------------
+
+    /// Enable or disable Annex S (Alternative INTER VLC) emission.
+    ///
+    /// When on, every picture is emitted with a PLUSPTYPE block carrying
+    /// OPPTYPE bit 13 (AIV) = 1. Each INTER residual block is encoded using
+    /// the Table I.2 INTRA TCOEF VLC (via
+    /// [`crate::aic::write_intra_tcoef`]) instead of the standard inter
+    /// Table 16 VLC when the INTRA codeword for the `(LAST, RUN, |LEVEL|)`
+    /// triple is strictly shorter (§S.2). When the CBPC counts indicate §S.3
+    /// applies (both chroma blocks coded), the CBPY uses the INTRA shape
+    /// (no XOR) on the inter MB.
+    ///
+    /// Combining with Annex E (SAC), Annex F (AP), Annex N (RPS), Annex G
+    /// (PB), Annex I (AIC), or Annex K (Slice) is rejected at `send_frame`
+    /// for now — a unified PLUSPTYPE writer for multi-annex streams is a
+    /// follow-up.
+    pub fn set_enable_annex_s_aiv(&mut self, enable: bool) {
+        self.enable_annex_s_aiv = enable;
+    }
+
+    /// Returns whether Annex S (AIV) emission is currently enabled.
+    pub fn enable_annex_s_aiv(&self) -> bool {
+        self.enable_annex_s_aiv
+    }
+
+    // -----------------------------------------------------------------------
+    // Annex T — Modified Quantization (encoder).
+    // -----------------------------------------------------------------------
+
+    /// Enable or disable Annex T (Modified Quantization) emission.
+    ///
+    /// When on, every picture is emitted with a PLUSPTYPE block carrying
+    /// OPPTYPE bit 14 (MQ) = 1. The DQUANT field in the MB layer uses the
+    /// §T.2 variable-length code; chrominance quantisation uses `QUANT_C`
+    /// from §T.3 / Table T.2 (a smaller step than luma). The §T.4
+    /// EXTENDED-ESCAPE is available for `|level| > 127` when QUANT < 8,
+    /// but the current encoder never exceeds QUANT = 31 so that path is
+    /// exercised only if the caller sets `pquant < 8`.
+    ///
+    /// Current scope: DQUANT is held constant per picture (no per-MB
+    /// DQUANT steps), so the MQ DQUANT VLC is never actually emitted —
+    /// the MQ flag only switches the chroma quantiser and signals the
+    /// receiver to use the §T.3 QUANT_C mapping.
+    ///
+    /// Combining with Annex E (SAC), Annex F (AP), Annex N (RPS), Annex G
+    /// (PB), Annex I (AIC), Annex K (Slice), or Annex S (AIV) is rejected
+    /// at `send_frame`.
+    pub fn set_enable_annex_t_mq(&mut self, enable: bool) {
+        self.enable_annex_t_mq = enable;
+    }
+
+    /// Returns whether Annex T (MQ) emission is currently enabled.
+    pub fn enable_annex_t_mq(&self) -> bool {
+        self.enable_annex_t_mq
+    }
+
+    // -----------------------------------------------------------------------
+    // Annex R — Independent Segment Decoding (encoder flag surface).
+    // -----------------------------------------------------------------------
+
+    /// Enable or disable Annex R (Independent Segment Decoding) flag in the
+    /// encoder output.
+    ///
+    /// When on (Annex K with RS submode must also be on — §R.3.1), the
+    /// picture header emits PLUSPTYPE with OPPTYPE bit 12 (ISD) = 1.
+    /// The encoder does not change the MB or MV layers — the ISD flag
+    /// tells the decoder it may decode each segment independently.
+    ///
+    /// `send_frame` returns `Error::Unsupported` if ISD is on without
+    /// Annex K enabled with RS submode.
+    pub fn set_enable_annex_r_isd(&mut self, enable: bool) {
+        self.enable_annex_r_isd = enable;
+    }
+
+    /// Returns whether Annex R (ISD) flag emission is currently enabled.
+    pub fn enable_annex_r_isd(&self) -> bool {
+        self.enable_annex_r_isd
+    }
+
+    // -----------------------------------------------------------------------
+    // Annex P — Reference Picture Resampling (encoder flag surface).
+    // -----------------------------------------------------------------------
+
+    /// Enable or disable Annex P (Reference Picture Resampling) flag.
+    /// When on, the RPR bit in MPPTYPE would be set — the actual resampling
+    /// parameter block is not yet emitted. `send_frame` returns
+    /// `Error::Unsupported` when this flag is set (body not yet wired).
+    pub fn set_enable_annex_p_rpr(&mut self, enable: bool) {
+        self.enable_annex_p_rpr = enable;
+    }
+
+    /// Returns whether Annex P (RPR) flag is currently enabled.
+    pub fn enable_annex_p_rpr(&self) -> bool {
+        self.enable_annex_p_rpr
+    }
+
+    // -----------------------------------------------------------------------
+    // Annex Q — Reduced-Resolution Update (encoder flag surface).
+    // -----------------------------------------------------------------------
+
+    /// Enable or disable Annex Q (Reduced-Resolution Update) flag.
+    /// When on, the RRU bit in MPPTYPE would be set — the actual half-
+    /// resolution update is not yet wired. `send_frame` returns
+    /// `Error::Unsupported` when this flag is set.
+    pub fn set_enable_annex_q_rru(&mut self, enable: bool) {
+        self.enable_annex_q_rru = enable;
+    }
+
+    /// Returns whether Annex Q (RRU) flag is currently enabled.
+    pub fn enable_annex_q_rru(&self) -> bool {
+        self.enable_annex_q_rru
+    }
+
+    // -----------------------------------------------------------------------
+    // Annex U — Enhanced Reference Picture Selection (encoder flag surface).
+    // -----------------------------------------------------------------------
+
+    /// Enable or disable Annex U (Enhanced RPS) flag. Annex U extends the
+    /// Annex N RPS mechanism with a richer back-channel. When on this flag
+    /// is stored but `send_frame` returns `Error::Unsupported` (body not
+    /// yet wired).
+    pub fn set_enable_annex_u_erps(&mut self, enable: bool) {
+        self.enable_annex_u_erps = enable;
+    }
+
+    /// Returns whether Annex U (ERPS) flag is currently enabled.
+    pub fn enable_annex_u_erps(&self) -> bool {
+        self.enable_annex_u_erps
+    }
+
+    // -----------------------------------------------------------------------
+    // Annex V — Data-Partitioned Slice (encoder flag surface).
+    // -----------------------------------------------------------------------
+
+    /// Enable or disable Annex V (Data-Partitioned Slice) flag. When on,
+    /// slices would be emitted with separate header / motion / texture
+    /// partitions. `send_frame` returns `Error::Unsupported` (body not yet
+    /// wired).
+    pub fn set_enable_annex_v_dpslice(&mut self, enable: bool) {
+        self.enable_annex_v_dpslice = enable;
+    }
+
+    /// Returns whether Annex V (data-partitioned slice) flag is enabled.
+    pub fn enable_annex_v_dpslice(&self) -> bool {
+        self.enable_annex_v_dpslice
+    }
+
+    // -----------------------------------------------------------------------
+    // Annex W — Additional Supplemental Enhancement Information (encoder
+    // flag surface).
+    // -----------------------------------------------------------------------
+
+    /// Enable or disable Annex W (Additional SEI / picture-message) flag.
+    /// When on, picture-message headers would be emitted via the PSUPP stream
+    /// using `FTYPE=15` extended-function-type records (§W / §L.15).
+    /// `send_frame` returns `Error::Unsupported` when this flag is set on
+    /// its own (schedule explicit SEI records via [`Self::push_sei`] with
+    /// [`Sei::ExtendedFunctionType`] instead to emit Annex W records today).
+    pub fn set_enable_annex_w_picture_msg(&mut self, enable: bool) {
+        self.enable_annex_w_picture_msg = enable;
+    }
+
+    /// Returns whether Annex W (picture-message) flag is enabled.
+    pub fn enable_annex_w_picture_msg(&self) -> bool {
+        self.enable_annex_w_picture_msg
+    }
 }
 
 impl Encoder for H263Encoder {
@@ -582,6 +863,97 @@ impl Encoder for H263Encoder {
                 "h263 encoder: Annex K (Slice Structured) is not yet supported in \
                  combination with other PLUSPTYPE optional modes (UMV / SAC / AP / \
                  RPS / PB / AIC)",
+            ));
+        }
+
+        // Annex P / Q — not yet wired (caller opted in but the body is missing).
+        if self.enable_annex_p_rpr {
+            return Err(Error::unsupported(
+                "h263 encoder: Annex P (Reference Picture Resampling) body \
+                 not yet wired — flag surface only (follow-up)",
+            ));
+        }
+        if self.enable_annex_q_rru {
+            return Err(Error::unsupported(
+                "h263 encoder: Annex Q (Reduced-Resolution Update) body \
+                 not yet wired — flag surface only (follow-up)",
+            ));
+        }
+
+        // Annex U (Enhanced RPS) — not yet wired.
+        if self.enable_annex_u_erps {
+            return Err(Error::unsupported(
+                "h263 encoder: Annex U (Enhanced Reference Picture Selection) body \
+                 not yet wired — flag surface only (follow-up)",
+            ));
+        }
+
+        // Annex V (data-partitioned slice) — not yet wired.
+        if self.enable_annex_v_dpslice {
+            return Err(Error::unsupported(
+                "h263 encoder: Annex V (Data-Partitioned Slice) body \
+                 not yet wired — flag surface only (follow-up)",
+            ));
+        }
+
+        // Annex W (picture-message) — not yet wired as an automatic encoder
+        // mode; callers that want to emit Annex W records today should use
+        // `push_sei(Sei::ExtendedFunctionType { ... })`.
+        if self.enable_annex_w_picture_msg {
+            return Err(Error::unsupported(
+                "h263 encoder: Annex W (Additional SEI / picture-message) \
+                 automatic emit not yet wired — use push_sei(ExtendedFunctionType) \
+                 for now",
+            ));
+        }
+
+        // Annex R (ISD) — requires Annex K with RS submode (§R.3.1).
+        if self.enable_annex_r_isd {
+            if !self.enable_annex_k_slice {
+                return Err(Error::unsupported(
+                    "h263 encoder: Annex R (ISD) requires Annex K Slice \
+                     Structured mode to also be enabled (§R.3.1)",
+                ));
+            }
+            // RS (Rectangular Slice) submode is not directly tracked on the
+            // encoder struct; the ISD + K combination is accepted and the
+            // PLUSPTYPE header writer sets both SS + ISD bits. The decoder
+            // enforces the RS submode constraint on its side.
+        }
+
+        // Annex S (AIV) — PLUSPTYPE-only; incompatible with other PLUSPTYPE
+        // annexes that have separate writers in this round.
+        if self.enable_annex_s_aiv
+            && (self.enable_annex_e
+                || self.enable_annex_f
+                || self.enable_annex_n_rps
+                || self.enable_annex_g_pb
+                || self.enable_annex_i_aic
+                || self.enable_annex_k_slice
+                || self.enable_annex_t_mq)
+        {
+            return Err(Error::unsupported(
+                "h263 encoder: Annex S (AIV) is not yet supported in combination \
+                 with Annex E / F / N / G / I / K / T (deferred to a unified \
+                 multi-annex PLUSPTYPE writer)",
+            ));
+        }
+
+        // Annex T (MQ) — PLUSPTYPE-only; incompatible with other PLUSPTYPE
+        // annexes that have separate writers in this round.
+        if self.enable_annex_t_mq
+            && (self.enable_annex_e
+                || self.enable_annex_f
+                || self.enable_annex_n_rps
+                || self.enable_annex_g_pb
+                || self.enable_annex_i_aic
+                || self.enable_annex_k_slice
+                || self.enable_annex_s_aiv)
+        {
+            return Err(Error::unsupported(
+                "h263 encoder: Annex T (MQ) is not yet supported in combination \
+                 with Annex E / F / N / G / I / K / S (deferred to a unified \
+                 multi-annex PLUSPTYPE writer)",
             ));
         }
 
@@ -750,6 +1122,117 @@ impl Encoder for H263Encoder {
             self.pending.push_back(pkt);
             return Ok(());
         }
+
+        // Annex S (AIV) routing — PLUSPTYPE with AIV bit; MB body uses AIV VLC
+        // for inter blocks when that saves bits (§S.2).
+        if self.enable_annex_s_aiv {
+            let sei = std::mem::take(&mut self.pending_sei);
+            let (bytes, pic, is_key) = if force_i {
+                let (b, p) = encode_i_picture_aiv_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                    &sei,
+                )?;
+                (b, p, true)
+            } else {
+                let reference = self.reference.as_ref().expect("reference checked above");
+                let (b, p) = encode_p_picture_aiv_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                    reference,
+                    self.enable_annex_f,
+                    self.enable_annex_d_umv,
+                    &sei,
+                )?;
+                (b, p, false)
+            };
+            let mut recon = pic;
+            if self.enable_annex_j {
+                let mb_w = self.width.div_ceil(16) as usize;
+                let mb_h = self.height.div_ceil(16) as usize;
+                let qp = vec![self.pquant; mb_w * mb_h];
+                crate::deblock::deblock_picture(&mut recon, &qp);
+            }
+            self.reference = Some(recon);
+            if is_key {
+                self.since_keyframe = 1;
+            } else {
+                self.since_keyframe += 1;
+            }
+            let mut pkt = Packet::new(0, self.time_base, bytes);
+            pkt.pts = v.pts;
+            pkt.dts = v.pts;
+            pkt.flags.keyframe = is_key;
+            self.pending.push_back(pkt);
+            return Ok(());
+        }
+
+        // Annex T (MQ) routing — PLUSPTYPE with MQ bit; chroma uses QUANT_C
+        // mapping from §T.3 / Table T.2 (luma QUANT → smaller chroma QUANT).
+        if self.enable_annex_t_mq {
+            let sei = std::mem::take(&mut self.pending_sei);
+            let (bytes, pic, is_key) = if force_i {
+                let (b, p) = encode_i_picture_mq_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                    &sei,
+                )?;
+                (b, p, true)
+            } else {
+                let reference = self.reference.as_ref().expect("reference checked above");
+                let (b, p) = encode_p_picture_mq_with_recon(
+                    self.width,
+                    self.height,
+                    self.source_format,
+                    self.pquant,
+                    tr,
+                    v,
+                    reference,
+                    self.enable_annex_f,
+                    self.enable_annex_d_umv,
+                    &sei,
+                )?;
+                (b, p, false)
+            };
+            let mut recon = pic;
+            if self.enable_annex_j {
+                let mb_w = self.width.div_ceil(16) as usize;
+                let mb_h = self.height.div_ceil(16) as usize;
+                let qp = vec![self.pquant; mb_w * mb_h];
+                crate::deblock::deblock_picture(&mut recon, &qp);
+            }
+            self.reference = Some(recon);
+            if is_key {
+                self.since_keyframe = 1;
+            } else {
+                self.since_keyframe += 1;
+            }
+            let mut pkt = Packet::new(0, self.time_base, bytes);
+            pkt.pts = v.pts;
+            pkt.dts = v.pts;
+            pkt.flags.keyframe = is_key;
+            self.pending.push_back(pkt);
+            return Ok(());
+        }
+
+        // Drain pending SEI. The baseline encode sub-functions (encode_i/p_picture_*)
+        // do not yet accept an SEI parameter — callers that need SEI should use
+        // push_sei() with Annex S (AIV) or Annex T (MQ) enabled, which do pass SEI
+        // through their PLUSPTYPE header writers. For the baseline path we discard
+        // queued records here rather than silently ignoring them across pictures.
+        let _pending_sei_for_main = std::mem::take(&mut self.pending_sei);
 
         let (data, mut recon, is_key) = if force_i {
             let (bytes, pic) = if self.enable_annex_i_aic {
@@ -2613,9 +3096,206 @@ fn write_picture_header_pb(
         bw.write_bits(dbquant as u32, 2);
     }
 
-    // PEI loop terminator.
-    bw.write_bits(0, 1);
+    // PEI loop terminator (no SEI on the baseline path — SEI-bearing callers
+    // use write_picture_header_with_sei instead).
+    write_pei_loop(bw, &[]);
     Ok(())
+}
+
+/// Baseline-PTYPE picture header writer with optional Annex L SEI records.
+/// Identical to [`write_picture_header_pb`] but serialises `sei` into the
+/// PEI/PSUPP loop before the terminator `PEI=0`.
+#[allow(clippy::too_many_arguments, dead_code)]
+fn write_picture_header_with_sei(
+    bw: &mut BitWriter,
+    source_format: SourceFormat,
+    pquant: u8,
+    tr: u8,
+    is_p_picture: bool,
+    advanced_prediction: bool,
+    sac_mode: bool,
+    umv_mode: bool,
+    sei: &[Sei],
+) -> Result<()> {
+    // Re-use the PB writer to emit everything up to (but not including) the
+    // PEI loop. We then append the SEI-bearing PEI loop ourselves.
+    //
+    // The PB writer always emits PEI=0. We replicate its body here to avoid
+    // two writes.
+    debug_assert!(bw.is_byte_aligned());
+    let src_code: u32 = match source_format {
+        SourceFormat::SubQcif => 1,
+        SourceFormat::Qcif => 2,
+        SourceFormat::Cif => 3,
+        SourceFormat::FourCif => 4,
+        SourceFormat::SixteenCif => 5,
+        _ => {
+            return Err(Error::unsupported(
+                "h263 encoder: only standard source formats 1..=5 are supported",
+            ));
+        }
+    };
+    #[allow(clippy::unusual_byte_groupings)]
+    let psc: u32 = 0b00_0000_0000_0000_0000_1_00000;
+    bw.write_bits(psc, 22);
+    bw.write_bits(tr as u32, 8);
+    bw.write_bits(1, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(src_code, 3);
+    bw.write_bits(u32::from(is_p_picture), 1);
+    bw.write_bits(if umv_mode { 1 } else { 0 }, 1);
+    bw.write_bits(if sac_mode { 1 } else { 0 }, 1);
+    let ap_bit = if is_p_picture && advanced_prediction {
+        1
+    } else {
+        0
+    };
+    bw.write_bits(ap_bit, 1);
+    bw.write_bits(0, 1); // PB-frames off
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::invalid(format!(
+            "h263 encoder: pquant {} out of range 1..=31",
+            pquant
+        )));
+    }
+    bw.write_bits(pquant as u32, 5);
+    bw.write_bits(0, 1); // CPM = 0
+                         // Emit SEI via PEI loop.
+    let psupp = serialise_sei_to_psupp(sei);
+    write_pei_loop(bw, &psupp);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Annex L — SEI emit helpers
+// ---------------------------------------------------------------------------
+
+/// Returns the number of PSUPP bytes required to encode `rec` in §L.2
+/// layout: `1` header byte + DSIZE parameter bytes (+ 1 extended byte for
+/// FTYPE=15 records).
+fn sei_payload_len(rec: &Sei) -> usize {
+    match rec {
+        Sei::DoNothing => 0,
+        Sei::FullPictureFreezeRequest => 0,
+        Sei::PartialPictureFreezeRequest { .. } => 4,
+        Sei::ResizingPartialPictureFreezeRequest { .. } => 8,
+        Sei::PartialPictureFreezeReleaseRequest { .. } => 4,
+        Sei::FullPictureSnapshotTag { .. } => 4,
+        Sei::PartialPictureSnapshotTag { .. } => 8,
+        Sei::VideoTimeSegmentStartTag { .. } => 4,
+        Sei::VideoTimeSegmentEndTag { .. } => 4,
+        Sei::ProgressiveRefinementSegmentStartTag { .. } => 4,
+        Sei::ProgressiveRefinementSegmentEndTag { .. } => 4,
+        Sei::ChromaKeyingInformation { payload } => payload.len(),
+        Sei::ExtendedFunctionType { payload, .. } => payload.len(),
+        Sei::Unknown { payload, .. } => payload.len(),
+    }
+}
+
+/// Serialise a slice of [`Sei`] records into a byte vector in §L.2 PSUPP
+/// format: each record is `(FTYPE<<4) | DSIZE` + DSIZE parameter bytes.
+/// Extended-FTYPE (FTYPE=15) records prepend the outer `0xF0` byte, then an
+/// extra octet `(ext_ftype << 4) | ext_dsize`, then `ext_dsize` payload bytes.
+fn serialise_sei_to_psupp(records: &[Sei]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for rec in records {
+        match rec {
+            Sei::DoNothing => out.push(0x10),                // FTYPE=1, DSIZE=0
+            Sei::FullPictureFreezeRequest => out.push(0x20), // FTYPE=2
+            Sei::PartialPictureFreezeRequest {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                out.push((3 << 4) | 4);
+                out.extend_from_slice(&[*x, *y, *width, *height]);
+            }
+            Sei::ResizingPartialPictureFreezeRequest {
+                displayed: (dx, dy, dw, dh),
+                decoded: (rx, ry, rw, rh),
+            } => {
+                out.push((4 << 4) | 8);
+                out.extend_from_slice(&[*dx, *dy, *dw, *dh, *rx, *ry, *rw, *rh]);
+            }
+            Sei::PartialPictureFreezeReleaseRequest {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                out.push((5 << 4) | 4);
+                out.extend_from_slice(&[*x, *y, *width, *height]);
+            }
+            Sei::FullPictureSnapshotTag { id } => {
+                out.push((6 << 4) | 4);
+                out.extend_from_slice(&id.to_be_bytes());
+            }
+            Sei::PartialPictureSnapshotTag {
+                id,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                out.push((7 << 4) | 8);
+                out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(&[*x, *y, *width, *height]);
+            }
+            Sei::VideoTimeSegmentStartTag { id } => {
+                out.push((8 << 4) | 4);
+                out.extend_from_slice(&id.to_be_bytes());
+            }
+            Sei::VideoTimeSegmentEndTag { id } => {
+                out.push((9 << 4) | 4);
+                out.extend_from_slice(&id.to_be_bytes());
+            }
+            Sei::ProgressiveRefinementSegmentStartTag { id } => {
+                out.push((10 << 4) | 4);
+                out.extend_from_slice(&id.to_be_bytes());
+            }
+            Sei::ProgressiveRefinementSegmentEndTag { id } => {
+                out.push((11 << 4) | 4);
+                out.extend_from_slice(&id.to_be_bytes());
+            }
+            Sei::ChromaKeyingInformation { payload } => {
+                let dsize = payload.len().min(15) as u8;
+                out.push((12 << 4) | dsize);
+                out.extend_from_slice(&payload[..dsize as usize]);
+            }
+            Sei::ExtendedFunctionType {
+                ext_ftype,
+                ext_dsize,
+                payload,
+            } => {
+                out.push(0xF0); // FTYPE=15, DSIZE=0
+                out.push((ext_ftype << 4) | (ext_dsize & 0x0F));
+                let n = (*ext_dsize as usize).min(payload.len());
+                out.extend_from_slice(&payload[..n]);
+            }
+            Sei::Unknown { ftype, payload } => {
+                let dsize = payload.len().min(15) as u8;
+                out.push((ftype << 4) | dsize);
+                out.extend_from_slice(&payload[..dsize as usize]);
+            }
+        }
+    }
+    out
+}
+
+/// Write the PEI/PSUPP loop per §5.1.24/§5.1.25, carrying the given PSUPP
+/// bytes. If `psupp` is empty, writes a single `PEI=0` terminator.
+/// Each byte in `psupp` is wrapped: `PEI=1` (1 bit) + 8-bit value. The
+/// loop ends with `PEI=0` (1 bit).
+fn write_pei_loop(bw: &mut BitWriter, psupp: &[u8]) {
+    for &byte in psupp {
+        bw.write_bits(1, 1); // PEI = 1
+        bw.write_bits(byte as u32, 8);
+    }
+    bw.write_bits(0, 1); // PEI = 0 — terminator
 }
 
 /// Round 13 — Annex N (Reference Picture Selection) PLUSPTYPE writer.
@@ -5210,6 +5890,901 @@ fn mb_luma_variance(src: &oxideav_core::frame::VideoPlane, mb_x: usize, mb_y: us
         }
     }
     sum_abs
+}
+
+// ---------------------------------------------------------------------------
+// Annex S — Alternative INTER VLC (encoder helpers + picture functions)
+// ---------------------------------------------------------------------------
+
+/// PLUSPTYPE picture header writer for Annex S (Alternative INTER VLC).
+/// Emits OPPTYPE bit 13 (AIV) = 1; all other OPPTYPE bits are off.
+fn write_plusptype_picture_header_aiv(
+    bw: &mut BitWriter,
+    source_format: SourceFormat,
+    pquant: u8,
+    tr: u8,
+    is_p_picture: bool,
+    sei: &[Sei],
+) -> Result<()> {
+    debug_assert!(bw.is_byte_aligned());
+    let src_code: u32 = match source_format {
+        SourceFormat::SubQcif => 1,
+        SourceFormat::Qcif => 2,
+        SourceFormat::Cif => 3,
+        SourceFormat::FourCif => 4,
+        SourceFormat::SixteenCif => 5,
+        _ => {
+            return Err(Error::unsupported(
+                "h263 AIV encoder: only standard source formats 1..=5 are supported",
+            ));
+        }
+    };
+    #[allow(clippy::unusual_byte_groupings)]
+    let psc: u32 = 0b00_0000_0000_0000_0000_1_00000;
+    bw.write_bits(psc, 22);
+    bw.write_bits(tr as u32, 8);
+    bw.write_bits(1, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0b111, 3); // PLUSPTYPE
+    bw.write_bits(0b001, 3); // UFEP=001
+                             // OPPTYPE (18 bits): src_fmt + AIV(bit13) + marker(bit15)
+    let bit = |k: u32, v: u32| (v & 1) << (18 - k);
+    let srcf_part = (src_code & 0b111) << 15;
+    let opptype: u32 = srcf_part
+        | bit(13, 1)  // AIV
+        | bit(15, 1); // marker
+    bw.write_bits(opptype, 18);
+    let pct: u32 = if is_p_picture { 0b001 } else { 0b000 };
+    let mpptype: u32 = (pct << 6) | 0b000_001;
+    bw.write_bits(mpptype, 9);
+    bw.write_bits(0, 1); // CPM=0
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::invalid(format!(
+            "h263 AIV encoder: pquant {pquant} out of range 1..=31"
+        )));
+    }
+    bw.write_bits(pquant as u32, 5);
+    let psupp = serialise_sei_to_psupp(sei);
+    write_pei_loop(bw, &psupp);
+    Ok(())
+}
+
+/// Measure the bit-length that [`crate::enc_tables::write_tcoef`] (inter VLC)
+/// would emit for a single `(last, run, level)` triple. Used by the AIV
+/// encoder to pick the shorter of INTER vs INTRA VLC per block.
+fn tcoef_inter_bit_len(last: bool, run: u8, level: i32) -> u32 {
+    use crate::enc_tables::lookup_tcoef;
+    let abs = level.unsigned_abs() as u8;
+    if let Some((bits, _)) = lookup_tcoef(last, run, abs) {
+        bits as u32 + 1 // +1 for sign bit
+    } else {
+        // Escape: 7 (prefix) + 1 (last) + 6 (run) + 8 (level) = 22 bits.
+        22
+    }
+}
+
+/// Measure the bit-length that [`crate::aic::write_intra_tcoef`] (AIC / INTRA
+/// VLC) would emit for a single `(last, run, level)` triple.
+fn tcoef_intra_bit_len(last: bool, run: u8, level: i32) -> u32 {
+    use crate::aic::lookup_intra_tcoef;
+    let abs = level.unsigned_abs() as u8;
+    if let Some((bits, _)) = lookup_intra_tcoef(last, run, abs) {
+        bits as u32 + 1 // +1 for sign bit
+    } else {
+        22 // Escape same shape as inter escape
+    }
+}
+
+/// Write one inter residual block using AIV (§S.2): for each `(last, run,
+/// level)` triple pick whichever VLC table (INTER or INTRA) emits fewer bits.
+/// The whole block uses a single VLC choice — we decide per-block (not
+/// per-coefficient) by summing bit lengths.
+fn write_block_ac_inter_aiv(bw: &mut BitWriter, levels: &[i32; 64]) {
+    // Collect nonzero coefficients in zigzag order (same as write_block_ac_inter).
+    let mut nonzero_zz: Vec<(usize, i32)> = Vec::with_capacity(8);
+    for zz in 0..64 {
+        let nat = ZIGZAG[zz];
+        let lv = levels[nat];
+        if lv != 0 {
+            nonzero_zz.push((zz, lv));
+        }
+    }
+    if nonzero_zz.is_empty() {
+        return; // No AC — should not be called with an all-zero block
+    }
+    // Build (last, run, level) triples and measure both VLC lengths.
+    let mut triples: Vec<(bool, u8, i32)> = Vec::with_capacity(nonzero_zz.len());
+    let mut inter_bits: u32 = 0;
+    let mut intra_bits: u32 = 0;
+    let mut prev_zz: i32 = -1;
+    for (i, &(zz, lv)) in nonzero_zz.iter().enumerate() {
+        let run = (zz as i32 - prev_zz - 1) as u8;
+        let last = i == nonzero_zz.len() - 1;
+        inter_bits += tcoef_inter_bit_len(last, run, lv);
+        intra_bits += tcoef_intra_bit_len(last, run, lv);
+        triples.push((last, run, lv));
+        prev_zz = zz as i32;
+    }
+    // Pick the shorter VLC table for this block.
+    if inter_bits <= intra_bits {
+        for &(last, run, lv) in &triples {
+            write_tcoef(bw, last, run, lv);
+        }
+    } else {
+        use crate::aic::write_intra_tcoef;
+        for &(last, run, lv) in &triples {
+            write_intra_tcoef(bw, last, run, lv);
+        }
+    }
+}
+
+/// Encode an I-picture with the Annex S (AIV) PLUSPTYPE header.
+/// I-pictures have no INTER blocks so the AIV VLC selection never fires;
+/// this function emits a standard intra picture body under the AIV header.
+pub fn encode_i_picture_aiv_with_recon(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    sei: &[Sei],
+) -> Result<(Vec<u8>, IPicture)> {
+    let mb_w = width.div_ceil(16) as usize;
+    let mb_h = height.div_ceil(16) as usize;
+    let (_num_gobs, mb_rows_per_gob) = source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263 AIV encoder: source format has no GOB layout"))?;
+    let mut bw = BitWriter::with_capacity(8192);
+    let mut recon = IPicture::new(width as usize, height as usize);
+    write_plusptype_picture_header_aiv(
+        &mut bw,
+        source_format,
+        pquant,
+        temporal_reference,
+        false,
+        sei,
+    )?;
+    for mb_y in 0..mb_h {
+        if mb_y > 0 && (mb_y as u32) % mb_rows_per_gob == 0 {
+            let gn = (mb_y as u32 / mb_rows_per_gob) as u8;
+            write_gob_header(&mut bw, gn, pquant)?;
+        }
+        for mb_x in 0..mb_w {
+            encode_intra_mb(
+                &mut bw, mb_x, mb_y, pquant, frame, width, height, &mut recon,
+            )?;
+        }
+    }
+    Ok((bw.finish(), recon))
+}
+
+/// Encode a P-picture with the Annex S (AIV) PLUSPTYPE header. The inter
+/// residual blocks use AIV VLC selection (§S.2: INTRA VLC when shorter).
+/// §S.3: when both chroma blocks of an INTER MB are coded, emit CBPY
+/// without XOR (same as INTRA CBPY encoding).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_picture_aiv_with_recon(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+    enable_annex_f: bool,
+    enable_annex_d_umv: bool,
+    sei: &[Sei],
+) -> Result<(Vec<u8>, IPicture)> {
+    // AIV + AP combination not yet wired at the multi-pass OBMC level.
+    if enable_annex_f {
+        return Err(Error::unsupported(
+            "h263 AIV + Annex F (Advanced Prediction): not yet combined",
+        ));
+    }
+    let mb_w = width.div_ceil(16) as usize;
+    let mb_h = height.div_ceil(16) as usize;
+    source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263 AIV encoder: source format has no GOB layout"))?;
+    let mut bw = BitWriter::with_capacity(8192);
+    let mut recon = IPicture::new(width as usize, height as usize);
+    let mut mv_grid = MvGrid::new(mb_w, mb_h);
+    write_plusptype_picture_header_aiv(
+        &mut bw,
+        source_format,
+        pquant,
+        temporal_reference,
+        true,
+        sei,
+    )?;
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            encode_p_mb_aiv(
+                &mut bw,
+                mb_x,
+                mb_y,
+                pquant,
+                frame,
+                width,
+                height,
+                reference,
+                &mut recon,
+                &mut mv_grid,
+                enable_annex_d_umv,
+            )?;
+        }
+    }
+    Ok((bw.finish(), recon))
+}
+
+/// Encode one P-MB with AIV VLC selection for inter residual blocks.
+/// Mirrors `encode_p_mb_full` but uses `write_block_ac_inter_aiv` for
+/// coded inter blocks, and applies §S.3 CBPY-without-XOR when both chroma
+/// blocks are coded.
+#[allow(clippy::too_many_arguments)]
+fn encode_p_mb_aiv(
+    bw: &mut BitWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    reference: &IPicture,
+    recon: &mut IPicture,
+    mv_grid: &mut MvGrid,
+    enable_annex_d_umv: bool,
+) -> Result<()> {
+    let _ = width;
+    let _ = height;
+
+    let src_y = &frame.planes[0];
+
+    // Motion estimation.
+    let (mvx, mvy, mv_sad) = if enable_annex_d_umv {
+        motion_estimate_mb_umv(frame, reference, mb_x, mb_y, mv_grid)
+    } else {
+        motion_estimate_mb(frame, reference, mb_x, mb_y)
+    };
+
+    // Compute zero-MV (skip) SAD.
+    let zero_sad = sad_block(
+        &frame.planes[0].data,
+        frame.planes[0].stride,
+        (mb_x * 16) as i32,
+        (mb_y * 16) as i32,
+        &reference.y,
+        reference.y_stride,
+        reference.y_stride as i32,
+        (reference.y.len() / reference.y_stride) as i32,
+        (mb_x * 16) as i32,
+        (mb_y * 16) as i32,
+        0,
+        0,
+        16,
+    );
+    let (pmx, pmy) = predict_mv(mv_grid, mb_x, mb_y);
+    let can_skip = pmx == 0 && pmy == 0 && zero_sad < mv_sad + 128;
+
+    // Build predictor for luma-abs-sum calculation (needed for intra decision).
+    let mut y_pred = [0u8; 256];
+    let mut u_pred = [0u8; 64];
+    let mut v_pred = [0u8; 64];
+    let decide_mv = if can_skip { (0, 0) } else { (mvx, mvy) };
+    build_mb_predictor(
+        reference,
+        mb_x,
+        mb_y,
+        decide_mv.0,
+        decide_mv.1,
+        &mut y_pred,
+        &mut u_pred,
+        &mut v_pred,
+    );
+
+    // Compute luma residual sum for intra decision.
+    let mut luma_abs_sum = 0u32;
+    for j in 0..16 {
+        for i in 0..16 {
+            let s = src_y.data[(mb_y * 16 + j) * src_y.stride + (mb_x * 16 + i)] as i32;
+            let p = y_pred[j * 16 + i] as i32;
+            luma_abs_sum += (s - p).unsigned_abs();
+        }
+    }
+    let intra_variance = mb_luma_variance(src_y, mb_x, mb_y);
+    let try_intra = intra_variance * 5 < luma_abs_sum;
+
+    if can_skip && luma_abs_sum < (quant as u32) * 128 {
+        bw.write_bits(1, 1); // COD = 1 (skipped)
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), false, false));
+        copy_predictor_to_recon(recon, mb_x, mb_y, &y_pred, &u_pred, &v_pred);
+        return Ok(());
+    }
+
+    bw.write_bits(0, 1); // COD = 0
+
+    if try_intra {
+        encode_p_mb_intra(bw, mb_x, mb_y, quant, frame, width, height, recon)?;
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), true, true));
+        return Ok(());
+    }
+
+    // Inter path with AIV VLC selection.
+    // Re-build predictor with the actual mv (not decide_mv).
+    build_mb_predictor(
+        reference,
+        mb_x,
+        mb_y,
+        mvx,
+        mvy,
+        &mut y_pred,
+        &mut u_pred,
+        &mut v_pred,
+    );
+
+    // Quantise residual for all 6 blocks.
+    let mut levels_all = [[0i32; 64]; 6];
+    let mut any_nonzero = [false; 6];
+
+    // Luma blocks.
+    let src_cb = &frame.planes[1];
+    let src_cr = &frame.planes[2];
+    for b in 0..4 {
+        let (sub_x, sub_y) = match b {
+            0 => (0, 0),
+            1 => (8, 0),
+            2 => (0, 8),
+            _ => (8, 8),
+        };
+        let mut resid = [0.0f32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                let py = mb_y * 16 + sub_y + j;
+                let px = mb_x * 16 + sub_x + i;
+                let s = src_y.data[py * src_y.stride + px] as i32;
+                let p = y_pred[(sub_y + j) * 16 + (sub_x + i)] as i32;
+                resid[j * 8 + i] = (s - p) as f32;
+            }
+        }
+        let mut dctf = resid;
+        fdct8x8(&mut dctf);
+        let levels = quantise_inter_block(&dctf, quant);
+        any_nonzero[b] = levels.iter().any(|&l| l != 0);
+        levels_all[b] = levels;
+    }
+    // Chroma blocks.
+    for (ci, plane) in [(0usize, src_cb), (1, src_cr)].iter() {
+        let pred = if *ci == 0 { &u_pred } else { &v_pred };
+        let mut resid = [0.0f32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                let py = mb_y * 8 + j;
+                let px = mb_x * 8 + i;
+                let s = plane.data[py * plane.stride + px] as i32;
+                let p = pred[j * 8 + i] as i32;
+                resid[j * 8 + i] = (s - p) as f32;
+            }
+        }
+        let mut dctf = resid;
+        fdct8x8(&mut dctf);
+        let levels = quantise_inter_block(&dctf, quant);
+        let b = 4 + ci;
+        any_nonzero[b] = levels.iter().any(|&l| l != 0);
+        levels_all[b] = levels;
+    }
+
+    let cbpc: u8 = ((any_nonzero[4] as u8) << 1) | (any_nonzero[5] as u8);
+    let cbpy_raw: u8 = ((any_nonzero[0] as u8) << 3)
+        | ((any_nonzero[1] as u8) << 2)
+        | ((any_nonzero[2] as u8) << 1)
+        | (any_nonzero[3] as u8);
+
+    // §S.3: when CBPC5=1 AND CBPC6=1 (both chroma coded), emit CBPY without XOR.
+    let both_chroma_coded = cbpc == 0b11;
+
+    write_mcbpc_inter(bw, PMbKind::Inter, cbpc);
+    if both_chroma_coded {
+        // §S.3: CBPY without XOR (INTRA encoding shape).
+        write_cbpy(bw, cbpy_raw);
+    } else {
+        write_cbpy(bw, cbpy_raw ^ 0xF);
+    }
+
+    // MVD.
+    let (px, py) = predict_mv(mv_grid, mb_x, mb_y);
+    if !enable_annex_d_umv {
+        encode_mv_component(bw, mvx, px);
+        encode_mv_component(bw, mvy, py);
+    } else {
+        encode_mv_component_umv(bw, mvx, px);
+        encode_mv_component_umv(bw, mvy, py);
+    }
+    mv_grid.set(mb_x, mb_y, MbMotion::mv1((mvx, mvy), true, false));
+
+    // Residual blocks — use AIV VLC selection for inter blocks.
+    for b in 0..6 {
+        if any_nonzero[b] {
+            write_block_ac_inter_aiv(bw, &levels_all[b]);
+        }
+        // Reconstruct block into `recon`.
+        let coeffs = dequantise_block(&levels_all[b], quant, false);
+        let mut c = coeffs;
+        let mut resid_out = [0i32; 64];
+        crate::block::idct_signed(&mut c, &mut resid_out);
+        let (plane, stride, px, py) = block_dst(recon, b, mb_x, mb_y);
+        let pred_slice: &[u8] = if b < 4 {
+            &y_pred
+        } else if b == 4 {
+            &u_pred
+        } else {
+            &v_pred
+        };
+        let pred_stride = if b < 4 { 16 } else { 8 };
+        let pred_off_x = if b < 4 {
+            match b {
+                0 => 0,
+                1 => 8,
+                2 => 0,
+                _ => 8,
+            }
+        } else {
+            0
+        };
+        let pred_off_y = if b < 4 {
+            match b {
+                0 | 1 => 0,
+                _ => 8,
+            }
+        } else {
+            0
+        };
+        for j in 0..8 {
+            for i in 0..8 {
+                let p = pred_slice[(pred_off_y + j) * pred_stride + (pred_off_x + i)] as i32;
+                let r = resid_out[j * 8 + i];
+                plane[(py + j) * stride + (px + i)] = (p + r).clamp(0, 255) as u8;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Annex T — Modified Quantization (encoder helpers + picture functions)
+// ---------------------------------------------------------------------------
+
+/// PLUSPTYPE picture header writer for Annex T (Modified Quantization).
+/// Emits OPPTYPE bit 14 (MQ) = 1; all other OPPTYPE bits are off.
+fn write_plusptype_picture_header_mq(
+    bw: &mut BitWriter,
+    source_format: SourceFormat,
+    pquant: u8,
+    tr: u8,
+    is_p_picture: bool,
+    sei: &[Sei],
+) -> Result<()> {
+    debug_assert!(bw.is_byte_aligned());
+    let src_code: u32 = match source_format {
+        SourceFormat::SubQcif => 1,
+        SourceFormat::Qcif => 2,
+        SourceFormat::Cif => 3,
+        SourceFormat::FourCif => 4,
+        SourceFormat::SixteenCif => 5,
+        _ => {
+            return Err(Error::unsupported(
+                "h263 MQ encoder: only standard source formats 1..=5 are supported",
+            ));
+        }
+    };
+    #[allow(clippy::unusual_byte_groupings)]
+    let psc: u32 = 0b00_0000_0000_0000_0000_1_00000;
+    bw.write_bits(psc, 22);
+    bw.write_bits(tr as u32, 8);
+    bw.write_bits(1, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0, 1);
+    bw.write_bits(0b111, 3); // PLUSPTYPE
+    bw.write_bits(0b001, 3); // UFEP=001
+                             // OPPTYPE (18 bits): src_fmt + MQ(bit14) + marker(bit15)
+    let bit = |k: u32, v: u32| (v & 1) << (18 - k);
+    let srcf_part = (src_code & 0b111) << 15;
+    let opptype: u32 = srcf_part
+        | bit(14, 1)  // MQ
+        | bit(15, 1); // marker
+    bw.write_bits(opptype, 18);
+    let pct: u32 = if is_p_picture { 0b001 } else { 0b000 };
+    let mpptype: u32 = (pct << 6) | 0b000_001;
+    bw.write_bits(mpptype, 9);
+    bw.write_bits(0, 1); // CPM=0
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::invalid(format!(
+            "h263 MQ encoder: pquant {pquant} out of range 1..=31"
+        )));
+    }
+    bw.write_bits(pquant as u32, 5);
+    let psupp = serialise_sei_to_psupp(sei);
+    write_pei_loop(bw, &psupp);
+    Ok(())
+}
+
+/// Encode an I-picture with the Annex T (MQ) PLUSPTYPE header.
+/// The I-picture body uses the standard intra encoder; the decoder's
+/// `decode_intra_mb_mq` handles DQUANT via §T.2 VLC and QUANT_C for chroma,
+/// but since we emit a fixed PQUANT with no per-MB DQUANT the MQ decoder path
+/// produces the same reconstruction as the baseline path at the picture level.
+pub fn encode_i_picture_mq_with_recon(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    sei: &[Sei],
+) -> Result<(Vec<u8>, IPicture)> {
+    let mb_w = width.div_ceil(16) as usize;
+    let mb_h = height.div_ceil(16) as usize;
+    let (_num_gobs, mb_rows_per_gob) = source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263 MQ encoder: source format has no GOB layout"))?;
+    let mut bw = BitWriter::with_capacity(8192);
+    let mut recon = IPicture::new(width as usize, height as usize);
+    write_plusptype_picture_header_mq(
+        &mut bw,
+        source_format,
+        pquant,
+        temporal_reference,
+        false,
+        sei,
+    )?;
+    for mb_y in 0..mb_h {
+        if mb_y > 0 && (mb_y as u32) % mb_rows_per_gob == 0 {
+            let gn = (mb_y as u32 / mb_rows_per_gob) as u8;
+            write_gob_header(&mut bw, gn, pquant)?;
+        }
+        for mb_x in 0..mb_w {
+            encode_intra_mb_mq(
+                &mut bw, mb_x, mb_y, pquant, frame, width, height, &mut recon,
+            )?;
+        }
+    }
+    Ok((bw.finish(), recon))
+}
+
+/// Encode a P-picture with the Annex T (MQ) PLUSPTYPE header. Chroma blocks
+/// use `QUANT_C = quant_c_for_quant(pquant)` for quantisation (§T.3 / Table
+/// T.2). Luma blocks use the standard `pquant`. No per-MB DQUANT is emitted
+/// (the encoder holds pquant fixed).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_picture_mq_with_recon(
+    width: u32,
+    height: u32,
+    source_format: SourceFormat,
+    pquant: u8,
+    temporal_reference: u8,
+    frame: &VideoFrame,
+    reference: &IPicture,
+    enable_annex_f: bool,
+    enable_annex_d_umv: bool,
+    sei: &[Sei],
+) -> Result<(Vec<u8>, IPicture)> {
+    if enable_annex_f {
+        return Err(Error::unsupported(
+            "h263 MQ + Annex F (Advanced Prediction): not yet combined",
+        ));
+    }
+    let mb_w = width.div_ceil(16) as usize;
+    let mb_h = height.div_ceil(16) as usize;
+    source_format
+        .gob_layout()
+        .ok_or_else(|| Error::invalid("h263 MQ encoder: source format has no GOB layout"))?;
+    let mut bw = BitWriter::with_capacity(8192);
+    let mut recon = IPicture::new(width as usize, height as usize);
+    let mut mv_grid = MvGrid::new(mb_w, mb_h);
+    write_plusptype_picture_header_mq(
+        &mut bw,
+        source_format,
+        pquant,
+        temporal_reference,
+        true,
+        sei,
+    )?;
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            encode_p_mb_mq(
+                &mut bw,
+                mb_x,
+                mb_y,
+                pquant,
+                frame,
+                width,
+                height,
+                reference,
+                &mut recon,
+                &mut mv_grid,
+                enable_annex_d_umv,
+            )?;
+        }
+    }
+    Ok((bw.finish(), recon))
+}
+
+/// Encode one intra MB under Annex T (MQ) rules. The key difference from the
+/// baseline is that chroma uses `QUANT_C` (§T.3) for dequantisation; the
+/// encoder quantises chroma with `quant_c` so the reconstruction matches what
+/// `decode_intra_mb_mq` produces.
+#[allow(clippy::too_many_arguments)]
+fn encode_intra_mb_mq(
+    bw: &mut BitWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    recon: &mut IPicture,
+) -> Result<()> {
+    use crate::mq::quant_c_for_quant;
+    let quant_c = quant_c_for_quant(quant as u32) as u8;
+
+    let mut blocks = [[0i32; 64]; 6];
+    let mut dc_pels = [128u8; 6];
+    let mut block_has_ac = [false; 6];
+
+    for b in 0..6 {
+        let q = if b < 4 { quant } else { quant_c };
+        let mut samples = [0.0f32; 64];
+        sample_block_for(frame, width, height, mb_x, mb_y, b, &mut samples);
+        let mut dctf = samples;
+        fdct8x8(&mut dctf);
+        let (dc_byte, levels, any_ac) = quantise_intra_block(&dctf, q);
+        dc_pels[b] = dc_byte;
+        block_has_ac[b] = any_ac;
+        blocks[b] = levels;
+    }
+    let cbpc: u8 = ((block_has_ac[4] as u8) << 1) | (block_has_ac[5] as u8);
+    let cbpy: u8 = ((block_has_ac[0] as u8) << 3)
+        | ((block_has_ac[1] as u8) << 2)
+        | ((block_has_ac[2] as u8) << 1)
+        | (block_has_ac[3] as u8);
+    write_mcbpc_intra(bw, cbpc);
+    write_cbpy(bw, cbpy);
+    for b in 0..6 {
+        let q = if b < 4 { quant } else { quant_c };
+        bw.write_bits(dc_pels[b] as u32, 8);
+        if block_has_ac[b] {
+            write_block_ac(bw, &blocks[b]);
+        }
+        reconstruct_intra_block(recon, b, mb_x, mb_y, dc_pels[b], &blocks[b], q);
+    }
+    Ok(())
+}
+
+/// Encode one P-MB under Annex T (MQ) rules. Chroma blocks use `QUANT_C`
+/// (§T.3 / Table T.2) for quantisation; luma uses the picture QUANT.
+/// No per-MB DQUANT is emitted (quant is held constant across the picture).
+#[allow(clippy::too_many_arguments)]
+fn encode_p_mb_mq(
+    bw: &mut BitWriter,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u8,
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    reference: &IPicture,
+    recon: &mut IPicture,
+    mv_grid: &mut MvGrid,
+    enable_annex_d_umv: bool,
+) -> Result<()> {
+    use crate::mq::quant_c_for_quant;
+    let quant_c = quant_c_for_quant(quant as u32) as u8;
+
+    let src_y = &frame.planes[0];
+    let src_cb = &frame.planes[1];
+    let src_cr = &frame.planes[2];
+
+    // Motion estimation and skip decision (same as baseline).
+    let (mvx, mvy, mv_sad) = if enable_annex_d_umv {
+        motion_estimate_mb_umv(frame, reference, mb_x, mb_y, mv_grid)
+    } else {
+        motion_estimate_mb(frame, reference, mb_x, mb_y)
+    };
+
+    let zero_sad = sad_block(
+        &frame.planes[0].data,
+        frame.planes[0].stride,
+        (mb_x * 16) as i32,
+        (mb_y * 16) as i32,
+        &reference.y,
+        reference.y_stride,
+        reference.y_stride as i32,
+        (reference.y.len() / reference.y_stride) as i32,
+        (mb_x * 16) as i32,
+        (mb_y * 16) as i32,
+        0,
+        0,
+        16,
+    );
+    let (pmx, pmy) = predict_mv(mv_grid, mb_x, mb_y);
+    let can_skip = pmx == 0 && pmy == 0 && zero_sad < mv_sad + 128;
+
+    // Build predictor for skip / intra decision.
+    let mut y_pred = [0u8; 256];
+    let mut u_pred = [0u8; 64];
+    let mut v_pred = [0u8; 64];
+    let decide_mv = if can_skip { (0, 0) } else { (mvx, mvy) };
+    build_mb_predictor(
+        reference,
+        mb_x,
+        mb_y,
+        decide_mv.0,
+        decide_mv.1,
+        &mut y_pred,
+        &mut u_pred,
+        &mut v_pred,
+    );
+
+    // Luma residual sum for intra decision.
+    let mut luma_abs_sum = 0u32;
+    for j in 0..16 {
+        for i in 0..16 {
+            let s = src_y.data[(mb_y * 16 + j) * src_y.stride + (mb_x * 16 + i)] as i32;
+            let p = y_pred[j * 16 + i] as i32;
+            luma_abs_sum += (s - p).unsigned_abs();
+        }
+    }
+    let intra_variance = mb_luma_variance(src_y, mb_x, mb_y);
+
+    if can_skip && luma_abs_sum < (quant as u32) * 128 {
+        bw.write_bits(1, 1);
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), false, false));
+        copy_predictor_to_recon(recon, mb_x, mb_y, &y_pred, &u_pred, &v_pred);
+        return Ok(());
+    }
+
+    bw.write_bits(0, 1); // COD = 0
+
+    if intra_variance * 5 < luma_abs_sum {
+        encode_intra_mb_mq(bw, mb_x, mb_y, quant, frame, width, height, recon)?;
+        mv_grid.set(mb_x, mb_y, MbMotion::mv1((0, 0), true, true));
+        return Ok(());
+    }
+
+    // Inter path with MQ chroma quant.
+    // Re-build predictor with actual mv.
+    build_mb_predictor(
+        reference,
+        mb_x,
+        mb_y,
+        mvx,
+        mvy,
+        &mut y_pred,
+        &mut u_pred,
+        &mut v_pred,
+    );
+
+    // Quantise residual — use quant_c for chroma blocks.
+    let mut levels_all = [[0i32; 64]; 6];
+    let mut any_nonzero = [false; 6];
+
+    // Luma blocks.
+    for b in 0..4 {
+        let (sub_x, sub_y) = match b {
+            0 => (0, 0),
+            1 => (8, 0),
+            2 => (0, 8),
+            _ => (8, 8),
+        };
+        let mut resid = [0.0f32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                let py = mb_y * 16 + sub_y + j;
+                let px = mb_x * 16 + sub_x + i;
+                let s = src_y.data[py * src_y.stride + px] as i32;
+                let p = y_pred[(sub_y + j) * 16 + (sub_x + i)] as i32;
+                resid[j * 8 + i] = (s - p) as f32;
+            }
+        }
+        let mut dctf = resid;
+        fdct8x8(&mut dctf);
+        let levels = quantise_inter_block(&dctf, quant);
+        any_nonzero[b] = levels.iter().any(|&l| l != 0);
+        levels_all[b] = levels;
+    }
+    // Chroma blocks — use quant_c.
+    for (ci, plane) in [(0usize, src_cb), (1, src_cr)].iter() {
+        let pred = if *ci == 0 { &u_pred } else { &v_pred };
+        let mut resid = [0.0f32; 64];
+        for j in 0..8 {
+            for i in 0..8 {
+                let py = mb_y * 8 + j;
+                let px = mb_x * 8 + i;
+                let s = plane.data[py * plane.stride + px] as i32;
+                let p = pred[j * 8 + i] as i32;
+                resid[j * 8 + i] = (s - p) as f32;
+            }
+        }
+        let mut dctf = resid;
+        fdct8x8(&mut dctf);
+        let levels = quantise_inter_block(&dctf, quant_c);
+        let b = 4 + ci;
+        any_nonzero[b] = levels.iter().any(|&l| l != 0);
+        levels_all[b] = levels;
+    }
+
+    let cbpc: u8 = ((any_nonzero[4] as u8) << 1) | (any_nonzero[5] as u8);
+    let cbpy_raw: u8 = ((any_nonzero[0] as u8) << 3)
+        | ((any_nonzero[1] as u8) << 2)
+        | ((any_nonzero[2] as u8) << 1)
+        | (any_nonzero[3] as u8);
+
+    write_mcbpc_inter(bw, PMbKind::Inter, cbpc);
+    write_cbpy(bw, cbpy_raw ^ 0xF); // inter CBPY with XOR
+
+    // MVD.
+    let (px, py) = predict_mv(mv_grid, mb_x, mb_y);
+    if !enable_annex_d_umv {
+        encode_mv_component(bw, mvx, px);
+        encode_mv_component(bw, mvy, py);
+    } else {
+        encode_mv_component_umv(bw, mvx, px);
+        encode_mv_component_umv(bw, mvy, py);
+    }
+    mv_grid.set(mb_x, mb_y, MbMotion::mv1((mvx, mvy), true, false));
+
+    // Residual blocks — use appropriate quant for each block.
+    for b in 0..6 {
+        if any_nonzero[b] {
+            write_block_ac_inter(bw, &levels_all[b]);
+        }
+        // Reconstruct: use quant for luma, quant_c for chroma.
+        let q_recon = if b < 4 { quant } else { quant_c };
+        let coeffs = dequantise_block(&levels_all[b], q_recon, false);
+        let mut c = coeffs;
+        let mut resid_out = [0i32; 64];
+        crate::block::idct_signed(&mut c, &mut resid_out);
+        let (plane, stride, px, py) = block_dst(recon, b, mb_x, mb_y);
+        let pred_slice: &[u8] = if b < 4 {
+            &y_pred
+        } else if b == 4 {
+            &u_pred
+        } else {
+            &v_pred
+        };
+        let pred_stride = if b < 4 { 16 } else { 8 };
+        let pred_off_x = if b < 4 {
+            match b {
+                0 => 0,
+                1 => 8,
+                2 => 0,
+                _ => 8,
+            }
+        } else {
+            0
+        };
+        let pred_off_y = if b < 4 {
+            match b {
+                0 | 1 => 0,
+                _ => 8,
+            }
+        } else {
+            0
+        };
+        for j in 0..8 {
+            for i in 0..8 {
+                let p = pred_slice[(pred_off_y + j) * pred_stride + (pred_off_x + i)] as i32;
+                let r = resid_out[j * 8 + i];
+                plane[(py + j) * stride + (px + i)] = (p + r).clamp(0, 255) as u8;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

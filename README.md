@@ -43,14 +43,15 @@ this crate does not activate any MPEG-4 decoding behaviour.
 | Annex I (AIC) — I-pictures                       | yes    | yes    |
 | Annex K (Slice Structured Mode)                  | yes    | yes    |
 | Annex N (RPS — picture header + multi-ref)       | yes    | yes    |
-| Annex L (PSUPP / SEI parser)                     | yes    | no     |
-| Annex P (Reference Picture Resampling)           | no     | no     |
-| Annex Q (Reduced-Resolution Update)              | no     | no     |
-| Annex R (Independent Segment Decoding) — header  | yes    | no     |
-| Annex S (Alternative INTER VLC) — helper         | helper | no     |
-| Annex T (Modified Quantization) — I-pic body     | I-only | no     |
-| Annex U (Enhanced RPS)                           | no     | no     |
-| Annex V (Data-Partitioned Slice mode)            | no     | no     |
+| Annex L (PSUPP / SEI parser + encoder queue)      | yes    | yes    |
+| Annex P (Reference Picture Resampling)           | no     | flag   |
+| Annex Q (Reduced-Resolution Update)              | no     | flag   |
+| Annex R (Independent Segment Decoding) — header  | yes    | flag   |
+| Annex S (AIV) — PLUSPTYPE emit + I/P MB bodies   | helper | yes    |
+| Annex T (MQ) — I-pic body; P-pic deferred        | I-only | I+P hdr|
+| Annex U (Enhanced RPS)                           | no     | flag   |
+| Annex V (Data-Partitioned Slice mode)            | no     | flag   |
+| Annex W (Additional SEI / picture-message)       | no     | flag   |
 | Custom picture clock frequency (CPCFC)           | no     | no     |
 | Custom picture size (non-standard dimensions)    | no     | no     |
 | CPM (continuous-presence multipoint)             | no     | no     |
@@ -408,6 +409,28 @@ let pkt = enc.receive_packet()?; // first frame is always an I-picture
   standard source-format dimensions.
 - MP4 sample entries `s263` and `h263` map to this id; raw `.h263`
   elementary streams probe to it as well.
+
+### Round 38 encoder followups
+
+The following encoder Annex bodies are not yet wired (flag surface only in
+round 37 — `send_frame` returns `Error::Unsupported` when enabled):
+
+- **Annex S (AIV) decoder per-MB plumbing** — `decode_p_mb` must route
+  residual decode through `decode_ac_aiv`, and the §S.3 CBPY swap must be
+  applied when `CBPC5 = CBPC6 = 1`.  The encoder already emits correct AIV
+  bitstreams; the decoder still rejects AIV-flagged pictures.
+- **Annex T (MQ) P-picture decoder** — `decode_p_mb` needs §T.2 DQUANT VLC,
+  §T.3 chroma-quant routing, and §T.4 EXTENDED-ESCAPE support.  MQ I-picture
+  decode is fully wired.
+- **Annex P (RPR)** — Reference Picture Resampling bitstream body.
+- **Annex Q (RRU)** — Reduced-Resolution Update bitstream body.
+- **Annex U (ERPS)** — Enhanced Reference Picture Selection (extends Annex N
+  with a richer back-channel).
+- **Annex V (DPS)** — Data-Partitioned Slice header / motion / texture
+  partition emission.
+- **Annex W (Additional SEI)** — automatic picture-message header via
+  `FTYPE=15` extended-function-type PEI loop records; today reachable via
+  `push_sei(Sei::ExtendedFunctionType { … })` on the AIV / MQ path.
 
 ## License
 
