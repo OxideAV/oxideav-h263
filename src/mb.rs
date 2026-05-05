@@ -213,6 +213,106 @@ fn decode_one_intra_block(
     Ok(())
 }
 
+/// Decode one I-picture macroblock under Annex T (Modified Quantization).
+///
+/// Differs from [`decode_intra_mb`] in three ways (§T.2 / §T.3 / §T.4):
+///
+/// 1. **DQUANT** is the §T.2 variable-length form (read via
+///    [`crate::mq::decode_dquant_mq`]) instead of the 2-bit Table 12 form.
+/// 2. **Chroma quant** for the two chroma blocks comes from
+///    [`crate::mq::quant_c_for_quant`] (Table T.2 / §T.3) — a smaller
+///    step size than luma.
+/// 3. **EXTENDED-ESCAPE** for `|LEVEL| > 127` is honoured by the AC
+///    decoder when QUANT < 8 (§T.4 / §T.5). This crate's `decode_ac`
+///    handles the standard 8-bit signed escape; the extended path is
+///    implemented inline below.
+///
+/// Returns the (possibly updated) luma QUANT. Caller carries the chroma
+/// quant derivation forward across MBs by re-deriving from the new luma
+/// QUANT each MB (the spec only stores QUANT in the bitstream — QUANT_C
+/// is always derived).
+pub fn decode_intra_mb_mq(
+    br: &mut BitReader<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    quant_in: u32,
+    pic: &mut IPicture,
+) -> Result<u32> {
+    // 1. MCBPC — loop over stuffing.
+    let mcbpc_v = loop {
+        let v = vlc::decode(br, mcbpc::i_table())?;
+        if v != mcbpc::STUFFING {
+            break v;
+        }
+    };
+    let (is_intra_q, cbpc) = if mcbpc_v < 4 {
+        (false, mcbpc_v)
+    } else if mcbpc_v < 8 {
+        (true, mcbpc_v - 4)
+    } else {
+        return Err(Error::invalid("h263 MQ MB: invalid MCBPC value"));
+    };
+
+    // 2. CBPY (intra variant — direct, no XOR).
+    let cbpy = vlc::decode(br, cbpy::table())?;
+
+    // 3. DQUANT — §T.2 VLC.
+    let mut quant = quant_in;
+    if is_intra_q {
+        quant = crate::mq::decode_dquant_mq(br, quant)?;
+    }
+
+    // 4. Per-block decode. Luma uses `quant`; chroma uses Table T.2.
+    let chroma_quant = crate::mq::quant_c_for_quant(quant);
+    let luma_coded = [
+        (cbpy >> 3) & 1 != 0,
+        (cbpy >> 2) & 1 != 0,
+        (cbpy >> 1) & 1 != 0,
+        cbpy & 1 != 0,
+    ];
+    let chroma_coded = [(cbpc >> 1) & 1 != 0, cbpc & 1 != 0];
+
+    for block_idx in 0..6usize {
+        let coded = if block_idx < 4 {
+            luma_coded[block_idx]
+        } else {
+            chroma_coded[block_idx - 4]
+        };
+        let q = if block_idx < 4 { quant } else { chroma_quant };
+        decode_one_intra_block_mq(br, block_idx, coded, mb_x, mb_y, q, pic)?;
+    }
+
+    Ok(quant)
+}
+
+/// Variant of [`decode_one_intra_block`] for Annex T. Uses the AC decoder
+/// with the §T.4 EXTENDED-ESCAPE allowance when `quant < 8`.
+fn decode_one_intra_block_mq(
+    br: &mut BitReader<'_>,
+    block_idx: usize,
+    has_ac: bool,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u32,
+    pic: &mut IPicture,
+) -> Result<()> {
+    let dc = decode_intradc(br)?;
+    let mut coeffs = [0i32; 64];
+    coeffs[0] = dc;
+
+    if has_ac {
+        crate::block::decode_ac_mq(br, &mut coeffs, 1, quant)?;
+    }
+
+    coeffs[0] = coeffs[0].clamp(-2048, 2047);
+
+    let mut out = [0u8; 64];
+    idct_and_clip(&mut coeffs, &mut out);
+
+    write_block_to_picture(pic, block_idx, mb_x, mb_y, &out);
+    Ok(())
+}
+
 /// Decode one I-picture intra macroblock under Annex I (Advanced INTRA
 /// Coding). Differences from [`decode_intra_mb`] (§I.2 / §I.3):
 ///

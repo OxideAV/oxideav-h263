@@ -301,6 +301,63 @@ impl H263Decoder {
                 hdr.width, hdr.height, self.limits.max_pixels_per_frame
             )));
         }
+        // Round-25 Annex R/S/T scope: header recognition is wired (the
+        // OPPTYPE bits are surfaced on `hdr`), but body driver coverage
+        // is partial. Reject combinations that would silently produce
+        // wrong pels, with a specific diagnostic citing the missing
+        // wiring.
+        //
+        // * Annex T body wiring lives in `crate::mb::decode_intra_mb_mq`
+        //   for I-pictures only. P-pictures with MQ would need
+        //   `decode_p_mb`/`decode_p_mb_pb` to route through the §T.2
+        //   DQUANT VLC + §T.3 chroma quant + §T.4 EXTENDED-ESCAPE — not
+        //   yet wired.
+        // * Annex S body wiring (§S.2 try-INTER-then-INTRA AC fallback +
+        //   §S.3 CBPY swap) is not wired into `decode_p_mb` — `crate::block::decode_ac_aiv`
+        //   exists as a helper and ships with unit tests, but the per-MB
+        //   plumbing is round-26 work.
+        // * Annex R needs the MV-prediction segment isolation across
+        //   slice/GOB boundaries to be tightened beyond the current
+        //   GOB-boundary reset; the decoder already resets MV prediction
+        //   at every GOB header but does not yet enforce the §R.2
+        //   constraint that out-of-segment MV references be extrapolated.
+        //   §R.3.1 also requires that R + Annex K imply Annex K's
+        //   Rectangular Slice (RS) submode.
+        if hdr.modified_quantization && hdr.coding_type == PictureCodingType::Predicted {
+            return Err(Error::unsupported(
+                "h263 Annex T (Modified Quantization) on P-pictures: \
+                 round-25 wires I-picture body only — P-MB plumbing is follow-up",
+            ));
+        }
+        if hdr.alternative_inter_vlc {
+            return Err(Error::unsupported(
+                "h263 Annex S (Alternative INTER VLC): round-25 wires the \
+                 helpers (`block::decode_ac_aiv`) + header recognition; per-MB \
+                 plumbing is follow-up",
+            ));
+        }
+        if hdr.independent_segment_decoding {
+            // §R.3.1 — Annex R + Annex K requires RS submode.
+            if hdr.slice_structured && !hdr.sss.rectangular_slice {
+                return Err(Error::invalid(
+                    "h263 Annex R (Independent Segment Decoding) + Annex K \
+                     requires Annex K's Rectangular Slice (RS) submode (§R.3.1)",
+                ));
+            }
+            // The MV-prediction segment isolation is already implicit in
+            // the GOB-boundary mask used by `predict_mv_with_gob_mask`;
+            // however, the §R.2.4 boundary extrapolation for out-of-
+            // segment MV references is not wired. Reject for now if any
+            // MV-using mode (UMV / AP / Annex J) is on.
+            if hdr.umv_mode || hdr.advanced_prediction || hdr.deblocking_filter {
+                return Err(Error::unsupported(
+                    "h263 Annex R (Independent Segment Decoding) combined with \
+                     UMV / AP / Annex J: round-25 wires header recognition + \
+                     §R.3.1 RS-submode constraint check; out-of-segment MV \
+                     extrapolation per §R.2.4 is follow-up",
+                ));
+            }
+        }
         match hdr.coding_type {
             PictureCodingType::Intra => {
                 let mut pic = if hdr.sac_mode {
@@ -574,6 +631,12 @@ pub fn decode_i_picture(
                         ))
                     },
                 )?
+            } else if hdr.modified_quantization {
+                crate::mb::decode_intra_mb_mq(br, mb_x, mb_y, quant, &mut pic).map_err(|e| {
+                    Error::invalid(format!(
+                        "h263 Annex T I-picture MB ({mb_x},{mb_y}) (q={quant}): {e}"
+                    ))
+                })?
             } else {
                 decode_intra_mb(br, mb_x, mb_y, quant, &mut pic).map_err(|e| {
                     Error::invalid(format!(

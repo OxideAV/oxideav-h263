@@ -196,6 +196,35 @@ pub struct PictureHeader {
     /// AND `UFEP=001` (an OPPTYPE block was carried). Encodes `RS` +
     /// `ASO` per [`crate::slice::SssMode`].
     pub sss: crate::slice::SssMode,
+    /// Annex R (Independent Segment Decoding) — only meaningful when
+    /// [`Self::plusptype`] is set. Mirrors OPPTYPE bit 12 (ISD). When
+    /// `true`, video picture segments (slices with Annex K, GOBs with
+    /// non-empty headers otherwise) are decoded with full independence:
+    /// no MV prediction across segment boundaries, no OBMC across,
+    /// no deblock across. See [`crate::sei`] for the parsed PSUPP
+    /// recognition (§5.1.25 / Annex L).
+    pub independent_segment_decoding: bool,
+    /// Annex S (Alternative INTER VLC) — only meaningful when
+    /// [`Self::plusptype`] is set. Mirrors OPPTYPE bit 13 (AIV). When
+    /// `true`, INTER blocks may use the Table I.2 INTRA TCOEF VLC for
+    /// large-coefficient runs that would otherwise overflow the 64-coeff
+    /// block (§S.2), and §S.3 swaps the INTER CBPY for the INTRA CBPY
+    /// shape whenever both chroma blocks are non-zero.
+    pub alternative_inter_vlc: bool,
+    /// Annex T (Modified Quantization) — only meaningful when
+    /// [`Self::plusptype`] is set. Mirrors OPPTYPE bit 14 (MQ). When
+    /// `true`, DQUANT becomes the §T.2 variable-length VLC, chrominance
+    /// uses the QUANT_C of §T.3 / Table T.2, and the §T.4 EXTENDED-ESCAPE
+    /// (`0000011 1000_0000` followed by an 11-bit rotated LEVEL) is
+    /// allowed for `|LEVEL| > 127` at QUANT < 8.
+    pub modified_quantization: bool,
+    /// Parsed Annex L PSUPP records (§L.2). Empty when no PEI bits were
+    /// set on the picture-header tail. Decoders that don't act on SEI
+    /// data can simply ignore this; round-25 wires the parser side and
+    /// surfaces the diagnostic so callers can log / forward freeze /
+    /// snapshot tags as needed. See [`crate::sei::Sei`] for the variant
+    /// list.
+    pub sei: Vec<crate::sei::Sei>,
 }
 
 /// Parse the picture header that follows the 22-bit PSC.
@@ -313,14 +342,14 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
         (0u8, 0u8)
     };
 
-    // PEI / PSPARE loop.
-    loop {
-        let pei = br.read_u1()?;
-        if pei == 0 {
-            break;
-        }
-        let _pspare = br.read_u32(8)?;
-    }
+    // PEI / PSPARE loop. PSPARE bytes carry PSUPP per §5.1.25 / Annex L —
+    // we collect them and parse with [`crate::sei::parse_psupp_stream`].
+    let psupp = read_psupp_stream(br)?;
+    let sei = if psupp.is_empty() {
+        Vec::new()
+    } else {
+        crate::sei::parse_psupp_stream(&psupp)?
+    };
 
     let (width, height) = source_format
         .dimensions()
@@ -355,7 +384,29 @@ pub fn parse_picture_header(br: &mut BitReader<'_>) -> Result<PictureHeader> {
         aic_mode: false,
         slice_structured: false,
         sss: crate::slice::SssMode::default(),
+        independent_segment_decoding: false,
+        alternative_inter_vlc: false,
+        modified_quantization: false,
+        sei,
     })
+}
+
+/// Read a PSUPP byte stream from the picture-header PEI loop.
+///
+/// Layout per §5.1.24 / §5.1.25: `PEI(1)` then, if `PEI == 1`, eight bits
+/// of PSUPP data, then another `PEI` bit, repeating until `PEI == 0`.
+/// Returns the concatenated PSUPP bytes ready to pass into
+/// [`crate::sei::parse_psupp_stream`].
+fn read_psupp_stream(br: &mut BitReader<'_>) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let pei = br.read_u1()?;
+        if pei == 0 {
+            return Ok(out);
+        }
+        let pspare = br.read_u32(8)? as u8;
+        out.push(pspare);
+    }
 }
 
 /// Parse the PLUSPTYPE tail (H.263+, Annex U of the 01/2005 edition). Called
@@ -437,6 +488,9 @@ fn parse_plusptype_tail(
         rps_mode,
         aic_mode,
         ss_mode,
+        isd_mode,
+        aiv_mode,
+        mq_mode,
     ) = if ufep == 0b001 {
         let opptype = br.read_u32(18)?;
         // MSB-first helpers: `bit(k)` returns the k-th spec bit
@@ -496,21 +550,22 @@ fn parse_plusptype_tail(
         // CPCFC / ETR / UUI / SSS / ELNUM / RLNUM (Figure 6 / part
         // 2). Encoder-side opt-in is on `H263Encoder` via
         // `set_enable_annex_n_rps`.
-        if isd {
-            return Err(Error::unsupported(
-                "h263 Annex R independent segment decoding: follow-up",
-            ));
-        }
-        if aiv {
-            return Err(Error::unsupported(
-                "h263 Annex S alternative inter VLC: follow-up",
-            ));
-        }
-        if mq {
-            return Err(Error::unsupported(
-                "h263 Annex T modified quantization: follow-up",
-            ));
-        }
+        // Annex R (Independent Segment Decoding) — round 25 accepts the
+        // OPPTYPE bit on input; the segment-isolation behaviour for MV
+        // prediction / OBMC / deblock is plumbed through the GOB/slice
+        // walker (see [`crate::decoder`]). Annex R requires non-empty GOB
+        // headers OR Annex K Slice Structured to define segments; with
+        // both off the picture is one big segment (no semantic change).
+        // Annex R + RS submode of Annex K is required when both are on
+        // (§R.3.1) — we surface ISD on the parsed header and let the body
+        // driver enforce the constraint.
+        // Annex S (Alternative INTER VLC) — round 25 accepts the OPPTYPE
+        // bit and surfaces it on the header. Decoder MB / block paths
+        // route through the alternative VLC selection (§S.2 / §S.3).
+        // Annex T (Modified Quantization) — round 25 accepts the OPPTYPE
+        // bit and surfaces it. Decoder DQUANT field reads the §T.2 VLC,
+        // chroma quant uses §T.3 / Table T.2, and the §T.4 EXTENDED-ESCAPE
+        // is honoured at QUANT < 8.
         // PLUSPTYPE + UMV: Table D.3 MVD VLC + UUI + direct `predictor +
         // differential` reconstruction (no sign-of-predictor cascade). Both
         // encode and decode paths are in `crate::motion`; wired into
@@ -526,6 +581,9 @@ fn parse_plusptype_tail(
             rps,
             aic,
             sss,
+            isd,
+            aiv,
+            mq,
         )
     } else if ufep == 0b000 {
         // Inherit previous-picture OPPTYPE state. Since we do not yet retain
@@ -538,7 +596,9 @@ fn parse_plusptype_tail(
         // bit that actually matters. `opptype_src_format = 0` signals
         // "no OPPTYPE, dimensions must be inferable from later CPFMT (which
         // in turn will not be present for UFEP==000)".
-        (0, false, false, false, false, false, false, false, false)
+        (
+            0, false, false, false, false, false, false, false, false, false, false, false,
+        )
     } else {
         return Err(Error::invalid(format!(
             "h263 PLUSPTYPE: invalid UFEP {ufep:03b}"
@@ -764,14 +824,13 @@ fn parse_plusptype_tail(
         return Err(Error::invalid("h263 PLUSPTYPE: PQUANT == 0"));
     }
 
-    // PEI / PSPARE loop.
-    loop {
-        let pei = br.read_u1()?;
-        if pei == 0 {
-            break;
-        }
-        let _pspare = br.read_u32(8)?;
-    }
+    // PEI / PSPARE loop. PSPARE bytes carry PSUPP per §5.1.25 / Annex L.
+    let psupp = read_psupp_stream(br)?;
+    let sei = if psupp.is_empty() {
+        Vec::new()
+    } else {
+        crate::sei::parse_psupp_stream(&psupp)?
+    };
 
     let source_format = SourceFormat::for_dimensions(width, height).expect("validated above");
 
@@ -804,6 +863,10 @@ fn parse_plusptype_tail(
         aic_mode,
         slice_structured: ss_mode,
         sss: sss_mode,
+        independent_segment_decoding: isd_mode,
+        alternative_inter_vlc: aiv_mode,
+        modified_quantization: mq_mode,
+        sei,
     })
 }
 

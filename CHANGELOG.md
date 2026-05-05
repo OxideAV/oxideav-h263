@@ -7,6 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Annex L (Supplemental Enhancement Information) — decoder.** New
+  `crate::sei` module exposes [`Sei`](crate::sei::Sei) (one variant per
+  defined `FTYPE` in Table L.1 plus `Unknown` for reserved values) and
+  [`parse_psupp_stream`](crate::sei::parse_psupp_stream) which walks
+  the concatenated PSUPP byte sequence per §L.2 (4-bit `FTYPE` + 4-bit
+  `DSIZE` + `DSIZE` parameter bytes). The picture-header parser now
+  collects PSUPP bytes from the §5.1.24 / §5.1.25 PEI loop on both
+  baseline and PLUSPTYPE inputs, parses them via the new module, and
+  surfaces the result on `PictureHeader::sei`. Records with reserved /
+  unknown FTYPE are kept as `Sei::Unknown` blobs (per §L.2's
+  forward-compatibility note: discard `DSIZE` bytes and continue).
+  Action semantics (e.g. actually freezing the displayed picture for
+  `Sei::FullPictureFreezeRequest`) are out of scope of this codec
+  crate — they are downstream presentation concerns. New integration
+  tests in `tests/annex_l_sei.rs` plus a dozen unit tests in
+  `crate::sei`.
+
+- **Annex T (Modified Quantization) — header recognition + helpers +
+  I-picture body driver.** New `crate::mq` module exposes:
+  * [`decode_dquant_mq`](crate::mq::decode_dquant_mq) — §T.2 variable-
+    length DQUANT field. First bit `1` → 2-bit small-step alteration
+    (Table T.1 indexed by prior QUANT); first bit `0` → 6-bit arbitrary
+    new QUANT. Returns the new QUANT in `1..=31`.
+  * [`quant_c_for_quant`](crate::mq::quant_c_for_quant) — §T.3 Table T.2
+    luma → chroma quant mapping (a smaller step size for chroma improves
+    fidelity).
+  * [`unrotate_extended_level`](crate::mq::unrotate_extended_level) /
+    [`rotate_extended_level`](crate::mq::rotate_extended_level) — §T.4
+    11-bit cyclic rotation that recovers a signed `LEVEL` outside the
+    standard `[-127, +127]` range from the on-the-wire EXTENDED-LEVEL
+    field. The rotation prevents start-code emulation.
+  * `crate::block::decode_ac_mq` — INTER/INTRA AC decode honouring §T.4
+    EXTENDED-ESCAPE (`0000011 ? ?????? 1000_0000` followed by 11 bits
+    of cyclically-rotated EXTENDED-LEVEL) + §T.5 restrictions
+    (`|level| > 127` only when `quant < 8`; reconstruction magnitude
+    clipped to 4096).
+  * `crate::mb::decode_intra_mb_mq` — I-picture MB body driver using
+    §T.2 DQUANT, §T.3 chroma quant, and the §T.4 EXTENDED-ESCAPE-
+    aware AC decoder.
+  The picture-header parser surfaces `PictureHeader::modified_quantization`
+  from PLUSPTYPE OPPTYPE bit 14. The I-picture decoder dispatches to
+  `decode_intra_mb_mq` automatically when the flag is set. P-pictures
+  with MQ are rejected at `decode_one_picture` with a specific
+  `Unsupported` diagnostic (the §T.2 / §T.3 / §T.4 plumbing through
+  `decode_p_mb` / `decode_p_mb_pb` is round-26 work). New integration
+  tests in `tests/annex_t_modified_quantization.rs` plus 6 unit tests
+  in `crate::mq`.
+
+- **Annex S (Alternative INTER VLC) — header recognition + helper.**
+  New `crate::block::decode_ac_aiv` implements the §S.2 try-INTER-then-
+  fallback-to-INTRA AC decoder: a snapshot of the bit reader is taken,
+  the inter table is tried first, and on RUN-overflow the snapshot is
+  restored and the same bits are re-parsed through Table I.2 (the AIC
+  INTRA TCOEF VLC). The picture-header parser surfaces
+  `PictureHeader::alternative_inter_vlc` from PLUSPTYPE OPPTYPE bit 13.
+  Per-MB plumbing (routing `decode_p_mb`'s residual decode through
+  `decode_ac_aiv`, plus the §S.3 CBPY swap when `CBPC5 = CBPC6 = 1`)
+  is round-26 work; for now the decoder rejects an AIV-flagged picture
+  with a specific `Unsupported` diagnostic. New integration tests in
+  `tests/annex_s_aiv.rs`.
+
+- **Annex R (Independent Segment Decoding) — header recognition +
+  §R.3.1 RS-submode constraint check.** The picture-header parser
+  surfaces `PictureHeader::independent_segment_decoding` from PLUSPTYPE
+  OPPTYPE bit 12. The decoder enforces §R.3.1 (Annex R + Annex K
+  requires Annex K's Rectangular Slice submode), surfacing a specific
+  `Invalid` diagnostic when the constraint is violated. The §R.2
+  segment-isolation behaviour for MV prediction reuses the existing
+  GOB-boundary mask in `predict_mv_with_gob_mask`; the §R.2.4 out-of-
+  segment MV extrapolation is round-26 work, so for now the decoder
+  rejects ISD + (UMV / AP / Annex J) with a specific `Unsupported`
+  diagnostic. New integration tests in `tests/annex_r_isd.rs`.
+
+- **Picture-header field surface widened.** `PictureHeader` gained four
+  new fields (`independent_segment_decoding`, `alternative_inter_vlc`,
+  `modified_quantization`, `sei: Vec<crate::sei::Sei>`); existing
+  callers that built `PictureHeader` literally (none in this crate)
+  must add the fields. The PLUSPTYPE OPPTYPE bits 12 / 13 / 14 (ISD /
+  AIV / MQ) that previously returned `Error::Unsupported` now parse
+  cleanly and surface on these fields.
+
+  Total tests: 147 → 248 (+101 new tests covering Annex L PSUPP parser,
+  Annex T helpers + I-picture body, Annex R/S header recognition +
+  guards, plus the integration tests above).
+
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-h263/compare/v0.0.6...v0.0.7) - 2026-05-03
 
 ### Other

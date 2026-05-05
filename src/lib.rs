@@ -189,8 +189,49 @@
 //!   positives skipped-P-MB zero runs would otherwise produce. MV
 //!   prediction is reset at every slice boundary (§K.1 rule 1).
 //!
+//! * **Annex L — Supplemental Enhancement Information (decoder, round 25).**
+//!   The picture-header `PEI` loop now collects PSUPP bytes per §5.1.24 /
+//!   §5.1.25 and runs them through [`sei::parse_psupp_stream`], which
+//!   walks the §L.2 layout (4-bit `FTYPE` + 4-bit `DSIZE` + `DSIZE`
+//!   parameter bytes) and surfaces a `Vec<sei::Sei>` on
+//!   [`picture::PictureHeader::sei`]. Every defined `FTYPE` (1..=15 per
+//!   Table L.1) gets its own [`sei::Sei`] variant; reserved FTYPE values
+//!   are kept as `Sei::Unknown { ftype, payload }` per §L.2's "discard
+//!   `DSIZE` bytes and continue" rule.
+//!
+//! * **Annex T — Modified Quantization (helpers + I-picture body, round 25).**
+//!   The [`mq`] module hosts `decode_dquant_mq` (§T.2 VLC DQUANT),
+//!   `quant_c_for_quant` (§T.3 / Table T.2 chroma quant mapping), and
+//!   `unrotate_extended_level` / `rotate_extended_level` (§T.4 11-bit
+//!   cyclic rotation). [`block::decode_ac_mq`] is the EXTENDED-ESCAPE-
+//!   aware AC decoder. [`mb::decode_intra_mb_mq`] is the I-picture MB
+//!   body driver, dispatched automatically when
+//!   [`picture::PictureHeader::modified_quantization`] is set. P-picture
+//!   body wiring is round-26 follow-up; MQ P-pictures are rejected with
+//!   a specific `Unsupported` diagnostic.
+//!
+//! * **Annex S — Alternative INTER VLC (helper, round 25).**
+//!   [`block::decode_ac_aiv`] is the §S.2 try-INTER-then-fall-back-to-
+//!   INTRA AC decoder (snapshot + inter parse, restore + intra parse on
+//!   RUN-overflow). Picture-header recognition surfaces
+//!   [`picture::PictureHeader::alternative_inter_vlc`] from PLUSPTYPE
+//!   OPPTYPE bit 13. Per-MB plumbing (routing `decode_p_mb`'s residual
+//!   decode through `decode_ac_aiv` + the §S.3 CBPY swap) is round-26
+//!   work; AIV-flagged pictures are rejected at `decode_one_picture`.
+//!
+//! * **Annex R — Independent Segment Decoding (header + R.3.1 check,
+//!   round 25).** The picture-header parser surfaces
+//!   [`picture::PictureHeader::independent_segment_decoding`] from
+//!   PLUSPTYPE OPPTYPE bit 12; the decoder enforces §R.3.1 (Annex R +
+//!   Annex K requires Annex K's Rectangular Slice submode). The §R.2.4
+//!   out-of-segment MV extrapolation is round-26 follow-up; ISD +
+//!   (UMV / AP / Annex J) is rejected with a specific `Unsupported`
+//!   diagnostic.
+//!
 //! Out of scope (returns `Error::Unsupported`):
-//! * Annex P (Reference Picture Resampling), Annex T (Modified Quantization).
+//! * Annex P (Reference Picture Resampling), Annex Q (Reduced-Resolution
+//!   Update), Annex U (Enhanced Reference Picture Selection), Annex V
+//!   (Data-Partitioned Slice mode).
 //! * Annex N back-channel-message body (BCM) — §N.4.2 BT/URF/TR/ELNUMI/
 //!   ELNUM/BCPM/BSBI/BEPB1/2/GN/MBA/RTR/BSTUF parsing is rejected with
 //!   a specific `Unsupported` diagnostic when BCI = "1".
@@ -216,9 +257,11 @@ pub mod interp;
 pub mod mb;
 pub mod mb_sac;
 pub mod motion;
+pub mod mq;
 pub mod pb;
 pub mod picture;
 pub mod sac;
+pub mod sei;
 pub mod slice;
 pub mod start_code;
 

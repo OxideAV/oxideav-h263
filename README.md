@@ -43,9 +43,14 @@ this crate does not activate any MPEG-4 decoding behaviour.
 | Annex I (AIC) — I-pictures                       | yes    | yes    |
 | Annex K (Slice Structured Mode)                  | yes    | yes    |
 | Annex N (RPS — picture header + multi-ref)       | yes    | yes    |
+| Annex L (PSUPP / SEI parser)                     | yes    | no     |
 | Annex P (Reference Picture Resampling)           | no     | no     |
 | Annex Q (Reduced-Resolution Update)              | no     | no     |
-| Annex T (Modified Quantization)                  | no     | no     |
+| Annex R (Independent Segment Decoding) — header  | yes    | no     |
+| Annex S (Alternative INTER VLC) — helper         | helper | no     |
+| Annex T (Modified Quantization) — I-pic body     | I-only | no     |
+| Annex U (Enhanced RPS)                           | no     | no     |
+| Annex V (Data-Partitioned Slice mode)            | no     | no     |
 | Custom picture clock frequency (CPCFC)           | no     | no     |
 | Custom picture size (non-standard dimensions)    | no     | no     |
 | CPM (continuous-presence multipoint)             | no     | no     |
@@ -59,9 +64,14 @@ only when all of the following hold:
 
 * UFEP = `001` (full OPPTYPE present) — cross-picture feature-flag
   inheritance (UFEP = `000`) is not yet tracked.
-* No Annex P / Q / R / S / T bits are set.
+* No Annex P / Q / U / V bits are set.
   (Annex D / E / F / I — AIC — and N — RPS — and K — Slice
-  Structured — ARE now accepted; see below.)
+  Structured — ARE accepted; Annex L — SEI — is parsed and surfaced;
+  Annex R — ISD — is recognised + the §R.3.1 RS-submode constraint
+  is enforced; Annex S — AIV — is recognised + the helper
+  `block::decode_ac_aiv` is shipped (per-MB plumbing follow-up); Annex
+  T — MQ — is recognised + the I-picture body driver is wired
+  (P-picture body follow-up). See annex sections below.)
 * No custom picture clock frequency.
 * Any custom picture size in CPFMT happens to coincide with one of the
   standard source formats (sub-QCIF / QCIF / CIF / 4CIF / 16CIF).
@@ -276,6 +286,79 @@ predictor).
   criterion was 5–10 %; the test asserts a softer floor (Annex M never
   larger than Annex G + 1 %) so the result is stable across QP / fixture
   tweaks while still catching gross regressions.
+
+### Annex L — Supplemental Enhancement Information
+
+Round 25 wires the Annex L PSUPP parser. The picture-header `PEI`
+loop (§5.1.24 / §5.1.25) now collects the de-interleaved PSUPP bytes
+and passes them through [`crate::sei::parse_psupp_stream`], which walks
+the §L.2 layout (4-bit `FTYPE` + 4-bit `DSIZE` + `DSIZE` parameter
+bytes) and surfaces a `Vec<crate::sei::Sei>` on the parsed
+`PictureHeader::sei` field. Every defined `FTYPE` (1..=15 per Table
+L.1, including Do-Nothing, Full / Partial / Resizing freeze requests
+and -release, snapshot tags, video-time-segment + progressive-
+refinement-segment tags, chroma keying information, and the §L.15
+extended-function-type indicator) gets its own [`Sei`] variant;
+reserved FTYPE values are forward-compatibility-preserved as
+`Sei::Unknown { ftype, payload }` per §L.2's "discard `DSIZE` bytes
+and continue" rule. Action semantics (e.g. actually freezing the
+displayed picture for `Sei::FullPictureFreezeRequest`) are out of
+scope of this codec crate — they are downstream presentation
+concerns.
+
+### Annex T — Modified Quantization
+
+Round 25 wires the Annex T helpers + the I-picture body driver:
+
+* **Header recognition** — PLUSPTYPE OPPTYPE bit 14 (MQ) surfaces on
+  `PictureHeader::modified_quantization`.
+* **`crate::mq` module** — `decode_dquant_mq` reads the §T.2 variable-
+  length DQUANT field (2 bits for a small-step alteration per Table
+  T.1, or 6 bits for an arbitrary new QUANT); `quant_c_for_quant`
+  applies the §T.3 / Table T.2 luma → chroma quant mapping;
+  `unrotate_extended_level` / `rotate_extended_level` perform the §T.4
+  11-bit cyclic rotation that recovers a signed `LEVEL` outside the
+  standard `[-127, +127]` range from the on-the-wire EXTENDED-LEVEL
+  field.
+* **`crate::block::decode_ac_mq`** — INTER/INTRA AC decoder honouring
+  the §T.4 EXTENDED-ESCAPE marker (`1000_0000` after the standard
+  escape body) + §T.5 restrictions (`|level| > 127` only when
+  `quant < 8`).
+* **I-picture MB body** — `crate::mb::decode_intra_mb_mq` is the
+  Annex T variant of `decode_intra_mb`, dispatched automatically by
+  the I-picture decoder when `hdr.modified_quantization` is set.
+  Chroma quant is derived per Table T.2.
+* P-picture body (decode_p_mb / decode_p_mb_pb routing through the
+  §T.2 DQUANT VLC and §T.3 chroma quant) is round-26 work; an MQ
+  P-picture is rejected at `decode_one_picture` with a specific
+  `Unsupported` diagnostic.
+
+### Annex S — Alternative INTER VLC (helper)
+
+Round 25 ships `crate::block::decode_ac_aiv` — the §S.2 try-INTER-then-
+fallback-to-INTRA AC decoder. Implementation snapshot the bit reader,
+runs the inter-VLC parse first; on RUN-overflow restores the snapshot
+and re-parses the same bits through Table I.2 (the AIC INTRA TCOEF
+VLC). Picture-header recognition surfaces
+`PictureHeader::alternative_inter_vlc` from PLUSPTYPE OPPTYPE bit 13.
+Per-MB plumbing (routing `decode_p_mb`'s residual decode through
+`decode_ac_aiv` + the §S.3 CBPY swap when `CBPC5 = CBPC6 = 1`) is
+round-26 work; AIV-flagged pictures are rejected at
+`decode_one_picture`.
+
+### Annex R — Independent Segment Decoding (header + R.3.1 check)
+
+Round 25 wires picture-header recognition (PLUSPTYPE OPPTYPE bit 12
+→ `PictureHeader::independent_segment_decoding`) and enforces §R.3.1
+(Annex R + Annex K requires Annex K's Rectangular Slice submode), with
+a specific `Invalid` diagnostic when the constraint is violated. The
+§R.2.4 out-of-segment MV extrapolation (which would let the decoder
+combine ISD with UMV / AP / Annex J without producing wrong pels) is
+round-26 work; for now the decoder rejects ISD + (UMV / AP / Annex J)
+with a specific `Unsupported` diagnostic. ISD on baseline
+1-MV-inter / I-pictures with no UMV / AP / Annex J is the only
+combination that decodes through round 25 — useful for streams that
+opt in to ISD purely for the GOB-boundary MV-prediction reset.
 
 ## Quick use
 
