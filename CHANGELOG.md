@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-h263/compare/v0.0.7...v0.0.8) - 2026-05-06
+
+### Other
+
+- drop stale REGISTRARS / with_all_features intra-doc links
+- drop dead `linkme` dep
+- fix clippy::match_single_binding in encoder_annex_round_trip.rs
+- fix clippy::collapsible_if in Annex R ISD guard
+- Annex L/S/T emit + P/Q/R/U/V/W flag surfaces + 20 integration tests
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- correct round 25 test-count delta (215 → 248, +33 not +101)
+- Annexes L / R / S / T — header recognition + helpers + I-pic body
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-h263/pull/502))
+- rustfmt fix for tests/docs_corpus.rs
+- wire docs/video/h263/ fixture corpus into integration test
+
 ### Added
 
 - **Annex L (Supplemental Enhancement Information) — decoder.** New
