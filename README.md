@@ -5,9 +5,9 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 3 — picture + GOB + macroblock headers.**
-The prior implementation was retired on 2026-05-18 under the
-workspace
+**Orphan-rebuild round 4 — picture + GOB + macroblock headers +
+block data.** The prior implementation was retired on 2026-05-18
+under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 the encoder VLC tables were declared as mirrors of a sibling crate's
 tables whose own provenance has been retired. The transitive
@@ -16,8 +16,9 @@ history was fully erased per the Hat-3 cold-enforcement procedure.
 
 The crate is being re-built clean-room against ITU-T Recommendation
 H.263 (01/2005). The current master implements §5.1 (picture layer),
-§5.2 (GOB layer up through GQUANT), and §5.3 (macroblock header
-through MVD2-4) for the non-PB-frame baseline:
+§5.2 (GOB layer up through GQUANT), §5.3 (macroblock header through
+MVD2-4), and §5.4 (block-layer INTRADC + TCOEF) for the non-PB-frame
+baseline:
 
 * §5.1.1 — Picture Start Code (PSC), 22 bits, value `0x000020`.
 * §5.1.2 — Temporal Reference (TR), 8 bits at the standard CIF
@@ -50,14 +51,26 @@ through MVD2-4) for the non-PB-frame baseline:
 * §5.3.7 / §5.3.8 — Motion Vector Data (MVD + MVD2-4), variable
   length; full Table 14 (64 codes). Components returned in
   half-pel units as signed `i8` in `[-32, +31]`.
+* §5.4.1 — DC coefficient for INTRA blocks (INTRADC), 8-bit FLC
+  per Table 15: codes `0x00` and `0x80` forbidden, `0xFF` is the
+  special slot for reconstruction level 1024, all others linear
+  `code * 8`.
+* §5.4.2 — Transform Coefficient (TCOEF), variable length; full
+  Table 16 (102 regular VLC code-points with trailing sign + the
+  `0000 011` ESCAPE prefix followed by a fixed-length 1 + 6 + 8 =
+  15-bit event with two forbidden LEVEL codes in baseline).
+  Coefficients are accumulated into a 64-entry array in **zigzag
+  scan position order**; the §6.2.3 / Figure 14 zigzag → 8×8
+  block-position permutation is exposed as the
+  `ZIGZAG_TO_BLOCK_POS` constant.
 
 The function surface is intentionally minimal:
 
 ```rust,ignore
 use oxideav_core::bits::BitReader;
 use oxideav_h263::{
-    parse_gob_layer, parse_macroblock, parse_picture_header,
-    H263SourceFormat, MbContext,
+    parse_block, parse_gob_layer, parse_macroblock, parse_picture_header,
+    BlockContext, H263SourceFormat, MbContext,
 };
 
 let mut r = BitReader::new(&bytes);
@@ -78,17 +91,40 @@ let mb = parse_macroblock(
         quantiser_before: gob.quantiser,
     },
 )?;
+
+// One block of the macroblock per §5.4, with the caller deriving
+// the INTRADC / coefficient presence from the MB type + CBP bits.
+let block = parse_block(
+    &mut r,
+    BlockContext {
+        has_intradc: mb.mb_type.unwrap().is_intra(),
+        has_coefficients: false, // for this luma block's CBPY bit
+    },
+)?;
 ```
 
 ### What is NOT yet implemented
 
-* Block-data decode (§5.4 / Annex H VLCs) — round 3 stops at the
-  macroblock header.
+* Inverse quantisation (§6.2.1) and inverse DCT (§6.2.4); the
+  `H263Block::coefficients` array is the raw sign-applied `LEVEL`
+  integers, not the reconstruction levels a renderer would need.
+* The §6.2.3 / Figure 14 scatter into 8×8 block layout. The
+  `ZIGZAG_TO_BLOCK_POS` permutation is exposed; the parser
+  itself stays in scan order.
+* The per-macroblock driver loop that walks all six blocks (4 luma
+  + 2 chroma), deriving each block's `BlockContext` from the
+  macroblock's MB type and CBPY / CBPC bits, is not yet wired —
+  callers compose `parse_block` themselves.
 * PB-frame MODB / CBPB / MVDB (§5.3.3 / §5.3.4 / §5.3.9, Annex G);
   the parser refuses no fields directly but the caller's picture
   context must keep `pb_frames = false`.
 * Annex T variable-length DQUANT (Modified Quantization mode);
-  the baseline 2-bit form is the only one decoded.
+  the baseline 2-bit form is the only one decoded, and the
+  Annex-T EXTENDED-ESCAPE LEVEL prefix (`1000 0000`) is not
+  accepted in TCOEF.
+* Annex I (Advanced INTRA Coding) — alternate scans and the
+  INTRADC-as-AC-coded-value path. Round-4 §5.4.1 is the baseline
+  8-bit FLC INTRADC form.
 * Annex D Table D.3 alternative MVD codes — round 3 uses Table 14
   unconditionally.
 * Annex O B/EI/EP picture macroblocks.
@@ -107,17 +143,20 @@ let mb = parse_macroblock(
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 3 coverage estimate
+### Round 4 coverage estimate
 
 * H.263 spec text covered: §5.1.1–§5.1.3 + §5.2.2 + §5.2.3 +
   §5.2.5 + §5.2.6 + §5.3.1 + §5.3.2 + §5.3.5 + §5.3.6 + §5.3.7 +
-  §5.3.8. Roughly 6 pages of the ~144-page recommendation.
-* Tests: 42 unit tests on synthetic buffers built with the spec's
+  §5.3.8 + §5.4.1 + §5.4.2 + Figure 14 zigzag table. Roughly 8
+  pages of the ~144-page recommendation.
+* Tests: 63 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
-  (21 + 4 codes), 12 (16 codes), and 14 (64 codes), plus one
-  composition test that drives all three parsers from a single
-  `BitReader`.
+  (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
+  and 16 (102 regular code-points across both sign polarities,
+  plus the ESCAPE event with both signs and both forbidden LEVEL
+  codes), plus two composition tests that chain four parsers
+  (picture → GOB → MB → block) from a single `BitReader`.
 
 ## License
 

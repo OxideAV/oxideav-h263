@@ -8,6 +8,57 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Block-layer parser (§5.4, non-PB-frame, non-Annex-T, non-Annex-I
+  baseline subset):
+  - §5.4.1 INTRADC — 8-bit FLC with two forbidden codes (`0x00`,
+    `0x80`) per Table 15, plus the `0xFF`-means-1024 special case;
+    all other codes map linearly to `code * 8`.
+  - §5.4.2 TCOEF — full Table 16 transcribed: 102 regular VLC
+    code-points (each followed by a single sign bit) plus the
+    `0000 011` ESCAPE prefix followed by a fixed-length 22-bit
+    event (`LAST (1) || RUN (6) || LEVEL (8, two's complement,
+    forbidden codes `0x00` / `0x80` in baseline)`). The VLC
+    dispatcher reads up to 13 prefix bits and matches against the
+    table by `(prefix-length, prefix-value)`; ESCAPE LEVEL is
+    interpreted as `i8` two's complement.
+  - Coefficient accumulation into a 64-entry `coefficients` array
+    in **zigzag scan position order** (slot 0 = DC). The
+    §6.2.3 / Figure 14 zigzag → 8×8 block-position permutation is
+    exposed as the `ZIGZAG_TO_BLOCK_POS` constant for callers that
+    need to scatter into pixel layout; the parser itself stays in
+    scan order.
+  - Per-block `BlockContext` (`has_intradc`, `has_coefficients`)
+    threaded by the caller from MB type + CBPY/CBPC bits.
+- Public `block` module with `H263Block`, `BlockContext`,
+  `parse_block`, `COEFFS_PER_BLOCK`, `ZIGZAG_TO_BLOCK_POS`.
+- 21 unit tests in `block::tests`: empty INTER skip, INTRA-DC-only,
+  INTRADC Table 15 spot-check across both special-case codes and
+  the linear range, single-event INTER, INTRA + AC, two-event with
+  RUN gap, full ESCAPE round-trip (positive + negative LEVEL),
+  both ESCAPE LEVEL forbidden codes, RUN-overflow rejection, the
+  full 102-entry Table 16 round-trip across both sign polarities,
+  Table-16 row-count invariant, zigzag-table endpoints +
+  permutation invariant, truncated-INTRADC EOF, invalid-prefix
+  rejection, and a `picture → GOB → MB → block` composition test.
+- New error variants `BadIntradcCode`, `BadTcoefCode`,
+  `BadTcoefEscapeLevel`, `BadTcoefRunOverflow`.
+
+### Not yet wired (after round 4)
+
+- Inverse quantisation (§6.2.1) and inverse DCT (§6.2.4); the
+  coefficient array is the raw sign-applied LEVEL integers, not
+  reconstruction levels.
+- Zigzag → 8×8 scatter (§6.2.3); `ZIGZAG_TO_BLOCK_POS` is exposed
+  but the parser leaves the caller to apply it.
+- Macroblock-loop assembly: round 4 parses *one* block given the
+  caller's `BlockContext`; the per-MB driver that walks all six
+  blocks (and applies CBPY/CBPC bits per-block) is not yet wired.
+- Annex I (Advanced INTRA Coding) — alternate scans + INTRADC as
+  a regular AC-coded value.
+- Annex T (Modified Quantization) — EXTENDED-ESCAPE LEVEL prefix
+  (relaxes the `0x80` forbidden code).
+- PB-frames B-block decode (§5.4 last paragraph + Annex G).
+
 - Macroblock-layer header parser (§5.3, non-PB-frame baseline subset):
   - §5.3.1 COD (1 bit, INTER pictures only); §5.3.2 MCBPC
     decoded against both Table 7 (I-pictures, 9 codes) and
@@ -35,10 +86,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - New error variants `BadMcbpcCode`, `BadCbpyCode`,
   `BadMvdCode`.
 
-### Not yet wired (after round 3)
+### Not yet wired (after round 3, superseded by round 4 above
+###  for §5.4)
 
-- Block-data decode (§5.4 / Annex H VLCs) — round 3 stops
-  at the macroblock header.
 - PB-frame MODB / CBPB / MVDB (§5.3.3 / §5.3.4 / §5.3.9,
   Annex G); the parser refuses no fields but the caller's
   picture context must keep `pb_frames = false`.

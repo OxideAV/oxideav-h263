@@ -21,11 +21,20 @@
 //!   DQUANT baseline form (§5.3.6, Table 13), and primary +
 //!   secondary MVD (§5.3.7 / §5.3.8, Table 14). The decode is
 //!   purely structural — no IDCT or pixel reconstruction.
+//! * **Round 4** — Block-layer parsing per §5.4: INTRADC (§5.4.1,
+//!   Table 15 — 8-bit FLC with two forbidden codes and the
+//!   `0xFF`-means-1024 special case) and TCOEF (§5.4.2, Table 16
+//!   — 102 regular VLC code-points + one 7-bit ESCAPE prefix
+//!   followed by a fixed-length 1+6+8 event). Decoded coefficients
+//!   land in a 64-entry zigzag-scan-order array per block; the
+//!   §6.2.3 / Figure 14 zigzag→8×8 position table is exposed for
+//!   callers that need it. Inverse quantisation (§6.2.1) and IDCT
+//!   (§6.2.4) remain out of scope.
 //!
-//! Block-data decode (§5.4) and the PB-frame / Annex-T / extended-PTYPE
-//! paths are still out of scope; every operational decode path
-//! returns [`Error::NotImplemented`] until a frame-yielding
-//! `Decoder` impl lands.
+//! PB-frame / Annex-T / Annex-I / extended-PTYPE paths are still
+//! out of scope; every operational decode path returns
+//! [`Error::NotImplemented`] until a frame-yielding `Decoder` impl
+//! lands.
 //!
 //! [spec]: https://www.itu.int/rec/T-REC-H.263
 
@@ -34,10 +43,12 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::RuntimeContext;
 
+pub mod block;
 pub mod gob_header;
 pub mod macroblock;
 pub mod picture_header;
 
+pub use block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
 pub use gob_header::{
     parse_gob_layer, parse_gob_layer_from_bytes, GobLayer, GBSC_BITS, GBSC_VALUE, GFID_BITS,
     GN_BITS, GOB_HEADER_BITS_NO_CPM, GQUANT_BITS,
@@ -95,6 +106,23 @@ pub enum Error {
     /// not present in the spec table — the prefix consumed 13 bits
     /// without matching any of the 64 entries.
     BadMvdCode,
+    /// The INTRADC 8-bit FLC (§5.4.1, Table 15) was one of the
+    /// two forbidden codes (`0x00` or `0x80`).
+    BadIntradcCode,
+    /// A TCOEF VLC prefix (§5.4.2, Table 16) was not present in
+    /// the spec table — 13 bits consumed without matching any of
+    /// the 102 regular code-points or the ESCAPE prefix.
+    BadTcoefCode,
+    /// The ESCAPE-mode LEVEL field (§5.4.2) was one of the two
+    /// forbidden codes (`0x00` or `0x80`) in baseline mode (the
+    /// `0x80` code is reserved as EXTENDED-ESCAPE under Annex T,
+    /// which round 4 does not implement).
+    BadTcoefEscapeLevel,
+    /// A TCOEF event's RUN advanced the zigzag scan position past
+    /// the 64-coefficient block boundary. Returned by [`block::parse_block`]
+    /// (§5.4.2 implicit constraint: RUN must keep the scan position
+    /// inside the block).
+    BadTcoefRunOverflow,
 }
 
 impl core::fmt::Display for Error {
@@ -145,6 +173,22 @@ impl core::fmt::Display for Error {
             Error::BadMvdCode => write!(
                 f,
                 "oxideav-h263: MVD component variable-length code not found in Table 14"
+            ),
+            Error::BadIntradcCode => write!(
+                f,
+                "oxideav-h263: INTRADC code 0x00 or 0x80 is forbidden per Table 15"
+            ),
+            Error::BadTcoefCode => write!(
+                f,
+                "oxideav-h263: TCOEF variable-length code not found in Table 16"
+            ),
+            Error::BadTcoefEscapeLevel => write!(
+                f,
+                "oxideav-h263: ESCAPE-mode TCOEF LEVEL was a forbidden code (0x00 or 0x80)"
+            ),
+            Error::BadTcoefRunOverflow => write!(
+                f,
+                "oxideav-h263: TCOEF RUN advanced the zigzag scan past coefficient 63"
             ),
         }
     }
