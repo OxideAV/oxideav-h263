@@ -3,15 +3,22 @@
 //! Pure-Rust ITU-T H.263 baseline video codec for the
 //! [oxideav](https://github.com/OxideAV/oxideav) framework.
 //!
-//! **Status:** orphan-rebuild round-1 (post 2026-05-18 audit).
+//! **Status:** orphan-rebuild round-2 (post 2026-05-18 audit).
 //!
 //! The decoder is being re-built clean-room against
-//! [ITU-T Recommendation H.263 (01/2005)][spec]. Round 1 lands the
-//! picture-header parser per §5.1 of the spec: the Picture Start Code
-//! (PSC), Temporal Reference (TR), and the variable-length Type
-//! Information (PTYPE) field with its source-format and picture-coding
-//! sub-fields. No macroblock, motion-vector, or DCT decode is wired up
-//! yet; every operational decode path still returns
+//! [ITU-T Recommendation H.263 (01/2005)][spec]. Coverage so far:
+//!
+//! * **Round 1** — picture-header parser per §5.1: the Picture Start
+//!   Code (PSC), Temporal Reference (TR), and the variable-length
+//!   Type Information (PTYPE) field with its source-format and
+//!   picture-coding sub-fields.
+//! * **Round 2** — GOB-layer header per §5.2: Group of Blocks Start
+//!   Code (GBSC), Group Number (GN), GOB Frame ID (GFID), and
+//!   Quantizer Information (GQUANT), for the CPM = "0" branch (no
+//!   GSBI on the wire).
+//!
+//! No macroblock, motion-vector, or DCT decode is wired up yet;
+//! every operational decode path still returns
 //! [`Error::NotImplemented`].
 //!
 //! [spec]: https://www.itu.int/rec/T-REC-H.263
@@ -21,8 +28,13 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::RuntimeContext;
 
+pub mod gob_header;
 pub mod picture_header;
 
+pub use gob_header::{
+    parse_gob_layer, parse_gob_layer_from_bytes, GobLayer, GBSC_BITS, GBSC_VALUE, GFID_BITS,
+    GN_BITS, GOB_HEADER_BITS_NO_CPM, GQUANT_BITS,
+};
 pub use picture_header::{
     parse_picture_header, H263PictureCodingType, H263PictureHeader, H263SourceFormat, PSC_BITS,
     PSC_VALUE,
@@ -53,6 +65,17 @@ pub enum Error {
     /// yet decoded — round 1 only covers the non-extended PTYPE
     /// header. See §5.1.4.
     ExtendedPtypeNotSupported,
+    /// The 17-bit Group of Blocks Start Code (GBSC, value
+    /// `0000 0000 0000 0000 1`) was not present at the current
+    /// bitstream position. See §5.2.2.
+    BadGroupStartCode,
+    /// The Group Number (GN) was outside the legal GOB-layer range.
+    /// Values `0`, `30`, `31` are rejected — `0` is reserved to PSC,
+    /// `30` is the EOSBS marker, `31` is the EOS marker. See §5.2.3.
+    InvalidGroupNumber,
+    /// GQUANT was `0`; §5.2.6 limits the natural-binary QUANT field
+    /// to `1..=31`.
+    InvalidQuantiser,
 }
 
 impl core::fmt::Display for Error {
@@ -81,6 +104,17 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-h263: extended PTYPE (PLUSPTYPE) path not yet supported"
             ),
+            Error::BadGroupStartCode => write!(
+                f,
+                "oxideav-h263: group-of-blocks start code (GBSC) not found at expected position"
+            ),
+            Error::InvalidGroupNumber => write!(
+                f,
+                "oxideav-h263: group number (GN) outside the legal GOB-layer range (1..=29)"
+            ),
+            Error::InvalidQuantiser => {
+                write!(f, "oxideav-h263: GQUANT was 0 (legal range is 1..=31)")
+            }
         }
     }
 }

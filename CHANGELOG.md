@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- GOB-layer header parser (§5.2, CPM = "0" branch):
+  - GBSC detection (17 bits, value `0000 0000 0000 0000 1`).
+  - GN (5 bits), accepted in `1..=29` (covers both standard and
+    custom picture-format ranges); `0` / `30` / `31` rejected as PSC
+    overlap / EOSBS / EOS markers.
+  - GFID (2 bits) consumed and exposed for future inter-GOB
+    continuity checks.
+  - GQUANT (5 bits) decoded as QUANT in `1..=31`; `0` rejected.
+- Public `GobLayer`, `parse_gob_layer`,
+  `parse_gob_layer_from_bytes`, and the `GBSC_VALUE` / `GBSC_BITS` /
+  `GN_BITS` / `GFID_BITS` / `GQUANT_BITS` /
+  `GOB_HEADER_BITS_NO_CPM` constants.
+- 14 unit tests against synthetic buffers built per §5.2 bit layout,
+  including one that chains the round-1 picture header with a
+  round-2 GOB header through a single `BitReader` and asserts the
+  reader is left at the first byte of macroblock data.
+- New error variants: `BadGroupStartCode`, `InvalidGroupNumber`,
+  `InvalidQuantiser`.
 - Picture-layer header parser (§5.1, non-extended PTYPE):
   - PSC detection (22 bits, value `0x000020`).
   - Temporal Reference (8 bits at standard CIF PCF).
@@ -25,7 +43,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 ### Not yet wired
 
 - Macroblock / motion-vector / DCT decode (§5.3, §5.4, Annex H).
-- GOB layer (§5.2), slice-structured mode (Annex K).
+- GSTUF stuffing (§5.2.1) — caller's responsibility to skip before
+  invoking the GOB parser.
+- GSBI (§5.2.4, CPM = "1" branch) — picture-layer CPM bit is not yet
+  exposed by the round-1 parser, so the GOB parser only handles the
+  CPM = "0" case.
+- Slice-structured mode (Annex K).
 - Annex-O optional fields after PTYPE (PQUANT, CPM/PSBI, TRB,
   DBQUANT, PEI/PSUPP).
 - Extended PTYPE / PLUSPTYPE path (§5.1.4) and every annex it gates.
