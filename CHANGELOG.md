@@ -8,6 +8,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Macroblock-layer header parser (§5.3, non-PB-frame baseline subset):
+  - §5.3.1 COD (1 bit, INTER pictures only); §5.3.2 MCBPC
+    decoded against both Table 7 (I-pictures, 9 codes) and
+    Table 8 (P-pictures, 25 codes including type-5
+    INTER4V+Q points reserved for PLUSPTYPE + Annex F/J);
+    §5.3.5 CBPY decoded against Table 12 (all 16 patterns);
+    §5.3.6 DQUANT baseline two-bit form with QUANT clipped to
+    `1..=31` per spec; §5.3.7 / §5.3.8 MVD + MVD2-4 decoded
+    against Table 14 (all 64 codes), returned in half-pel
+    units as signed `i8` in `[-32, +31]`.
+  - VLC dispatch uses `BitReader::read_unary` for the
+    leading-zero prefix and per-bucket suffix bits — every
+    bit-pattern matches the spec's MSB-first printed code
+    1-for-1.
+- Public `H263Macroblock`, `MbType`, `MbContext`, `Mvd`
+  types and `parse_macroblock` free function in the new
+  `macroblock` module.
+- 20 unit tests against synthetic buffers (full Table 7,
+  full Table 8 indices 0..=20, full type-5 sub-codes, full
+  Table 12, full Table 14 + extremes + non-zero round-trip),
+  the COD-skip path, DQUANT clamping at both ends, the
+  MCBPC stuffing path, and a composition test that chains
+  picture / GOB / macroblock parsers through a single
+  `BitReader`.
+- New error variants `BadMcbpcCode`, `BadCbpyCode`,
+  `BadMvdCode`.
+
+### Not yet wired (after round 3)
+
+- Block-data decode (§5.4 / Annex H VLCs) — round 3 stops
+  at the macroblock header.
+- PB-frame MODB / CBPB / MVDB (§5.3.3 / §5.3.4 / §5.3.9,
+  Annex G); the parser refuses no fields but the caller's
+  picture context must keep `pb_frames = false`.
+- Annex T variable-length DQUANT (Modified Quantization
+  mode); the baseline 2-bit form is the only one decoded.
+- Annex D Table D.3 alternative MVD codes — round 3 uses
+  Table 14 unconditionally.
+- Annex O B/EI/EP picture macroblocks.
+
 - GOB-layer header parser (§5.2, CPM = "0" branch):
   - GBSC detection (17 bits, value `0000 0000 0000 0000 1`).
   - GN (5 bits), accepted in `1..=29` (covers both standard and

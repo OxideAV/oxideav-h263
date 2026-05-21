@@ -16,10 +16,16 @@
 //!   Code (GBSC), Group Number (GN), GOB Frame ID (GFID), and
 //!   Quantizer Information (GQUANT), for the CPM = "0" branch (no
 //!   GSBI on the wire).
+//! * **Round 3** — Macroblock-layer header per §5.3: COD (§5.3.1),
+//!   MCBPC (§5.3.2, Tables 7 / 8), CBPY (§5.3.5, Table 12),
+//!   DQUANT baseline form (§5.3.6, Table 13), and primary +
+//!   secondary MVD (§5.3.7 / §5.3.8, Table 14). The decode is
+//!   purely structural — no IDCT or pixel reconstruction.
 //!
-//! No macroblock, motion-vector, or DCT decode is wired up yet;
-//! every operational decode path still returns
-//! [`Error::NotImplemented`].
+//! Block-data decode (§5.4) and the PB-frame / Annex-T / extended-PTYPE
+//! paths are still out of scope; every operational decode path
+//! returns [`Error::NotImplemented`] until a frame-yielding
+//! `Decoder` impl lands.
 //!
 //! [spec]: https://www.itu.int/rec/T-REC-H.263
 
@@ -29,12 +35,14 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::RuntimeContext;
 
 pub mod gob_header;
+pub mod macroblock;
 pub mod picture_header;
 
 pub use gob_header::{
     parse_gob_layer, parse_gob_layer_from_bytes, GobLayer, GBSC_BITS, GBSC_VALUE, GFID_BITS,
     GN_BITS, GOB_HEADER_BITS_NO_CPM, GQUANT_BITS,
 };
+pub use macroblock::{parse_macroblock, H263Macroblock, MbContext, MbType, Mvd};
 pub use picture_header::{
     parse_picture_header, H263PictureCodingType, H263PictureHeader, H263SourceFormat, PSC_BITS,
     PSC_VALUE,
@@ -74,8 +82,19 @@ pub enum Error {
     /// `30` is the EOSBS marker, `31` is the EOS marker. See §5.2.3.
     InvalidGroupNumber,
     /// GQUANT was `0`; §5.2.6 limits the natural-binary QUANT field
-    /// to `1..=31`.
+    /// to `1..=31`. Also returned by the macroblock parser when the
+    /// caller passes an out-of-range QUANT through [`MbContext`].
     InvalidQuantiser,
+    /// The MCBPC codeword (§5.3.2) was not present in Table 7 or
+    /// Table 8 — either the leading-zero run had no corresponding
+    /// bucket, or the suffix bits did not match any defined code.
+    BadMcbpcCode,
+    /// The CBPY codeword (§5.3.5) was not present in Table 12.
+    BadCbpyCode,
+    /// A motion-vector difference component (§5.3.7, Table 14) was
+    /// not present in the spec table — the prefix consumed 13 bits
+    /// without matching any of the 64 entries.
+    BadMvdCode,
 }
 
 impl core::fmt::Display for Error {
@@ -115,6 +134,18 @@ impl core::fmt::Display for Error {
             Error::InvalidQuantiser => {
                 write!(f, "oxideav-h263: GQUANT was 0 (legal range is 1..=31)")
             }
+            Error::BadMcbpcCode => write!(
+                f,
+                "oxideav-h263: MCBPC variable-length code not found in Table 7/8"
+            ),
+            Error::BadCbpyCode => write!(
+                f,
+                "oxideav-h263: CBPY variable-length code not found in Table 12"
+            ),
+            Error::BadMvdCode => write!(
+                f,
+                "oxideav-h263: MVD component variable-length code not found in Table 14"
+            ),
         }
     }
 }
