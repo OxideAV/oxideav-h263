@@ -8,6 +8,44 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Inverse quantisation, zigzag scatter, and 8×8 inverse DCT (round 5):
+  - §6.1 / §6.2.1 H.261-style modulo-2-oddifier inverse-quant rule
+    applied to AC coefficients (DC slot preserved for INTRA — already
+    holds the Table 15 reconstruction level from round 4):
+    `|REC| = QUANT · (2 · |LEVEL| + 1)` for odd QUANT,
+    `|REC| = QUANT · (2 · |LEVEL| + 1) − 1` for even QUANT,
+    then `REC = sign(LEVEL) · |REC|`.
+  - §6.2.2 reconstruction-level clip to `[-2048, +2047]` applied to
+    AC slots in-place.
+  - §6.2.3 / Figure 14 zigzag → 8×8 scatter via
+    [`scatter_into_block`].
+  - §6.2.4 inverse DCT computed directly in `f64` against a 64-entry
+    `cos(π·(2n+1)·k/16)` table. Output rounded to nearest integer
+    and clipped to `[-256, +255]` per §6.2.4. Annex A.7 accuracy
+    budget satisfied by construction (the kernel matches the
+    "at least 64-bit floating point" reference exactly).
+  - §6.3.2 intra-block 8-bit sample clip to `[0, 255]`.
+  - End-to-end composer [`reconstruct_intra_block`] takes a parsed
+    [`H263Block`] + QUANT and emits an 8×8 `u8` sample block.
+- Public `dequant` module with `dequantise_ac`, `scatter_into_block`,
+  `AC_REC_MIN`, `AC_REC_MAX`.
+- Public `idct` module with `idct_8x8`, `reconstruct_intra_samples`,
+  `BLOCK_DIM`, `IDCT_OUT_MIN`, `IDCT_OUT_MAX`.
+- 30 unit tests across `dequant::tests`, `idct::tests`, and
+  `lib_tests`: zero-level stays zero across all 31 QUANT values,
+  odd/even QUANT spot-checks at small and large LEVELs, the
+  "REC is always odd" §6.2.1 invariant, INTRA DC preservation,
+  INTER slot-0 processing, §6.2.2 clip at both extremes, scatter
+  permutation bijectivity, §A.8 zero-in/zero-out invariant,
+  DC-only IDCT spot-checks at positive and negative DC, the
+  single-AC-coefficient horizontal-basis ±1 error budget, IDCT
+  diagonal symmetry, IDCT saturation safety, intra-DC uniform-field
+  reconstruct at three DC values, INTRADC = 800 → pixel 100,
+  DC + small AC pattern with sign-reversal across the row,
+  intra-reconstruction clipped at both 0 and 255 by §6.3.2.
+
+### Block-layer parser (round 4, kept for context)
+
 - Block-layer parser (§5.4, non-PB-frame, non-Annex-T, non-Annex-I
   baseline subset):
   - §5.4.1 INTRADC — 8-bit FLC with two forbidden codes (`0x00`,
@@ -43,21 +81,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - New error variants `BadIntradcCode`, `BadTcoefCode`,
   `BadTcoefEscapeLevel`, `BadTcoefRunOverflow`.
 
-### Not yet wired (after round 4)
+### Not yet wired (after round 5)
 
-- Inverse quantisation (§6.2.1) and inverse DCT (§6.2.4); the
-  coefficient array is the raw sign-applied LEVEL integers, not
-  reconstruction levels.
-- Zigzag → 8×8 scatter (§6.2.3); `ZIGZAG_TO_BLOCK_POS` is exposed
-  but the parser leaves the caller to apply it.
-- Macroblock-loop assembly: round 4 parses *one* block given the
-  caller's `BlockContext`; the per-MB driver that walks all six
-  blocks (and applies CBPY/CBPC bits per-block) is not yet wired.
+- Macroblock-loop assembly: round 5 reconstructs *one* block given
+  the caller's QUANT; the per-MB driver that walks all six blocks
+  (and applies CBPY/CBPC bits + per-block context per-block) is not
+  yet wired.
+- P-frame motion compensation (§6.1, including §6.1.2 half-pel
+  bilinear interpolation) — round 5 reconstructs INTRA blocks only.
+  INTER block reconstruction needs the motion-compensated
+  prediction added before §6.3.2 clipping.
+- §6.3.2 deblocking filter for the §G.2 Improved PB-frames mode
+  (not the §6.3.2 final-clip step, which is implemented).
 - Annex I (Advanced INTRA Coding) — alternate scans + INTRADC as
   a regular AC-coded value.
 - Annex T (Modified Quantization) — EXTENDED-ESCAPE LEVEL prefix
   (relaxes the `0x80` forbidden code).
 - PB-frames B-block decode (§5.4 last paragraph + Annex G).
+- Annex J deblocking filter.
 
 - Macroblock-layer header parser (§5.3, non-PB-frame baseline subset):
   - §5.3.1 COD (1 bit, INTER pictures only); §5.3.2 MCBPC

@@ -28,8 +28,14 @@
 //!   followed by a fixed-length 1+6+8 event). Decoded coefficients
 //!   land in a 64-entry zigzag-scan-order array per block; the
 //!   §6.2.3 / Figure 14 zigzag→8×8 position table is exposed for
-//!   callers that need it. Inverse quantisation (§6.2.1) and IDCT
-//!   (§6.2.4) remain out of scope.
+//!   callers that need it.
+//! * **Round 5** — Coefficient reconstruction §6.1 / §6.2.1
+//!   inverse-quant (H.261-style modulo-2-oddifier), §6.2.2 clip,
+//!   §6.2.3 zigzag scatter, §6.2.4 separable 8×8 IDCT (direct
+//!   orthonormal kernel in `f64`, meeting Annex A.7), and §6.3.2
+//!   intra-block sample clip to `[0, 255]`. Composed end-to-end
+//!   into [`reconstruct_intra_block`] which takes a parsed
+//!   [`H263Block`] + QUANT and emits an 8×8 `u8` sample block.
 //!
 //! PB-frame / Annex-T / Annex-I / extended-PTYPE paths are still
 //! out of scope; every operational decode path returns
@@ -44,15 +50,19 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::RuntimeContext;
 
 pub mod block;
+pub mod dequant;
 pub mod gob_header;
+pub mod idct;
 pub mod macroblock;
 pub mod picture_header;
 
 pub use block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
+pub use dequant::{dequantise_ac, scatter_into_block, AC_REC_MAX, AC_REC_MIN};
 pub use gob_header::{
     parse_gob_layer, parse_gob_layer_from_bytes, GobLayer, GBSC_BITS, GBSC_VALUE, GFID_BITS,
     GN_BITS, GOB_HEADER_BITS_NO_CPM, GQUANT_BITS,
 };
+pub use idct::{idct_8x8, reconstruct_intra_samples, BLOCK_DIM, IDCT_OUT_MAX, IDCT_OUT_MIN};
 pub use macroblock::{parse_macroblock, H263Macroblock, MbContext, MbType, Mvd};
 pub use picture_header::{
     parse_picture_header, H263PictureCodingType, H263PictureHeader, H263SourceFormat, PSC_BITS,
@@ -213,4 +223,173 @@ oxideav_core::register!("h263", register);
 pub fn parse_picture_header_from_bytes(data: &[u8]) -> Result<H263PictureHeader> {
     let mut reader = BitReader::new(data);
     parse_picture_header(&mut reader)
+}
+
+/// End-to-end intra-block reconstruction: takes a parsed
+/// [`H263Block`] (in zigzag scan order, with INTRADC already applied
+/// to slot 0 per Table 15) and the macroblock's QUANT, and produces
+/// an 8×8 `u8` sample block ready to copy into the picture buffer.
+///
+/// This composes:
+///
+/// 1. §6.1 / §6.2.1 inverse-quant of AC coefficients (DC preserved
+///    for INTRA),
+/// 2. §6.2.2 clip of AC reconstruction levels to `[-2048, 2047]`,
+/// 3. §6.2.3 / Figure 14 zigzag → 8×8 scatter,
+/// 4. §6.2.4 inverse DCT in `f64` (Annex A.7-conformant by
+///    construction),
+/// 5. §6.3.2 clip to the 8-bit picture range `[0, 255]`.
+///
+/// `quant` is the QUANT from §5.2.6 / §5.3.6 (range `1..=31`); the
+/// function clamps out-of-range values defensively.
+pub fn reconstruct_intra_block(block: &H263Block, quant: u8) -> [u8; COEFFS_PER_BLOCK] {
+    let mut scan = block.clone();
+    dequant::dequantise_ac(&mut scan, quant, /* is_intra = */ true);
+    let scattered = dequant::scatter_into_block(&scan.coefficients);
+    idct::reconstruct_intra_samples(&scattered)
+}
+
+#[cfg(test)]
+mod lib_tests {
+    use super::*;
+
+    /// End-to-end DC-only INTRA block: INTRADC code `0x10` → Table 15
+    /// reconstruction level `0x10 * 8 = 128`. With no AC coefficients,
+    /// scatter places 128 at block (0, 0); the IDCT distributes
+    /// 128/8 = 16 to every pixel; §6.3.2 clip is a no-op.
+    #[test]
+    fn intra_dc_only_block_reconstruct_is_uniform_field() {
+        let mut block = H263Block::empty();
+        block.coefficients[0] = 128; // INTRADC reconstruction level
+        block.had_intradc = true;
+
+        // QUANT is irrelevant for an INTRA block with no AC, since
+        // the DC slot bypasses the formula — pick a representative
+        // mid-range value.
+        let samples = reconstruct_intra_block(&block, 8);
+        assert!(samples.iter().all(|&p| p == 16));
+    }
+
+    /// DC = 800 → pixel = 100 (within `[0, 255]`); same with QUANT = 1.
+    #[test]
+    fn intra_dc_800_reconstructs_to_pixel_100() {
+        let mut block = H263Block::empty();
+        block.coefficients[0] = 800;
+        block.had_intradc = true;
+        let samples = reconstruct_intra_block(&block, 1);
+        assert!(samples.iter().all(|&p| p == 100));
+    }
+
+    /// Hand-derived block: INTRADC = 1024 (the `0xFF` Table 15 special
+    /// case) plus one AC at zigzag slot 1 with LEVEL = 1, QUANT = 1
+    /// (odd). After dequant slot 1 becomes 1 * 3 = 3. Scatter puts
+    /// scan-slot 0 at block position 0 (DC), scan-slot 1 at block
+    /// position 1 — i.e. F(u=1, v=0) = 3 — per Figure 14. The IDCT
+    /// gives
+    /// `f(x, y) = (1024/8) + (3/4)·(1/√2)·cos(π(2x+1)/16)`
+    /// ≈ `128 + 0.530·cos(π(2x+1)/16)`.
+    /// Cosine ranges roughly `[-0.981, +0.981]`, so the AC term is
+    /// at most ≈ ±0.520 — every pixel rounds within ±1 of 128 after
+    /// §6.3.2 clip. The pattern is independent of `y`.
+    #[test]
+    fn intra_dc_plus_small_ac_at_qp1() {
+        let mut block = H263Block::empty();
+        block.coefficients[0] = 1024;
+        block.coefficients[1] = 1;
+        block.had_intradc = true;
+        let samples = reconstruct_intra_block(&block, 1);
+        // Every pixel is within ±1 of 128, and the pattern is
+        // y-invariant: row 0 must equal row 1 must equal ... must
+        // equal row 7.
+        for y in 1..BLOCK_DIM {
+            for x in 0..BLOCK_DIM {
+                assert_eq!(
+                    samples[y * BLOCK_DIM + x],
+                    samples[x],
+                    "(x={}, y={}) differs from row 0",
+                    x,
+                    y
+                );
+            }
+        }
+        for (x, &p) in samples[..BLOCK_DIM].iter().enumerate() {
+            let delta = (p as i32 - 128).abs();
+            assert!(delta <= 1, "x={} pixel={} delta={}", x, p, delta);
+        }
+        // The horizontal-cosine modulation must give exactly one
+        // sign reversal across the row (cos(π(2x+1)/16) crosses zero
+        // between x=3 and x=4): pixels 0-3 should be ≥ 128, pixels
+        // 4-7 should be ≤ 128.
+        for (x, &p) in samples[..4].iter().enumerate() {
+            assert!(p >= 128, "x={} = {}", x, p);
+        }
+        for (offset, &p) in samples[4..BLOCK_DIM].iter().enumerate() {
+            let x = 4 + offset;
+            assert!(p <= 128, "x={} = {}", x, p);
+        }
+    }
+
+    /// QUANT = 2 (even) AC reconstruction: LEVEL = 1 → |REC| = 5.
+    /// Scattered into F(1, 0), the IDCT produces a horizontal cosine
+    /// modulation with amplitude (5/4)·(1/√2) ≈ 0.884 around the DC
+    /// level. Pick DC = 1024 (pixel 128) and assert each pixel is
+    /// within ±1 of 128.
+    #[test]
+    fn intra_even_quant_ac_reconstruction() {
+        let mut block = H263Block::empty();
+        block.coefficients[0] = 1024;
+        block.coefficients[1] = 1;
+        block.had_intradc = true;
+        let samples = reconstruct_intra_block(&block, 2);
+        for (i, &p) in samples.iter().enumerate() {
+            let delta = (p as i32 - 128).abs();
+            assert!(delta <= 1, "pixel {} = {} (delta {})", i, p, delta);
+        }
+    }
+
+    /// Saturation: an INTRADC = 2032 alone (DC pixel = 254) plus a
+    /// strong AC term can push some pixels above the §6.2.4 [-256,
+    /// +255] window — the §6.3.2 clip pins display values to 255.
+    /// Pick a high QUANT and a max LEVEL in slot 1 (zigzag F(1,0));
+    /// the cosine modulation has amplitude (|REC|/4)·(1/√2). With
+    /// |REC| = 31·255 = 7905 clipped to 2047 (§6.2.2), the amplitude
+    /// is 2047/(4·√2) ≈ 361.7, well above the 1-pixel-of-room from
+    /// the DC level. So pixels on the positive lobe must hit the
+    /// §6.3.2 ceiling of 255, and pixels on the negative lobe must
+    /// hit the §6.3.2 floor of 0.
+    #[test]
+    fn intra_reconstruction_clipped_at_both_picture_extremes() {
+        let mut block = H263Block::empty();
+        block.coefficients[0] = 2032; // INTRADC code 0xFE → 2032
+        block.coefficients[1] = 127; // pre-dequant LEVEL on scan slot 1
+        block.had_intradc = true;
+        let samples = reconstruct_intra_block(&block, 31);
+        // Some pixel must hit 255 (positive lobe of cosine).
+        assert!(
+            samples.contains(&255),
+            "expected ≥1 pixel clipped at 255: {:?}",
+            samples
+        );
+        // Some pixel must hit 0 (negative lobe of cosine).
+        assert!(
+            samples.contains(&0),
+            "expected ≥1 pixel clipped at 0: {:?}",
+            samples
+        );
+    }
+
+    /// Empty INTER block (no AC, no DC, since INTER has no INTRADC)
+    /// reconstructs to all zeros under the §6.2.4 + §6.3.2 path.
+    /// This is the §A.8 "all zeros in, all zeros out" invariant.
+    #[test]
+    fn empty_block_reconstructs_to_zero_field() {
+        let block = H263Block::empty();
+        // We invoke the lower-level functions directly because
+        // `reconstruct_intra_block` adds the §6.3.2 [0, 255] clip;
+        // we want to exercise that an all-zero coefficient array is
+        // already at 0 pre-clip.
+        let scattered = dequant::scatter_into_block(&block.coefficients);
+        let pixels = idct::idct_8x8(&scattered);
+        assert!(pixels.iter().all(|&p| p == 0));
+    }
 }

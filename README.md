@@ -5,9 +5,9 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 4 — picture + GOB + macroblock headers +
-block data.** The prior implementation was retired on 2026-05-18
-under the workspace
+**Orphan-rebuild round 5 — picture + GOB + macroblock headers +
+block data + intra-block reconstruction.** The prior implementation
+was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 the encoder VLC tables were declared as mirrors of a sibling crate's
 tables whose own provenance has been retired. The transitive
@@ -17,8 +17,9 @@ history was fully erased per the Hat-3 cold-enforcement procedure.
 The crate is being re-built clean-room against ITU-T Recommendation
 H.263 (01/2005). The current master implements §5.1 (picture layer),
 §5.2 (GOB layer up through GQUANT), §5.3 (macroblock header through
-MVD2-4), and §5.4 (block-layer INTRADC + TCOEF) for the non-PB-frame
-baseline:
+MVD2-4), §5.4 (block-layer INTRADC + TCOEF), and §6.1 / §6.2 / §6.3.2
+(intra-block reconstruction = inverse-quant + zigzag scatter + IDCT +
+sample clip) for the non-PB-frame baseline:
 
 * §5.1.1 — Picture Start Code (PSC), 22 bits, value `0x000020`.
 * §5.1.2 — Temporal Reference (TR), 8 bits at the standard CIF
@@ -63,6 +64,24 @@ baseline:
   scan position order**; the §6.2.3 / Figure 14 zigzag → 8×8
   block-position permutation is exposed as the
   `ZIGZAG_TO_BLOCK_POS` constant.
+* §6.1 / §6.2.1 — Inverse quantisation of AC coefficients with the
+  H.261-style modulo-2-oddifier rule: `|REC| = QUANT · (2 · |LEVEL|
+  + 1)` for odd QUANT, minus 1 for even QUANT; INTRA's DC slot
+  bypasses the formula (the Table 15 reconstruction level lands
+  there at parse time).
+* §6.2.2 — AC reconstruction-level clip to `[-2048, +2047]`.
+* §6.2.3 — Zigzag → 8×8 scatter (Figure 14).
+* §6.2.4 — Inverse DCT computed in `f64` against a 64-entry
+  `cos(π·(2n+1)·k/16)` table, rounded to nearest integer and
+  clipped to `[-256, +255]`. The spec's "arithmetic procedures …
+  are not defined, but should meet the error tolerance specified
+  in Annex A" — the `f64` kernel matches the Annex A.7 "at least
+  64-bit floating point" reference exactly, so the accuracy
+  budget is satisfied by construction.
+* §6.3.2 — Intra-block sample clip to `[0, 255]`. End-to-end
+  composer `reconstruct_intra_block(block, quant)` takes a parsed
+  `H263Block` and produces an 8×8 `u8` sample block ready for the
+  picture buffer.
 
 The function surface is intentionally minimal:
 
@@ -70,7 +89,7 @@ The function surface is intentionally minimal:
 use oxideav_core::bits::BitReader;
 use oxideav_h263::{
     parse_block, parse_gob_layer, parse_macroblock, parse_picture_header,
-    BlockContext, H263SourceFormat, MbContext,
+    reconstruct_intra_block, BlockContext, H263SourceFormat, MbContext,
 };
 
 let mut r = BitReader::new(&bytes);
@@ -101,20 +120,24 @@ let block = parse_block(
         has_coefficients: false, // for this luma block's CBPY bit
     },
 )?;
+
+// §6.1 / §6.2 / §6.3.2 intra-block reconstruction: dequantise,
+// scatter zigzag → 8×8, inverse DCT, clip to [0, 255].
+let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 ```
 
 ### What is NOT yet implemented
 
-* Inverse quantisation (§6.2.1) and inverse DCT (§6.2.4); the
-  `H263Block::coefficients` array is the raw sign-applied `LEVEL`
-  integers, not the reconstruction levels a renderer would need.
-* The §6.2.3 / Figure 14 scatter into 8×8 block layout. The
-  `ZIGZAG_TO_BLOCK_POS` permutation is exposed; the parser
-  itself stays in scan order.
+* P-frame motion compensation (§6.1, including §6.1.2 half-pel
+  bilinear interpolation). Round 5 reconstructs INTRA blocks only;
+  INTER block reconstruction needs the motion-compensated
+  prediction added before the §6.3.2 sample clip.
 * The per-macroblock driver loop that walks all six blocks (4 luma
   + 2 chroma), deriving each block's `BlockContext` from the
   macroblock's MB type and CBPY / CBPC bits, is not yet wired —
-  callers compose `parse_block` themselves.
+  callers compose `parse_block` + `reconstruct_intra_block`
+  themselves.
+* Annex J / Annex N deblocking filter.
 * PB-frame MODB / CBPB / MVDB (§5.3.3 / §5.3.4 / §5.3.9, Annex G);
   the parser refuses no fields directly but the caller's picture
   context must keep `pb_frames = false`.
@@ -143,20 +166,27 @@ let block = parse_block(
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 4 coverage estimate
+### Round 5 coverage estimate
 
 * H.263 spec text covered: §5.1.1–§5.1.3 + §5.2.2 + §5.2.3 +
   §5.2.5 + §5.2.6 + §5.3.1 + §5.3.2 + §5.3.5 + §5.3.6 + §5.3.7 +
-  §5.3.8 + §5.4.1 + §5.4.2 + Figure 14 zigzag table. Roughly 8
-  pages of the ~144-page recommendation.
-* Tests: 63 unit tests on synthetic buffers built with the spec's
+  §5.3.8 + §5.4.1 + §5.4.2 + §6.1 / §6.2.1 + §6.2.2 + §6.2.3 +
+  §6.2.4 + §6.3.2 (intra clip) + Figure 14 zigzag table. Roughly
+  10 pages of the ~144-page recommendation.
+* Tests: 93 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
   (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
   and 16 (102 regular code-points across both sign polarities,
   plus the ESCAPE event with both signs and both forbidden LEVEL
-  codes), plus two composition tests that chain four parsers
-  (picture → GOB → MB → block) from a single `BitReader`.
+  codes); 12 dequant tests including the §6.2.1 "REC is always
+  odd" invariant across 31 QUANT × 20 LEVEL combinations and the
+  §6.2.2 clip at both extremes; 8 IDCT tests including the §A.8
+  zero-in/zero-out invariant, the single-AC-coefficient basis-
+  pattern ±1 error budget, and IDCT diagonal symmetry; 6 end-to-end
+  intra-block reconstruction tests; plus a composition test that
+  chains four parsers (picture → GOB → MB → block) from a single
+  `BitReader`.
 
 ## License
 
