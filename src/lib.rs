@@ -36,6 +36,14 @@
 //!   intra-block sample clip to `[0, 255]`. Composed end-to-end
 //!   into [`reconstruct_intra_block`] which takes a parsed
 //!   [`H263Block`] + QUANT and emits an 8×8 `u8` sample block.
+//! * **Round 6** — P-frame motion compensation: §6.1.1 differential
+//!   motion-vector reconstruction (predictor + Table-14 difference,
+//!   wrapped into the permitted `[-32, 31]` half-pel window) and
+//!   median predictor, Table 18 chroma-vector derivation, §6.1.2
+//!   half-pel bilinear interpolation (Figure 13) with §D.1 edge
+//!   replication, and §6.3.1 INTER summation + §6.3.2 clip. Composed
+//!   end-to-end into [`reconstruct_inter_block_with_prediction`]. See
+//!   the [`motion`] module.
 //!
 //! PB-frame / Annex-T / Annex-I / extended-PTYPE paths are still
 //! out of scope; every operational decode path returns
@@ -54,6 +62,7 @@ pub mod dequant;
 pub mod gob_header;
 pub mod idct;
 pub mod macroblock;
+pub mod motion;
 pub mod picture_header;
 
 pub use block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
@@ -64,6 +73,11 @@ pub use gob_header::{
 };
 pub use idct::{idct_8x8, reconstruct_intra_samples, BLOCK_DIM, IDCT_OUT_MAX, IDCT_OUT_MIN};
 pub use macroblock::{parse_macroblock, H263Macroblock, MbContext, MbType, Mvd};
+pub use motion::{
+    chroma_mv, chroma_mv_component, median3, motion_compensate_block, predict_mv_median,
+    reconstruct_inter_block, reconstruct_mv, reconstruct_mv_component, MotionVector, RefPlane,
+    MV_HALF_MAX, MV_HALF_MIN, MV_HALF_SPAN, RCONTROL_DEFAULT,
+};
 pub use picture_header::{
     parse_picture_header, H263PictureCodingType, H263PictureHeader, H263SourceFormat, PSC_BITS,
     PSC_VALUE,
@@ -247,6 +261,39 @@ pub fn reconstruct_intra_block(block: &H263Block, quant: u8) -> [u8; COEFFS_PER_
     dequant::dequantise_ac(&mut scan, quant, /* is_intra = */ true);
     let scattered = dequant::scatter_into_block(&scan.coefficients);
     idct::reconstruct_intra_samples(&scattered)
+}
+
+/// End-to-end INTER-block reconstruction: takes a parsed
+/// [`H263Block`] (zigzag scan order; INTER has no separate INTRADC, so
+/// slot 0 is an ordinary AC coefficient), the macroblock's QUANT, and
+/// an 8×8 motion-compensated `prediction` block (from
+/// [`motion::motion_compensate_block`]), and produces the
+/// reconstructed 8×8 `u8` sample block.
+///
+/// This composes:
+///
+/// 1. §6.1 / §6.2.1 inverse-quant of *all* coefficients (INTER has no
+///    DC bypass — slot 0 is processed under the standard formula),
+/// 2. §6.2.2 clip of reconstruction levels to `[-2048, 2047]`,
+/// 3. §6.2.3 / Figure 14 zigzag → 8×8 scatter,
+/// 4. §6.2.4 inverse DCT in `f64` (Annex A.7-conformant by
+///    construction),
+/// 5. §6.3.1 summation of the IDCT residual with the
+///    motion-compensated prediction,
+/// 6. §6.3.2 clip to the 8-bit picture range `[0, 255]`.
+///
+/// `quant` is the QUANT from §5.2.6 / §5.3.6 (range `1..=31`); the
+/// function clamps out-of-range values defensively.
+pub fn reconstruct_inter_block_with_prediction(
+    block: &H263Block,
+    quant: u8,
+    prediction: &[u8; COEFFS_PER_BLOCK],
+) -> [u8; COEFFS_PER_BLOCK] {
+    let mut scan = block.clone();
+    dequant::dequantise_ac(&mut scan, quant, /* is_intra = */ false);
+    let scattered = dequant::scatter_into_block(&scan.coefficients);
+    let residual = idct::idct_8x8(&scattered);
+    motion::reconstruct_inter_block(prediction, &residual)
 }
 
 #[cfg(test)]

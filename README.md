@@ -5,9 +5,10 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 5 — picture + GOB + macroblock headers +
-block data + intra-block reconstruction.** The prior implementation
-was retired on 2026-05-18 under the workspace
+**Orphan-rebuild round 6 — picture + GOB + macroblock headers +
+block data + intra-block reconstruction + P-frame motion compensation
+and INTER-block reconstruction.** The prior implementation was retired
+on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 the encoder VLC tables were declared as mirrors of a sibling crate's
 tables whose own provenance has been retired. The transitive
@@ -17,9 +18,11 @@ history was fully erased per the Hat-3 cold-enforcement procedure.
 The crate is being re-built clean-room against ITU-T Recommendation
 H.263 (01/2005). The current master implements §5.1 (picture layer),
 §5.2 (GOB layer up through GQUANT), §5.3 (macroblock header through
-MVD2-4), §5.4 (block-layer INTRADC + TCOEF), and §6.1 / §6.2 / §6.3.2
+MVD2-4), §5.4 (block-layer INTRADC + TCOEF), §6.1 / §6.2 / §6.3.2
 (intra-block reconstruction = inverse-quant + zigzag scatter + IDCT +
-sample clip) for the non-PB-frame baseline:
+sample clip), and §6.1.1 / §6.1.2 / §6.3.1 (P-frame motion-vector
+reconstruction, half-pel bilinear interpolation, and INTER-block
+prediction + residual summation) for the non-PB-frame baseline:
 
 * §5.1.1 — Picture Start Code (PSC), 22 bits, value `0x000020`.
 * §5.1.2 — Temporal Reference (TR), 8 bits at the standard CIF
@@ -82,6 +85,29 @@ sample clip) for the non-PB-frame baseline:
   composer `reconstruct_intra_block(block, quant)` takes a parsed
   `H263Block` and produces an 8×8 `u8` sample block ready for the
   picture buffer.
+* §6.1.1 — Differential motion-vector reconstruction. Each Table 14
+  MVD code carries a *pair* of difference values; only one yields a
+  component in the permitted range `[-16, 15.5]` (= `[-32, 31]`
+  half-pel, a 64-wide window). `reconstruct_mv_component` forms
+  `predictor + difference` and wraps it into the window;
+  `reconstruct_mv` applies it to an `Mvd` per component. The
+  predictor is the per-component median of the three Figure-12
+  candidates (`predict_mv_median` / `median3`). Table 18 derives the
+  chrominance vector (`chroma_mv` / `chroma_mv_component`): luma
+  component halved, quarter-pel fraction snapped to the nearest half.
+* §6.1.2 — Half-pixel bilinear interpolation (Figure 13) with
+  `RCONTROL` (implied `0` in baseline): `a = A`,
+  `b = (A+B+1−RCONTROL)/2`, `c = (A+C+1−RCONTROL)/2`,
+  `d = (A+B+C+D+2−RCONTROL)/4`, truncating division. Reference-plane
+  access (`RefPlane`) uses §D.1 edge replication. `motion_compensate_block`
+  fetches an 8×8 motion-compensated prediction at a given block
+  origin + motion vector.
+* §6.3.1 / §6.3.2 — INTER-block reconstruction. `reconstruct_inter_block`
+  sums the motion-compensated prediction with the IDCT residual and
+  clips to `[0, 255]`. End-to-end composer
+  `reconstruct_inter_block_with_prediction(block, quant, prediction)`
+  runs dequant (no INTRA DC bypass) → §6.2.2 clip → zigzag scatter →
+  IDCT → §6.3.1 summation → §6.3.2 clip.
 
 The function surface is intentionally minimal:
 
@@ -128,15 +154,18 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 
 ### What is NOT yet implemented
 
-* P-frame motion compensation (§6.1, including §6.1.2 half-pel
-  bilinear interpolation). Round 5 reconstructs INTRA blocks only;
-  INTER block reconstruction needs the motion-compensated
-  prediction added before the §6.3.2 sample clip.
+* The §6.1.1 / Figure-12 border decision rules that *select* the
+  three MV-prediction candidates (zero-out for INTRA / not-coded /
+  outside-picture neighbours). Round 6's `predict_mv_median` takes
+  the three candidates as given; deriving them needs the macroblock
+  grid + COD state from the (not-yet-wired) driver loop.
 * The per-macroblock driver loop that walks all six blocks (4 luma
   + 2 chroma), deriving each block's `BlockContext` from the
-  macroblock's MB type and CBPY / CBPC bits, is not yet wired —
-  callers compose `parse_block` + `reconstruct_intra_block`
-  themselves.
+  macroblock's MB type and CBPY / CBPC bits, allocates the picture
+  planes, selects the MV-prediction candidates, and dispatches
+  `reconstruct_intra_block` / `reconstruct_inter_block_with_prediction`
+  per block, is not yet wired — callers compose the per-block
+  primitives themselves.
 * Annex J / Annex N deblocking filter.
 * PB-frame MODB / CBPB / MVDB (§5.3.3 / §5.3.4 / §5.3.9, Annex G);
   the parser refuses no fields directly but the caller's picture
@@ -166,14 +195,17 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 5 coverage estimate
+### Round 6 coverage estimate
 
 * H.263 spec text covered: §5.1.1–§5.1.3 + §5.2.2 + §5.2.3 +
   §5.2.5 + §5.2.6 + §5.3.1 + §5.3.2 + §5.3.5 + §5.3.6 + §5.3.7 +
-  §5.3.8 + §5.4.1 + §5.4.2 + §6.1 / §6.2.1 + §6.2.2 + §6.2.3 +
-  §6.2.4 + §6.3.2 (intra clip) + Figure 14 zigzag table. Roughly
-  10 pages of the ~144-page recommendation.
-* Tests: 93 unit tests on synthetic buffers built with the spec's
+  §5.3.8 + §5.4.1 + §5.4.2 + §6.1.1 (MV reconstruct + median
+  predictor + Table 18 chroma) + §6.1.2 (half-pel interpolation,
+  Figure 13) + §6.2.1 + §6.2.2 + §6.2.3 + §6.2.4 + §6.3.1 (INTER
+  summation) + §6.3.2 (sample clip) + §D.1 edge replication +
+  Figure 14 zigzag table. Roughly 12 pages of the ~144-page
+  recommendation.
+* Tests: 117 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
   (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
@@ -184,9 +216,15 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   §6.2.2 clip at both extremes; 8 IDCT tests including the §A.8
   zero-in/zero-out invariant, the single-AC-coefficient basis-
   pattern ±1 error budget, and IDCT diagonal symmetry; 6 end-to-end
-  intra-block reconstruction tests; plus a composition test that
-  chains four parsers (picture → GOB → MB → block) from a single
-  `BitReader`.
+  intra-block reconstruction tests; 24 motion tests covering MV
+  reconstruction (in-range / both-side wrap / exhaustive
+  in-range sweep), median predictor, Table 18 chroma derivation,
+  §6.1.2 half-pel interpolation (integer / horizontal with RCONTROL
+  0 and 1 / vertical / diagonal / edge replication), block-level
+  motion compensation (zero / integer / half-pel shift), and
+  §6.3.1 + §6.3.2 INTER summation with clip; plus a composition
+  test that chains four parsers (picture → GOB → MB → block) from
+  a single `BitReader`.
 
 ## License
 

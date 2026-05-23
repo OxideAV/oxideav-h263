@@ -8,6 +8,51 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- P-frame motion compensation + INTER-block reconstruction (round 6):
+  - §6.1.1 differential motion-vector reconstruction. Each Table 14
+    MVD code is a *pair* of difference values; only one yields a
+    component in the permitted range `[-16, 15.5]` (= `[-32, 31]` in
+    half-pel units, a 64-wide window). `reconstruct_mv_component`
+    forms `predictor + difference` and wraps it into that window;
+    `reconstruct_mv` applies it per-component to an [`Mvd`].
+  - §6.1.1 median predictor: `median3` (three-candidate median) and
+    `predict_mv_median` (per-component median of MV1/MV2/MV3 from
+    Figure 12). The Figure-12 border decision rules that *select*
+    the three candidates are the macroblock-loop driver's job (not
+    yet wired) — these functions take the candidates as given.
+  - Table 18 chrominance-vector derivation: `chroma_mv_component`
+    halves the luma component and snaps the quarter-pel fraction to
+    the nearest half-pel position (0→0, ¼/½/¾→½, 1→1).
+  - §6.1.2 / Figure 13 half-pixel bilinear interpolation with
+    `RCONTROL` (implied `0` in baseline): `a = A`,
+    `b = (A+B+1−RCONTROL)/2`, `c = (A+C+1−RCONTROL)/2`,
+    `d = (A+B+C+D+2−RCONTROL)/4` (truncating division). Reference
+    access uses §D.1 edge replication (out-of-bounds → nearest edge
+    pixel).
+  - §6.1 block-level motion compensation: `motion_compensate_block`
+    fetches an 8×8 motion-compensated prediction from a `RefPlane`
+    view of a reference-picture plane at a given block origin + MV.
+  - §6.3.1 summation + §6.3.2 clip: `reconstruct_inter_block` sums
+    the motion-compensated prediction with the IDCT residual and
+    clips to `[0, 255]`.
+  - End-to-end composer `reconstruct_inter_block_with_prediction`
+    (lib root): dequant (no INTRA DC bypass) → §6.2.2 clip → zigzag
+    scatter → IDCT → §6.3.1 summation → §6.3.2 clip.
+- Public `motion` module with `MotionVector`, `RefPlane`,
+  `reconstruct_mv`, `reconstruct_mv_component`, `predict_mv_median`,
+  `median3`, `chroma_mv`, `chroma_mv_component`,
+  `motion_compensate_block`, `reconstruct_inter_block`, the
+  `MV_HALF_MIN` / `MV_HALF_MAX` / `MV_HALF_SPAN` / `RCONTROL_DEFAULT`
+  constants.
+- 24 unit tests in `motion::tests`: MV-component zero / in-range /
+  high-wrap / low-wrap / always-in-range exhaustive sweep, full-MV
+  reconstruct, median3 + per-component median, Table 18 chroma
+  (zero-fraction + fraction-snaps-to-half + negatives), half-pel
+  integer / horizontal (RCONTROL 0 and 1) / vertical / diagonal /
+  edge-replication, block MC (zero vector, integer shift, half-pel
+  shift), INTER summation (zero residual, additive residual, §6.3.2
+  clip at both extremes, flat-plane end-to-end).
+
 - Inverse quantisation, zigzag scatter, and 8×8 inverse DCT (round 5):
   - §6.1 / §6.2.1 H.261-style modulo-2-oddifier inverse-quant rule
     applied to AC coefficients (DC slot preserved for INTRA — already
@@ -81,12 +126,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - New error variants `BadIntradcCode`, `BadTcoefCode`,
   `BadTcoefEscapeLevel`, `BadTcoefRunOverflow`.
 
-### Not yet wired (after round 5)
+### Not yet wired (after round 6)
 
-- Macroblock-loop assembly: round 5 reconstructs *one* block given
-  the caller's QUANT; the per-MB driver that walks all six blocks
-  (and applies CBPY/CBPC bits + per-block context per-block) is not
-  yet wired.
+- Macroblock-loop assembly: the per-MB driver that walks all six
+  blocks (deriving each block's `BlockContext` from MB type +
+  CBPY/CBPC bits), selects the three §6.1.1 / Figure-12 MV-prediction
+  candidates per the border decision rules, allocates per-frame
+  picture planes, and dispatches `reconstruct_intra_block` /
+  `reconstruct_inter_block_with_prediction` per block, is not yet
+  wired. Round 6 provides the per-block INTER primitives; the driver
+  that calls them across a whole picture is the next step.
+- §6.1.1 Figure-12 border decision rules (candidate-predictor
+  selection at GOB / picture edges). Round 6's `predict_mv_median`
+  takes the three candidates as given; the rules that derive them
+  (zero-out for INTRA / not-coded / outside-picture neighbours) need
+  the macroblock grid + COD state from the driver loop.
+
+### Not yet wired (after round 5, superseded by round 6 above for §6.1)
+
 - P-frame motion compensation (§6.1, including §6.1.2 half-pel
   bilinear interpolation) — round 5 reconstructs INTRA blocks only.
   INTER block reconstruction needs the motion-compensated
