@@ -5,10 +5,10 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 6 — picture + GOB + macroblock headers +
+**Orphan-rebuild round 7 — picture + GOB + macroblock headers +
 block data + intra-block reconstruction + P-frame motion compensation
-and INTER-block reconstruction.** The prior implementation was retired
-on 2026-05-18 under the workspace
+and INTER-block reconstruction + Annex J deblocking filter.** The
+prior implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 the encoder VLC tables were declared as mirrors of a sibling crate's
 tables whose own provenance has been retired. The transitive
@@ -20,9 +20,11 @@ H.263 (01/2005). The current master implements §5.1 (picture layer),
 §5.2 (GOB layer up through GQUANT), §5.3 (macroblock header through
 MVD2-4), §5.4 (block-layer INTRADC + TCOEF), §6.1 / §6.2 / §6.3.2
 (intra-block reconstruction = inverse-quant + zigzag scatter + IDCT +
-sample clip), and §6.1.1 / §6.1.2 / §6.3.1 (P-frame motion-vector
+sample clip), §6.1.1 / §6.1.2 / §6.3.1 (P-frame motion-vector
 reconstruction, half-pel bilinear interpolation, and INTER-block
-prediction + residual summation) for the non-PB-frame baseline:
+prediction + residual summation), and Annex J §J.3 (in-loop block-edge
+deblocking filter with the full Table J.2 STRENGTH lookup) for the
+non-PB-frame baseline:
 
 * §5.1.1 — Picture Start Code (PSC), 22 bits, value `0x000020`.
 * §5.1.2 — Temporal Reference (TR), 8 bits at the standard CIF
@@ -108,6 +110,20 @@ prediction + residual summation) for the non-PB-frame baseline:
   `reconstruct_inter_block_with_prediction(block, quant, prediction)`
   runs dequant (no INTRA DC bypass) → §6.2.2 clip → zigzag scatter →
   IDCT → §6.3.1 summation → §6.3.2 clip.
+* Annex J §J.3 — in-loop deblocking edge filter. Four-tap formula
+  on `(A, B, C, D)` straddling each 8×8 block edge:
+  `d = (A − 4B + 4C − D) / 8`,
+  `d1 = UpDownRamp(d, STRENGTH)`,
+  `d2 = clipd1((A − D) / 4, d1 / 2)`,
+  `B1 = clip(B + d1)`, `C1 = clip(C − d1)`,
+  `A1 = A − d2`, `D1 = D + d2`, with `UpDownRamp` per Figure J.2.
+  Full Table J.2 (QUANT → STRENGTH) transcribed for QUANT `1..=31`.
+  `deblock_plane` driver runs all horizontal edges before all
+  vertical edges per the §J.3 ordering rule, skips picture-edge
+  boundaries per the §J.3 picture-edge rule, and exposes a per-edge
+  `EdgeCondition` callback so the macroblock-loop driver can express
+  the §J.3 "block1 coded OR block2 coded" application condition and
+  the §K/§R slice-boundary skip rules.
 
 The function surface is intentionally minimal:
 
@@ -162,11 +178,17 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * The per-macroblock driver loop that walks all six blocks (4 luma
   + 2 chroma), deriving each block's `BlockContext` from the
   macroblock's MB type and CBPY / CBPC bits, allocates the picture
-  planes, selects the MV-prediction candidates, and dispatches
+  planes, selects the MV-prediction candidates, dispatches
   `reconstruct_intra_block` / `reconstruct_inter_block_with_prediction`
-  per block, is not yet wired — callers compose the per-block
-  primitives themselves.
-* Annex J / Annex N deblocking filter.
+  per block, and invokes `deblock::deblock_plane` against the
+  reconstructed luma and chroma planes (with per-edge `EdgeCondition`
+  derived from the macroblock grid's COD / MB-type / segment-id
+  state), is not yet wired — callers compose the per-block primitives
+  themselves.
+* Annex N (Reference Picture Selection mode) and slice-boundary /
+  Independent-Segment-Decoding skip rules for the deblocking
+  filter (the filter primitive itself is in `deblock`; the rules
+  that tell it which edges to skip live in the macroblock driver).
 * PB-frame MODB / CBPB / MVDB (§5.3.3 / §5.3.4 / §5.3.9, Annex G);
   the parser refuses no fields directly but the caller's picture
   context must keep `pb_frames = false`.
@@ -195,7 +217,7 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 6 coverage estimate
+### Round 7 coverage estimate
 
 * H.263 spec text covered: §5.1.1–§5.1.3 + §5.2.2 + §5.2.3 +
   §5.2.5 + §5.2.6 + §5.3.1 + §5.3.2 + §5.3.5 + §5.3.6 + §5.3.7 +
@@ -203,9 +225,11 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   predictor + Table 18 chroma) + §6.1.2 (half-pel interpolation,
   Figure 13) + §6.2.1 + §6.2.2 + §6.2.3 + §6.2.4 + §6.3.1 (INTER
   summation) + §6.3.2 (sample clip) + §D.1 edge replication +
-  Figure 14 zigzag table. Roughly 12 pages of the ~144-page
-  recommendation.
-* Tests: 117 unit tests on synthetic buffers built with the spec's
+  Figure 14 zigzag table + Annex J §J.3 (four-tap edge filter
+  + Table J.2 STRENGTH lookup + horizontal-before-vertical
+  ordering + picture-edge skip). Roughly 16 pages of the
+  ~144-page recommendation.
+* Tests: 138 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
   (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
@@ -222,9 +246,18 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   §6.1.2 half-pel interpolation (integer / horizontal with RCONTROL
   0 and 1 / vertical / diagonal / edge replication), block-level
   motion compensation (zero / integer / half-pel shift), and
-  §6.3.1 + §6.3.2 INTER summation with clip; plus a composition
-  test that chains four parsers (picture → GOB → MB → block) from
-  a single `BitReader`.
+  §6.3.1 + §6.3.2 INTER summation with clip; plus 21 deblock tests
+  covering the full Table J.2 STRENGTH lookup, `UpDownRamp` shape
+  (zero-input / identity-inside-window / descending-segment /
+  above-2S-zero / RRU-infinite identity), `clipd1` symmetry, the
+  four-tap filter (flat-input identity / in-window attenuation
+  hand-derived against the spec / strong-edge preservation /
+  clip-overflow on B1 and C1 / 1296-input never-panic sweep),
+  and the `deblock_plane` driver (flat no-op / all-skip no-op /
+  near-edge-only modification / horizontal-stripes-only-horizontal-
+  pass / orientation symmetry / bad-dimension panics); plus a
+  composition test that chains four parsers (picture → GOB → MB →
+  block) from a single `BitReader`.
 
 ## License
 

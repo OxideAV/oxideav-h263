@@ -44,6 +44,13 @@
 //!   replication, and §6.3.1 INTER summation + §6.3.2 clip. Composed
 //!   end-to-end into [`reconstruct_inter_block_with_prediction`]. See
 //!   the [`motion`] module.
+//! * **Round 7** — Annex J Deblocking Filter mode: the §J.3
+//!   four-tap edge filter (`d = (A−4B+4C−D)/8`,
+//!   `d1 = UpDownRamp(d, STRENGTH)`,
+//!   `d2 = clipd1((A−D)/4, d1/2)`), the full Table J.2 STRENGTH
+//!   lookup for QUANT in `1..=31`, the §J.3 picture-edge skip rule,
+//!   and the §J.3 horizontal-before-vertical edge ordering driver
+//!   [`deblock_plane`]. See the [`deblock`] module.
 //!
 //! PB-frame / Annex-T / Annex-I / extended-PTYPE paths are still
 //! out of scope; every operational decode path returns
@@ -58,6 +65,7 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::RuntimeContext;
 
 pub mod block;
+pub mod deblock;
 pub mod dequant;
 pub mod gob_header;
 pub mod idct;
@@ -66,6 +74,10 @@ pub mod motion;
 pub mod picture_header;
 
 pub use block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
+pub use deblock::{
+    apply_edge_samples, clipd1, deblock_plane, filter_edge_samples, strength_for_quant,
+    up_down_ramp, EdgeCondition, STRENGTH_RRU_INFINITE,
+};
 pub use dequant::{dequantise_ac, scatter_into_block, AC_REC_MAX, AC_REC_MIN};
 pub use gob_header::{
     parse_gob_layer, parse_gob_layer_from_bytes, GobLayer, GBSC_BITS, GBSC_VALUE, GFID_BITS,

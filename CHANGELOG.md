@@ -8,6 +8,60 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex J Deblocking Filter mode (round 7):
+  - §J.3 four-tap edge filter in [`deblock::filter_edge_samples`] /
+    [`deblock::apply_edge_samples`]. For the per-edge sample set
+    `(A, B, C, D)` with A, B in `block1` and C, D in `block2`,
+    computes `d = (A − 4B + 4C − D) / 8`,
+    `d1 = UpDownRamp(d, STRENGTH)`,
+    `d2 = clipd1((A − D) / 4, d1 / 2)`,
+    `B1 = clip(B + d1)`, `C1 = clip(C − d1)`,
+    `A1 = A − d2`, `D1 = D + d2`, with division truncating toward
+    zero per §J.3 ("/ denotes division by truncation toward zero").
+    `B1` and `C1` are clipped to `[0, 255]` per §6.3.2; `A1` and
+    `D1` are also clipped in the `apply_edge_samples` convenience
+    (defensive — §J.3's commentary asserts in-range by design).
+  - §J.3 `UpDownRamp(x, STRENGTH)` function (Figure J.2):
+    `SIGN(x) · max(0, |x| − max(0, 2·(|x| − STRENGTH)))`. The
+    [`deblock::up_down_ramp`] implementation handles zero input,
+    the identity-inside-strength-window region (`|x| ≤ S`), the
+    descending-slope region (`S < |x| ≤ 2S`), and the
+    above-2·STRENGTH zero region.
+  - §J.3 `clipd1(x, lim) = clamp(x, −|lim|, +|lim|)` per spec.
+  - Table J.2/H.263 transcription: full QUANT → STRENGTH lookup
+    for QUANT `1..=31`, exposed as [`deblock::strength_for_quant`].
+  - §J.3 plane-level driver [`deblock::deblock_plane`]: walks every
+    8×8 horizontal edge first (per the §J.3 ordering rule
+    "horizontal-before-vertical"), then every vertical edge.
+    Built-in picture-edge skip per the §J.3 rule "no filtering
+    across a picture edge". Per-edge application condition (the
+    §J.3 "block1 coded OR block2 coded" rule and §K/§R slice
+    skips) expressed by a caller-supplied closure that returns an
+    [`deblock::EdgeCondition`] (`Filter { strength }` or `Skip`).
+  - §Q.7.2 Reduced-Resolution Update mode escape: the
+    [`deblock::STRENGTH_RRU_INFINITE`] constant degenerates
+    `UpDownRamp` to the identity transform per §Q.7.2 ("the
+    parameter STRENGTH is given the value of positive infinity").
+- Public `deblock` module re-exported from the crate root:
+  `apply_edge_samples`, `clipd1`, `deblock_plane`,
+  `filter_edge_samples`, `strength_for_quant`, `up_down_ramp`,
+  `EdgeCondition`, `STRENGTH_RRU_INFINITE`.
+- 21 unit tests in `deblock::tests`: full Table J.2 transcription
+  cross-check across all 31 QUANT values, QUANT clamping for
+  out-of-range input, `UpDownRamp` zero-input, identity inside
+  strength window (every `|x| ≤ S` for `S ∈ 1..=12`), descending
+  segment spot-checks at S=7 (|x|=8 → 6, |x|=10 → 4, |x|=13 → 1,
+  |x|=14 → 0), above-2S zero region, RRU-infinite identity sweep,
+  `clipd1` symmetry, the four-tap filter on flat input
+  (identity), a hand-derived in-window jump (A=B=100, C=D=120,
+  STRENGTH=5 → A1=101, B1=103, C1=117, D1=119), a strong-edge
+  preservation case (A=B=10, C=D=250, STRENGTH=5 → unchanged),
+  a B1/C1 clip-overflow check, a 1296-input never-panic sweep,
+  and six plane-driver tests covering flat picture (no-op),
+  all-skip (no-op), near-edge-only modification, horizontal-stripes
+  only-horizontal-pass-active, orientation symmetry across the
+  H/V axes, and bad-dimension panic assertions.
+
 - P-frame motion compensation + INTER-block reconstruction (round 6):
   - §6.1.1 differential motion-vector reconstruction. Each Table 14
     MVD code is a *pair* of difference values; only one yields a
