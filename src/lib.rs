@@ -69,6 +69,16 @@
 //!   macroblocks, the §6.1.1 / Figure-12 candidate-predictor selection
 //!   border rules, and an optional Annex J §J.3 deblocking pass. See
 //!   the [`picture`] module.
+//! * **Round 10** — Annex D §D.2 Unrestricted Motion Vector mode
+//!   (PLUSPTYPE absent): [`reconstruct_mv_component_umv`] /
+//!   [`reconstruct_mv_umv`] extend the per-component range from the
+//!   default `[-32, 31]` to `[-63, 63]` half-pel, with the §D.2
+//!   predictor-dependent selection of the Table-14 difference pair.
+//!   The driver applies it whenever the PTYPE bit-10 UMV flag is set;
+//!   §D.1 edge replication (already always-on) supplies the
+//!   out-of-picture samples. The PLUSPTYPE / UUI ranges of Tables
+//!   D.1 / D.2 and the Table-D.3 reversible VLC stay gated on the
+//!   not-yet-decoded extended-PTYPE header.
 //!
 //! PB-frame / Annex-T / extended-PTYPE / INTER4V (Annex F) paths are
 //! still out of scope, as is the remainder of Annex I (Table I.2 VLC +
@@ -113,8 +123,9 @@ pub use idct::{idct_8x8, reconstruct_intra_samples, BLOCK_DIM, IDCT_OUT_MAX, IDC
 pub use macroblock::{parse_macroblock, H263Macroblock, MbContext, MbType, Mvd};
 pub use motion::{
     chroma_mv, chroma_mv_component, median3, motion_compensate_block, predict_mv_median,
-    reconstruct_inter_block, reconstruct_mv, reconstruct_mv_component, MotionVector, RefPlane,
-    MV_HALF_MAX, MV_HALF_MIN, MV_HALF_SPAN, RCONTROL_DEFAULT,
+    reconstruct_inter_block, reconstruct_mv, reconstruct_mv_component,
+    reconstruct_mv_component_umv, reconstruct_mv_umv, MotionVector, RefPlane, MV_HALF_MAX,
+    MV_HALF_MIN, MV_HALF_SPAN, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN, RCONTROL_DEFAULT,
 };
 pub use picture::{decode_picture, DecodeOptions, YuvFrame};
 pub use picture_header::{

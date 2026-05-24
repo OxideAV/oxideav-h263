@@ -5,14 +5,16 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 9 — full-picture decode driver wiring the
-per-layer parsers and per-block reconstruction into a decoded YUV
-frame (baseline single-MV path: INTRA / INTER / skipped macroblocks,
-§6.1.1 Figure-12 MV prediction, optional Annex J deblocking), on top
-of round 8's picture + GOB + macroblock headers + block data +
-intra-block reconstruction + P-frame motion compensation and
-INTER-block reconstruction + Annex J deblocking filter + Annex I
-Advanced INTRA Coding scan/mode layer.** The
+**Orphan-rebuild round 10 — Annex D §D.2 Unrestricted Motion Vector
+mode (PLUSPTYPE-absent case): the extended `[-63, 63]` half-pel
+per-component MV range with the §D.2 predictor-dependent difference-pair
+selection, wired into the decode driver behind the PTYPE bit-10 UMV
+flag, on top of round 9's full-picture decode driver (baseline
+single-MV path: INTRA / INTER / skipped macroblocks, §6.1.1 Figure-12
+MV prediction, optional Annex J deblocking) + round 8's picture + GOB +
+macroblock headers + block data + intra-block reconstruction + P-frame
+motion compensation and INTER-block reconstruction + Annex J deblocking
+filter + Annex I Advanced INTRA Coding scan/mode layer.** The
 prior implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 the encoder VLC tables were declared as mirrors of a sibling crate's
@@ -167,6 +169,19 @@ the non-PB-frame baseline:
   the standardized source formats; INTER4V (four MVs, Annex F),
   PB-frames, extended PTYPE, Annex T DQUANT, CPM = 1, slice mode and
   custom formats return `Error::NotImplemented`.
+* Annex D §D.2 — Unrestricted Motion Vector mode (PLUSPTYPE absent).
+  `reconstruct_mv_component_umv` / `reconstruct_mv_umv` extend the
+  per-component MV range from the default `[-32, 31]` to `[-63, 63]`
+  half-pel (spec `[-31.5, 31.5]`), applying the §D.2
+  predictor-dependent difference-pair selection: a predictor in
+  `[-31, 32]` half-pel uses the first Table-14 column directly with no
+  wrap, while a predictor outside that range picks the pair member
+  giving a component in `[-63, 63]` with the predictor's sign (zero
+  allowed either way). The decode driver switches to this path when the
+  PTYPE bit-10 UMV flag is set; the always-on §D.1 edge replication
+  supplies the out-of-picture samples. The PLUSPTYPE / UUI ranges of
+  Tables D.1 / D.2 and the Table-D.3 reversible VLC stay gated on the
+  not-yet-decoded extended-PTYPE header.
 
 The high-level entry point decodes a whole picture in one call:
 
@@ -269,8 +284,11 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   neighbour blocks). The §I.2 INTRA_MODE VLC, the two §I.3 alternate
   scans, and the §I.3 scan-selection rule landed in round 8.
   Round-4 §5.4.1 is still the baseline 8-bit FLC INTRADC form.
-* Annex D Table D.3 alternative MVD codes — round 3 uses Table 14
-  unconditionally.
+* Annex D — only the §D.2 PLUSPTYPE-absent extended range landed
+  (round 10). The PLUSPTYPE / UUI-dependent ranges of Tables D.1 / D.2
+  and the Table-D.3 reversible-VLC encoding of the difference (used
+  whenever PLUSPTYPE is present) remain gated on the not-yet-decoded
+  extended-PTYPE header.
 * Annex O B/EI/EP picture macroblocks.
 * GSTUF stuffing (§5.2.1) — the caller skips it before invoking the
   GOB parser; the parser does not auto-detect leading zeros.
@@ -287,7 +305,7 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 9 coverage estimate
+### Round 10 coverage estimate
 
 * H.263 spec text covered: §4.2.1 (GOB / MB scan layout, per-format
   GOB & MB-row counts) + §5.1.1–§5.1.3 + §5.2.2 + §5.2.3 +
@@ -301,10 +319,12 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   horizontal-before-vertical ordering + picture-edge skip + driver
   edge-condition wiring) + Annex I §I.2 INTRA_MODE VLC (Table I.1) +
   §I.3 alternate DCT scans (Figure I.2-a / I.2-b) + §I.3
-  scan-selection rule, now composed into a full-picture decode driver
-  (`decode_picture` → `YuvFrame`). Roughly 18 pages of the
+  scan-selection rule + Annex D §D.2 (PLUSPTYPE-absent extended
+  `[-63, 63]` half-pel range + predictor-dependent difference-pair
+  selection), now composed into a full-picture decode driver
+  (`decode_picture` → `YuvFrame`). Roughly 19 pages of the
   ~144-page recommendation.
-* Tests: 172 unit tests on synthetic buffers built with the spec's
+* Tests: 179 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
   (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
@@ -315,13 +335,17 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   §6.2.2 clip at both extremes; 8 IDCT tests including the §A.8
   zero-in/zero-out invariant, the single-AC-coefficient basis-
   pattern ±1 error budget, and IDCT diagonal symmetry; 6 end-to-end
-  intra-block reconstruction tests; 24 motion tests covering MV
+  intra-block reconstruction tests; 30 motion tests covering MV
   reconstruction (in-range / both-side wrap / exhaustive
   in-range sweep), median predictor, Table 18 chroma derivation,
   §6.1.2 half-pel interpolation (integer / horizontal with RCONTROL
   0 and 1 / vertical / diagonal / edge replication), block-level
-  motion compensation (zero / integer / half-pel shift), and
-  §6.3.1 + §6.3.2 INTER summation with clip; plus 21 deblock tests
+  motion compensation (zero / integer / half-pel shift),
+  §6.3.1 + §6.3.2 INTER summation with clip, and the Annex D §D.2 UMV
+  reconstruction (first-column no-wrap / below- and above-range
+  sign-and-bound selection / extended-range invariant across the whole
+  UMV space / full-vector application / agreement with the default
+  rule where the default sum does not wrap); plus 21 deblock tests
   covering the full Table J.2 STRENGTH lookup, `UpDownRamp` shape
   (zero-input / identity-inside-window / descending-segment /
   above-2S-zero / RRU-infinite identity), `clipd1` symmetry, the
@@ -339,7 +363,7 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   alternate-horizontal scan / the scans differ off-DC / Figure-I.2
   spot-checks for both grids), and the §I.3 scan-selection rule; plus
   a composition test that chains four parsers (picture → GOB → MB →
-  block) from a single `BitReader`; plus 19 `picture`-driver tests
+  block) from a single `BitReader`; plus 20 `picture`-driver tests
   covering the per-format GOB / MB layout constants (QCIF / CIF / 4CIF),
   `YuvFrame` construction, Figure-5 luma-block origins, 8×8 blitting,
   the §6.1.1 / Figure-12 candidate-predictor selection (top-left
@@ -348,8 +372,9 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   full-picture decodes (QCIF INTRA DC-only uniform field at two DC
   levels / INTRA+deblock no-op on a flat field / CBPY-driven per-block
   AC presence / INTER all-skipped exact reference copy / INTER
-  horizontal +1-pixel MV shift with §D.1 edge replication / missing
-  reference + extended-PTYPE refusals).
+  horizontal +1-pixel MV shift with §D.1 edge replication / Annex D
+  §D.2 UMV vector kept in the extended range past the default wrap /
+  missing reference + extended-PTYPE refusals).
 
 ## License
 

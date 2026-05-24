@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex D §D.2 Unrestricted Motion Vector mode (round 10), PLUSPTYPE
+  *absent* case, in the [`motion`] module:
+  - `reconstruct_mv_component_umv(predictor, difference)` and
+    `reconstruct_mv_umv(predictor, mvd)` extend the per-component
+    motion-vector range from the default `[-32, 31]` to `[-63, 63]`
+    half-pel (spec `[-31.5, 31.5]`) and apply the §D.2
+    predictor-dependent selection of the Table-14 difference pair:
+    a predictor inside `[-31, 32]` half-pel uses the first column
+    directly (no wrap); a predictor outside that range picks the pair
+    member yielding a component inside `[-63, 63]` with the same sign as
+    the predictor (zero allowed for either sign).
+  - New range constants `MV_UMV_HALF_MIN` (-63) / `MV_UMV_HALF_MAX`
+    (+63), re-exported from the crate root alongside the two functions.
+  - `decode_picture` applies the §D.2 reconstruction whenever the
+    PTYPE bit-10 UMV flag is set; the always-on §D.1 edge replication
+    supplies the out-of-picture samples. The PLUSPTYPE / UUI ranges of
+    Tables D.1 / D.2 and the Table-D.3 reversible VLC stay gated on the
+    not-yet-decoded extended-PTYPE header.
+  - 6 unit tests in `motion::tests` (first-column no-wrap; below/above
+    range sign-and-bound selection; extended-range invariant across the
+    whole UMV space; full-vector application; agreement with the default
+    reconstruction where the default sum does not wrap) and 1 driver
+    test in `picture::tests` (a UMV vector that would have wrapped under
+    the default rule is kept in the extended range).
 - Full-picture decode driver (round 9), in the new [`picture`] module:
   - `decode_picture(data, reference, options) -> Result<YuvFrame>`
     walks all GOBs of a picture top-to-bottom (§4.2.1, using the

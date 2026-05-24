@@ -27,8 +27,18 @@
 //! rule: a pixel referenced outside the coded picture area is replaced
 //! by the nearest edge pixel ("limiting the motion vector to the last
 //! full-pixel position inside the coded picture area"). This is the
-//! always-on boundary behaviour; the wider extrapolation ranges of
-//! Annex D (Unrestricted Motion Vector mode) are not enabled.
+//! always-on boundary behaviour, and it is exactly the §D.1 rule the
+//! Unrestricted Motion Vector mode relies on when a vector points
+//! outside the picture.
+//!
+//! Annex D §D.2 — the **Unrestricted Motion Vector mode** with
+//! PLUSPTYPE *absent* from the picture header — is wired through
+//! [`reconstruct_mv_component_umv`] / [`reconstruct_mv_umv`]: the
+//! per-component range is widened from the default `[-32, 31]` to
+//! `[-63, 63]` half-pel, with the §D.2 predictor-dependent selection of
+//! the Table-14 difference pair. The wider PLUSPTYPE / UUI ranges of
+//! Tables D.1 / D.2 and the Table-D.3 reversible VLC remain gated on
+//! the not-yet-decoded extended-PTYPE header.
 
 use crate::block::COEFFS_PER_BLOCK;
 use crate::idct::BLOCK_DIM;
@@ -102,6 +112,87 @@ pub fn reconstruct_mv(predictor: MotionVector, mvd: Mvd) -> MotionVector {
     MotionVector {
         dx_half: reconstruct_mv_component(predictor.dx_half, mvd.dx_half as i32),
         dy_half: reconstruct_mv_component(predictor.dy_half, mvd.dy_half as i32),
+    }
+}
+
+// ---- Annex D §D.2 Unrestricted Motion Vector mode (non-PLUSPTYPE) ---
+
+/// Annex D §D.2 extended motion-vector component range, lower bound, in
+/// **half-pel units** (spec "Vector" value `-31.5`). Applies in the
+/// Unrestricted Motion Vector mode when PLUSPTYPE is *absent* from the
+/// picture header.
+pub const MV_UMV_HALF_MIN: i32 = -63;
+/// Annex D §D.2 extended motion-vector component range, upper bound, in
+/// **half-pel units** (spec "Vector" value `+31.5`).
+pub const MV_UMV_HALF_MAX: i32 = 63;
+
+/// Annex D §D.2 reconstruction of one motion-vector component in the
+/// **Unrestricted Motion Vector mode** with PLUSPTYPE *absent* from the
+/// picture header.
+///
+/// In this mode the per-component range is extended from the default
+/// `[-32, 31]` (spec `[-16, 15.5]`) to `[-63, 63]` half-pel
+/// (spec `[-31.5, 31.5]`). `difference` is the Table-14 "Vector"
+/// column value already decoded into `[-32, 31]` half-pel; that value
+/// stands for a *pair* of differences `{difference, difference ± 64}`
+/// (the two members differ by [`MV_HALF_SPAN`]). §D.2 selects which
+/// member to add to the predictor:
+///
+/// * If the predictor `Pc` lies in `[-31, 32]` half-pel
+///   (spec `[-15.5, 16]`), "only the first column of vector
+///   differences applies" — the component is `Pc + difference`, with
+///   no wrap. The result is guaranteed to land in `[Pc-32, Pc+31]`,
+///   which is inside `[-63, 63]`.
+/// * Otherwise (predictor outside `[-31, 32]`), the member of the pair
+///   is chosen that yields a component inside `[-63, 63]` **with the
+///   same sign as the predictor**, where zero counts as either sign.
+///   Concretely (§D.2):
+///   - `-63 ≤ Pc ≤ -32` ⇒ result in `[-63, 0]`,
+///   - `33 ≤ Pc ≤ 63` ⇒ result in `[0, 63]`.
+///
+/// Both `predictor` and `difference` are half-pel; the returned
+/// component is in `[-63, 63]`.
+pub fn reconstruct_mv_component_umv(predictor: i32, difference: i32) -> i32 {
+    // §D.2: predictor inside [-31, 32] -> the first column applies
+    // directly (no pair selection, no wrap).
+    if (-31..=32).contains(&predictor) {
+        return predictor + difference;
+    }
+
+    // Predictor outside [-31, 32]: the Table-14 codeword denotes the
+    // pair {difference, difference ± MV_HALF_SPAN}; pick the member
+    // whose `predictor + member` lands inside [-63, 63] with the same
+    // sign as the predictor (zero allowed for either sign).
+    let alt = if difference >= 0 {
+        difference - MV_HALF_SPAN
+    } else {
+        difference + MV_HALF_SPAN
+    };
+    let candidates = [predictor + difference, predictor + alt];
+    let want_nonneg = predictor > 0;
+    for &mvc in &candidates {
+        if !(MV_UMV_HALF_MIN..=MV_UMV_HALF_MAX).contains(&mvc) {
+            continue;
+        }
+        // Same sign as the predictor, with zero permitted either way.
+        let ok = if want_nonneg { mvc >= 0 } else { mvc <= 0 };
+        if ok {
+            return mvc;
+        }
+    }
+    // Per §D.2 exactly one candidate satisfies the constraints; this
+    // fallback (clamp into range) keeps the function total against
+    // malformed predictor/difference combinations.
+    (predictor + difference).clamp(MV_UMV_HALF_MIN, MV_UMV_HALF_MAX)
+}
+
+/// Annex D §D.2 reconstruction of a full motion vector in the
+/// Unrestricted Motion Vector mode (PLUSPTYPE absent), applying
+/// [`reconstruct_mv_component_umv`] per component.
+pub fn reconstruct_mv_umv(predictor: MotionVector, mvd: Mvd) -> MotionVector {
+    MotionVector {
+        dx_half: reconstruct_mv_component_umv(predictor.dx_half, mvd.dx_half as i32),
+        dy_half: reconstruct_mv_component_umv(predictor.dy_half, mvd.dy_half as i32),
     }
 }
 
@@ -380,6 +471,112 @@ mod tests {
         };
         let mv = reconstruct_mv(pred, mvd);
         assert_eq!(mv, MotionVector::new(-32, 31));
+    }
+
+    // ---- Annex D §D.2 UMV component reconstruction ---------------
+
+    /// §D.2: predictor inside [-31, 32] uses the first column directly
+    /// (no wrap), so the component can leave the default [-32, 31]
+    /// window and reach the extended [-63, 63] range.
+    #[test]
+    fn umv_predictor_in_range_no_wrap() {
+        // Default mode would wrap 32+31=63 down to -1; UMV keeps it.
+        assert_eq!(reconstruct_mv_component_umv(32, 31), 63);
+        // Symmetric low end: -31 + (-32) = -63 (in range, no wrap).
+        assert_eq!(reconstruct_mv_component_umv(-31, -32), -63);
+        // Ordinary interior sum is unchanged.
+        assert_eq!(reconstruct_mv_component_umv(4, 6), 10);
+        assert_eq!(reconstruct_mv_component_umv(0, 0), 0);
+        // Boundary predictors of the "first column" range.
+        assert_eq!(reconstruct_mv_component_umv(32, 0), 32);
+        assert_eq!(reconstruct_mv_component_umv(-31, 0), -31);
+    }
+
+    /// §D.2: predictor below -31 forces a non-positive component with
+    /// the same (negative) sign as the predictor. The pair member that
+    /// satisfies `-63 ≤ MVc ≤ 0` is selected.
+    #[test]
+    fn umv_predictor_below_range_selects_nonpositive() {
+        // Pc = -40. difference = 31 (Vector column). The pair is
+        // {31, 31-64=-33}. Pc+31 = -9 (in [-63,0]) — selected.
+        assert_eq!(reconstruct_mv_component_umv(-40, 31), -9);
+        // difference = -32: pair {-32, -32+64=32}. Pc-32 = -72 (out),
+        // Pc+32 = -8 (in [-63,0]) — selected.
+        assert_eq!(reconstruct_mv_component_umv(-40, -32), -8);
+        // Result always non-positive and in range for every difference.
+        for d in -32..=31 {
+            let v = reconstruct_mv_component_umv(-50, d);
+            assert!(
+                (MV_UMV_HALF_MIN..=0).contains(&v),
+                "Pc=-50 d={d} -> {v} not in [-63, 0]"
+            );
+        }
+    }
+
+    /// §D.2: predictor above 32 forces a non-negative component with
+    /// the same (positive) sign as the predictor.
+    #[test]
+    fn umv_predictor_above_range_selects_nonnegative() {
+        // Pc = 40. difference = -32: pair {-32, 32}. Pc-32 = 8 (in
+        // [0,63]) — selected; Pc+(-32)=8 actually, let the impl decide.
+        let v = reconstruct_mv_component_umv(40, -32);
+        assert!((0..=MV_UMV_HALF_MAX).contains(&v), "{v} not in [0,63]");
+        // Result always non-negative and in range for every difference.
+        for d in -32..=31 {
+            let v = reconstruct_mv_component_umv(50, d);
+            assert!(
+                (0..=MV_UMV_HALF_MAX).contains(&v),
+                "Pc=50 d={d} -> {v} not in [0, 63]"
+            );
+        }
+    }
+
+    /// Every (predictor, difference) pair in the UMV space yields a
+    /// component inside the extended [-63, 63] window.
+    #[test]
+    fn umv_component_always_in_extended_range() {
+        for p in MV_UMV_HALF_MIN..=MV_UMV_HALF_MAX {
+            for d in MV_HALF_MIN..=MV_HALF_MAX {
+                let v = reconstruct_mv_component_umv(p, d);
+                assert!(
+                    (MV_UMV_HALF_MIN..=MV_UMV_HALF_MAX).contains(&v),
+                    "p={p} d={d} -> {v} out of extended range"
+                );
+            }
+        }
+    }
+
+    /// `reconstruct_mv_umv` applies the §D.2 rule per component.
+    #[test]
+    fn umv_full_vector() {
+        // dx: predictor 32 (in range) + 31 -> 63 (no wrap).
+        // dy: predictor -50 (below range) + 0 -> 0.
+        let pred = MotionVector::new(32, -50);
+        let mvd = Mvd {
+            dx_half: 31,
+            dy_half: 0,
+        };
+        let mv = reconstruct_mv_umv(pred, mvd);
+        assert_eq!(mv.dx_half, 63);
+        assert!((MV_UMV_HALF_MIN..=0).contains(&mv.dy_half));
+    }
+
+    /// In the predictor "first column" range, UMV and the default
+    /// reconstruction agree whenever the default sum does not wrap.
+    #[test]
+    fn umv_matches_default_when_no_wrap() {
+        for p in -31..=32 {
+            for d in MV_HALF_MIN..=MV_HALF_MAX {
+                let sum = p + d;
+                if (MV_HALF_MIN..=MV_HALF_MAX).contains(&sum) {
+                    assert_eq!(
+                        reconstruct_mv_component_umv(p, d),
+                        reconstruct_mv_component(p, d),
+                        "p={p} d={d}"
+                    );
+                }
+            }
+        }
     }
 
     // ---- §6.1.1 median predictor ---------------------------------

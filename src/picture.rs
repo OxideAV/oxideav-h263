@@ -69,8 +69,8 @@ use crate::gob_header::parse_gob_layer;
 use crate::idct::BLOCK_DIM;
 use crate::macroblock::{parse_macroblock, H263Macroblock, MbContext, MbType};
 use crate::motion::{
-    chroma_mv, motion_compensate_block, predict_mv_median, reconstruct_mv, MotionVector, RefPlane,
-    RCONTROL_DEFAULT,
+    chroma_mv, motion_compensate_block, predict_mv_median, reconstruct_mv, reconstruct_mv_umv,
+    MotionVector, RefPlane, RCONTROL_DEFAULT,
 };
 use crate::picture_header::{parse_picture_header, H263PictureCodingType};
 use crate::{reconstruct_inter_block_with_prediction, reconstruct_intra_block, Error, Result};
@@ -388,6 +388,7 @@ pub fn decode_picture(
                     row,
                     gob_top_row,
                     gob_header_present,
+                    header.umv_mode,
                     &mut current_quant,
                 )?;
                 record_grid(
@@ -452,6 +453,7 @@ fn decode_one_macroblock(
     row: usize,
     gob_top_row: usize,
     gob_header_present: bool,
+    umv_mode: bool,
     current_quant: &mut u8,
 ) -> Result<MotionVector> {
     let luma_stride = frame.luma_width;
@@ -539,10 +541,16 @@ fn decode_one_macroblock(
     // INTER / INTER+Q (single MV).
     let reference = reference.ok_or(Error::NotImplemented)?;
 
-    // §6.1.1 / Figure-12 predictor + Table-14 MVD.
+    // §6.1.1 / Figure-12 predictor + Table-14 MVD. In the Annex D
+    // Unrestricted Motion Vector mode (non-PLUSPTYPE) the §D.2
+    // extended-range reconstruction replaces the default wrap.
     let predictor = predict_mv(grid, mb_cols, col, row, gob_top_row, gob_header_present);
     let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
-    let luma_mv = reconstruct_mv(predictor, mvd);
+    let luma_mv = if umv_mode {
+        reconstruct_mv_umv(predictor, mvd)
+    } else {
+        reconstruct_mv(predictor, mvd)
+    };
     let chroma_vec = chroma_mv(luma_mv);
 
     // INTER macroblocks: CBPY is the *complement* on the wire — the
@@ -1288,5 +1296,99 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Annex D §D.2 driver wiring: with the PTYPE bit-10 UMV flag set,
+    /// a motion vector component whose `predictor + difference` would
+    /// overflow the default `[-32, 31]` window is *not* wrapped — the
+    /// §D.2 first-column rule keeps it in the extended `[-63, 63]`
+    /// range, sampling to the right rather than the (wrapped) left.
+    ///
+    /// Construction (QCIF INTER, UMV on, top row):
+    /// * MB(0,0): predictor 0, MVD dx = +31 half-pel (Table-14 idx 63,
+    ///   code `0000000000110`), dy = 0 (`1`). UMV first-column rule:
+    ///   MV = 0 + 31 = +31 (also in default range, identical there).
+    /// * MB(1,0): top-row predictor = median(MV1, MV1, MV1) = +31 (the
+    ///   left neighbour MV; §6.1.1 rule 3 copies MV1 into MV2/MV3 at a
+    ///   top border). Predictor 31 ∈ [-31, 32] → §D.2 first column →
+    ///   MV = 31 + 31 = +62 half-pel (= +31 pixels). In *default* mode
+    ///   this would have wrapped to 62 - 64 = -2 half-pel.
+    ///
+    /// The remaining macroblocks are skipped.
+    #[test]
+    fn decode_inter_umv_extends_mv_beyond_default_window() {
+        // Reference: a horizontal ramp value == column (mod 256).
+        let mut reference = YuvFrame::grey(176, 144);
+        for y in 0..144 {
+            for x in 0..176 {
+                reference.y[y * 176 + x] = (x % 256) as u8;
+            }
+        }
+
+        let mut w = BitWriter::new();
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8);
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_u32(0b010, 3); // QCIF
+        w.write_bit(true); // INTER
+        w.write_bit(true); // UMV mode ON (PTYPE bit 10)
+        w.write_bit(false); // sac
+        w.write_bit(false); // ap
+        w.write_bit(false); // pb
+
+        for gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for mb in 0..11 {
+                if gob == 0 && (mb == 0 || mb == 1) {
+                    // Coded INTER MB (COD = 0), MCBPC `1` = type 0 cbpc 00.
+                    w.write_bit(false);
+                    w.write_bit(true);
+                    // CBPY index 15 codeword `11` -> INTER pattern 0000
+                    // (no luma AC).
+                    w.write_u32(0b11, 2);
+                    // MVD dx = +31 half-pel: Table-14 idx 63 code
+                    // 0000000000110 (13 bits); dy = 0 (`1`).
+                    w.write_u32(0b0_0000_0000_0011_0, 13);
+                    w.write_bit(true);
+                } else {
+                    // Skipped (COD = 1).
+                    w.write_bit(true);
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let frame =
+            decode_picture(&data, Some(&reference), DecodeOptions::default()).expect("decode");
+
+        // MB(1,0) output pixel (x=16, y): source half-pel x =
+        // 16*2 + 62 = 94 -> integer 47, phase 0 -> reference value 47.
+        // (Default-mode wrap to -2 half-pel would give source 30 ->
+        // integer 15 -> value 15, so this asserts the §D.2 extension.)
+        for y in 0..16 {
+            assert_eq!(
+                frame.y[y * 176 + 16],
+                47,
+                "UMV MB(1,0) pixel (16,{y}) should sample +31px to the right"
+            );
+        }
+        // Sanity: a wrapped (default) decode would have produced 15
+        // here, which must not be the case.
+        assert_ne!(frame.y[16], 15, "UMV vector must not wrap like default");
+
+        // MB(0,0) pixel (x=0): source half-pel x = 0*2 + 31 = 31 ->
+        // integer 15, phase 1 -> b = (ref[15] + ref[16] + 1)/2 =
+        // (15 + 16 + 1)/2 = 16.
+        assert_eq!(frame.y[0], 16, "MB(0,0) +31 half-pel phase");
     }
 }
