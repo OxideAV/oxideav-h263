@@ -83,6 +83,52 @@ impl H263SourceFormat {
             H263SourceFormat::Reserved110 => None,
         }
     }
+
+    /// Number of GOBs per picture in the non-Reduced-Resolution case
+    /// (§4.2.1): 6 for sub-QCIF, 9 for QCIF, 18 for CIF / 4CIF / 16CIF.
+    ///
+    /// Returns `None` for the reserved `"110"` value.
+    pub fn num_gobs(self) -> Option<u32> {
+        match self {
+            H263SourceFormat::SubQcif => Some(6),
+            H263SourceFormat::Qcif => Some(9),
+            H263SourceFormat::Cif => Some(18),
+            H263SourceFormat::Cif4 => Some(18),
+            H263SourceFormat::Cif16 => Some(18),
+            H263SourceFormat::Reserved110 => None,
+        }
+    }
+
+    /// Number of 16×16 luma macroblock rows that one GOB spans, in the
+    /// non-Reduced-Resolution case (§4.2.1 / §4.2): one row for
+    /// sub-QCIF / QCIF / CIF, two rows for 4CIF, four rows for 16CIF.
+    ///
+    /// Returns `None` for the reserved `"110"` value.
+    pub fn mb_rows_per_gob(self) -> Option<u32> {
+        match self {
+            H263SourceFormat::SubQcif | H263SourceFormat::Qcif | H263SourceFormat::Cif => Some(1),
+            H263SourceFormat::Cif4 => Some(2),
+            H263SourceFormat::Cif16 => Some(4),
+            H263SourceFormat::Reserved110 => None,
+        }
+    }
+
+    /// Number of 16×16 macroblocks across one row of the picture
+    /// (luma width / 16). 11 for QCIF, 22 for CIF, etc.
+    ///
+    /// Returns `None` for the reserved `"110"` value.
+    pub fn mbs_per_row(self) -> Option<u32> {
+        self.luma_dimensions().map(|(w, _)| w / 16)
+    }
+
+    /// Total number of 16×16 macroblocks in the picture
+    /// (`mbs_per_row * mb_rows`). Returns `None` for `"110"`.
+    pub fn total_macroblocks(self) -> Option<u32> {
+        match (self.luma_dimensions(), self.mbs_per_row()) {
+            (Some((_, h)), Some(per_row)) => Some(per_row * (h / 16)),
+            _ => None,
+        }
+    }
 }
 
 /// Picture coding type (§5.1.3, bit 9).

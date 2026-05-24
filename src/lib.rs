@@ -61,12 +61,21 @@
 //!   quantization, and the DC/AC prediction reconstruction are
 //!   deferred (they need the macroblock-grid driver for neighbour
 //!   blocks).
+//! * **Round 9** — full-picture decode driver: [`decode_picture`]
+//!   walks all GOBs / macroblocks of a picture (§4.2.1) and composes
+//!   the per-layer parsers and per-block reconstruction primitives
+//!   into a decoded planar 4:2:0 [`YuvFrame`]. The baseline single-MV
+//!   path covers INTRA / INTRA+Q / INTER / INTER+Q / skipped
+//!   macroblocks, the §6.1.1 / Figure-12 candidate-predictor selection
+//!   border rules, and an optional Annex J §J.3 deblocking pass. See
+//!   the [`picture`] module.
 //!
-//! PB-frame / Annex-T / extended-PTYPE paths are still out of scope,
-//! as is the remainder of Annex I (Table I.2 VLC + prediction
-//! reconstruction); every operational decode path returns
-//! [`Error::NotImplemented`] until a frame-yielding `Decoder` impl
-//! lands.
+//! PB-frame / Annex-T / extended-PTYPE / INTER4V (Annex F) paths are
+//! still out of scope, as is the remainder of Annex I (Table I.2 VLC +
+//! prediction reconstruction); the driver returns
+//! [`Error::NotImplemented`] for them. The `oxideav_core::Decoder`
+//! registration is still a no-op — [`decode_picture`] is the
+//! frame-yielding surface pending the full streaming `Decoder` impl.
 //!
 //! [spec]: https://www.itu.int/rec/T-REC-H.263
 
@@ -83,6 +92,7 @@ pub mod gob_header;
 pub mod idct;
 pub mod macroblock;
 pub mod motion;
+pub mod picture;
 pub mod picture_header;
 
 pub use aic::{
@@ -106,6 +116,7 @@ pub use motion::{
     reconstruct_inter_block, reconstruct_mv, reconstruct_mv_component, MotionVector, RefPlane,
     MV_HALF_MAX, MV_HALF_MIN, MV_HALF_SPAN, RCONTROL_DEFAULT,
 };
+pub use picture::{decode_picture, DecodeOptions, YuvFrame};
 pub use picture_header::{
     parse_picture_header, H263PictureCodingType, H263PictureHeader, H263SourceFormat, PSC_BITS,
     PSC_VALUE,

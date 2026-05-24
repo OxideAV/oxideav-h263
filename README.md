@@ -5,9 +5,13 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 8 — picture + GOB + macroblock headers +
-block data + intra-block reconstruction + P-frame motion compensation
-and INTER-block reconstruction + Annex J deblocking filter + Annex I
+**Orphan-rebuild round 9 — full-picture decode driver wiring the
+per-layer parsers and per-block reconstruction into a decoded YUV
+frame (baseline single-MV path: INTRA / INTER / skipped macroblocks,
+§6.1.1 Figure-12 MV prediction, optional Annex J deblocking), on top
+of round 8's picture + GOB + macroblock headers + block data +
+intra-block reconstruction + P-frame motion compensation and
+INTER-block reconstruction + Annex J deblocking filter + Annex I
 Advanced INTRA Coding scan/mode layer.** The
 prior implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
@@ -142,8 +146,49 @@ the non-PB-frame baseline:
   VLC, the modified inverse quantization, and the DC/AC prediction
   reconstruction (which need the neighbour blocks the macroblock-grid
   driver supplies) are deferred.
+* §4.2.1 / §5 / §6 — full-picture decode driver (`picture` module).
+  `decode_picture` walks all GOBs of a picture top-to-bottom (using the
+  per-format GOB count and macroblock-rows-per-GOB from the source
+  format) and all macroblocks of each GOB left-to-right, deriving each
+  of the six blocks' `BlockContext` from the MB type + CBPY (luma) /
+  CBPC (chroma) bits and dispatching `reconstruct_intra_block` /
+  `reconstruct_inter_block_with_prediction`. For INTER macroblocks it
+  derives the §6.1.1 / Figure-12 median predictor — implementing the
+  candidate border-decision rules (INTRA / not-coded → zero, left/top/
+  GOB-top/right borders) against a live macroblock grid — reconstructs
+  the luma MV with the Table-14 MVD, motion-compensates the luma blocks
+  and the Table-18 chroma blocks, and sums residuals. Skipped
+  macroblocks (COD = 1) copy the reference with a zero MV. An optional
+  Annex J §J.3 deblocking pass (via `DecodeOptions::deblock`) runs
+  `deblock_plane` over all three planes with a per-edge `EdgeCondition`
+  derived from the grid's coded/not-coded state and each macroblock's
+  QUANT. The result is a planar 4:2:0 `YuvFrame`. The baseline subset
+  covers INTRA / INTRA+Q / INTER / INTER+Q / skipped macroblocks for
+  the standardized source formats; INTER4V (four MVs, Annex F),
+  PB-frames, extended PTYPE, Annex T DQUANT, CPM = 1, slice mode and
+  custom formats return `Error::NotImplemented`.
 
-The function surface is intentionally minimal:
+The high-level entry point decodes a whole picture in one call:
+
+```rust,ignore
+use oxideav_h263::{decode_picture, DecodeOptions, YuvFrame};
+
+// Decode an INTRA (I) picture — no reference frame needed.
+let frame: YuvFrame = decode_picture(&bytes, None, DecodeOptions::default())?;
+assert_eq!((frame.luma_width, frame.luma_height), (176, 144));
+
+// Decode the next INTER (P) picture against the previous frame, with
+// the Annex J deblocking filter enabled.
+let next = decode_picture(
+    &p_bytes,
+    Some(&frame),
+    DecodeOptions { deblock: true },
+)?;
+```
+
+The lower-level per-layer parsers and per-block reconstruction
+primitives the driver composes remain public for callers that need
+finer control:
 
 ```rust,ignore
 use oxideav_core::bits::BitReader;
@@ -188,21 +233,20 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 
 ### What is NOT yet implemented
 
-* The §6.1.1 / Figure-12 border decision rules that *select* the
-  three MV-prediction candidates (zero-out for INTRA / not-coded /
-  outside-picture neighbours). Round 6's `predict_mv_median` takes
-  the three candidates as given; deriving them needs the macroblock
-  grid + COD state from the (not-yet-wired) driver loop.
-* The per-macroblock driver loop that walks all six blocks (4 luma
-  + 2 chroma), deriving each block's `BlockContext` from the
-  macroblock's MB type and CBPY / CBPC bits, allocates the picture
-  planes, selects the MV-prediction candidates, dispatches
-  `reconstruct_intra_block` / `reconstruct_inter_block_with_prediction`
-  per block, and invokes `deblock::deblock_plane` against the
-  reconstructed luma and chroma planes (with per-edge `EdgeCondition`
-  derived from the macroblock grid's COD / MB-type / segment-id
-  state), is not yet wired — callers compose the per-block primitives
-  themselves.
+* INTER4V / INTER4V+Q macroblocks (MB types 2 / 5) — four motion
+  vectors per macroblock. The driver decodes the single-MV INTER
+  path; the four-vector candidate-predictor redefinition lives in
+  Annex F (§F.2 / Figure F.1), which is not yet wired, so the driver
+  returns `Error::NotImplemented` when it meets such a macroblock.
+* GOB-0-header-elision: the driver requires every GOB (including the
+  topmost) to carry a GBSC/GN/GFID/GQUANT header on the wire, because
+  the picture-layer PQUANT (the QUANT GOB 0 would inherit when its
+  header is omitted) lives in the not-yet-decoded optional-field
+  block. A bitstream that omits the GOB-0 header would mis-frame.
+* Multi-picture sequence demuxing: `decode_picture` decodes one
+  picture given an explicit reference frame; chaining pictures (PSC
+  scanning, reference-frame management across a stream) is the
+  caller's responsibility.
 * Annex N (Reference Picture Selection mode) and slice-boundary /
   Independent-Segment-Decoding skip rules for the deblocking
   filter (the filter primitive itself is in `deblock`; the rules
@@ -243,21 +287,24 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 8 coverage estimate
+### Round 9 coverage estimate
 
-* H.263 spec text covered: §5.1.1–§5.1.3 + §5.2.2 + §5.2.3 +
+* H.263 spec text covered: §4.2.1 (GOB / MB scan layout, per-format
+  GOB & MB-row counts) + §5.1.1–§5.1.3 + §5.2.2 + §5.2.3 +
   §5.2.5 + §5.2.6 + §5.3.1 + §5.3.2 + §5.3.5 + §5.3.6 + §5.3.7 +
   §5.3.8 + §5.4.1 + §5.4.2 + §6.1.1 (MV reconstruct + median
-  predictor + Table 18 chroma) + §6.1.2 (half-pel interpolation,
-  Figure 13) + §6.2.1 + §6.2.2 + §6.2.3 + §6.2.4 + §6.3.1 (INTER
-  summation) + §6.3.2 (sample clip) + §D.1 edge replication +
-  Figure 14 zigzag table + Annex J §J.3 (four-tap edge filter
-  + Table J.2 STRENGTH lookup + horizontal-before-vertical
-  ordering + picture-edge skip) + Annex I §I.2 INTRA_MODE VLC
-  (Table I.1) + §I.3 alternate DCT scans (Figure I.2-a / I.2-b)
-  + §I.3 scan-selection rule. Roughly 17 pages of the
+  predictor + Figure-12 candidate border-decision rules + Table 18
+  chroma) + §6.1.2 (half-pel interpolation, Figure 13) + §6.2.1 +
+  §6.2.2 + §6.2.3 + §6.2.4 + §6.3.1 (INTER summation) + §6.3.2
+  (sample clip) + §D.1 edge replication + Figure 14 zigzag table +
+  Annex J §J.3 (four-tap edge filter + Table J.2 STRENGTH lookup +
+  horizontal-before-vertical ordering + picture-edge skip + driver
+  edge-condition wiring) + Annex I §I.2 INTRA_MODE VLC (Table I.1) +
+  §I.3 alternate DCT scans (Figure I.2-a / I.2-b) + §I.3
+  scan-selection rule, now composed into a full-picture decode driver
+  (`decode_picture` → `YuvFrame`). Roughly 18 pages of the
   ~144-page recommendation.
-* Tests: 153 unit tests on synthetic buffers built with the spec's
+* Tests: 172 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
   (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
@@ -292,7 +339,17 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   alternate-horizontal scan / the scans differ off-DC / Figure-I.2
   spot-checks for both grids), and the §I.3 scan-selection rule; plus
   a composition test that chains four parsers (picture → GOB → MB →
-  block) from a single `BitReader`.
+  block) from a single `BitReader`; plus 19 `picture`-driver tests
+  covering the per-format GOB / MB layout constants (QCIF / CIF / 4CIF),
+  `YuvFrame` construction, Figure-5 luma-block origins, 8×8 blitting,
+  the §6.1.1 / Figure-12 candidate-predictor selection (top-left
+  all-border zero / left-neighbour at top row / INTRA-neighbour zero
+  candidate / interior median / right-edge MV3-zero), and end-to-end
+  full-picture decodes (QCIF INTRA DC-only uniform field at two DC
+  levels / INTRA+deblock no-op on a flat field / CBPY-driven per-block
+  AC presence / INTER all-skipped exact reference copy / INTER
+  horizontal +1-pixel MV shift with §D.1 edge replication / missing
+  reference + extended-PTYPE refusals).
 
 ## License
 

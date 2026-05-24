@@ -8,6 +8,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Full-picture decode driver (round 9), in the new [`picture`] module:
+  - `decode_picture(data, reference, options) -> Result<YuvFrame>`
+    walks all GOBs of a picture top-to-bottom (§4.2.1, using the
+    per-source-format GOB count and macroblock-rows-per-GOB) and all
+    macroblocks of each GOB left-to-right, threading QUANT through the
+    GOB header and any per-macroblock DQUANT, and produces a decoded
+    planar 4:2:0 [`YuvFrame`].
+  - Per-macroblock dispatch: derives each of the six blocks'
+    `BlockContext` from the MB type + CBPY (luma, with INTER
+    complement) / CBPC (chroma) bits and runs `reconstruct_intra_block`
+    (INTRA / INTRA+Q) or `reconstruct_inter_block_with_prediction`
+    (INTER / INTER+Q). Skipped macroblocks (COD = 1) copy the
+    reference with a zero motion vector (§5.3.1).
+  - §6.1.1 / Figure-12 motion-vector prediction: implements the
+    candidate border-decision rules (rule 1 INTRA / not-coded → zero;
+    rule 2 left-border MV1 zero; rule 3 top / GOB-top MV2,MV3 ← MV1;
+    rule 4 right-border MV3 zero) against a live macroblock grid, then
+    reconstructs the luma MV with the Table-14 MVD, motion-compensates
+    the four luma blocks and the Table-18-derived chroma blocks, and
+    sums the IDCT residuals.
+  - Optional Annex J §J.3 deblocking via `DecodeOptions::deblock`:
+    runs `deblock_plane` over all three planes with a per-edge
+    `EdgeCondition` derived from the grid's coded/not-coded state and
+    each macroblock's QUANT (Table J.2 STRENGTH).
+  - New source-format layout helpers on `H263SourceFormat`:
+    `num_gobs`, `mb_rows_per_gob`, `mbs_per_row`, `total_macroblocks`.
+  - Out of scope (return `Error::NotImplemented`): INTER4V / INTER4V+Q
+    (Annex F four-vector prediction), PB-frames, extended PTYPE,
+    Annex T DQUANT, CPM = 1, slice-structured mode, custom source
+    formats, and an INTER picture with no reference.
+- Public `picture` module re-exported from the crate root:
+  `decode_picture`, `DecodeOptions`, `YuvFrame`.
+- 19 unit tests in `picture::tests`: per-format GOB/MB layout constants
+  (QCIF / CIF / 4CIF), `YuvFrame::grey` dimensions, Figure-5 luma-block
+  origins, 8×8 block blitting, the five §6.1.1 / Figure-12
+  candidate-predictor cases, and seven end-to-end decodes (QCIF INTRA
+  DC-only uniform field at two DC levels; INTRA + deblock no-op on a
+  flat field; CBPY-driven per-block AC presence; INTER all-skipped
+  exact reference copy; INTER +1-pixel horizontal MV shift with §D.1
+  edge replication; missing-reference and extended-PTYPE refusals).
+
 - Annex I Advanced INTRA Coding — scan + prediction-mode layer
   (round 8), in the new [`aic`] module:
   - §I.2 INTRA_MODE field VLC (Table I.1) via
