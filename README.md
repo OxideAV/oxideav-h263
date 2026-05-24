@@ -5,9 +5,10 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 7 — picture + GOB + macroblock headers +
+**Orphan-rebuild round 8 — picture + GOB + macroblock headers +
 block data + intra-block reconstruction + P-frame motion compensation
-and INTER-block reconstruction + Annex J deblocking filter.** The
+and INTER-block reconstruction + Annex J deblocking filter + Annex I
+Advanced INTRA Coding scan/mode layer.** The
 prior implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 the encoder VLC tables were declared as mirrors of a sibling crate's
@@ -22,9 +23,11 @@ MVD2-4), §5.4 (block-layer INTRADC + TCOEF), §6.1 / §6.2 / §6.3.2
 (intra-block reconstruction = inverse-quant + zigzag scatter + IDCT +
 sample clip), §6.1.1 / §6.1.2 / §6.3.1 (P-frame motion-vector
 reconstruction, half-pel bilinear interpolation, and INTER-block
-prediction + residual summation), and Annex J §J.3 (in-loop block-edge
-deblocking filter with the full Table J.2 STRENGTH lookup) for the
-non-PB-frame baseline:
+prediction + residual summation), Annex J §J.3 (in-loop block-edge
+deblocking filter with the full Table J.2 STRENGTH lookup), and the
+Annex I §I.2 / §I.3 Advanced INTRA Coding scan-and-mode layer
+(INTRA_MODE VLC + the two alternate DCT scans + scan selection) for
+the non-PB-frame baseline:
 
 * §5.1.1 — Picture Start Code (PSC), 22 bits, value `0x000020`.
 * §5.1.2 — Temporal Reference (TR), 8 bits at the standard CIF
@@ -124,6 +127,21 @@ non-PB-frame baseline:
   `EdgeCondition` callback so the macroblock-loop driver can express
   the §J.3 "block1 coded OR block2 coded" application condition and
   the §K/§R slice-boundary skip rules.
+* Annex I §I.2 / §I.3 — Advanced INTRA Coding scan-and-mode layer
+  (the `aic` module). The §I.2 INTRA_MODE field VLC (Table I.1):
+  `0` → DC-Only, `10` → Vertical DC&AC, `11` → Horizontal DC&AC,
+  decoded into `IntraMode` by `decode_intra_mode`. The two §I.3
+  alternate DCT scans (Figure I.2) as scan-position → block-position
+  permutations in the Figure-14 convention:
+  `ALT_HORIZONTAL_TO_BLOCK_POS` (Figure I.2-a, horizontal
+  frequencies first) and `ALT_VERTICAL_TO_BLOCK_POS` (Figure I.2-b,
+  the ITU-T H.262 alternate scan). The §I.3 scan-selection rule
+  `scan_for_intra_mode`: mode 0 keeps the Figure-14 zigzag, mode 1
+  selects the alternate-horizontal scan, mode 2 the
+  alternate-vertical scan. The Table I.2 separate INTRA-coefficient
+  VLC, the modified inverse quantization, and the DC/AC prediction
+  reconstruction (which need the neighbour blocks the macroblock-grid
+  driver supplies) are deferred.
 
 The function surface is intentionally minimal:
 
@@ -196,9 +214,17 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   the baseline 2-bit form is the only one decoded, and the
   Annex-T EXTENDED-ESCAPE LEVEL prefix (`1000 0000`) is not
   accepted in TCOEF.
-* Annex I (Advanced INTRA Coding) — alternate scans and the
-  INTRADC-as-AC-coded-value path. Round-4 §5.4.1 is the baseline
-  8-bit FLC INTRADC form.
+* Annex I (Advanced INTRA Coding) — the remaining parts beyond the
+  round-8 scan-and-mode layer: the Table I.2 separate
+  INTRA-coefficient VLC (the dedicated |LEVEL|/RUN interpretation
+  that replaces Table 16 for INTRA), the INTRADC-as-AC-coded-value
+  path, the §I.3 modified inverse quantization
+  (`RecC = 2·QUANT·LEVEL`, no dead-zone) with variable-step INTRADC,
+  and the DC/AC prediction reconstruction + `oddifyclipDC` /
+  `clipAC` clipping (which need the macroblock-grid driver's
+  neighbour blocks). The §I.2 INTRA_MODE VLC, the two §I.3 alternate
+  scans, and the §I.3 scan-selection rule landed in round 8.
+  Round-4 §5.4.1 is still the baseline 8-bit FLC INTRADC form.
 * Annex D Table D.3 alternative MVD codes — round 3 uses Table 14
   unconditionally.
 * Annex O B/EI/EP picture macroblocks.
@@ -217,7 +243,7 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 7 coverage estimate
+### Round 8 coverage estimate
 
 * H.263 spec text covered: §5.1.1–§5.1.3 + §5.2.2 + §5.2.3 +
   §5.2.5 + §5.2.6 + §5.3.1 + §5.3.2 + §5.3.5 + §5.3.6 + §5.3.7 +
@@ -227,9 +253,11 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   summation) + §6.3.2 (sample clip) + §D.1 edge replication +
   Figure 14 zigzag table + Annex J §J.3 (four-tap edge filter
   + Table J.2 STRENGTH lookup + horizontal-before-vertical
-  ordering + picture-edge skip). Roughly 16 pages of the
+  ordering + picture-edge skip) + Annex I §I.2 INTRA_MODE VLC
+  (Table I.1) + §I.3 alternate DCT scans (Figure I.2-a / I.2-b)
+  + §I.3 scan-selection rule. Roughly 17 pages of the
   ~144-page recommendation.
-* Tests: 138 unit tests on synthetic buffers built with the spec's
+* Tests: 153 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
   (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
@@ -255,8 +283,15 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   clip-overflow on B1 and C1 / 1296-input never-panic sweep),
   and the `deblock_plane` driver (flat no-op / all-skip no-op /
   near-edge-only modification / horizontal-stripes-only-horizontal-
-  pass / orientation symmetry / bad-dimension panics); plus a
-  composition test that chains four parsers (picture → GOB → MB →
+  pass / orientation symmetry / bad-dimension panics); plus 15 Annex I
+  `aic` tests covering the INTRA_MODE VLC (each of the three Table I.1
+  codes / exact-bit-consumption for the 1-bit and 2-bit forms / EOF
+  mid-field / EOF on empty buffer / index round-trip), the two
+  alternate scans (both are permutations of 0..=63 / DC-first in every
+  scan / the alternate-vertical scan is the transpose of the
+  alternate-horizontal scan / the scans differ off-DC / Figure-I.2
+  spot-checks for both grids), and the §I.3 scan-selection rule; plus
+  a composition test that chains four parsers (picture → GOB → MB →
   block) from a single `BitReader`.
 
 ## License

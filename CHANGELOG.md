@@ -8,6 +8,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex I Advanced INTRA Coding — scan + prediction-mode layer
+  (round 8), in the new [`aic`] module:
+  - §I.2 INTRA_MODE field VLC (Table I.1) via
+    [`aic::decode_intra_mode`] → [`aic::IntraMode`]: `0` → DC-Only,
+    `10` → Vertical DC&AC, `11` → Horizontal DC&AC. One mode is
+    transmitted per INTRA macroblock when Advanced INTRA Coding is
+    in use. EOF mid-field surfaces `Error::UnexpectedEof` rather
+    than guessing a mode.
+  - §I.3 alternate DCT scans (Figure I.2) as scan-position →
+    block-position permutations in the Figure-14 convention:
+    [`aic::ALT_HORIZONTAL_TO_BLOCK_POS`] (Figure I.2-a,
+    Alternate-Horizontal, horizontal frequencies first) and
+    [`aic::ALT_VERTICAL_TO_BLOCK_POS`] (Figure I.2-b,
+    Alternate-Vertical, identical to the ITU-T H.262 alternate
+    scan). The two scans are transposes of each other.
+  - §I.3 scan-selection rule [`aic::scan_for_intra_mode`]: prediction
+    mode 0 keeps the Figure-14 zigzag scan, mode 1 selects the
+    Alternate-Horizontal scan, mode 2 the Alternate-Vertical scan.
+  - The remainder of Annex I — the Table I.2 separate
+    INTRA-coefficient VLC, the §I.3 modified inverse quantization
+    (`RecC = 2·QUANT·LEVEL`, no dead-zone) with variable-step
+    INTRADC, and the DC/AC prediction reconstruction + `oddifyclipDC`
+    / `clipAC` clipping — is deferred (it needs the macroblock-grid
+    driver to supply the neighbouring reconstructed blocks).
+- Public `aic` module re-exported from the crate root:
+  `decode_intra_mode`, `scan_for_intra_mode`, `IntraMode`,
+  `ALT_HORIZONTAL_TO_BLOCK_POS`, `ALT_VERTICAL_TO_BLOCK_POS`.
+- 15 unit tests in `aic::tests`: the three Table I.1 INTRA_MODE
+  codes; exact-bit-consumption for the 1-bit (`0`) and 2-bit
+  (`10` / `11`) forms; EOF mid-field and EOF on an empty buffer;
+  `IntraMode::index` round-trip; both alternate scans are
+  permutations of 0..=63; DC is first in every scan; the
+  Alternate-Vertical scan is the transpose of the
+  Alternate-Horizontal scan; the scans differ off-DC; Figure-I.2
+  spot-checks for both grids; and the §I.3 scan-selection rule.
+
 - Annex J Deblocking Filter mode (round 7):
   - §J.3 four-tap edge filter in [`deblock::filter_edge_samples`] /
     [`deblock::apply_edge_samples`]. For the per-edge sample set

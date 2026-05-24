@@ -51,9 +51,20 @@
 //!   lookup for QUANT in `1..=31`, the §J.3 picture-edge skip rule,
 //!   and the §J.3 horizontal-before-vertical edge ordering driver
 //!   [`deblock_plane`]. See the [`deblock`] module.
+//! * **Round 8** — Annex I Advanced INTRA Coding, scan + mode layer:
+//!   the §I.2 INTRA_MODE field VLC (Table I.1 →
+//!   [`aic::IntraMode`]), the two §I.3 alternate DCT scans
+//!   (Figure I.2: [`aic::ALT_HORIZONTAL_TO_BLOCK_POS`] /
+//!   [`aic::ALT_VERTICAL_TO_BLOCK_POS`]), and the §I.3 scan-selection
+//!   rule [`aic::scan_for_intra_mode`]. See the [`aic`] module. The
+//!   Table I.2 separate INTRA-coefficient VLC, the modified inverse
+//!   quantization, and the DC/AC prediction reconstruction are
+//!   deferred (they need the macroblock-grid driver for neighbour
+//!   blocks).
 //!
-//! PB-frame / Annex-T / Annex-I / extended-PTYPE paths are still
-//! out of scope; every operational decode path returns
+//! PB-frame / Annex-T / extended-PTYPE paths are still out of scope,
+//! as is the remainder of Annex I (Table I.2 VLC + prediction
+//! reconstruction); every operational decode path returns
 //! [`Error::NotImplemented`] until a frame-yielding `Decoder` impl
 //! lands.
 //!
@@ -64,6 +75,7 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::RuntimeContext;
 
+pub mod aic;
 pub mod block;
 pub mod deblock;
 pub mod dequant;
@@ -73,6 +85,10 @@ pub mod macroblock;
 pub mod motion;
 pub mod picture_header;
 
+pub use aic::{
+    decode_intra_mode, scan_for_intra_mode, IntraMode, ALT_HORIZONTAL_TO_BLOCK_POS,
+    ALT_VERTICAL_TO_BLOCK_POS,
+};
 pub use block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
 pub use deblock::{
     apply_edge_samples, clipd1, deblock_plane, filter_edge_samples, strength_for_quant,
