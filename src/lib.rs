@@ -90,16 +90,26 @@
 //!   [`chroma_mv_component_4mv`] reduce the sum of the four luma
 //!   vectors to one chroma vector with the Table F.1 sixteenth →
 //!   half-pixel snap (asymmetric `{0,1,2}→0`, `{3..=13}→1`,
-//!   `{14,15}→2` mapping). The §F.3 overlapped block motion
-//!   compensation and the macroblock-driver wiring that walks the
-//!   neighbour grid are out of scope.
+//!   `{14,15}→2` mapping).
+//! * **Round 12** — Annex F §F.3 overlapped block motion compensation
+//!   (OBMC) for the 8×8 luminance prediction, as the pure function
+//!   [`obmc_predict_block`] over the Figures F.2 / F.3 / F.4 weight
+//!   matrices [`H0`] / [`H1`] / [`H2`]. Each pixel is
+//!   `(q·H0 + r·H1 + s·H2 + 4) / 8` with `q` the current block's MV
+//!   and `r` / `s` the per-pixel "top-or-bottom" / "left-or-right"
+//!   remote vectors, each wrapped in [`RemoteMv`] so the caller can
+//!   encode the §F.3 substitution rules (not-coded → zero; INTRA /
+//!   outside picture / bottom-of-MB → current vector) without folding
+//!   the resolved vector here. The macroblock-driver wiring that walks
+//!   the live neighbour grid and dispatches `obmc_predict_block` per
+//!   8×8 luminance block of an INTER4V macroblock remains out of scope.
 //!
-//! PB-frame / Annex-T / extended-PTYPE / §F.3 OBMC paths are still out
-//! of scope, as is the remainder of Annex I (Table I.2 VLC +
-//! prediction reconstruction); the driver returns
-//! [`Error::NotImplemented`] for them. The `oxideav_core::Decoder`
-//! registration is still a no-op — [`decode_picture`] is the
-//! frame-yielding surface pending the full streaming `Decoder` impl.
+//! PB-frame / Annex-T / extended-PTYPE paths are still out of scope, as
+//! is the remainder of Annex I (Table I.2 VLC + prediction
+//! reconstruction); the driver returns [`Error::NotImplemented`] for
+//! them. The `oxideav_core::Decoder` registration is still a no-op —
+//! [`decode_picture`] is the frame-yielding surface pending the full
+//! streaming `Decoder` impl.
 //!
 //! [spec]: https://www.itu.int/rec/T-REC-H.263
 
@@ -137,10 +147,11 @@ pub use idct::{idct_8x8, reconstruct_intra_samples, BLOCK_DIM, IDCT_OUT_MAX, IDC
 pub use macroblock::{parse_macroblock, H263Macroblock, MbContext, MbType, Mvd};
 pub use motion::{
     chroma_mv, chroma_mv_4mv, chroma_mv_component, chroma_mv_component_4mv, median3,
-    motion_compensate_block, predict_mv_median, reconstruct_inter_block, reconstruct_mv,
-    reconstruct_mv_component, reconstruct_mv_component_umv, reconstruct_mv_umv,
+    motion_compensate_block, obmc_predict_block, predict_mv_median, reconstruct_inter_block,
+    reconstruct_mv, reconstruct_mv_component, reconstruct_mv_component_umv, reconstruct_mv_umv,
     select_4mv_candidates, LumaBlockIndex, Mb4Mv, Mb4MvNeighbourhood, MotionVector, RefPlane,
-    MV_HALF_MAX, MV_HALF_MIN, MV_HALF_SPAN, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN, RCONTROL_DEFAULT,
+    RemoteMv, H0, H1, H2, MV_HALF_MAX, MV_HALF_MIN, MV_HALF_SPAN, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN,
+    OBMC_WEIGHT_SUM, RCONTROL_DEFAULT,
 };
 pub use picture::{decode_picture, DecodeOptions, YuvFrame};
 pub use picture_header::{

@@ -8,6 +8,65 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex F §F.3 Overlapped Block Motion Compensation (OBMC) for the
+  8×8 luminance prediction (round 12), as a pure function in the
+  [`motion`] module:
+  - `H0`, `H1`, `H2`: the three Figures F.2 / F.3 / F.4 8×8 weighting
+    matrices (`u8`), stored row-major so `H0[j][i] == H0(i, j)` per
+    the §F.3 "(i, j) denotes the column and row" indexing note. The
+    per-pixel sum `H0[j][i] + H1[j][i] + H2[j][i]` is exactly 8 by
+    spec construction, exposed as `OBMC_WEIGHT_SUM`; this guarantees
+    the `(... + 4) / 8` rounding step divides cleanly.
+  - `RemoteMv { Zero, Current, Vector(MotionVector) }`: the §F.3
+    last-paragraph substitution rules for the four remote vectors.
+    `Zero` is the "not coded" rule; `Current` is the union of the
+    "INTRA / outside picture / current block at bottom of MB → use
+    current vector" rules; `Vector(mv)` is the baseline coded-neighbour
+    case. `RemoteMv::resolve(current)` returns the half-pel
+    `MotionVector` the §F.3 weighted average should sample with.
+  - `obmc_predict_block(plane, block_x, block_y, q_mv, r_top, r_bot,
+    s_left, s_right, rcontrol)`: produces one 8×8 OBMC prediction
+    block. For every output pixel `(i, j)`:
+    `P(i, j) = (q · H0[j][i] + r · H1[j][i] + s · H2[j][i] + 4) / 8`
+    where `q` / `r` / `s` are §6.1.2 / Figure-13 half-pel bilinear
+    samples for the current MV / the top-or-bottom remote MV
+    (`j < 4` picks `r_top`, `j >= 4` picks `r_bot`) / the
+    left-or-right remote MV (`i < 4` picks `s_left`, `i >= 4` picks
+    `s_right`). Reference access uses `RefPlane::at`'s §D.1 edge
+    replication. The final pixel is clipped to `[0, 255]` per §6.3.2.
+  - Out of scope (deferred to a later round): the macroblock-loop
+    driver wiring that, for each INTER4V macroblock, walks the live
+    four-MV neighbour grid (left / right / above / below at 8×8
+    granularity) and dispatches `obmc_predict_block` four times
+    (one per `LumaBlockIndex`) with the correct `RemoteMv`
+    classification per the §F.3 last-paragraph rules. The decode
+    driver still returns `Error::NotImplemented` for INTER4V.
+- Public re-exports from the crate root: `obmc_predict_block`,
+  `RemoteMv`, `H0`, `H1`, `H2`, `OBMC_WEIGHT_SUM`.
+- 12 unit tests in `motion::tests`: per-pixel weight sum (every
+  position sums to 8); `H0` Figure F.2 spot-checks (four corners = 4,
+  central 4×4 = 6, first-row non-corner = 5); `H1` Figure F.3
+  spot-checks (rows 0/7 all 2, row 1/6 cols 2..=5 are 2 with col 0/7
+  edges = 1, interior rows 2..=5 are 1 everywhere); `H2` Figure F.4
+  spot-checks (top/bottom row = `[2,1,1,1,1,1,1,2]`, interior rows
+  = `[2,2,1,1,1,1,2,2]`); `H1` vs `H2` corner-shape contrast
+  (corners both 2 but the "+1 lane" runs along rows for H1 and along
+  columns for H2 — not strict transposes); flat-reference identity
+  (a uniform plane stays uniform regardless of vectors); all-current
+  collapse (q == r == s ⇒ `(q·8 + 4)/8 == q`, matching
+  `motion_compensate_block`); zero-vector reference copy on a column
+  ramp; `RemoteMv::Zero` vs `RemoteMv::Vector(default())` equivalence;
+  top-vs-bottom split observable on a row-ramp reference with hand-
+  derived `(j=0, i=4) = 56` and `(j=7, i=4) = 128` per Figures F.2 /
+  F.3; left-vs-right split observable on a column-ramp reference with
+  hand-derived `(j=2, i=0) = 28` and `(j=2, i=7) = 64` per Figures
+  F.2 / F.4; `RemoteMv::resolve` per-variant rule; picture-edge
+  replication (a flat reference with the block origin past the right
+  edge keeps every prediction pixel at the flat reference value);
+  in-range non-degenerate sweep on a mixed reference (the prediction
+  has at least two distinct pixel values, confirming the weighted
+  sum actually executed).
+
 - Annex F §F.2 Advanced Prediction mode — four-motion-vector
   candidate-predictor redefinition (Figure F.1) and Table F.1
   sixteenth-pixel chrominance vector derivation (round 11), as pure

@@ -49,10 +49,19 @@
 //! grid (the caller decides which neighbour MBs are present, INTRA, or
 //! not coded — those map to `None`) and return the three §F.2 candidate
 //! predictors for one of the four 8×8 luminance blocks in a
-//! macroblock, ready to feed into [`predict_mv_median`]. The §F.3
-//! overlapped block motion compensation (the weighted three-prediction
-//! H0/H1/H2 average) and the macroblock-driver wiring that derives the
-//! neighbour grid from the live picture state are out of scope for the
+//! macroblock, ready to feed into [`predict_mv_median`].
+//!
+//! Annex F §F.3 — the **overlapped block motion compensation** weighted
+//! three-prediction average for the 8×8 luminance prediction — is
+//! provided as the pure function [`obmc_predict_block`] over the
+//! Figures F.2 / F.3 / F.4 weight matrices [`H0`] / [`H1`] / [`H2`].
+//! The caller passes the current block's motion vector plus the four
+//! remote vectors (top, bottom, left, right) wrapped in [`RemoteMv`] so
+//! the §F.3 substitution rules ("not coded → zero" / "INTRA / outside
+//! picture / bottom-of-MB → current vector") can be expressed without
+//! folding the resolved vector here. The macroblock-driver wiring that
+//! walks the live neighbour grid and dispatches `obmc_predict_block` per
+//! 8×8 luminance block of an INTER4V macroblock is out of scope for the
 //! current round.
 
 use crate::block::COEFFS_PER_BLOCK;
@@ -698,6 +707,228 @@ pub fn chroma_mv_4mv(luma: &Mb4Mv) -> MotionVector {
         dx_half: chroma_mv_component_4mv(sum_x),
         dy_half: chroma_mv_component_4mv(sum_y),
     }
+}
+
+// ---- Annex F §F.3 Overlapped block motion compensation --------------
+
+/// Annex F §F.3 / Figure F.2 — weighting matrix `H0(i, j)` for the
+/// **current** luminance block's motion vector contribution to its own
+/// 8×8 OBMC prediction.
+///
+/// Indexing convention from §F.3: `(i, j)` denotes **column and row**,
+/// respectively. We store the matrix in row-major form so
+/// `H0[j][i] == H0(i, j)`. The matrix is symmetric about both axes; its
+/// per-pixel sum with [`H1`] and [`H2`] is exactly 8, so the rounding
+/// term `+4` in the §F.3 averaging formula divides cleanly by 8.
+pub const H0: [[u8; BLOCK_DIM]; BLOCK_DIM] = [
+    [4, 5, 5, 5, 5, 5, 5, 4],
+    [5, 5, 5, 5, 5, 5, 5, 5],
+    [5, 5, 6, 6, 6, 6, 5, 5],
+    [5, 5, 6, 6, 6, 6, 5, 5],
+    [5, 5, 6, 6, 6, 6, 5, 5],
+    [5, 5, 6, 6, 6, 6, 5, 5],
+    [5, 5, 5, 5, 5, 5, 5, 5],
+    [4, 5, 5, 5, 5, 5, 5, 4],
+];
+
+/// Annex F §F.3 / Figure F.3 — weighting matrix `H1(i, j)` for the
+/// **top-or-bottom** remote luminance block's motion-vector contribution
+/// to the current 8×8 OBMC prediction. Stored row-major (so
+/// `H1[j][i] == H1(i, j)`).
+///
+/// The matrix is asymmetric in `j`: rows 0 and 7 carry weight 2 across
+/// every column (the "edge" rows adjacent to the remote block), while
+/// the interior rows carry weight 1 with localised "+1" cells at the
+/// `i ∈ {2..=5}` columns of the *second* and *seventh* rows
+/// (`j ∈ {1, 6}`). The §F.3 averaging formula's H0 / H1 / H2 sum is
+/// exactly 8 at every `(i, j)` position by construction.
+pub const H1: [[u8; BLOCK_DIM]; BLOCK_DIM] = [
+    [2, 2, 2, 2, 2, 2, 2, 2],
+    [1, 1, 2, 2, 2, 2, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 2, 2, 2, 2, 1, 1],
+    [2, 2, 2, 2, 2, 2, 2, 2],
+];
+
+/// Annex F §F.3 / Figure F.4 — weighting matrix `H2(i, j)` for the
+/// **left-or-right** remote luminance block's motion-vector contribution
+/// to the current 8×8 OBMC prediction. Stored row-major (so
+/// `H2[j][i] == H2(i, j)`).
+///
+/// `H2` is the transpose-style mirror of `H1`: the high-weight cells
+/// live on the *columns* `i ∈ {0, 1, 6, 7}` rather than the rows
+/// `j ∈ {0, 7}`. Specifically, columns 0/1/6/7 carry weight 2 inside
+/// `j ∈ {1..=6}` and weight 1 on the corner-adjacent cells; the
+/// interior columns `i ∈ {2..=5}` carry weight 1 everywhere.
+pub const H2: [[u8; BLOCK_DIM]; BLOCK_DIM] = [
+    [2, 1, 1, 1, 1, 1, 1, 2],
+    [2, 2, 1, 1, 1, 1, 2, 2],
+    [2, 2, 1, 1, 1, 1, 2, 2],
+    [2, 2, 1, 1, 1, 1, 2, 2],
+    [2, 2, 1, 1, 1, 1, 2, 2],
+    [2, 2, 1, 1, 1, 1, 2, 2],
+    [2, 2, 1, 1, 1, 1, 2, 2],
+    [2, 1, 1, 1, 1, 1, 1, 2],
+];
+
+/// Per-pixel sum of [`H0`], [`H1`] and [`H2`] — by §F.3 construction,
+/// always **8**. The `+ 4` term in the §F.3 weighted-average formula
+/// then divides cleanly by 8 to produce one rounded prediction pixel.
+pub const OBMC_WEIGHT_SUM: u32 = 8;
+
+/// One of the two remote motion vectors fed into the §F.3 OBMC weighted
+/// average for a given pixel.
+///
+/// The §F.3 last paragraph spells out three rules for the remote vector
+/// supplied to `r(x,y)` and `s(x,y)`:
+///
+/// * If the surrounding macroblock is **not coded** (COD = 1), the
+///   corresponding remote MV is **zero** ([`Self::Zero`]).
+/// * If the surrounding block is **INTRA-coded** (or its macroblock is
+///   outside the picture / current segment), the remote MV is **replaced
+///   by the current block's MV** ([`Self::Current`]). The same
+///   substitution applies when "the current block is at the bottom of
+///   the macroblock (for block number 3 or 4) [and] the remote motion
+///   vector corresponding with an 8 * 8 luminance block in the
+///   macroblock below the current macroblock is replaced by the motion
+///   vector for the current block".
+/// * Otherwise the remote vector is the surrounding block's own coded
+///   MV ([`Self::Vector`]).
+///
+/// The PB-frames INTRA-block exception ("the INTRA block's motion vector
+/// is used") is encoded by the caller passing [`Self::Vector`] with that
+/// block's coded MV instead of [`Self::Current`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteMv {
+    /// §F.3 not-coded macroblock rule: the remote vector is zero.
+    Zero,
+    /// §F.3 INTRA / outside-picture / bottom-of-MB rule: the remote
+    /// vector is replaced by the current block's own motion vector.
+    Current,
+    /// §F.3 baseline case: the remote vector is the surrounding block's
+    /// coded motion vector, supplied directly.
+    Vector(MotionVector),
+}
+
+impl RemoteMv {
+    /// Resolve [`Self`] against the current block's motion vector,
+    /// returning the half-pel [`MotionVector`] the §F.3 weighted average
+    /// should sample with.
+    #[inline]
+    pub fn resolve(self, current: MotionVector) -> MotionVector {
+        match self {
+            RemoteMv::Zero => MotionVector::default(),
+            RemoteMv::Current => current,
+            RemoteMv::Vector(mv) => mv,
+        }
+    }
+}
+
+/// Annex F §F.3 — produce one 8×8 luminance OBMC prediction block using
+/// the weighted three-prediction average from Figures F.2 / F.3 / F.4.
+///
+/// Computes, for every output pixel `(i, j)` in the block (with `j` the
+/// row and `i` the column, per the §F.3 indexing note):
+///
+/// ```text
+///   P(i, j) = (q(i, j) * H0[j][i]
+///            + r(i, j) * H1[j][i]
+///            + s(i, j) * H2[j][i]
+///            + 4) / 8
+/// ```
+///
+/// where `q`, `r`, `s` are the §6.1.2 / Figure-13 half-pel-interpolated
+/// reference samples for the three vectors:
+///
+/// * `q_mv` — the current block's coded motion vector.
+/// * `r_top` (rows 0..=3) and `r_bot` (rows 4..=7) — the remote
+///   "top-or-bottom" vector. For the upper half of the block (`j < 4`)
+///   the vector of the block **above** is used; for the lower half
+///   (`j >= 4`) the vector of the block **below** is used (§F.3 second
+///   paragraph + Figure F.3).
+/// * `s_left` (columns 0..=3) and `s_right` (columns 4..=7) — the
+///   remote "left-or-right" vector. The left half uses the vector of the
+///   block to the **left**, the right half the vector of the block to
+///   the **right** (§F.3 second paragraph + Figure F.4).
+///
+/// Each remote vector is supplied as a [`RemoteMv`] so the caller can
+/// express the §F.3 "not coded → zero / INTRA / outside picture / bottom-
+/// of-MB → current" substitution rules without folding the resolved
+/// vector here. `block_x` / `block_y` are the block's top-left integer
+/// pixel position in the current picture; `plane` is the luma reference
+/// plane (with the always-on §D.1 edge replication via
+/// [`RefPlane::at`]).
+///
+/// `rcontrol` is the §6.1.2 `RCONTROL` bit (implied `0` in baseline H.263).
+#[allow(clippy::too_many_arguments)]
+pub fn obmc_predict_block(
+    plane: &RefPlane<'_>,
+    block_x: usize,
+    block_y: usize,
+    q_mv: MotionVector,
+    r_top: RemoteMv,
+    r_bot: RemoteMv,
+    s_left: RemoteMv,
+    s_right: RemoteMv,
+    rcontrol: i32,
+) -> [u8; COEFFS_PER_BLOCK] {
+    let r_top_mv = r_top.resolve(q_mv);
+    let r_bot_mv = r_bot.resolve(q_mv);
+    let s_left_mv = s_left.resolve(q_mv);
+    let s_right_mv = s_right.resolve(q_mv);
+
+    let mut out = [0u8; COEFFS_PER_BLOCK];
+    for j in 0..BLOCK_DIM {
+        let r_mv = if j < BLOCK_DIM / 2 {
+            r_top_mv
+        } else {
+            r_bot_mv
+        };
+        for i in 0..BLOCK_DIM {
+            let s_mv = if i < BLOCK_DIM / 2 {
+                s_left_mv
+            } else {
+                s_right_mv
+            };
+            // §6.1.2 half-pel source positions for q, r, s. Each output
+            // pixel is at integer position (block_x + i, block_y + j);
+            // the half-pel reference position is (2·pos + mv).
+            let base_hx = ((block_x + i) as i32) * 2;
+            let base_hy = ((block_y + j) as i32) * 2;
+            let q = sample_half_pel(
+                plane,
+                base_hx + q_mv.dx_half,
+                base_hy + q_mv.dy_half,
+                rcontrol,
+            );
+            let r = sample_half_pel(
+                plane,
+                base_hx + r_mv.dx_half,
+                base_hy + r_mv.dy_half,
+                rcontrol,
+            );
+            let s = sample_half_pel(
+                plane,
+                base_hx + s_mv.dx_half,
+                base_hy + s_mv.dy_half,
+                rcontrol,
+            );
+            let h0 = H0[j][i] as i32;
+            let h1 = H1[j][i] as i32;
+            let h2 = H2[j][i] as i32;
+            // §F.3 weighted average with rounding. By construction
+            // h0+h1+h2 == 8, so the divisor is exact.
+            let p = (q * h0 + r * h1 + s * h2 + 4) / 8;
+            // §6.3.2 final clip; bilinear sample values are in [0, 255]
+            // and the convex combination preserves the range, but clip
+            // defensively in case of arithmetic edge cases.
+            out[j * BLOCK_DIM + i] = p.clamp(0, 255) as u8;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1446,5 +1677,385 @@ mod tests {
             let bound = sum.unsigned_abs() as i32 * 2 / 16 + 2;
             assert!(got <= bound, "sum={sum} got={got} bound={bound}");
         }
+    }
+
+    // ---- Annex F §F.3 OBMC weight matrices -----------------------
+
+    /// The three weight matrices must sum to exactly 8 at every
+    /// position; this is the structural invariant that makes the
+    /// `(... + 4) / 8` divisor exact in `obmc_predict_block`.
+    #[test]
+    fn obmc_weights_sum_to_eight_per_pixel() {
+        for j in 0..BLOCK_DIM {
+            for i in 0..BLOCK_DIM {
+                let sum = H0[j][i] as u32 + H1[j][i] as u32 + H2[j][i] as u32;
+                assert_eq!(sum, OBMC_WEIGHT_SUM, "(i,j)=({i},{j}) sum={sum}");
+            }
+        }
+    }
+
+    /// `H0` per Figure F.2: corners = 4, central 4×4 = 6, rest = 5.
+    #[test]
+    fn obmc_h0_figure_f2_spot_checks() {
+        // Four corners.
+        assert_eq!(H0[0][0], 4);
+        assert_eq!(H0[0][7], 4);
+        assert_eq!(H0[7][0], 4);
+        assert_eq!(H0[7][7], 4);
+        // Central 4×4 sub-block (rows 2..=5, cols 2..=5).
+        for (j, row) in H0.iter().enumerate().take(6).skip(2) {
+            for (i, &cell) in row.iter().enumerate().take(6).skip(2) {
+                assert_eq!(cell, 6, "(i,j)=({i},{j})");
+            }
+        }
+        // First row at non-corner positions = 5.
+        for (i, &cell) in H0[0].iter().enumerate().take(7).skip(1) {
+            assert_eq!(cell, 5, "i={i}");
+        }
+    }
+
+    /// `H1` per Figure F.3: rows 0 and 7 = 2 everywhere; rows 1 and 6
+    /// have weight 2 only at columns 2..=5; interior rows are 1
+    /// everywhere.
+    #[test]
+    fn obmc_h1_figure_f3_spot_checks() {
+        for (i, &cell) in H1[0].iter().enumerate() {
+            assert_eq!(cell, 2, "row 0 i={i}");
+        }
+        for (i, &cell) in H1[7].iter().enumerate() {
+            assert_eq!(cell, 2, "row 7 i={i}");
+        }
+        // Row 1: cols 2..=5 = 2, edges = 1.
+        for (i, &cell) in H1[1].iter().enumerate().take(6).skip(2) {
+            assert_eq!(cell, 2, "row 1 i={i}");
+        }
+        for (i, &cell) in H1[6].iter().enumerate().take(6).skip(2) {
+            assert_eq!(cell, 2, "row 6 i={i}");
+        }
+        assert_eq!(H1[1][0], 1);
+        assert_eq!(H1[1][7], 1);
+        assert_eq!(H1[6][0], 1);
+        assert_eq!(H1[6][7], 1);
+        // Interior rows 2..=5: all ones.
+        for (j, row) in H1.iter().enumerate().take(6).skip(2) {
+            for (i, &cell) in row.iter().enumerate() {
+                assert_eq!(cell, 1, "(i,j)=({i},{j})");
+            }
+        }
+    }
+
+    /// `H2` per Figure F.4: columns 0 and 7 carry weight 1 on the
+    /// first/last row and 2 on interior rows; columns 1 and 6 carry
+    /// 2 on interior rows; columns 2..=5 are 1 everywhere.
+    #[test]
+    fn obmc_h2_figure_f4_spot_checks() {
+        // Top row of H2: 2 1 1 1 1 1 1 2.
+        let top_row: [u8; BLOCK_DIM] = [2, 1, 1, 1, 1, 1, 1, 2];
+        assert_eq!(H2[0], top_row);
+        assert_eq!(H2[7], top_row);
+        // Interior rows: 2 2 1 1 1 1 2 2.
+        let mid_row: [u8; BLOCK_DIM] = [2, 2, 1, 1, 1, 1, 2, 2];
+        for (j, row) in H2.iter().enumerate().take(7).skip(1) {
+            assert_eq!(*row, mid_row, "row {j}");
+        }
+    }
+
+    /// `H1` and `H2` share the same per-row/per-column character — both
+    /// have weight 2 along the "block boundary" edges adjacent to the
+    /// remote block (Figures F.3 and F.4) — but they are **not** strict
+    /// transposes: the second-and-seventh "lane" pattern differs at the
+    /// corners. Verify the per-corner shape directly so any future
+    /// transcription error in either matrix is caught.
+    #[test]
+    fn obmc_h1_h2_corner_shapes() {
+        // H1 corners (rows 0/7, cols 0/7) are 2.
+        for &(j, i) in &[(0, 0), (0, 7), (7, 0), (7, 7)] {
+            assert_eq!(H1[j][i], 2, "H1 corner ({i},{j})");
+        }
+        // H2 corners (rows 0/7, cols 0/7) are 2.
+        for &(j, i) in &[(0, 0), (0, 7), (7, 0), (7, 7)] {
+            assert_eq!(H2[j][i], 2, "H2 corner ({i},{j})");
+        }
+        // H1's row-1 col-1 is 1 (the "+1 lane" is at cols 2..=5 only),
+        // while H2's row-1 col-1 is 2 (the "+1 lane" is at the column
+        // direction).
+        assert_eq!(H1[1][1], 1);
+        assert_eq!(H2[1][1], 2);
+    }
+
+    // ---- Annex F §F.3 OBMC weighted prediction -------------------
+
+    /// On a flat reference, every prediction is the same flat value
+    /// regardless of vectors. (The convex combination preserves the
+    /// constant.)
+    #[test]
+    fn obmc_flat_reference_is_identity() {
+        let buf = vec![128u8; 32 * 16];
+        let p = RefPlane::new(&buf, 32, 16);
+        let q = MotionVector::new(2, -2);
+        let pred = obmc_predict_block(
+            &p,
+            8,
+            4,
+            q,
+            RemoteMv::Vector(MotionVector::new(-4, 0)),
+            RemoteMv::Vector(MotionVector::new(4, 4)),
+            RemoteMv::Vector(MotionVector::new(0, -4)),
+            RemoteMv::Vector(MotionVector::new(6, 0)),
+            0,
+        );
+        assert!(pred.iter().all(|&v| v == 128));
+    }
+
+    /// When all three vectors are identical (the "all remotes resolve to
+    /// the current MV" case, e.g. picture-border + INTRA-only
+    /// neighbourhood), the §F.3 weighted average degenerates to one
+    /// `motion_compensate_block` call:
+    /// `(q·H0 + q·H1 + q·H2 + 4) / 8 == (q·8 + 4) / 8 == q` (the +4 /8
+    /// is exact for integers in `0..=255`, since `q*8` is a multiple of 8
+    /// and adding 4 then dividing by 8 lands on `q` for non-negative
+    /// values).
+    #[test]
+    fn obmc_all_current_matches_single_mc() {
+        // Reference: pixel value = column.
+        let mut buf = vec![0u8; 32 * 16];
+        for y in 0..16 {
+            for x in 0..32 {
+                buf[y * 32 + x] = x as u8;
+            }
+        }
+        let p = RefPlane::new(&buf, 32, 16);
+        let q = MotionVector::new(2, 0); // +1 pixel
+        let obmc = obmc_predict_block(
+            &p,
+            0,
+            0,
+            q,
+            RemoteMv::Current,
+            RemoteMv::Current,
+            RemoteMv::Current,
+            RemoteMv::Current,
+            0,
+        );
+        let single = motion_compensate_block(&p, 0, 0, q, 0);
+        assert_eq!(obmc, single);
+    }
+
+    /// Sanity: when `q == 0`, `r == 0`, `s == 0` and the reference is
+    /// a pure column ramp, every output pixel reproduces its column
+    /// value at `(block_x + i, block_y + j)`.
+    #[test]
+    fn obmc_zero_vectors_copies_reference() {
+        let mut buf = vec![0u8; 32 * 16];
+        for y in 0..16 {
+            for x in 0..32 {
+                buf[y * 32 + x] = x as u8;
+            }
+        }
+        let p = RefPlane::new(&buf, 32, 16);
+        let pred = obmc_predict_block(
+            &p,
+            4,
+            2,
+            MotionVector::default(),
+            RemoteMv::Zero,
+            RemoteMv::Zero,
+            RemoteMv::Zero,
+            RemoteMv::Zero,
+            0,
+        );
+        for j in 0..BLOCK_DIM {
+            for i in 0..BLOCK_DIM {
+                assert_eq!(pred[j * BLOCK_DIM + i], (4 + i) as u8, "(i,j)=({i},{j})");
+            }
+        }
+    }
+
+    /// `RemoteMv::Zero` and `RemoteMv::Vector(MotionVector::default())`
+    /// resolve to the same vector and therefore produce identical
+    /// predictions.
+    #[test]
+    fn obmc_remote_zero_equals_vector_zero() {
+        let mut buf = vec![0u8; 32 * 16];
+        for y in 0..16 {
+            for x in 0..32 {
+                buf[y * 32 + x] = ((x + y) % 200) as u8;
+            }
+        }
+        let p = RefPlane::new(&buf, 32, 16);
+        let q = MotionVector::new(3, -1);
+        let a = obmc_predict_block(
+            &p,
+            8,
+            4,
+            q,
+            RemoteMv::Zero,
+            RemoteMv::Zero,
+            RemoteMv::Zero,
+            RemoteMv::Zero,
+            0,
+        );
+        let b = obmc_predict_block(
+            &p,
+            8,
+            4,
+            q,
+            RemoteMv::Vector(MotionVector::default()),
+            RemoteMv::Vector(MotionVector::default()),
+            RemoteMv::Vector(MotionVector::default()),
+            RemoteMv::Vector(MotionVector::default()),
+            0,
+        );
+        assert_eq!(a, b);
+    }
+
+    /// The split between `r_top` (rows 0..=3) and `r_bot` (rows 4..=7)
+    /// is observable: feeding different `RemoteMv::Vector` values to
+    /// the two halves changes the output across the j=3/j=4 boundary
+    /// while leaving the central q contribution intact.
+    #[test]
+    fn obmc_top_bottom_split_observable() {
+        // Reference where pixel value depends on row only: row r -> r * 10.
+        let mut buf = vec![0u8; 32 * 32];
+        for y in 0..32 {
+            for x in 0..32 {
+                buf[y * 32 + x] = (y * 8).min(255) as u8;
+            }
+        }
+        let p = RefPlane::new(&buf, 32, 32);
+        let q = MotionVector::default(); // q reads row exactly.
+        let top_vec = MotionVector::new(0, -8); // -4 rows up
+        let bot_vec = MotionVector::new(0, 8); // +4 rows down
+        let pred = obmc_predict_block(
+            &p,
+            8,
+            8,
+            q,
+            RemoteMv::Vector(top_vec),
+            RemoteMv::Vector(bot_vec),
+            RemoteMv::Current,
+            RemoteMv::Current,
+            0,
+        );
+        // Sample two specific rows to assert the H0/H1 weighting
+        // applied correctly. At (i=4, j=0):
+        //   q = row 8 = 64, r = row 4 = 32, s = q (= 64).
+        //   H0[0][4]=5, H1[0][4]=2, H2[0][4]=1.
+        //   P = (64*5 + 32*2 + 64*1 + 4) / 8 = (320 + 64 + 64 + 4)/8
+        //     = 452 / 8 = 56.
+        assert_eq!(pred[4], 56);
+        // At (i=4, j=7):
+        //   q = row 15 = 120, r = row 19 = 152, s = q (= 120).
+        //   H0[7][4]=5, H1[7][4]=2, H2[7][4]=1.
+        //   P = (120*5 + 152*2 + 120*1 + 4) / 8 = (600+304+120+4)/8
+        //     = 1028 / 8 = 128.
+        assert_eq!(pred[7 * BLOCK_DIM + 4], 128);
+    }
+
+    /// The split between `s_left` (cols 0..=3) and `s_right`
+    /// (cols 4..=7) is observable: feeding different vectors to the
+    /// two halves changes the output across the i=3/i=4 boundary.
+    #[test]
+    fn obmc_left_right_split_observable() {
+        // Reference where pixel value depends on column only: col c -> c * 4.
+        let mut buf = vec![0u8; 32 * 32];
+        for y in 0..32 {
+            for x in 0..32 {
+                buf[y * 32 + x] = (x * 4).min(255) as u8;
+            }
+        }
+        let p = RefPlane::new(&buf, 32, 32);
+        let q = MotionVector::default();
+        let left_vec = MotionVector::new(-8, 0); // -4 cols
+        let right_vec = MotionVector::new(8, 0); // +4 cols
+        let pred = obmc_predict_block(
+            &p,
+            8,
+            4,
+            q,
+            RemoteMv::Current,
+            RemoteMv::Current,
+            RemoteMv::Vector(left_vec),
+            RemoteMv::Vector(right_vec),
+            0,
+        );
+        // At (i=0, j=2):
+        //   q = col 8 = 32, r = q (= 32), s = col 4 = 16.
+        //   H0[2][0]=5, H1[2][0]=1, H2[2][0]=2.
+        //   P = (32*5 + 32*1 + 16*2 + 4)/8 = (160+32+32+4)/8 = 228/8 = 28.
+        assert_eq!(pred[2 * BLOCK_DIM], 28);
+        // At (i=7, j=2):
+        //   q = col 15 = 60, r = q (= 60), s = col 19 = 76.
+        //   H0[2][7]=5, H1[2][7]=1, H2[2][7]=2.
+        //   P = (60*5 + 60*1 + 76*2 + 4)/8 = (300+60+152+4)/8 = 516/8 = 64.
+        assert_eq!(pred[2 * BLOCK_DIM + 7], 64);
+    }
+
+    /// `RemoteMv::resolve` matches the documented substitution rules.
+    #[test]
+    fn remote_mv_resolve_rules() {
+        let cur = MotionVector::new(7, -3);
+        assert_eq!(RemoteMv::Zero.resolve(cur), MotionVector::default());
+        assert_eq!(RemoteMv::Current.resolve(cur), cur);
+        let other = MotionVector::new(-2, 4);
+        assert_eq!(RemoteMv::Vector(other).resolve(cur), other);
+    }
+
+    /// Picture-edge replication: a block partially outside the
+    /// reference plane is filled via `RefPlane::at`'s clamp, and the
+    /// OBMC weighted average is still in `[0, 255]`.
+    #[test]
+    fn obmc_edge_replication_in_range() {
+        let buf = vec![123u8; 16 * 16];
+        let p = RefPlane::new(&buf, 16, 16);
+        // Block origin past the right edge; every fetch clamps.
+        let pred = obmc_predict_block(
+            &p,
+            20,
+            20,
+            MotionVector::new(40, 40),
+            RemoteMv::Current,
+            RemoteMv::Current,
+            RemoteMv::Current,
+            RemoteMv::Current,
+            0,
+        );
+        // The reference is flat at 123; the prediction must be flat at
+        // 123 even after clamping every fetch.
+        assert!(pred.iter().all(|&v| v == 123), "got={pred:?}");
+    }
+
+    /// End-to-end sanity: every OBMC pixel is in `[0, 255]` across a
+    /// non-trivial vector combination.
+    #[test]
+    fn obmc_in_range_sweep() {
+        let mut buf = vec![0u8; 32 * 32];
+        for y in 0..32 {
+            for x in 0..32 {
+                buf[y * 32 + x] = ((x * 7 + y * 11) % 256) as u8;
+            }
+        }
+        let p = RefPlane::new(&buf, 32, 32);
+        let q = MotionVector::new(1, 1);
+        let pred = obmc_predict_block(
+            &p,
+            8,
+            8,
+            q,
+            RemoteMv::Vector(MotionVector::new(2, -2)),
+            RemoteMv::Vector(MotionVector::new(-2, 2)),
+            RemoteMv::Vector(MotionVector::new(-3, 0)),
+            RemoteMv::Vector(MotionVector::new(3, 0)),
+            0,
+        );
+        // `u8` is by definition in [0, 255]; check the prediction is
+        // non-degenerate (not all zero, not all 255) for confidence the
+        // weighted-average actually executed.
+        let min = pred.iter().copied().min().unwrap();
+        let max = pred.iter().copied().max().unwrap();
+        assert!(
+            min < max,
+            "min={min} max={max} (flat prediction is wrong here)"
+        );
     }
 }

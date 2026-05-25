@@ -5,16 +5,19 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 11 — Annex F §F.2 Advanced Prediction mode
-four-motion-vector candidate-predictor redefinition (Figure F.1) and
-Table F.1 sixteenth-pixel chrominance vector derivation, as pure
-transformations (`LumaBlockIndex` / `Mb4MvNeighbourhood` /
-`select_4mv_candidates` / `chroma_mv_4mv`), on top of round 10's Annex
-D §D.2 Unrestricted Motion Vector mode (extended `[-63, 63]` half-pel
-per-component range with predictor-dependent difference-pair selection,
-PLUSPTYPE-absent case) + round 9's full-picture decode driver (baseline
-single-MV path: INTRA / INTER / skipped macroblocks, §6.1.1 Figure-12
-MV prediction, optional Annex J deblocking) + round 8's picture + GOB +
+**Orphan-rebuild round 12 — Annex F §F.3 overlapped block motion
+compensation (OBMC) for the 8×8 luminance prediction, as the pure
+function `obmc_predict_block` over the Figures F.2 / F.3 / F.4 weight
+matrices (`H0` / `H1` / `H2`), with the four §F.3 remote-vector
+substitution rules expressed as the `RemoteMv` enum (`Zero` /
+`Current` / `Vector(mv)`). On top of round 11's §F.2 four-motion-vector
+candidate-predictor redefinition + Table F.1 sixteenth-pixel chroma
+derivation, round 10's Annex D §D.2 Unrestricted Motion Vector mode
+(extended `[-63, 63]` half-pel per-component range with
+predictor-dependent difference-pair selection, PLUSPTYPE-absent case),
+round 9's full-picture decode driver (baseline single-MV path:
+INTRA / INTER / skipped macroblocks, §6.1.1 Figure-12 MV prediction,
+optional Annex J deblocking), and rounds 1-8's picture + GOB +
 macroblock headers + block data + intra-block reconstruction + P-frame
 motion compensation and INTER-block reconstruction + Annex J deblocking
 filter + Annex I Advanced INTRA Coding scan/mode layer.** The
@@ -204,10 +207,31 @@ the non-PB-frame baseline:
   median. `chroma_mv_4mv(luma)` / `chroma_mv_component_4mv(sum)`
   perform §F.2's "sum of the four luminance vectors divided by 8"
   chroma derivation with the Table F.1 sixteenth → half-pixel snap
-  (`{0,1,2}→0`, `{3..=13}→1`, `{14,15}→2`). The §F.3 overlapped block
-  motion compensation (the weighted three-prediction H0/H1/H2 average)
-  and the driver wiring that walks the live neighbour grid are out of
-  scope for this round; the decode driver still returns
+  (`{0,1,2}→0`, `{3..=13}→1`, `{14,15}→2`).
+* Annex F §F.3 — overlapped block motion compensation (OBMC) for the
+  8×8 luminance prediction, as the pure function `obmc_predict_block`
+  over the Figures F.2 / F.3 / F.4 weight matrices `H0` / `H1` / `H2`.
+  Each output pixel `(i, j)` of the 8×8 block is
+  `(q · H0[j][i] + r · H1[j][i] + s · H2[j][i] + 4) / 8`, with `q`
+  the §6.1.2 / Figure-13 half-pel bilinear sample for the current
+  block's MV and `r` / `s` the corresponding samples for the
+  per-pixel "top-or-bottom" / "left-or-right" remote vectors:
+  `j < 4` picks `r_top`, `j >= 4` picks `r_bot`; `i < 4` picks
+  `s_left`, `i >= 4` picks `s_right`. The per-pixel sum `H0+H1+H2`
+  is exactly 8 by construction (exposed as `OBMC_WEIGHT_SUM`), so
+  the `(... + 4) / 8` rounding step divides cleanly. Each remote
+  vector is supplied via a `RemoteMv` enum so the caller can encode
+  the §F.3 substitution rules without folding the resolved vector
+  here: `RemoteMv::Zero` for the "not coded → zero" rule;
+  `RemoteMv::Current` for the union of the "INTRA / outside picture
+  / current block at bottom of MB → use current vector" rules;
+  `RemoteMv::Vector(mv)` for the baseline coded-neighbour case. The
+  reference-plane fetches use `RefPlane::at`'s always-on §D.1 edge
+  replication. The macroblock-loop driver wiring that walks the
+  live four-MV neighbour grid for an INTER4V macroblock and
+  dispatches `obmc_predict_block` four times (once per
+  `LumaBlockIndex` with the correct `RemoteMv` classification) is
+  out of scope for this round; the decode driver still returns
   `Error::NotImplemented` for INTER4V macroblocks.
 
 The high-level entry point decodes a whole picture in one call:
@@ -279,11 +303,13 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   for the four-vector path is still pending. Round 11 landed the
   §F.2 candidate-predictor redefinition (Figure F.1) and the Table
   F.1 sixteenth-pixel chroma derivation as pure primitives
-  (`select_4mv_candidates`, `chroma_mv_4mv`), but the macroblock-loop
-  driver does not yet walk the neighbour grid to feed them; the
-  driver returns `Error::NotImplemented` when it meets an INTER4V
-  macroblock. The §F.3 overlapped block motion compensation (the
-  weighted three-prediction H0/H1/H2 average) is also out of scope.
+  (`select_4mv_candidates`, `chroma_mv_4mv`); round 12 landed the
+  §F.3 OBMC weighted three-prediction average as the pure function
+  `obmc_predict_block` over the Figures F.2 / F.3 / F.4 weight
+  matrices. The macroblock-loop driver does not yet walk the four-MV
+  neighbour grid to feed `obmc_predict_block` four times per INTER4V
+  macroblock; the driver returns `Error::NotImplemented` when it
+  meets one.
 * GOB-0-header-elision: the driver requires every GOB (including the
   topmost) to carry a GBSC/GN/GFID/GQUANT header on the wire, because
   the picture-layer PQUANT (the QUANT GOB 0 would inherit when its
@@ -336,7 +362,7 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 11 coverage estimate
+### Round 12 coverage estimate
 
 * H.263 spec text covered: §4.2.1 (GOB / MB scan layout, per-format
   GOB & MB-row counts) + §5.1.1–§5.1.3 + §5.2.2 + §5.2.3 +
@@ -354,11 +380,14 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   `[-63, 63]` half-pel range + predictor-dependent difference-pair
   selection) + Annex F §F.2 (four-vector candidate-predictor
   redefinition per Figure F.1 + Table F.1 sixteenth-pixel chroma
-  derivation), now composed into a full-picture decode driver
+  derivation) + Annex F §F.3 (overlapped block motion compensation
+  weighted three-prediction average with the Figures F.2 / F.3 / F.4
+  weight matrices and the `Zero` / `Current` / `Vector` remote-MV
+  substitution rules), now composed into a full-picture decode driver
   (`decode_picture` → `YuvFrame`) for the single-MV path and exposed
-  as pure primitives for the §F.2 four-MV path. Roughly 20 pages of
-  the ~144-page recommendation.
-* Tests: 196 unit tests on synthetic buffers built with the spec's
+  as pure primitives for the §F.2 four-MV path and §F.3 OBMC weighted
+  average. Roughly 21 pages of the ~144-page recommendation.
+* Tests: 210 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
   (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
@@ -422,7 +451,27 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   positive/negative sixteenth-snap, the full-pixel integer chroma
   result, the Table F.1 asymmetry round-trip at the low (2/3) and
   high (13/14) boundaries with negative mirror, and the bounded
-  chroma magnitude sweep across `[-200, +200]` sums.
+  chroma magnitude sweep across `[-200, +200]` sums; plus 14 Annex F
+  §F.3 OBMC tests covering the per-pixel `H0+H1+H2 == 8` invariant
+  across every position, Figure F.2 spot-checks on `H0` (four
+  corners = 4 / central 4×4 = 6 / first-row non-corner = 5),
+  Figure F.3 spot-checks on `H1` (rows 0/7 all 2 / rows 1/6 cols
+  2..=5 = 2 with col 0/7 edges = 1 / interior rows 2..=5 all 1),
+  Figure F.4 spot-checks on `H2` (top/bottom row `[2,1,1,1,1,1,1,2]`
+  / interior rows `[2,2,1,1,1,1,2,2]`), the `H1` vs `H2`
+  corner-shape contrast (corners both 2 but the "+1 lane" runs along
+  rows for H1 and columns for H2), `obmc_predict_block` flat-
+  reference identity, all-current vector collapse to a single
+  `motion_compensate_block` call, zero-vector reference copy on a
+  column ramp, `RemoteMv::Zero` vs `RemoteMv::Vector(default())`
+  equivalence, top-vs-bottom split observable on a row-ramp
+  reference with hand-derived `(j=0, i=4) = 56` and `(j=7, i=4) =
+  128`, left-vs-right split observable on a column-ramp reference
+  with hand-derived `(j=2, i=0) = 28` and `(j=2, i=7) = 64`,
+  `RemoteMv::resolve` per-variant rule, picture-edge replication
+  (flat reference with origin past the right edge keeps every
+  prediction pixel flat), and an in-range non-degenerate sweep on
+  a mixed reference.
 
 ## License
 
