@@ -128,6 +128,7 @@ pub mod macroblock;
 pub mod motion;
 pub mod picture;
 pub mod picture_header;
+pub mod plus_ptype;
 
 pub use aic::{
     decode_intra_mode, scan_for_intra_mode, IntraMode, ALT_HORIZONTAL_TO_BLOCK_POS,
@@ -155,8 +156,14 @@ pub use motion::{
 };
 pub use picture::{decode_picture, DecodeOptions, YuvFrame};
 pub use picture_header::{
-    parse_picture_header, H263PictureCodingType, H263PictureHeader, H263SourceFormat, PSC_BITS,
-    PSC_VALUE,
+    parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
+    H263PictureHeader, H263PictureLayer, H263SourceFormat, PSC_BITS, PSC_VALUE,
+};
+pub use plus_ptype::{
+    parse_plus_ptype, CustomPcf, CustomPictureFormat, ExtendedPar, InheritedExtendedState, Mpptype,
+    Opptype, PlusPictureType, PlusPtypeHeader, PlusSourceFormat, SliceStructuredSubmode, Uui,
+    CPCFC_BITS, CPFMT_BITS, EPAR_BITS, ETR_BITS, MPPTYPE_BITS, OPPTYPE_BITS, SSS_BITS, UFEP_BITS,
+    UFEP_FULL, UFEP_MANDATORY_ONLY,
 };
 
 /// Crate-local error type. The orphan-rebuild scaffold returns
@@ -184,6 +191,21 @@ pub enum Error {
     /// yet decoded — round 1 only covers the non-extended PTYPE
     /// header. See §5.1.4.
     ExtendedPtypeNotSupported,
+    /// A reserved-valued or fixed-bit field inside the extended-PTYPE
+    /// (PLUSPTYPE) header did not hold its spec-mandated value: a
+    /// reserved UFEP code (§5.1.4.1), a missing OPPTYPE / MPPTYPE
+    /// start-code-emulation guard or a set reserved bit (§5.1.4.2 /
+    /// §5.1.4.3), a reserved picture-type code, or a forbidden CPFMT /
+    /// EPAR / CPCFC field value (§5.1.5–§5.1.7).
+    PlusPtypeReservedField,
+    /// The extended-PTYPE (PLUSPTYPE) header signalled an optional mode
+    /// or picture type whose remaining picture-header fields carry
+    /// variable-length or externally-negotiated sub-bitstreams that are
+    /// not staged for byte-level parsing here — Reference Picture
+    /// Selection (§5.1.13–§5.1.17, Annex N), Reference Picture
+    /// Resampling (§5.1.18, Annex P), or a scalability-layer picture
+    /// type (B / EI / EP, Annex O). See §5.1.4.
+    PlusPtypeUnsupported,
     /// The 17-bit Group of Blocks Start Code (GBSC, value
     /// `0000 0000 0000 0000 1`) was not present at the current
     /// bitstream position. See §5.2.2.
@@ -250,6 +272,14 @@ impl core::fmt::Display for Error {
             Error::ExtendedPtypeNotSupported => write!(
                 f,
                 "oxideav-h263: extended PTYPE (PLUSPTYPE) path not yet supported"
+            ),
+            Error::PlusPtypeReservedField => write!(
+                f,
+                "oxideav-h263: a reserved/fixed-bit field in the PLUSPTYPE header had an illegal value"
+            ),
+            Error::PlusPtypeUnsupported => write!(
+                f,
+                "oxideav-h263: PLUSPTYPE signalled an optional mode (RPS/RPR/scalability layer) whose header fields are not yet parsed"
             ),
             Error::BadGroupStartCode => write!(
                 f,

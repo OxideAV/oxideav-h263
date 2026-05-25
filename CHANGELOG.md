@@ -8,6 +8,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Extended-PTYPE (PLUSPTYPE) picture-header parsing per §5.1.4 onward
+  (round 13), in the new `plus_ptype` module, dispatched from the
+  picture layer when PTYPE bits 6-8 are `"111"`:
+  - `parse_plus_ptype(reader, inherited)` decodes the Figure-8 "optional
+    PLUSPTYPE-related fields" block in order — `UFEP` (§5.1.4.1),
+    `OPPTYPE` (§5.1.4.2, present iff `UFEP = "001"`), `MPPTYPE`
+    (§5.1.4.3, always present), then the deterministic-width fields
+    `CPM` / `PSBI` (§5.1.20 / §5.1.21 / §5.1.4.7), `CPFMT` (§5.1.5),
+    `EPAR` (§5.1.6), `CPCFC` (§5.1.7), `ETR` (§5.1.8), `UUI` (§5.1.9),
+    and `SSS` (§5.1.10), each gated by its spec presence rule.
+  - `Opptype` exposes the 18-bit optional part: source format (with the
+    `"110"` custom code), custom-PCF flag, and the Annex
+    D/E/F/I/J/K/N/R/S/T mode bits, validating the bit-15
+    start-code-emulation guard and the three reserved zero bits.
+  - `Mpptype` exposes the 9-bit mandatory part: picture-type code
+    (I / P / Improved-PB / B / EI / EP), RPR / RRU mode flags, rounding
+    type, with the bit-9 guard and reserved-bit checks.
+  - `CustomPictureFormat` / `ExtendedPar` / `CustomPcf` decode the
+    custom-format chain with `luma_width` = `(PWI + 1) * 4` and
+    `luma_height` = `PHI * 4` (§5.1.5), the extended-PAR `"1111"`
+    follow-on (§5.1.6), and the custom-PCF divisor / conversion code
+    (§5.1.7), rejecting the spec's forbidden field values.
+  - `Uui` decodes the 1-or-2-bit Unlimited-UMV indicator (§5.1.9);
+    `InheritedExtendedState` carries the prior `UFEP = "001"` custom-PCF
+    state that a `UFEP = "000"` header needs to know whether ETR is
+    present (§5.1.4.4 / §5.1.8).
+  - `H263PictureLayer` + `parse_picture_layer(reader, inherited)`: a
+    unified picture-header entry that returns `Baseline` for non-`"111"`
+    source formats and `Extended` (TR + split/doc-cam/freeze prefix +
+    `PlusPtypeHeader`) for the extended path. The legacy
+    `parse_picture_header` keeps its baseline-only contract and still
+    returns `ExtendedPtypeNotSupported` for `"111"`.
+  - New `Error::PlusPtypeReservedField` (illegal reserved/fixed bits)
+    and `Error::PlusPtypeUnsupported` (Reference Picture Selection
+    §5.1.13–§5.1.17, Reference Picture Resampling §5.1.18, or a
+    scalability-layer B/EI/EP picture type whose remaining
+    variable-length / externally-negotiated header fields are not yet
+    staged — refused rather than mis-framed).
+  - Out of scope (deferred): the §5.1.11–§5.1.18 scalability / RPS / RPR
+    sub-bitstreams (Annexes N, O, P) and wiring `parse_picture_layer`
+    into the `decode_picture` driver for custom source formats.
 - Annex F §F.3 Overlapped Block Motion Compensation (OBMC) for the
   8×8 luminance prediction (round 12), as a pure function in the
   [`motion`] module:

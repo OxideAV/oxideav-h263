@@ -355,17 +355,29 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   (§5.1.27, EOS/EOSBS as PSC-prefixed codes).
 * The Annex-O optional fields after PTYPE: PQUANT, CPM/PSBI, TRB,
   DBQUANT, PEI/PSUPP.
-* Extended PTYPE / PLUSPTYPE (§5.1.4) and every annex it gates
-  (Annexes I, J, K, M, N, O, P, Q, R, S, T) — the parser surfaces a
-  dedicated `ExtendedPtypeNotSupported` error rather than guessing.
+* Extended PTYPE / PLUSPTYPE — the §5.1.4 onward picture-header *parse*
+  landed in round 13 (`plus_ptype` module + `parse_picture_layer`):
+  UFEP / OPPTYPE / MPPTYPE plus the deterministic-width CPM, PSBI,
+  CPFMT, EPAR, CPCFC, ETR, UUI, and SSS fields (§5.1.4.1–§5.1.10 /
+  §5.1.20 / §5.1.21). Still NOT done: the §5.1.11–§5.1.18 scalability /
+  reference-picture-selection / reference-picture-resampling
+  sub-bitstreams (Annexes N, O, P) — `parse_plus_ptype` returns
+  `PlusPtypeUnsupported` for them rather than mis-framing — and wiring
+  `parse_picture_layer` into the `decode_picture` driver (so the
+  PLUSPTYPE-gated mode flags actually drive a decode, and custom source
+  formats produce a frame). The legacy baseline-only
+  `parse_picture_header` still returns `ExtendedPtypeNotSupported` for
+  source-format `"111"`.
 * Encoder. Round 3 is decode-only.
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 12 coverage estimate
+### Round 13 coverage estimate
 
 * H.263 spec text covered: §4.2.1 (GOB / MB scan layout, per-format
-  GOB & MB-row counts) + §5.1.1–§5.1.3 + §5.2.2 + §5.2.3 +
+  GOB & MB-row counts) + §5.1.1–§5.1.3 + §5.1.4.1–§5.1.10 (extended
+  PTYPE: UFEP / OPPTYPE / MPPTYPE + CPM / PSBI / CPFMT / EPAR / CPCFC /
+  ETR / UUI / SSS picture-header parse) + §5.2.2 + §5.2.3 +
   §5.2.5 + §5.2.6 + §5.3.1 + §5.3.2 + §5.3.5 + §5.3.6 + §5.3.7 +
   §5.3.8 + §5.4.1 + §5.4.2 + §6.1.1 (MV reconstruct + median
   predictor + Figure-12 candidate border-decision rules + Table 18
@@ -386,8 +398,11 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   substitution rules), now composed into a full-picture decode driver
   (`decode_picture` → `YuvFrame`) for the single-MV path and exposed
   as pure primitives for the §F.2 four-MV path and §F.3 OBMC weighted
-  average. Roughly 21 pages of the ~144-page recommendation.
-* Tests: 210 unit tests on synthetic buffers built with the spec's
+  average, plus the extended-PTYPE (PLUSPTYPE) picture-header parse
+  (`plus_ptype` module + `parse_picture_layer` dispatch on PTYPE
+  source-format `"111"`). Roughly 22 pages of the ~144-page
+  recommendation.
+* Tests: 229 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
   (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
@@ -471,7 +486,17 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   `RemoteMv::resolve` per-variant rule, picture-edge replication
   (flat reference with origin past the right edge keeps every
   prediction pixel flat), and an in-range non-degenerate sweep on
-  a mixed reference.
+  a mixed reference; plus 16 extended-PTYPE tests covering the
+  `UFEP = "001"` full path (QCIF P minimal / CIF I with AP/AIC/DF/AIV/MQ
+  on), CPM pulling PSBI, the custom-format chain (CPFMT → extended-PAR
+  EPAR with `(PWI+1)*4 = 352` / `PHI*4 = 288`), the custom-PCF chain
+  (CPCFC → ETR), the UUI `"1"` / `"01"` limited / unlimited forms, the
+  `UFEP = "000"` path with and without an inherited custom-PCF state
+  gating ETR, the reserved-UFEP / missing-SCE-guard / reserved
+  picture-type / forbidden-PAR-code rejections, the RPS / RPR /
+  B-picture `PlusPtypeUnsupported` refusals, a short-buffer EOF, and the
+  `parse_picture_layer` Baseline-vs-Extended dispatch (with the legacy
+  `parse_picture_header` still rejecting `"111"`).
 
 ## License
 

@@ -36,6 +36,7 @@
 
 use oxideav_core::bits::BitReader;
 
+use crate::plus_ptype::{parse_plus_ptype, InheritedExtendedState, PlusPtypeHeader};
 use crate::{Error, Result};
 
 /// Length in bits of the Picture Start Code (§5.1.1).
@@ -250,6 +251,154 @@ pub fn parse_picture_header(reader: &mut BitReader<'_>) -> Result<H263PictureHea
     })
 }
 
+/// The §5.1.3 PTYPE prefix bits 3-5 that precede the source-format
+/// field — split-screen / document-camera / freeze-release. These are
+/// shared between the baseline and extended-PTYPE picture-header paths
+/// (they are read before bits 6-8 select which path follows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtypePrefix {
+    /// §5.1.2 — Temporal Reference (8 bits at standard CIF PCF).
+    pub temporal_reference: u8,
+    /// §5.1.3 bit 3 — Split-screen indicator.
+    pub split_screen: bool,
+    /// §5.1.3 bit 4 — Document-camera indicator.
+    pub document_camera: bool,
+    /// §5.1.3 bit 5 — Full-picture freeze release.
+    pub freeze_release: bool,
+}
+
+/// The extended-PTYPE picture header: the §5.1.3 prefix bits (TR,
+/// split-screen, document-camera, freeze-release) plus the full
+/// [`PlusPtypeHeader`] decoded from the Figure-8 fields that follow when
+/// PTYPE bits 6-8 are `"111"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct H263ExtendedPicture {
+    /// §5.1.3 bits 3-5 + §5.1.2 — the prefix shared with the baseline
+    /// header.
+    pub prefix: PtypePrefix,
+    /// §5.1.4 onward — the parsed PLUSPTYPE-related fields.
+    pub plus: PlusPtypeHeader,
+}
+
+/// A parsed H.263 picture layer, dispatched on PTYPE bits 6-8.
+///
+/// `Baseline` is the non-extended-PTYPE header (§5.1.1–§5.1.3) returned
+/// by [`parse_picture_header`]; `Extended` is the PLUSPTYPE path
+/// (§5.1.4 onward) returned when bits 6-8 are `"111"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H263PictureLayer {
+    /// Non-extended-PTYPE picture header.
+    Baseline(H263PictureHeader),
+    /// Extended-PTYPE (PLUSPTYPE) picture header.
+    Extended(H263ExtendedPicture),
+}
+
+/// Read the shared §5.1.1–§5.1.3 prefix (PSC, TR, PTYPE bits 1-5) and
+/// the 3-bit source-format field, returning the prefix plus the raw
+/// source-format bits so the caller can dispatch on `"111"`.
+fn parse_common_prefix(reader: &mut BitReader<'_>) -> Result<(PtypePrefix, u32)> {
+    // §5.1.1 — Picture Start Code (22 bits, value 0x000020).
+    let psc = reader
+        .read_u32(PSC_BITS)
+        .map_err(|_| Error::UnexpectedEof)?;
+    if psc != PSC_VALUE {
+        return Err(Error::BadPictureStartCode);
+    }
+
+    // §5.1.2 — Temporal Reference (8 bits at standard CIF PCF).
+    let tr = reader.read_u32(8).map_err(|_| Error::UnexpectedEof)? as u8;
+
+    // §5.1.3 — PTYPE bit 1: always 1.
+    if !reader.read_bit().map_err(|_| Error::UnexpectedEof)? {
+        return Err(Error::BadPtypeFixedBits);
+    }
+    // §5.1.3 — PTYPE bit 2: always 0.
+    if reader.read_bit().map_err(|_| Error::UnexpectedEof)? {
+        return Err(Error::BadPtypeFixedBits);
+    }
+
+    // §5.1.3 — PTYPE bits 3..5: split-screen / doc-camera / freeze.
+    let split_screen = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    let document_camera = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    let freeze_release = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+
+    // §5.1.3 — PTYPE bits 6..8: source format.
+    let source_format_bits = reader.read_u32(3).map_err(|_| Error::UnexpectedEof)?;
+
+    Ok((
+        PtypePrefix {
+            temporal_reference: tr,
+            split_screen,
+            document_camera,
+            freeze_release,
+        },
+        source_format_bits,
+    ))
+}
+
+/// Parse a full H.263 picture layer, dispatching on PTYPE bits 6-8.
+///
+/// When bits 6-8 are `"111"` (extended PTYPE), the [`PlusPtypeHeader`]
+/// fields of §5.1.4 onward are parsed and returned as
+/// [`H263PictureLayer::Extended`]; otherwise the baseline §5.1.3 PTYPE
+/// is parsed and returned as [`H263PictureLayer::Baseline`].
+///
+/// `inherited` supplies the state a `UFEP = "000"` extended header needs
+/// (the custom-PCF flag that gates §5.1.8 ETR); it is ignored on the
+/// baseline path. Pass [`InheritedExtendedState::default`] for a fresh
+/// stream.
+pub fn parse_picture_layer(
+    reader: &mut BitReader<'_>,
+    inherited: InheritedExtendedState,
+) -> Result<H263PictureLayer> {
+    let (prefix, source_format_bits) = parse_common_prefix(reader)?;
+
+    if source_format_bits == 0b111 {
+        let plus = parse_plus_ptype(reader, inherited)?;
+        return Ok(H263PictureLayer::Extended(H263ExtendedPicture {
+            prefix,
+            plus,
+        }));
+    }
+
+    let source_format = match source_format_bits {
+        0b000 => return Err(Error::ForbiddenSourceFormat),
+        0b001 => H263SourceFormat::SubQcif,
+        0b010 => H263SourceFormat::Qcif,
+        0b011 => H263SourceFormat::Cif,
+        0b100 => H263SourceFormat::Cif4,
+        0b101 => H263SourceFormat::Cif16,
+        0b110 => H263SourceFormat::Reserved110,
+        // `0b111` handled above.
+        _ => unreachable!(),
+    };
+
+    // §5.1.3 — PTYPE bits 9..13: coding-type + optional-mode flags.
+    let coding_type_bit = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    let coding_type = if coding_type_bit {
+        H263PictureCodingType::Inter
+    } else {
+        H263PictureCodingType::Intra
+    };
+    let umv_mode = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    let sac_mode = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    let advanced_prediction = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    let pb_frames = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+
+    Ok(H263PictureLayer::Baseline(H263PictureHeader {
+        temporal_reference: prefix.temporal_reference,
+        split_screen: prefix.split_screen,
+        document_camera: prefix.document_camera,
+        freeze_release: prefix.freeze_release,
+        source_format,
+        coding_type,
+        umv_mode,
+        sac_mode,
+        advanced_prediction,
+        pb_frames,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +583,88 @@ mod tests {
     fn parse_picture_header_from(data: &[u8]) -> Result<H263PictureHeader> {
         let mut r = BitReader::new(data);
         parse_picture_header(&mut r)
+    }
+
+    #[test]
+    fn picture_layer_dispatches_baseline_for_non_111_source_format() {
+        // QCIF intra baseline — must come back as the Baseline variant
+        // with the same fields the legacy parser produces.
+        let bytes = build_header(
+            42, false, false, false, 0b010, true, false, false, false, false,
+        );
+        let mut r = BitReader::new(&bytes);
+        let layer = parse_picture_layer(&mut r, InheritedExtendedState::default()).expect("parse");
+        match layer {
+            H263PictureLayer::Baseline(h) => {
+                assert_eq!(h.temporal_reference, 42);
+                assert_eq!(h.source_format, H263SourceFormat::Qcif);
+                assert_eq!(h.coding_type, H263PictureCodingType::Inter);
+            }
+            other => panic!("expected Baseline, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn picture_layer_dispatches_extended_for_111_source_format() {
+        use crate::plus_ptype::{PlusPictureType, PlusSourceFormat, UFEP_FULL};
+        // PSC + TR + PTYPE bits 1-8 with source-format "111", then a
+        // minimal UFEP=001 QCIF P-picture PLUSPTYPE, CPM=0.
+        let mut w = BitWriter::new();
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(7, 8); // TR
+        w.write_bit(true); // PTYPE bit1
+        w.write_bit(false); // PTYPE bit2
+        w.write_bit(false); // split
+        w.write_bit(false); // doc-cam
+        w.write_bit(false); // freeze
+        w.write_u32(0b111, 3); // extended PTYPE
+                               // PLUSPTYPE: UFEP=001.
+        w.write_u32(UFEP_FULL, 3);
+        // OPPTYPE QCIF, all modes off, SCE guard set.
+        w.write_u32(0b010, 3);
+        for _ in 0..11 {
+            w.write_bit(false);
+        }
+        w.write_bit(true); // bit 15 guard
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        // MPPTYPE P-picture, guards.
+        w.write_u32(0b001, 3);
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // 7
+        w.write_bit(false); // 8
+        w.write_bit(true); // 9 guard
+        w.write_bit(false); // CPM
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let layer = parse_picture_layer(&mut r, InheritedExtendedState::default()).expect("parse");
+        match layer {
+            H263PictureLayer::Extended(e) => {
+                assert_eq!(e.prefix.temporal_reference, 7);
+                assert_eq!(e.plus.ufep, 0b001);
+                assert_eq!(e.plus.source_format(), Some(PlusSourceFormat::Qcif));
+                assert_eq!(e.plus.mpptype.picture_type, PlusPictureType::Inter);
+            }
+            other => panic!("expected Extended, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn legacy_parse_picture_header_still_rejects_111() {
+        // The backward-compatible baseline-only entry must keep its
+        // ExtendedPtypeNotSupported behaviour for source-format "111".
+        let bytes = build_header(
+            0, false, false, false, 0b111, false, false, false, false, false,
+        );
+        assert_eq!(
+            parse_picture_header_from(&bytes).unwrap_err(),
+            Error::ExtendedPtypeNotSupported
+        );
     }
 }
