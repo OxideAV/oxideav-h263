@@ -103,6 +103,17 @@
 //!   the resolved vector here. The macroblock-driver wiring that walks
 //!   the live neighbour grid and dispatches `obmc_predict_block` per
 //!   8×8 luminance block of an INTER4V macroblock remains out of scope.
+//! * **Round 14** — Annex I §I.3 / Table I.2 separate INTRA-coefficient
+//!   VLC, as the pure event-level primitive [`decode_intra_tcoef_event`]
+//!   in the new [`intra_tcoef`] module. The 102 regular codewords reuse
+//!   Table 16's bit patterns at every index (per §I.3) but reassign the
+//!   `(RUN, |LEVEL|)` columns (with `LAST` preserved); the 7-bit
+//!   ESCAPE prefix and its 1+6+8 fixed-length tail are decoded
+//!   identically to §5.4.2 with the baseline forbidden LEVEL codes
+//!   (`0x00` / `0x80`) applied. Wiring the I.2 VLC into a full
+//!   INTRA-block parser with the §I.3 absorbed-INTRADC semantics
+//!   (line 4214) and the DC/AC prediction reconstruction is deferred
+//!   pending the macroblock-grid driver.
 //!
 //! PB-frame / Annex-T / extended-PTYPE paths are still out of scope, as
 //! is the remainder of Annex I (Table I.2 VLC + prediction
@@ -124,6 +135,7 @@ pub mod deblock;
 pub mod dequant;
 pub mod gob_header;
 pub mod idct;
+pub mod intra_tcoef;
 pub mod macroblock;
 pub mod motion;
 pub mod picture;
@@ -145,6 +157,7 @@ pub use gob_header::{
     GN_BITS, GOB_HEADER_BITS_NO_CPM, GQUANT_BITS,
 };
 pub use idct::{idct_8x8, reconstruct_intra_samples, BLOCK_DIM, IDCT_OUT_MAX, IDCT_OUT_MIN};
+pub use intra_tcoef::{decode_intra_tcoef_event, IntraTcoefEvent, INTRA_TCOEF_REGULAR_ENTRIES};
 pub use macroblock::{parse_macroblock, H263Macroblock, MbContext, MbType, Mvd};
 pub use motion::{
     chroma_mv, chroma_mv_4mv, chroma_mv_component, chroma_mv_component_4mv, median3,

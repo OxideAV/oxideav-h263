@@ -5,21 +5,27 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 12 — Annex F §F.3 overlapped block motion
-compensation (OBMC) for the 8×8 luminance prediction, as the pure
-function `obmc_predict_block` over the Figures F.2 / F.3 / F.4 weight
-matrices (`H0` / `H1` / `H2`), with the four §F.3 remote-vector
-substitution rules expressed as the `RemoteMv` enum (`Zero` /
-`Current` / `Vector(mv)`). On top of round 11's §F.2 four-motion-vector
-candidate-predictor redefinition + Table F.1 sixteenth-pixel chroma
-derivation, round 10's Annex D §D.2 Unrestricted Motion Vector mode
-(extended `[-63, 63]` half-pel per-component range with
-predictor-dependent difference-pair selection, PLUSPTYPE-absent case),
-round 9's full-picture decode driver (baseline single-MV path:
-INTRA / INTER / skipped macroblocks, §6.1.1 Figure-12 MV prediction,
-optional Annex J deblocking), and rounds 1-8's picture + GOB +
-macroblock headers + block data + intra-block reconstruction + P-frame
-motion compensation and INTER-block reconstruction + Annex J deblocking
+**Orphan-rebuild round 14 — Annex I §I.3 / Table I.2 separate
+INTRA-coefficient VLC, as the pure event-level primitive
+`decode_intra_tcoef_event` in the new `intra_tcoef` module: 102
+regular codewords reusing Table 16's bit patterns at every index
+(per §I.3) but with reassigned `(RUN, |LEVEL|)` columns (`LAST`
+preserved), plus the §5.4.2 ESCAPE prefix + 1 + 6 + 8 fixed-length
+tail. On top of round 13's extended-PTYPE (PLUSPTYPE)
+picture-header parse (UFEP / OPPTYPE / MPPTYPE + CPM / PSBI /
+CPFMT / EPAR / CPCFC / ETR / UUI / SSS), round 12's §F.3 OBMC
+weighted three-prediction average (`obmc_predict_block` over
+`H0` / `H1` / `H2` with the `RemoteMv` substitution rules), round
+11's §F.2 four-motion-vector candidate-predictor redefinition +
+Table F.1 sixteenth-pixel chroma derivation, round 10's Annex D
+§D.2 Unrestricted Motion Vector mode (extended `[-63, 63]` half-pel
+per-component range with predictor-dependent difference-pair
+selection, PLUSPTYPE-absent case), round 9's full-picture decode
+driver (baseline single-MV path: INTRA / INTER / skipped
+macroblocks, §6.1.1 Figure-12 MV prediction, optional Annex J
+deblocking), and rounds 1-8's picture + GOB + macroblock headers +
+block data + intra-block reconstruction + P-frame motion
+compensation and INTER-block reconstruction + Annex J deblocking
 filter + Annex I Advanced INTRA Coding scan/mode layer.** The
 prior implementation was retired on 2026-05-18 under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
@@ -208,6 +214,23 @@ the non-PB-frame baseline:
   perform §F.2's "sum of the four luminance vectors divided by 8"
   chroma derivation with the Table F.1 sixteenth → half-pixel snap
   (`{0,1,2}→0`, `{3..=13}→1`, `{14,15}→2`).
+* Annex I §I.3 — separate INTRA-coefficient VLC (Table I.2), as the
+  pure primitive `decode_intra_tcoef_event` in the `intra_tcoef`
+  module. Per §I.3 line 4033 the 102 regular codewords are bit-for-bit
+  identical to Table 16 at every index, but `(RUN, |LEVEL|)` are
+  reassigned (e.g. idx 1 = `1111s` decodes to RUN=1/|L|=1 under I.2
+  vs RUN=0/|L|=2 under Table 16); `LAST` is preserved between the
+  two tables so indices 0..=57 stay `LAST=0` and 58..=101 stay
+  `LAST=1`. The 7-bit ESCAPE prefix `0000 011` and its
+  1 + 6 + 8 = 15-bit fixed-length tail are decoded identically to
+  §5.4.2, with the baseline forbidden LEVEL codes (`0x00` / `0x80`)
+  rejected. The §I.3 modified inverse quantization
+  (`RecC = 2 · QUANT · LEVEL`, no dead-zone), the variable-step
+  INTRADC reconstruction, and the DC/AC prediction reconstruction
+  with `oddifyclipDC` / `clipAC` are deferred (they need the
+  macroblock-grid driver's neighbour blocks), as is the §I.3
+  line-4214 "INTRADC absorbed into the coefficient stream" reframing
+  of MCBPC / CBPY.
 * Annex F §F.3 — overlapped block motion compensation (OBMC) for the
   8×8 luminance prediction, as the pure function `obmc_predict_block`
   over the Figures F.2 / F.3 / F.4 weight matrices `H0` / `H1` / `H2`.
@@ -331,16 +354,18 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   Annex-T EXTENDED-ESCAPE LEVEL prefix (`1000 0000`) is not
   accepted in TCOEF.
 * Annex I (Advanced INTRA Coding) — the remaining parts beyond the
-  round-8 scan-and-mode layer: the Table I.2 separate
-  INTRA-coefficient VLC (the dedicated |LEVEL|/RUN interpretation
-  that replaces Table 16 for INTRA), the INTRADC-as-AC-coded-value
-  path, the §I.3 modified inverse quantization
+  round-8 scan-and-mode layer and the round-14 Table I.2 separate
+  INTRA-coefficient VLC: the INTRADC-as-AC-coded-value path (§I.3
+  line 4214: INTRADC absorbed into the per-block coefficient stream
+  for MCBPC / CBPY purposes), the §I.3 modified inverse quantization
   (`RecC = 2·QUANT·LEVEL`, no dead-zone) with variable-step INTRADC,
   and the DC/AC prediction reconstruction + `oddifyclipDC` /
   `clipAC` clipping (which need the macroblock-grid driver's
   neighbour blocks). The §I.2 INTRA_MODE VLC, the two §I.3 alternate
-  scans, and the §I.3 scan-selection rule landed in round 8.
-  Round-4 §5.4.1 is still the baseline 8-bit FLC INTRADC form.
+  scans, and the §I.3 scan-selection rule landed in round 8; the
+  Table I.2 event-level VLC primitive landed in round 14. Round-4
+  §5.4.1 is still the baseline 8-bit FLC INTRADC form (the AIC
+  reframing of INTRADC awaits the macroblock-grid driver).
 * Annex D — only the §D.2 PLUSPTYPE-absent extended range landed
   (round 10). The PLUSPTYPE / UUI-dependent ranges of Tables D.1 / D.2
   and the Table-D.3 reversible-VLC encoding of the difference (used
@@ -372,7 +397,7 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 13 coverage estimate
+### Round 14 coverage estimate
 
 * H.263 spec text covered: §4.2.1 (GOB / MB scan layout, per-format
   GOB & MB-row counts) + §5.1.1–§5.1.3 + §5.1.4.1–§5.1.10 (extended
@@ -388,7 +413,10 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   horizontal-before-vertical ordering + picture-edge skip + driver
   edge-condition wiring) + Annex I §I.2 INTRA_MODE VLC (Table I.1) +
   §I.3 alternate DCT scans (Figure I.2-a / I.2-b) + §I.3
-  scan-selection rule + Annex D §D.2 (PLUSPTYPE-absent extended
+  scan-selection rule + Annex I §I.3 Table I.2 separate
+  INTRA-coefficient VLC (102 regular + ESCAPE entries; reused
+  Table-16 bit patterns reinterpreted under the I.2 (RUN, |LEVEL|)
+  reassignment) + Annex D §D.2 (PLUSPTYPE-absent extended
   `[-63, 63]` half-pel range + predictor-dependent difference-pair
   selection) + Annex F §F.2 (four-vector candidate-predictor
   redefinition per Figure F.1 + Table F.1 sixteenth-pixel chroma
@@ -397,12 +425,12 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   weight matrices and the `Zero` / `Current` / `Vector` remote-MV
   substitution rules), now composed into a full-picture decode driver
   (`decode_picture` → `YuvFrame`) for the single-MV path and exposed
-  as pure primitives for the §F.2 four-MV path and §F.3 OBMC weighted
-  average, plus the extended-PTYPE (PLUSPTYPE) picture-header parse
-  (`plus_ptype` module + `parse_picture_layer` dispatch on PTYPE
-  source-format `"111"`). Roughly 22 pages of the ~144-page
-  recommendation.
-* Tests: 229 unit tests on synthetic buffers built with the spec's
+  as pure primitives for the §F.2 four-MV path, §F.3 OBMC weighted
+  average, and the §I.3 Table I.2 event-level VLC, plus the
+  extended-PTYPE (PLUSPTYPE) picture-header parse (`plus_ptype`
+  module + `parse_picture_layer` dispatch on PTYPE source-format
+  `"111"`). Roughly 23 pages of the ~144-page recommendation.
+* Tests: 248 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
   (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
@@ -496,7 +524,20 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   picture-type / forbidden-PAR-code rejections, the RPS / RPR /
   B-picture `PlusPtypeUnsupported` refusals, a short-buffer EOF, and the
   `parse_picture_layer` Baseline-vs-Extended dispatch (with the legacy
-  `parse_picture_header` still rejecting `"111"`).
+  `parse_picture_header` still rejecting `"111"`); plus 19 Annex I §I.3
+  Table I.2 INTRA-coefficient VLC tests covering the table-shape
+  invariants (102 regular + 1 ESCAPE row; all 102
+  `(LAST, RUN, |LEVEL|)` triples pairwise distinct; LAST column
+  matches Table 16's index-58 boundary, proving no code/bits cross-up
+  with Table 16), the full 102-entry round-trip across both sign
+  polarities, spec spot-checks at indices 0 / 1 / 12 / 22 / 28 / 58 /
+  101 (with the idx-1 and idx-22 ones designed to catch a
+  silent-aliasing back to Table 16's interpretation), the ESCAPE
+  positive-LEVEL round-trip, ESCAPE negative-LEVEL via two's
+  complement, both baseline-forbidden ESCAPE LEVEL codes (`0x00` /
+  `0x80`), 13-bits-all-zero → `BadTcoefCode`, empty-buffer →
+  `UnexpectedEof`, exact bit-consumption of the 3-bit `10s` entry,
+  and exact bit-consumption of the 22-bit ESCAPE event.
 
 ## License
 

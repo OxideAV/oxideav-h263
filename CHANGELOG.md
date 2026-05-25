@@ -8,6 +8,52 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex I §I.3 / Table I.2 separate INTRA-coefficient VLC (round 14),
+  in the new `intra_tcoef` module:
+  - `decode_intra_tcoef_event(reader) -> Result<IntraTcoefEvent>`
+    decodes one Table-I.2 `(LAST, RUN, LEVEL)` event from a
+    `BitReader`. The 102 regular codewords reuse Table 16's bit
+    patterns at every index (per §I.3, line 4033 of the spec text)
+    but reassign the `(RUN, |LEVEL|)` columns; `LAST` is preserved
+    between the two tables at each index (indices 0..=57 are
+    `LAST=0`, 58..=101 are `LAST=1`). The 7-bit ESCAPE prefix and
+    its 1 + 6 + 8 fixed-length tail are decoded identically to
+    §5.4.2, with the baseline forbidden LEVEL codes (`0x00` / `0x80`)
+    applied — Annex T's EXTENDED-ESCAPE relaxation is out of scope.
+  - `IntraTcoefEvent { last, run, level }` is the decoded triple
+    (sign already folded into `level`; ESCAPE `LEVEL` interpreted
+    as `i8` two's complement).
+  - `INTRA_TCOEF_REGULAR_ENTRIES = 102` exposes the regular-entry
+    count for callers that want to cross-check against Table 16.
+  - Out of scope (deferred): driving a full INTRA-block parser
+    around this primitive (the §I.3 modified inverse quantization
+    `RecC = 2·QUANT·LEVEL` with variable-step INTRADC, the §I.3
+    DC/AC prediction reconstruction with `oddifyclipDC` / `clipAC`,
+    and the §I.3 line-4214 "INTRADC absorbed into the coefficient
+    stream" reframing of MCBPC / CBPY all need the macroblock-grid
+    driver to supply the neighbour blocks).
+- Public re-exports from the crate root: `decode_intra_tcoef_event`,
+  `IntraTcoefEvent`, `INTRA_TCOEF_REGULAR_ENTRIES`.
+- 19 unit tests in `intra_tcoef::tests`:
+  - Table-shape invariants (102 regular + 1 ESCAPE; all 102
+    `(LAST, RUN, |LEVEL|)` tuples pairwise distinct; LAST column
+    matches the spec's index-58 boundary that Table 16 also
+    observes — proves we have not transposed any code/bits pair
+    relative to Table 16).
+  - Full 102-entry round-trip across both sign polarities (encode
+    each row's `(bits - 1)` prefix + sign bit, decode, verify
+    `(last, run, level)` matches).
+  - Spec spot-checks at indices 0, 1, 12, 22, 28, 58, 101 — chosen
+    to exercise both ends of the table, two LAST-equality boundaries
+    (idx 0 / 58 / 101), and indices where the I.2 interpretation
+    *diverges* from Table 16 (idx 1: RUN=1/|L|=1 vs Table 16's
+    RUN=0/|L|=2; idx 22: |L|=5 vs Table 16's RUN=3/|L|=1).
+  - ESCAPE positive-LEVEL round-trip (LAST=1, RUN=7, LEVEL=+50),
+    negative-LEVEL via two's complement (LEVEL=-2 from `0xFE`),
+    and both baseline-forbidden LEVEL codes (`0x00` / `0x80`).
+  - Reader-failure paths: 13 zero bits → `BadTcoefCode`;
+    empty buffer → `UnexpectedEof`; index-0 `10s` consumes exactly
+    3 bits; ESCAPE consumes exactly 22 bits.
 - Extended-PTYPE (PLUSPTYPE) picture-header parsing per §5.1.4 onward
   (round 13), in the new `plus_ptype` module, dispatched from the
   picture layer when PTYPE bits 6-8 are `"111"`:
