@@ -5,11 +5,14 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 10 — Annex D §D.2 Unrestricted Motion Vector
-mode (PLUSPTYPE-absent case): the extended `[-63, 63]` half-pel
-per-component MV range with the §D.2 predictor-dependent difference-pair
-selection, wired into the decode driver behind the PTYPE bit-10 UMV
-flag, on top of round 9's full-picture decode driver (baseline
+**Orphan-rebuild round 11 — Annex F §F.2 Advanced Prediction mode
+four-motion-vector candidate-predictor redefinition (Figure F.1) and
+Table F.1 sixteenth-pixel chrominance vector derivation, as pure
+transformations (`LumaBlockIndex` / `Mb4MvNeighbourhood` /
+`select_4mv_candidates` / `chroma_mv_4mv`), on top of round 10's Annex
+D §D.2 Unrestricted Motion Vector mode (extended `[-63, 63]` half-pel
+per-component range with predictor-dependent difference-pair selection,
+PLUSPTYPE-absent case) + round 9's full-picture decode driver (baseline
 single-MV path: INTRA / INTER / skipped macroblocks, §6.1.1 Figure-12
 MV prediction, optional Annex J deblocking) + round 8's picture + GOB +
 macroblock headers + block data + intra-block reconstruction + P-frame
@@ -182,6 +185,30 @@ the non-PB-frame baseline:
   supplies the out-of-picture samples. The PLUSPTYPE / UUI ranges of
   Tables D.1 / D.2 and the Table-D.3 reversible VLC stay gated on the
   not-yet-decoded extended-PTYPE header.
+* Annex F §F.2 — Advanced Prediction mode four-motion-vector
+  candidate-predictor redefinition (Figure F.1) and Table F.1
+  sixteenth-pixel chrominance vector derivation, as pure transformations
+  in the `motion` module. `LumaBlockIndex` (B1 / B2 / B3 / B4) names
+  the four 8×8 luminance blocks of a macroblock in Figure 5 order;
+  `Mb4Mv` is the per-MB MV array; `Mb4MvNeighbourhood { current, left,
+  above, above_right, right }` holds the §F.2-relevant neighbours with
+  `Option` wrappers so the caller can encode the §6.1.1 default-to-zero
+  decisions for INTRA / not-coded / border macroblocks.
+  `select_4mv_candidates(block, &neighbourhood)` returns `(MV1, MV2,
+  MV3)` per Figure F.1's "8×8 block at the physically same relative
+  position around MV" rule: B1 → (B2 of MB-left, B3 of MB-above, B4 of
+  MB-above); B2 → (B1 of current, B4 of MB-above, B3 of
+  MB-above-right); B3 → (B4 of MB-left, B1 of current, B2 of current);
+  B4 → (B3 of current, B2 of current, B1 of MB-right). The output
+  feeds directly into `predict_mv_median` for the §6.1.1 per-component
+  median. `chroma_mv_4mv(luma)` / `chroma_mv_component_4mv(sum)`
+  perform §F.2's "sum of the four luminance vectors divided by 8"
+  chroma derivation with the Table F.1 sixteenth → half-pixel snap
+  (`{0,1,2}→0`, `{3..=13}→1`, `{14,15}→2`). The §F.3 overlapped block
+  motion compensation (the weighted three-prediction H0/H1/H2 average)
+  and the driver wiring that walks the live neighbour grid are out of
+  scope for this round; the decode driver still returns
+  `Error::NotImplemented` for INTER4V macroblocks.
 
 The high-level entry point decodes a whole picture in one call:
 
@@ -248,11 +275,15 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 
 ### What is NOT yet implemented
 
-* INTER4V / INTER4V+Q macroblocks (MB types 2 / 5) — four motion
-  vectors per macroblock. The driver decodes the single-MV INTER
-  path; the four-vector candidate-predictor redefinition lives in
-  Annex F (§F.2 / Figure F.1), which is not yet wired, so the driver
-  returns `Error::NotImplemented` when it meets such a macroblock.
+* INTER4V / INTER4V+Q macroblocks (MB types 2 / 5) — driver wiring
+  for the four-vector path is still pending. Round 11 landed the
+  §F.2 candidate-predictor redefinition (Figure F.1) and the Table
+  F.1 sixteenth-pixel chroma derivation as pure primitives
+  (`select_4mv_candidates`, `chroma_mv_4mv`), but the macroblock-loop
+  driver does not yet walk the neighbour grid to feed them; the
+  driver returns `Error::NotImplemented` when it meets an INTER4V
+  macroblock. The §F.3 overlapped block motion compensation (the
+  weighted three-prediction H0/H1/H2 average) is also out of scope.
 * GOB-0-header-elision: the driver requires every GOB (including the
   topmost) to carry a GBSC/GN/GFID/GQUANT header on the wire, because
   the picture-layer PQUANT (the QUANT GOB 0 would inherit when its
@@ -305,7 +336,7 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 10 coverage estimate
+### Round 11 coverage estimate
 
 * H.263 spec text covered: §4.2.1 (GOB / MB scan layout, per-format
   GOB & MB-row counts) + §5.1.1–§5.1.3 + §5.2.2 + §5.2.3 +
@@ -321,10 +352,13 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   §I.3 alternate DCT scans (Figure I.2-a / I.2-b) + §I.3
   scan-selection rule + Annex D §D.2 (PLUSPTYPE-absent extended
   `[-63, 63]` half-pel range + predictor-dependent difference-pair
-  selection), now composed into a full-picture decode driver
-  (`decode_picture` → `YuvFrame`). Roughly 19 pages of the
-  ~144-page recommendation.
-* Tests: 179 unit tests on synthetic buffers built with the spec's
+  selection) + Annex F §F.2 (four-vector candidate-predictor
+  redefinition per Figure F.1 + Table F.1 sixteenth-pixel chroma
+  derivation), now composed into a full-picture decode driver
+  (`decode_picture` → `YuvFrame`) for the single-MV path and exposed
+  as pure primitives for the §F.2 four-MV path. Roughly 20 pages of
+  the ~144-page recommendation.
+* Tests: 196 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
   (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
@@ -374,7 +408,21 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   AC presence / INTER all-skipped exact reference copy / INTER
   horizontal +1-pixel MV shift with §D.1 edge replication / Annex D
   §D.2 UMV vector kept in the extended range past the default wrap /
-  missing reference + extended-PTYPE refusals).
+  missing reference + extended-PTYPE refusals); plus 17 Annex F §F.2
+  tests covering `LumaBlockIndex` round-trip, the Figure F.1
+  candidate-predictor selection per block (B1 isolated all-zero / B1
+  left-only and above-only partial neighbourhoods / B2 / B3
+  full-neighbourhood with distinctive vectors / B4 right-edge MV3-zero
+  and B4 with MB-right present), the one-vector-per-MB equivalence (a
+  uniform 4-MV array reduces to the Figure-12 single-MV candidates),
+  the end-to-end median predictor on a uniform field, the Table F.1
+  16-entry sixteenth → half-pixel transcription, the all-zero chroma
+  MV, the four-uniform-luma equivalence with the §6.1.1 single-MV
+  chroma rule across nine integer-pixel offsets, the
+  positive/negative sixteenth-snap, the full-pixel integer chroma
+  result, the Table F.1 asymmetry round-trip at the low (2/3) and
+  high (13/14) boundaries with negative mirror, and the bounded
+  chroma magnitude sweep across `[-200, +200]` sums.
 
 ## License
 

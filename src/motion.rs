@@ -39,6 +39,21 @@
 //! the Table-14 difference pair. The wider PLUSPTYPE / UUI ranges of
 //! Tables D.1 / D.2 and the Table-D.3 reversible VLC remain gated on
 //! the not-yet-decoded extended-PTYPE header.
+//!
+//! Annex F §F.2 — the **Advanced Prediction mode** four-motion-vector
+//! candidate-predictor redefinition (Figure F.1) and the Table F.1
+//! sixteenth-pixel chrominance-vector derivation — is provided as pure
+//! transformations in [`LumaBlockIndex`], [`Mb4MvNeighbourhood`],
+//! [`select_4mv_candidates`] and [`chroma_mv_4mv`] /
+//! [`chroma_mv_component_4mv`]. They take a fully resolved neighbour
+//! grid (the caller decides which neighbour MBs are present, INTRA, or
+//! not coded — those map to `None`) and return the three §F.2 candidate
+//! predictors for one of the four 8×8 luminance blocks in a
+//! macroblock, ready to feed into [`predict_mv_median`]. The §F.3
+//! overlapped block motion compensation (the weighted three-prediction
+//! H0/H1/H2 average) and the macroblock-driver wiring that derives the
+//! neighbour grid from the live picture state are out of scope for the
+//! current round.
 
 use crate::block::COEFFS_PER_BLOCK;
 use crate::idct::BLOCK_DIM;
@@ -406,6 +421,283 @@ pub fn reconstruct_inter_block(
         *dst = sum.clamp(0, 255) as u8;
     }
     out
+}
+
+// ---- Annex F §F.2 Four motion vectors per macroblock ----------------
+
+/// Index of one 8×8 luminance block within a macroblock, in Figure 5
+/// (§4.2.5) order.
+///
+/// The four luminance blocks of a macroblock are arranged in a 2×2
+/// grid; this enum names the four positions so the Annex F §F.2
+/// candidate-predictor redefinition (Figure F.1) can be expressed as a
+/// pure function of "which block am I deriving predictors for".
+///
+/// ```text
+///   | B1 (top-left)    | B2 (top-right)    |
+///   | B3 (bottom-left) | B4 (bottom-right) |
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LumaBlockIndex {
+    /// Top-left 8×8 luminance block in the macroblock (block 1 of
+    /// Figure 5).
+    B1,
+    /// Top-right 8×8 luminance block (block 2 of Figure 5).
+    B2,
+    /// Bottom-left 8×8 luminance block (block 3 of Figure 5).
+    B3,
+    /// Bottom-right 8×8 luminance block (block 4 of Figure 5).
+    B4,
+}
+
+impl LumaBlockIndex {
+    /// All four luma blocks in Figure-5 order: `[B1, B2, B3, B4]`.
+    pub const ALL: [LumaBlockIndex; 4] = [
+        LumaBlockIndex::B1,
+        LumaBlockIndex::B2,
+        LumaBlockIndex::B3,
+        LumaBlockIndex::B4,
+    ];
+
+    /// Per Figure 5: index `0..=3` mapping to [`Self::B1`] .. [`Self::B4`].
+    pub fn from_index(i: usize) -> Option<Self> {
+        Self::ALL.get(i).copied()
+    }
+
+    /// Per Figure 5: `B1 -> 0`, `B2 -> 1`, `B3 -> 2`, `B4 -> 3`.
+    pub fn index(self) -> usize {
+        match self {
+            LumaBlockIndex::B1 => 0,
+            LumaBlockIndex::B2 => 1,
+            LumaBlockIndex::B3 => 2,
+            LumaBlockIndex::B4 => 3,
+        }
+    }
+}
+
+/// The four 8×8 luminance motion vectors of a macroblock, in
+/// [`LumaBlockIndex`] (Figure 5) order.
+///
+/// In the Advanced Prediction mode (§F.2) every macroblock carries four
+/// vectors — the §F.2 last paragraph clarifies that even one-vector
+/// macroblocks "are defined as four vectors with the same value", so
+/// the caller can store every neighbouring macroblock as a 4-element
+/// array unconditionally.
+pub type Mb4Mv = [MotionVector; 4];
+
+/// A view of the per-block motion vectors at the five macroblock
+/// positions Figure F.1 references when deriving the [`MV1`, `MV2`,
+/// `MV3`] candidates for any of the four luminance blocks in the
+/// **current** macroblock.
+///
+/// Each `Option` represents an availability decision that must already
+/// have been made by the caller per the §6.1.1 border-decision rules:
+///
+/// * `None` — the corresponding candidate predictor is treated as zero
+///   (the §6.1.1 rule-1 "INTRA / not-coded → zero" decision, the
+///   rule-2 "outside picture or slice at the left" decision, and the
+///   rule-4 "outside picture at the right" decision all collapse the
+///   neighbouring 4-MV array into `None`).
+/// * `Some([mv0, mv1, mv2, mv3])` — the four 8×8 luminance vectors of
+///   the neighbour macroblock are available, in [`LumaBlockIndex`] /
+///   Figure-5 order.
+///
+/// The §6.1.1 rule-3 "outside picture/GOB at top → MV2 and MV3 become
+/// MV1" is applied **after** [`select_4mv_candidates`] returns, by the
+/// caller, because it depends on the resolved MV1 not on the raw
+/// neighbour grid.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Mb4MvNeighbourhood {
+    /// The current macroblock's four luma vectors (in Figure-5 order).
+    /// Always present.
+    pub current: Mb4Mv,
+    /// The macroblock to the **left** of the current one. `None` if the
+    /// current MB is at the left picture / slice border or the left
+    /// neighbour was INTRA / not coded.
+    pub left: Option<Mb4Mv>,
+    /// The macroblock **above** the current one. `None` if at the top
+    /// picture / GOB border or INTRA / not coded.
+    pub above: Option<Mb4Mv>,
+    /// The macroblock **above-right** of the current one. `None` if at
+    /// the picture border, or INTRA / not coded.
+    pub above_right: Option<Mb4Mv>,
+    /// The macroblock to the **right** of the current one. `None` if
+    /// at the right picture border or INTRA / not coded. Used only for
+    /// the block-4 case (Figure F.1 lower-right sub-figure), where the
+    /// "above-right" of block 4 reads block 1 of the right neighbour.
+    pub right: Option<Mb4Mv>,
+}
+
+impl Mb4MvNeighbourhood {
+    /// Construct a neighbourhood with only the current MB's vectors
+    /// (every external neighbour set to `None`). Used at picture
+    /// corners and in unit tests.
+    pub fn isolated(current: Mb4Mv) -> Self {
+        Self {
+            current,
+            left: None,
+            above: None,
+            above_right: None,
+            right: None,
+        }
+    }
+}
+
+/// Annex F §F.2 / Figure F.1 — candidate-predictor selection for one of
+/// the four luminance blocks in the current macroblock.
+///
+/// Returns the `(MV1, MV2, MV3)` candidates for the §6.1.1 median
+/// predictor (which is then fed into [`predict_mv_median`]). The
+/// neighbour-grid lookup follows Figure F.1's "the 8×8 block at the
+/// physically same relative position around `MV`" convention:
+///
+/// | block | MV1 = left of block        | MV2 = above block            | MV3 = above-right of block         |
+/// |-------|----------------------------|------------------------------|------------------------------------|
+/// | B1    | `left.B2` else 0           | `above.B3` else 0            | `above.B4` else 0                  |
+/// | B2    | `current.B1`               | `above.B4` else 0            | `above_right.B3` else 0            |
+/// | B3    | `left.B4` else 0           | `current.B1`                 | `current.B2`                       |
+/// | B4    | `current.B3`               | `current.B2`                 | `right.B1` else 0                  |
+///
+/// The "else 0" entries are the §6.1.1 default — when the requested
+/// neighbour is not available the candidate is zero. The §6.1.1 rule-3
+/// "if MB-above is unavailable, set MV2 and MV3 to MV1" rewrite is
+/// **not** applied here: it's the caller's responsibility, because the
+/// rule depends on the *resolved* MV1 and the caller knows from the
+/// border state whether MB-above is present (rule 3) or whether
+/// individual cells were INTRA (rule 1).
+///
+/// The caller passes the [`Mb4MvNeighbourhood`] with `None` for any
+/// neighbour MB that is INTRA, not coded, or outside the picture /
+/// slice / GOB; the function never looks "through" `None`.
+pub fn select_4mv_candidates(
+    block: LumaBlockIndex,
+    n: &Mb4MvNeighbourhood,
+) -> (MotionVector, MotionVector, MotionVector) {
+    let zero = MotionVector::default();
+    match block {
+        // B1 (top-left): left of B1 is B2 of MB-left; above is B3 of
+        // MB-above; above-right is B4 of MB-above (the upper-right
+        // 8×8 of the row of blocks above current).
+        LumaBlockIndex::B1 => {
+            let mv1 = n
+                .left
+                .map(|m| m[LumaBlockIndex::B2.index()])
+                .unwrap_or(zero);
+            let mv2 = n
+                .above
+                .map(|m| m[LumaBlockIndex::B3.index()])
+                .unwrap_or(zero);
+            let mv3 = n
+                .above
+                .map(|m| m[LumaBlockIndex::B4.index()])
+                .unwrap_or(zero);
+            (mv1, mv2, mv3)
+        }
+        // B2 (top-right): left of B2 is B1 of current; above is B4 of
+        // MB-above; above-right is B3 of MB-above-right.
+        LumaBlockIndex::B2 => {
+            let mv1 = n.current[LumaBlockIndex::B1.index()];
+            let mv2 = n
+                .above
+                .map(|m| m[LumaBlockIndex::B4.index()])
+                .unwrap_or(zero);
+            let mv3 = n
+                .above_right
+                .map(|m| m[LumaBlockIndex::B3.index()])
+                .unwrap_or(zero);
+            (mv1, mv2, mv3)
+        }
+        // B3 (bottom-left): left of B3 is B4 of MB-left; above is B1
+        // of current; above-right is B2 of current.
+        LumaBlockIndex::B3 => {
+            let mv1 = n
+                .left
+                .map(|m| m[LumaBlockIndex::B4.index()])
+                .unwrap_or(zero);
+            let mv2 = n.current[LumaBlockIndex::B1.index()];
+            let mv3 = n.current[LumaBlockIndex::B2.index()];
+            (mv1, mv2, mv3)
+        }
+        // B4 (bottom-right): left of B4 is B3 of current; above is B2
+        // of current; above-right is B1 of MB-right.
+        LumaBlockIndex::B4 => {
+            let mv1 = n.current[LumaBlockIndex::B3.index()];
+            let mv2 = n.current[LumaBlockIndex::B2.index()];
+            let mv3 = n
+                .right
+                .map(|m| m[LumaBlockIndex::B1.index()])
+                .unwrap_or(zero);
+            (mv1, mv2, mv3)
+        }
+    }
+}
+
+/// Table F.1 — Annex F §F.2 modification of one **sixteenth-pixel**
+/// chrominance vector component "towards the nearest half-pixel
+/// position".
+///
+/// Index = sixteenth-pixel position `0..=15`; value = resulting
+/// position expressed as a numerator over `2` (i.e., chroma half-pixel
+/// units). 0 → 0/2, 3..=13 → 1/2, 14..=15 → 2/2. The table is **not**
+/// symmetric around 8: positions 0, 1, 2 collapse to 0 (3 entries),
+/// positions 14 and 15 collapse to 2 (2 entries), the middle 11
+/// positions collapse to 1.
+const TABLE_F1_SIXTEENTH_TO_HALF: [u8; 16] = [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2];
+
+/// Annex F §F.2 / Table F.1 — modification of one chroma vector
+/// component for the **four-motion-vector** case.
+///
+/// `luma_sum_half` is the **sum** of the four corresponding luma
+/// motion-vector components (in luma half-pel units, [`MotionVector`]
+/// convention). The returned chroma component is in **chroma half-pel
+/// units** (the same convention as the rest of this module — directly
+/// usable as the half-pel displacement on the chroma plane).
+///
+/// The derivation follows the spec literally: the sum of the four luma
+/// components divided by 8 (chroma half-pel) lands on a position with
+/// granularity `1/16` of a chroma pixel; Table F.1 then snaps the
+/// residual sixteenth-pixel fraction to the nearest half-pixel
+/// position (with the table's asymmetric mapping for the
+/// `{0,1,2} → 0`, `{3..=13} → 1`, `{14,15} → 2` buckets).
+///
+/// In our `i32` half-pel arithmetic, the conversion identity is:
+///
+/// * `sum(luma_half_pel)` *is* the sixteenth-pel position directly —
+///   each luma half-pel equals four chroma sixteenth-pels, and we sum
+///   four of them then divide by 8, which is the same as dividing the
+///   sum by 2 to get chroma half-pel, or equivalently by 16 to get
+///   chroma pixels with the residual as the sixteenth-pel position.
+/// * `|sum| / 16` is the integer **chroma-pixel** magnitude; multiply
+///   by 2 to express it in chroma half-pel.
+/// * `|sum| % 16` is the residual **sixteenth-pixel** position
+///   (`0..=15`); Table F.1 maps it to a half-pixel fraction
+///   (`0`, `1`, or `2` in chroma half-pel units).
+/// * The sign is restored from `sign(sum)` (symmetric mirror — the
+///   spec's Table F.1 only enumerates positive positions, and the
+///   chroma vector is the same way symmetric around zero in baseline
+///   bilinear interpolation).
+pub fn chroma_mv_component_4mv(luma_sum_half: i32) -> i32 {
+    let sign = if luma_sum_half < 0 { -1 } else { 1 };
+    let mag = luma_sum_half.unsigned_abs() as i32;
+    let full_chroma_pixels = mag / 16;
+    let sixteenth = (mag % 16) as usize;
+    let frac_half = TABLE_F1_SIXTEENTH_TO_HALF[sixteenth] as i32;
+    sign * (full_chroma_pixels * 2 + frac_half)
+}
+
+/// Annex F §F.2 / Table F.1 — chroma vector for one macroblock's four
+/// luma motion vectors. Returns the chroma displacement (in half-pel
+/// units, [`MotionVector`] convention) applied to both Cb and Cr
+/// blocks as the §F.2 last paragraph mandates ("the prediction for
+/// chrominance is obtained by applying the motion vector MVDCHR to all
+/// pixels in the two chrominance blocks").
+pub fn chroma_mv_4mv(luma: &Mb4Mv) -> MotionVector {
+    let sum_x = luma.iter().map(|mv| mv.dx_half).sum::<i32>();
+    let sum_y = luma.iter().map(|mv| mv.dy_half).sum::<i32>();
+    MotionVector {
+        dx_half: chroma_mv_component_4mv(sum_x),
+        dy_half: chroma_mv_component_4mv(sum_y),
+    }
 }
 
 #[cfg(test)]
@@ -829,5 +1121,330 @@ mod tests {
         let res = [20i16; COEFFS_PER_BLOCK];
         let rec = reconstruct_inter_block(&pred, &res);
         assert!(rec.iter().all(|&v| v == 120));
+    }
+
+    // ---- Annex F §F.2 / Figure F.1 four-MV candidate selection ----
+
+    /// Helper: build a distinctive 4-MV array so candidate-selection
+    /// tests can tell which block's vector was picked.
+    fn distinctive_mb(tag: i32) -> Mb4Mv {
+        [
+            MotionVector::new(tag * 10 + 1, tag * 10 + 1),
+            MotionVector::new(tag * 10 + 2, tag * 10 + 2),
+            MotionVector::new(tag * 10 + 3, tag * 10 + 3),
+            MotionVector::new(tag * 10 + 4, tag * 10 + 4),
+        ]
+    }
+
+    /// `LumaBlockIndex::ALL` is exactly `[B1, B2, B3, B4]` and
+    /// `index()` / `from_index()` round-trip.
+    #[test]
+    fn luma_block_index_round_trip() {
+        assert_eq!(LumaBlockIndex::ALL.len(), 4);
+        for (i, blk) in LumaBlockIndex::ALL.iter().enumerate() {
+            assert_eq!(blk.index(), i);
+            assert_eq!(LumaBlockIndex::from_index(i), Some(*blk));
+        }
+        assert_eq!(LumaBlockIndex::from_index(4), None);
+    }
+
+    /// B1 with every external neighbour `None` (picture top-left
+    /// corner) gives `(0, 0, 0)` — every candidate is zero per the
+    /// §6.1.1 default rule.
+    #[test]
+    fn select_4mv_b1_isolated_is_all_zero() {
+        let n = Mb4MvNeighbourhood::isolated(distinctive_mb(0));
+        let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B1, &n);
+        assert_eq!(mv1, MotionVector::default());
+        assert_eq!(mv2, MotionVector::default());
+        assert_eq!(mv3, MotionVector::default());
+    }
+
+    /// B1 with MB-left present: MV1 = B2 of MB-left; MV2 / MV3 stay
+    /// zero (no MB above).
+    #[test]
+    fn select_4mv_b1_left_only() {
+        let n = Mb4MvNeighbourhood {
+            current: distinctive_mb(1),
+            left: Some(distinctive_mb(2)),
+            above: None,
+            above_right: None,
+            right: None,
+        };
+        let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B1, &n);
+        // B2 of MB-left has tag*10+2 = 22.
+        assert_eq!(mv1, MotionVector::new(22, 22));
+        assert_eq!(mv2, MotionVector::default());
+        assert_eq!(mv3, MotionVector::default());
+    }
+
+    /// B1 with MB-above present: MV2 = B3 of MB-above, MV3 = B4 of
+    /// MB-above; MV1 stays zero (no MB-left).
+    #[test]
+    fn select_4mv_b1_above_only() {
+        let n = Mb4MvNeighbourhood {
+            current: distinctive_mb(1),
+            left: None,
+            above: Some(distinctive_mb(3)),
+            above_right: None,
+            right: None,
+        };
+        let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B1, &n);
+        assert_eq!(mv1, MotionVector::default());
+        // B3 of MB-above (tag 3) = 33; B4 of MB-above = 34.
+        assert_eq!(mv2, MotionVector::new(33, 33));
+        assert_eq!(mv3, MotionVector::new(34, 34));
+    }
+
+    /// B2 with every neighbour present: MV1 = B1 of current, MV2 = B4
+    /// of MB-above, MV3 = B3 of MB-above-right.
+    #[test]
+    fn select_4mv_b2_full_neighbourhood() {
+        let n = Mb4MvNeighbourhood {
+            current: distinctive_mb(1),
+            left: Some(distinctive_mb(2)),
+            above: Some(distinctive_mb(3)),
+            above_right: Some(distinctive_mb(4)),
+            right: Some(distinctive_mb(5)),
+        };
+        let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B2, &n);
+        // B1 of current = 11; B4 of MB-above = 34; B3 of above-right = 43.
+        assert_eq!(mv1, MotionVector::new(11, 11));
+        assert_eq!(mv2, MotionVector::new(34, 34));
+        assert_eq!(mv3, MotionVector::new(43, 43));
+    }
+
+    /// B3 lookups are entirely inside the current MB except for MV1
+    /// which reads B4 of MB-left.
+    #[test]
+    fn select_4mv_b3_full_neighbourhood() {
+        let n = Mb4MvNeighbourhood {
+            current: distinctive_mb(1),
+            left: Some(distinctive_mb(2)),
+            above: Some(distinctive_mb(3)),
+            above_right: Some(distinctive_mb(4)),
+            right: Some(distinctive_mb(5)),
+        };
+        let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B3, &n);
+        // B4 of MB-left = 24; B1 of current = 11; B2 of current = 12.
+        assert_eq!(mv1, MotionVector::new(24, 24));
+        assert_eq!(mv2, MotionVector::new(11, 11));
+        assert_eq!(mv3, MotionVector::new(12, 12));
+    }
+
+    /// B4's MV3 reads MB-right's B1. With MB-right absent (right
+    /// picture edge), MV3 falls back to zero per the §6.1.1 rule-4
+    /// default; MV1 = current B3, MV2 = current B2 stay intra-MB.
+    #[test]
+    fn select_4mv_b4_right_edge_mv3_zero() {
+        let n = Mb4MvNeighbourhood {
+            current: distinctive_mb(1),
+            left: Some(distinctive_mb(2)),
+            above: Some(distinctive_mb(3)),
+            above_right: Some(distinctive_mb(4)),
+            right: None,
+        };
+        let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B4, &n);
+        // B3 of current = 13; B2 of current = 12; MV3 = zero.
+        assert_eq!(mv1, MotionVector::new(13, 13));
+        assert_eq!(mv2, MotionVector::new(12, 12));
+        assert_eq!(mv3, MotionVector::default());
+    }
+
+    /// B4 with MB-right present: MV3 = B1 of MB-right.
+    #[test]
+    fn select_4mv_b4_right_present() {
+        let n = Mb4MvNeighbourhood {
+            current: distinctive_mb(1),
+            left: None,
+            above: None,
+            above_right: None,
+            right: Some(distinctive_mb(5)),
+        };
+        let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B4, &n);
+        // B3 of current = 13; B2 of current = 12; B1 of MB-right = 51.
+        assert_eq!(mv1, MotionVector::new(13, 13));
+        assert_eq!(mv2, MotionVector::new(12, 12));
+        assert_eq!(mv3, MotionVector::new(51, 51));
+    }
+
+    /// §F.2 last paragraph: "if only one motion vector per macroblock
+    /// is present, this is defined as four vectors with the same
+    /// value." When a one-MV macroblock is treated as a uniform 4-MV
+    /// MB, the §F.2 candidate-predictor selection collapses to the
+    /// single-vector Figure-12 candidates: MV1 of B1 = the single MV
+    /// of MB-left; MV2 of B1 = the single MV of MB-above; etc.
+    #[test]
+    fn one_mv_neighbour_uniform_4mv_equivalence() {
+        let single_current = MotionVector::new(5, -3);
+        let single_left = MotionVector::new(-2, 4);
+        let single_above = MotionVector::new(7, 7);
+        let single_above_right = MotionVector::new(-9, 0);
+        let single_right = MotionVector::new(1, 1);
+        let n = Mb4MvNeighbourhood {
+            current: [single_current; 4],
+            left: Some([single_left; 4]),
+            above: Some([single_above; 4]),
+            above_right: Some([single_above_right; 4]),
+            right: Some([single_right; 4]),
+        };
+        // B1: MV1 should equal the single MV of MB-left, MV2/MV3 the
+        // single MV of MB-above (Figure-12 single-MV layout).
+        let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B1, &n);
+        assert_eq!(mv1, single_left);
+        assert_eq!(mv2, single_above);
+        assert_eq!(mv3, single_above);
+        // B2: MV1 = single of current, MV2 = single of above, MV3 =
+        // single of above-right (= Figure-12 for the MB's single MV).
+        let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B2, &n);
+        assert_eq!(mv1, single_current);
+        assert_eq!(mv2, single_above);
+        assert_eq!(mv3, single_above_right);
+        // B3: every candidate inside current MB / MB-left, so all
+        // candidates equal the per-MB single vector.
+        let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B3, &n);
+        assert_eq!(mv1, single_left);
+        assert_eq!(mv2, single_current);
+        assert_eq!(mv3, single_current);
+        // B4: same — MV3 picks up MB-right's single vector.
+        let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B4, &n);
+        assert_eq!(mv1, single_current);
+        assert_eq!(mv2, single_current);
+        assert_eq!(mv3, single_right);
+    }
+
+    /// End-to-end: the §F.2 median predictor is just
+    /// `predict_mv_median` applied to [`select_4mv_candidates`]'s
+    /// output. Picking a uniform-everywhere neighbourhood gives the
+    /// median of (5,5,5) = 5 for every block.
+    #[test]
+    fn predict_mv_median_from_4mv_candidates() {
+        let v = MotionVector::new(5, -7);
+        let n = Mb4MvNeighbourhood {
+            current: [v; 4],
+            left: Some([v; 4]),
+            above: Some([v; 4]),
+            above_right: Some([v; 4]),
+            right: Some([v; 4]),
+        };
+        for blk in LumaBlockIndex::ALL {
+            let (mv1, mv2, mv3) = select_4mv_candidates(blk, &n);
+            assert_eq!(predict_mv_median(mv1, mv2, mv3), v, "block {blk:?}");
+        }
+    }
+
+    // ---- Annex F §F.2 / Table F.1 chroma vector derivation --------
+
+    /// Table F.1 transcription: every position `0..=15` snaps to the
+    /// documented half-pel position.
+    #[test]
+    fn chroma_4mv_table_f1_transcription() {
+        // Sum of four luma vectors == sixteenth-pel position directly
+        // in our integer half-pel arithmetic (4 components of equal
+        // half-pel each contribute exactly that many sixteenths to
+        // the chroma vector, since chroma is half-resolution).
+        let expected = [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2];
+        for (sixteenth, &want) in expected.iter().enumerate() {
+            let got = chroma_mv_component_4mv(sixteenth as i32);
+            assert_eq!(got, want, "sixteenth={sixteenth}");
+        }
+    }
+
+    /// All four luma MVs zero -> chroma MV zero.
+    #[test]
+    fn chroma_4mv_all_zero() {
+        let mvs: Mb4Mv = [MotionVector::default(); 4];
+        assert_eq!(chroma_mv_4mv(&mvs), MotionVector::default());
+    }
+
+    /// Four identical full-pel luma MVs collapse to the §6.1.1
+    /// single-MV chroma rule: each component sums to 4·v, divided
+    /// by 8 = v/2 (in luma half-pel terms ↔ chroma half-pel terms).
+    /// For an integer luma full-pel offset (dx_half = 2k), this gives
+    /// the same chroma half-pel as `chroma_mv_component` does for the
+    /// single value `2k`.
+    #[test]
+    fn chroma_4mv_uniform_matches_single_mv_rule() {
+        // Pick a few integer-pixel offsets (dx_half multiples of 2).
+        for k in -8..=8 {
+            let luma_half = 2 * k; // an even half-pel = full-pixel offset
+            let mvs: Mb4Mv = [MotionVector::new(luma_half, 0); 4];
+            let chroma = chroma_mv_4mv(&mvs);
+            let want_single = super::chroma_mv_component(luma_half);
+            assert_eq!(chroma.dx_half, want_single, "k={k}");
+            assert_eq!(chroma.dy_half, 0);
+        }
+    }
+
+    /// A four-vector sum of `+4` luma half-pel (each MV +1 half-pel)
+    /// gives sixteenth position 4 → Table F.1 → half-position 1
+    /// (one chroma half-pel step). Sign is preserved on the negative
+    /// mirror.
+    #[test]
+    fn chroma_4mv_sixteenth_snap_positive_and_negative() {
+        let mvs_pos: Mb4Mv = [
+            MotionVector::new(1, 0),
+            MotionVector::new(1, 0),
+            MotionVector::new(1, 0),
+            MotionVector::new(1, 0),
+        ];
+        assert_eq!(chroma_mv_4mv(&mvs_pos), MotionVector::new(1, 0));
+        let mvs_neg: Mb4Mv = [
+            MotionVector::new(-1, 0),
+            MotionVector::new(-1, 0),
+            MotionVector::new(-1, 0),
+            MotionVector::new(-1, 0),
+        ];
+        assert_eq!(chroma_mv_4mv(&mvs_neg), MotionVector::new(-1, 0));
+    }
+
+    /// A four-vector sum that crosses a chroma-pixel boundary: each
+    /// MV +8 half-pel = +4 luma pixels per block, sum = 32 luma
+    /// half-pel = 2 chroma pixels = 4 chroma half-pel. Pure integer
+    /// pixel result, no Table F.1 fractional contribution.
+    #[test]
+    fn chroma_4mv_full_pixel_integer_result() {
+        let mvs: Mb4Mv = [MotionVector::new(8, 16); 4]; // +4 px / +8 px
+        let chroma = chroma_mv_4mv(&mvs);
+        // sum_x = 32 luma half-pel -> chroma x = 32/16 = 2 chroma
+        // pixels = 4 chroma half-pel. sum_y = 64 -> 8 chroma half-pel.
+        assert_eq!(chroma.dx_half, 4);
+        assert_eq!(chroma.dy_half, 8);
+    }
+
+    /// Table F.1 asymmetry round-trip: position 2 → 0 (so chroma is
+    /// a whole chroma pixel) but position 3 → 1 (so chroma snaps up
+    /// to a chroma half-pel). The transition happens at the spec
+    /// boundary, not at 8.
+    #[test]
+    fn chroma_4mv_table_f1_low_boundary_asymmetry() {
+        // sixteenth = 2 -> half = 0.
+        assert_eq!(chroma_mv_component_4mv(2), 0);
+        // sixteenth = 3 -> half = 1.
+        assert_eq!(chroma_mv_component_4mv(3), 1);
+        // sixteenth = 13 -> half = 1.
+        assert_eq!(chroma_mv_component_4mv(13), 1);
+        // sixteenth = 14 -> half = 2 (= one chroma pixel).
+        assert_eq!(chroma_mv_component_4mv(14), 2);
+        // Negative mirror of each.
+        assert_eq!(chroma_mv_component_4mv(-2), 0);
+        assert_eq!(chroma_mv_component_4mv(-3), -1);
+        assert_eq!(chroma_mv_component_4mv(-13), -1);
+        assert_eq!(chroma_mv_component_4mv(-14), -2);
+    }
+
+    /// Chroma derivation is always in the half-pel chroma range
+    /// implied by the luma-pixel UMV range: every (mv1..mv4) sum in
+    /// the default `[-32, 31]` half-pel range produces a chroma
+    /// component bounded by `|sum| / 16 * 2 + 2`.
+    #[test]
+    fn chroma_4mv_bounded_sweep() {
+        // Sweep four-vector sums across the full single-MV span; the
+        // chroma magnitude is always at most |sum|·2/16 + 2.
+        for sum in -200..=200 {
+            let got = chroma_mv_component_4mv(sum).unsigned_abs() as i32;
+            let bound = sum.unsigned_abs() as i32 * 2 / 16 + 2;
+            assert!(got <= bound, "sum={sum} got={got} bound={bound}");
+        }
     }
 }

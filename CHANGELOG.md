@@ -8,6 +8,64 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex F §F.2 Advanced Prediction mode — four-motion-vector
+  candidate-predictor redefinition (Figure F.1) and Table F.1
+  sixteenth-pixel chrominance vector derivation (round 11), as pure
+  transformations in the [`motion`] module:
+  - `LumaBlockIndex` (B1 / B2 / B3 / B4) names the four 8×8 luminance
+    blocks in a macroblock in Figure 5 / §4.2.5 order. `Mb4Mv =
+    [MotionVector; 4]` is the per-macroblock motion-vector array
+    aligned with that index. `Mb4MvNeighbourhood { current, left,
+    above, above_right, right }` holds the four-vector grids of the
+    current macroblock and its four §F.2-relevant neighbours, with
+    each external neighbour wrapped in `Option` so the caller can
+    encode the §6.1.1 default-to-zero rules for INTRA / not-coded /
+    border macroblocks.
+  - `select_4mv_candidates(block, &neighbourhood)` implements Figure
+    F.1's "the 8×8 block at the physically same relative position
+    around MV" mapping. Per the figure, MV1 / MV2 / MV3 for each
+    block are: B1 → (B2 of MB-left, B3 of MB-above, B4 of MB-above);
+    B2 → (B1 of current, B4 of MB-above, B3 of MB-above-right);
+    B3 → (B4 of MB-left, B1 of current, B2 of current); B4 → (B3
+    of current, B2 of current, B1 of MB-right). Output feeds directly
+    into `predict_mv_median` for the §6.1.1 per-component median.
+  - `chroma_mv_component_4mv(luma_sum_half)` and `chroma_mv_4mv(luma)`
+    perform §F.2's "sum of the four luminance vectors divided by 8"
+    chroma derivation with the Table F.1 sixteenth → half-pixel snap
+    (asymmetric `{0,1,2}→0`, `{3..=13}→1`, `{14,15}→2` mapping). The
+    arithmetic exploits the identity that our luma half-pel sum is
+    *directly* the chroma sixteenth-pel position (since one luma
+    half-pel equals four chroma sixteenth-pels), so the computation
+    is `(|sum| / 16) * 2 + TABLE_F1[|sum| % 16]` with sign restored.
+  - Out of scope for this round (§F.3 overlapped block motion
+    compensation — the weighted three-prediction H0/H1/H2 average —
+    and the macroblock-loop driver wiring that walks the live
+    neighbour grid and feeds it into `select_4mv_candidates`). The
+    driver still returns `Error::NotImplemented` when it meets an
+    INTER4V macroblock.
+- Public re-exports from the crate root: `LumaBlockIndex`, `Mb4Mv`,
+  `Mb4MvNeighbourhood`, `select_4mv_candidates`,
+  `chroma_mv_component_4mv`, `chroma_mv_4mv`.
+- 17 unit tests in `motion::tests`: `LumaBlockIndex` round-trip
+  (`ALL.len() == 4`, `from_index` / `index` bijection); per-block
+  candidate selection (B1 isolated all-zero, B1 left-only and
+  above-only partial neighbourhoods, B2 / B3 full-neighbourhood with
+  distinctive vectors, B4 right-edge MV3-zero and B4 with MB-right
+  present); one-vector-per-MB equivalence (when every neighbour MB
+  carries a uniform 4-MV array, §F.2's candidate selection reduces
+  to the Figure-12 single-vector candidates); end-to-end median
+  predictor from `select_4mv_candidates` output on a uniform field;
+  Table F.1 16-entry transcription (every sixteenth-pel position
+  `0..=15` snaps to the documented half-pel position); all-zero
+  chroma MV; four-uniform-luma equivalence with the §6.1.1 single-MV
+  chroma rule across nine integer-pixel offsets; positive /
+  negative sixteenth-snap (one half-pel step out for sum ±4);
+  full-pixel integer chroma derivation (sum = ±32 / ±64 →
+  exact chroma half-pel multiples); Table F.1 asymmetry round-trip
+  (low boundary at sixteenth = 2 / 3 and high boundary at 13 / 14,
+  with negative mirror); bounded chroma magnitude sweep across
+  `[-200, +200]` sums (`|chroma| ≤ |sum|·2/16 + 2`).
+
 - Annex D §D.2 Unrestricted Motion Vector mode (round 10), PLUSPTYPE
   *absent* case, in the [`motion`] module:
   - `reconstruct_mv_component_umv(predictor, difference)` and

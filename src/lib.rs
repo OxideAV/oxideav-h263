@@ -79,9 +79,23 @@
 //!   out-of-picture samples. The PLUSPTYPE / UUI ranges of Tables
 //!   D.1 / D.2 and the Table-D.3 reversible VLC stay gated on the
 //!   not-yet-decoded extended-PTYPE header.
+//! * **Round 11** — Annex F §F.2 four-motion-vector candidate-predictor
+//!   redefinition (Figure F.1) and Table F.1 sixteenth-pixel chroma
+//!   derivation as pure transformations: [`LumaBlockIndex`] /
+//!   [`Mb4Mv`] / [`Mb4MvNeighbourhood`] + [`select_4mv_candidates`]
+//!   return the three §6.1.1 median-predictor candidates `(MV1, MV2,
+//!   MV3)` for any of the four 8×8 luminance blocks in a current
+//!   macroblock, given the four-MV grids of its left / above /
+//!   above-right / right neighbours. [`chroma_mv_4mv`] /
+//!   [`chroma_mv_component_4mv`] reduce the sum of the four luma
+//!   vectors to one chroma vector with the Table F.1 sixteenth →
+//!   half-pixel snap (asymmetric `{0,1,2}→0`, `{3..=13}→1`,
+//!   `{14,15}→2` mapping). The §F.3 overlapped block motion
+//!   compensation and the macroblock-driver wiring that walks the
+//!   neighbour grid are out of scope.
 //!
-//! PB-frame / Annex-T / extended-PTYPE / INTER4V (Annex F) paths are
-//! still out of scope, as is the remainder of Annex I (Table I.2 VLC +
+//! PB-frame / Annex-T / extended-PTYPE / §F.3 OBMC paths are still out
+//! of scope, as is the remainder of Annex I (Table I.2 VLC +
 //! prediction reconstruction); the driver returns
 //! [`Error::NotImplemented`] for them. The `oxideav_core::Decoder`
 //! registration is still a no-op — [`decode_picture`] is the
@@ -122,10 +136,11 @@ pub use gob_header::{
 pub use idct::{idct_8x8, reconstruct_intra_samples, BLOCK_DIM, IDCT_OUT_MAX, IDCT_OUT_MIN};
 pub use macroblock::{parse_macroblock, H263Macroblock, MbContext, MbType, Mvd};
 pub use motion::{
-    chroma_mv, chroma_mv_component, median3, motion_compensate_block, predict_mv_median,
-    reconstruct_inter_block, reconstruct_mv, reconstruct_mv_component,
-    reconstruct_mv_component_umv, reconstruct_mv_umv, MotionVector, RefPlane, MV_HALF_MAX,
-    MV_HALF_MIN, MV_HALF_SPAN, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN, RCONTROL_DEFAULT,
+    chroma_mv, chroma_mv_4mv, chroma_mv_component, chroma_mv_component_4mv, median3,
+    motion_compensate_block, predict_mv_median, reconstruct_inter_block, reconstruct_mv,
+    reconstruct_mv_component, reconstruct_mv_component_umv, reconstruct_mv_umv,
+    select_4mv_candidates, LumaBlockIndex, Mb4Mv, Mb4MvNeighbourhood, MotionVector, RefPlane,
+    MV_HALF_MAX, MV_HALF_MIN, MV_HALF_SPAN, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN, RCONTROL_DEFAULT,
 };
 pub use picture::{decode_picture, DecodeOptions, YuvFrame};
 pub use picture_header::{
