@@ -5,7 +5,24 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 15 — Annex K Slice Structured mode slice-layer
+**Orphan-rebuild round 16 — Annex F §F.2 / §F.3 INTER4V four-motion-
+vector + Overlapped Block Motion Compensation driver wiring. The
+`decode_picture` driver now reconstructs INTER4V / INTER4V+Q
+macroblocks end-to-end whenever the picture header's Advanced
+Prediction flag is set: the per-macroblock grid carries a full
+`[MotionVector; 4]` per MB (`LumaBlockIndex` / Figure-5 order);
+each of the four luma MVs is reconstructed from
+`select_4mv_candidates` + `predict_mv_median` with the §6.1.1
+rule-3 / rule-4 border rewrites + Annex D §D.2 UMV extension
+applied per block; Annex F §F.3 OBMC is dispatched per luma block
+via `obmc_predict_block` with the four remote MVs classified into
+`RemoteMv` tags per the §F.3 substitution rules (not-coded → zero,
+INTRA / off-picture → current, baseline → coded vector; B3 / B4's
+bottom remote unconditionally `Current` per §F.3 last sentence);
+the chroma vector comes from `chroma_mv_4mv` (sum of four luma
+vectors / 8 with the Table F.1 sixteenth → half snap), and both
+chroma blocks use standard half-pel MC (no chroma OBMC per §F.2).
+On top of round 15's Annex K Slice Structured mode slice-layer
 header (`slice_header` module): `parse_slice_layer` and
 `parse_first_slice_header` decode the §K.2 / Figure K.1 syntax
 (SSC + SEPB1 + optional SSBI + MBA + optional SEPB2 + SQUANT +
@@ -352,17 +369,20 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 
 ### What is NOT yet implemented
 
-* INTER4V / INTER4V+Q macroblocks (MB types 2 / 5) — driver wiring
-  for the four-vector path is still pending. Round 11 landed the
-  §F.2 candidate-predictor redefinition (Figure F.1) and the Table
-  F.1 sixteenth-pixel chroma derivation as pure primitives
-  (`select_4mv_candidates`, `chroma_mv_4mv`); round 12 landed the
-  §F.3 OBMC weighted three-prediction average as the pure function
-  `obmc_predict_block` over the Figures F.2 / F.3 / F.4 weight
-  matrices. The macroblock-loop driver does not yet walk the four-MV
-  neighbour grid to feed `obmc_predict_block` four times per INTER4V
-  macroblock; the driver returns `Error::NotImplemented` when it
-  meets one.
+* INTER4V macroblocks **outside** the Advanced Prediction mode — the
+  only other place INTER4V appears is the PLUSPTYPE Deblocking-Filter
+  mode (§5.3.2 Table 9 row 5: INTER4V+Q in DF mode without AP). The
+  macroblock parser only pulls MVD2-4 when AP is on, and the
+  `decode_inter4v_macroblock` path refuses with
+  `Error::NotImplemented` when AP is off. The INTER4V driver itself
+  is otherwise complete: round 16 landed the per-block 4-MV
+  reconstruction (Figure F.1 candidates + Table 14 MVD + Annex D §D.2
+  UMV extension when enabled), the Annex F §F.3 OBMC luma prediction
+  per block (`obmc_predict_block` per `LumaBlockIndex`, fed with
+  per-pixel-classified `RemoteMv` tags), the §F.2 / Table F.1
+  sixteenth-pixel chroma vector (`chroma_mv_4mv`), and §6.3.1
+  residual summation + §6.3.2 clip composed via
+  `reconstruct_inter_block_with_prediction`.
 * GOB-0-header-elision: the driver requires every GOB (including the
   topmost) to carry a GBSC/GN/GFID/GQUANT header on the wire, because
   the picture-layer PQUANT (the QUANT GOB 0 would inherit when its
@@ -431,7 +451,7 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 15 coverage estimate
+### Round 16 coverage estimate
 
 * H.263 spec text covered: §4.2.1 (GOB / MB scan layout, per-format
   GOB & MB-row counts) + §5.1.1–§5.1.3 + §5.1.4.1–§5.1.10 (extended
@@ -454,21 +474,25 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   `[-63, 63]` half-pel range + predictor-dependent difference-pair
   selection) + Annex F §F.2 (four-vector candidate-predictor
   redefinition per Figure F.1 + Table F.1 sixteenth-pixel chroma
-  derivation) + Annex F §F.3 (overlapped block motion compensation
-  weighted three-prediction average with the Figures F.2 / F.3 / F.4
-  weight matrices and the `Zero` / `Current` / `Vector` remote-MV
-  substitution rules) + Annex K §K.2 Slice Structured mode
-  slice-layer header parse (SSC + SEPB1/2/3 + optional SSBI per
+  derivation, **now wired into the `decode_picture` driver** —
+  INTER4V / INTER4V+Q macroblocks reconstruct end-to-end when
+  Advanced Prediction is on) + Annex F §F.3 (overlapped block motion
+  compensation weighted three-prediction average with the Figures
+  F.2 / F.3 / F.4 weight matrices and the `Zero` / `Current` /
+  `Vector` remote-MV substitution rules, **now dispatched per luma
+  block by the INTER4V driver path** with per-pixel classification
+  of the four remote MVs and the §F.3 last-sentence "bottom-of-MB →
+  current" rule applied to B3 / B4) + Annex K §K.2 Slice Structured
+  mode slice-layer header parse (SSC + SEPB1/2/3 + optional SSBI per
   Table K.1 + MBA per Table K.2 + SQUANT + optional SWI per Table K.3
   + GFID, plus the §K.2 first-slice reduced form), now composed into
   a full-picture decode driver (`decode_picture` → `YuvFrame`) for
-  the single-MV path and exposed as pure primitives for the §F.2
-  four-MV path, §F.3 OBMC weighted average, the §I.3 Table I.2
-  event-level VLC, and the §K.2 slice-layer header, plus the
-  extended-PTYPE (PLUSPTYPE) picture-header parse (`plus_ptype`
+  the single-MV path **and the Annex F four-MV + OBMC path**, plus
+  the extended-PTYPE (PLUSPTYPE) picture-header parse (`plus_ptype`
   module + `parse_picture_layer` dispatch on PTYPE source-format
-  `"111"`). Roughly 25 pages of the ~144-page recommendation.
-* Tests: 278 unit tests on synthetic buffers built with the spec's
+  `"111"`) and the §K.2 slice-layer header still exposed as a pure
+  primitive. Roughly 25 pages of the ~144-page recommendation.
+* Tests: 289 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
   (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
@@ -591,7 +615,22 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   short-buffer rejections, the §K.2 first-slice reduced-form parse
   (minimal QCIF, with-SWI under RS, MBA-overflow, bad-SEPB3), reader-
   position-after-parse advance, and the SSC-equals-GBSC numerical
-  identity.
+  identity; plus 11 Annex F §F.2 / §F.3 INTER4V driver tests covering
+  end-to-end INTER4V zero-MV reproducing the reference verbatim (the
+  §F.3 `q = r = s = ref(x,y)` weighted-average identity), exact byte
+  equivalence between INTER4V-zero and single-MV-zero on the same
+  picture (the §F.2 last-paragraph "one vector = four equal vectors"
+  rule), INTER4V on a flat-grey reference reproducing flat grey,
+  INTER4V refusal without Advanced Prediction, INTER4V after an INTRA
+  left-neighbour macroblock (the §F.3 INTRA-substitution path), the
+  §F.3 `RemoteMv` classification for B1 at the top-left picture corner
+  (top/left → `Current`; bottom/right resolve inside the current MB),
+  the §F.3 last-sentence "B3 / B4 bottom remote always `Current`"
+  rule, the §F.3 `not-coded` neighbour → `Zero` rule, the §F.3
+  `INTRA` neighbour → `Current` rule, and the
+  `build_4mv_neighbourhood` collapse of an INTRA / not-coded
+  neighbour to `None` versus a coded neighbour exposing its per-block
+  MV array.
 
 ## License
 

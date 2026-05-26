@@ -8,6 +8,58 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex F §F.2 / §F.3 INTER4V four-motion-vector + Overlapped Block
+  Motion Compensation driver wiring (round 16) in the `picture`
+  module. The full-picture decode driver `decode_picture` now
+  reconstructs INTER4V / INTER4V+Q macroblocks end-to-end whenever the
+  picture header's Advanced Prediction flag is set:
+  - The per-macroblock grid carries a full `[MotionVector; 4]` per MB
+    (one per 8×8 luminance block, in `LumaBlockIndex` / Figure-5
+    order); single-MV INTER and skipped / INTRA macroblocks
+    replicate / zero the same vector across all four slots per the
+    §F.2 last paragraph ("one-vector macroblocks are defined as four
+    vectors with the same value").
+  - `decode_inter4v_macroblock` reconstructs each of the four luma
+    MVs by feeding `select_4mv_candidates` + `predict_mv_median` with
+    the live `Mb4MvNeighbourhood` built from the grid, applying the
+    §6.1.1 rule-3 "above unavailable → MV2 = MV3 = MV1" rewrite and
+    the rule-4 "right-edge → MV3 = 0" rewrite per block, plus the
+    Annex D §D.2 UMV extended reconstruction when the picture header
+    enables it.
+  - The Annex F §F.3 OBMC weighted average is dispatched per luma
+    block via `obmc_predict_block`, with the four remote MVs
+    classified into `RemoteMv` tags per the §F.3 substitution rules:
+    not-coded neighbour → `Zero`; INTRA / off-picture neighbour →
+    `Current`; otherwise the surrounding 8×8 block's coded MV. The
+    §F.3 last-sentence "bottom-of-MB → current" rule unconditionally
+    forces the bottom remote to `Current` for B3 / B4.
+  - The chroma vector is derived via `chroma_mv_4mv` (sum of the four
+    luma vectors / 8 with the Table F.1 sixteenth → half snap); both
+    chroma blocks use standard half-pel motion compensation (no
+    chroma OBMC per §F.2). The §6.3.1 residual summation +
+    §6.3.2 clip then composes per-block via
+    `reconstruct_inter_block_with_prediction`, gated on the §5.3.5
+    INTER orientation of CBPY (`cbpy ^ 0b1111`).
+  - 11 new tests covering: end-to-end INTER4V zero-MV reproducing the
+    reference verbatim (the OBMC `q = r = s = ref(x,y)` identity),
+    INTER4V-vs-single-MV exact byte equivalence on the all-zero-MV
+    case, INTER4V with a flat-grey reference reproducing flat grey
+    (Annex F invariant on the §F.3 weighted average with H0+H1+H2=8),
+    INTER4V refusal without Advanced Prediction (defensive guard for
+    PLUSPTYPE Deblocking-Filter mode), INTER4V after an INTRA left
+    neighbour (substitution-rule path), and direct unit tests for
+    `classify_remote_mvs` (B1 at top-left corner →
+    top/left = `Current`; B3 bottom remote always `Current`;
+    not-coded neighbour → `Zero`; INTRA neighbour → `Current`) and
+    `build_4mv_neighbourhood` (INTRA neighbour → `None`; coded
+    neighbour → `Some([...])`).
+  - Single-MV INTER, skipped, and INTRA macroblocks are unaffected
+    (the existing driver tests continue to pass); the per-MB
+    `Mb4Mv` slot is populated with `[mv; 4]` for single-MV INTER and
+    `[zero; 4]` for INTRA / skipped, so the §F.2 last-paragraph
+    "single-vector = four equal vectors" rule continues to hold for
+    INTER4V macroblocks reading from single-MV neighbours.
+
 - Annex K Slice Structured mode slice-layer header parse (round 15),
   in the new `slice_header` module:
   - `parse_slice_layer(reader, &SliceHeaderContext) -> Result<SliceLayer>`

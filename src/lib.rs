@@ -127,13 +127,30 @@
 //!   SSBI (Table K.1) enforced. Wiring the slice header into the
 //!   `decode_picture` driver (so a slice-structured bitstream actually
 //!   reconstructs a frame) is the next round's work.
+//! * **Round 16** — Annex F §F.2 / §F.3 INTER4V four-motion-vector +
+//!   Overlapped Block Motion Compensation driver wiring. The
+//!   [`decode_picture`] driver now reconstructs INTER4V / INTER4V+Q
+//!   macroblocks end-to-end whenever the picture header's Advanced
+//!   Prediction flag is set: each of the four luma MVs is built from
+//!   `select_4mv_candidates` + `predict_mv_median` over a live
+//!   four-MV neighbour grid, the §F.3 OBMC weighted average is
+//!   dispatched per luma block via [`obmc_predict_block`] with the
+//!   four remote MVs classified into [`RemoteMv`] tags per the §F.3
+//!   substitution rules (not-coded → zero; INTRA / off-picture →
+//!   current; baseline → coded vector; §F.3 last sentence forces B3 /
+//!   B4's bottom remote to `Current`), and the chroma vector comes
+//!   from [`chroma_mv_4mv`] (sum of the four luma vectors / 8 with
+//!   the Table F.1 sixteenth → half snap). Chroma blocks use standard
+//!   half-pel motion compensation (no OBMC for chroma per §F.2).
 //!
-//! PB-frame / Annex-T / extended-PTYPE paths are still out of scope, as
-//! is the remainder of Annex I (Table I.2 VLC + prediction
-//! reconstruction); the driver returns [`Error::NotImplemented`] for
-//! them. The `oxideav_core::Decoder` registration is still a no-op —
-//! [`decode_picture`] is the frame-yielding surface pending the full
-//! streaming `Decoder` impl.
+//! PB-frame / Annex-T / extended-PTYPE-gated decode paths are still
+//! out of scope, as is the §I.3 AIC prediction reconstruction (the
+//! Table I.2 event-level VLC is exposed in [`intra_tcoef`] but the
+//! macroblock-grid neighbour-block plumbing for the DC/AC prediction
+//! is not yet wired); the driver returns [`Error::NotImplemented`]
+//! for them. The `oxideav_core::Decoder` registration is still a
+//! no-op — [`decode_picture`] is the frame-yielding surface pending
+//! the full streaming `Decoder` impl.
 //!
 //! [spec]: https://www.itu.int/rec/T-REC-H.263
 
