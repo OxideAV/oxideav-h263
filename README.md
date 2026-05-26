@@ -5,13 +5,19 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 14 — Annex I §I.3 / Table I.2 separate
-INTRA-coefficient VLC, as the pure event-level primitive
-`decode_intra_tcoef_event` in the new `intra_tcoef` module: 102
-regular codewords reusing Table 16's bit patterns at every index
-(per §I.3) but with reassigned `(RUN, |LEVEL|)` columns (`LAST`
-preserved), plus the §5.4.2 ESCAPE prefix + 1 + 6 + 8 fixed-length
-tail. On top of round 13's extended-PTYPE (PLUSPTYPE)
+**Orphan-rebuild round 15 — Annex K Slice Structured mode slice-layer
+header (`slice_header` module): `parse_slice_layer` and
+`parse_first_slice_header` decode the §K.2 / Figure K.1 syntax
+(SSC + SEPB1 + optional SSBI + MBA + optional SEPB2 + SQUANT +
+optional SWI + SEPB3 + GFID) for general slices and the §K.2
+reduced form for the first slice after the picture start code,
+with Tables K.1 / K.2 / K.3 driving SSBI legality and the
+MBA / SWI field widths per the `SliceHeaderContext`
+picture-geometry / CPM / RS-submode / RRU inputs. On top of round
+14's Annex I §I.3 / Table I.2 separate INTRA-coefficient VLC
+(`decode_intra_tcoef_event` — 102 regular codewords reusing
+Table 16 bit patterns under reassigned `(RUN, |LEVEL|)` columns,
+plus the §5.4.2 ESCAPE event), round 13's extended-PTYPE (PLUSPTYPE)
 picture-header parse (UFEP / OPPTYPE / MPPTYPE + CPM / PSBI /
 CPFMT / EPAR / CPCFC / ETR / UUI / SSS), round 12's §F.3 OBMC
 weighted three-prediction average (`obmc_predict_block` over
@@ -256,6 +262,30 @@ the non-PB-frame baseline:
   `LumaBlockIndex` with the correct `RemoteMv` classification) is
   out of scope for this round; the decode driver still returns
   `Error::NotImplemented` for INTER4V macroblocks.
+* Annex K §K.2 — Slice Structured mode slice-layer header parse
+  (`slice_header` module). `parse_slice_layer` decodes the §K.2 /
+  Figure K.1 layout for slices other than the picture's first
+  (SSC + SEPB1 + optional SSBI + MBA + optional SEPB2 + SQUANT +
+  optional SWI + SEPB3 + GFID); `parse_first_slice_header` decodes
+  the §K.2 reduced form for the slice that immediately follows the
+  picture start code (SEPB1 + MBA + optional SEPB2 + optional SWI +
+  SEPB3). `SliceHeaderContext` carries the picture geometry plus the
+  CPM / Rectangular-Slice / RRU flags that drive conditional-field
+  presence: SSBI is on the wire iff CPM is set, SWI iff Rectangular
+  Slice submode is in effect (PLUSPTYPE SSS bit 1), and SEPB2 follows
+  the §K.2.6 rule (MBA-width > 11 / > 9 thresholds against CPM, or
+  RS-on for the first slice). MBA and SWI field widths come from
+  Tables K.2 and K.3 with both the default and the Annex Q
+  Reduced-Resolution Update columns transcribed (six rows each
+  covering sub-QCIF / QCIF / CIF / 4CIF / 16CIF / 2048-wide).
+  SSBI rejects every 4-bit value outside the Table K.1 set
+  (`1001` / `1010` / `1011` / `1101`), exposed via
+  `ssbi_to_subbitstream`. The §K.2.2 SSC value `0x00001` is
+  numerically identical to the §5.2.2 GBSC value; the disambiguation
+  is by picture-level mode (PLUSPTYPE SS=1), not bitstream-level.
+  Wiring the slice header into the `decode_picture` driver (so a
+  slice-structured bitstream actually reconstructs a frame) is the
+  next round's work; `decode_picture` still walks GOB headers only.
 
 The high-level entry point decodes a whole picture in one call:
 
@@ -376,8 +406,12 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   GOB parser; the parser does not auto-detect leading zeros.
 * GSBI (§5.2.4, CPM = "1" case) — picture-layer CPM is not yet
   exposed, so the GOB parser only handles the CPM = "0" branch.
-* Slice-structured mode (Annex K), end-of-sequence markers
-  (§5.1.27, EOS/EOSBS as PSC-prefixed codes).
+* Slice-structured mode (Annex K) — the §K.2 slice-layer header parse
+  landed in round 15 (`slice_header` module: `parse_slice_layer` /
+  `parse_first_slice_header`), but the `decode_picture` driver does
+  not yet dispatch on it (it still walks GOB headers only). End-of-
+  sequence markers (§5.1.27, EOS/EOSBS as PSC-prefixed codes) are
+  still not parsed.
 * The Annex-O optional fields after PTYPE: PQUANT, CPM/PSBI, TRB,
   DBQUANT, PEI/PSUPP.
 * Extended PTYPE / PLUSPTYPE — the §5.1.4 onward picture-header *parse*
@@ -397,7 +431,7 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 14 coverage estimate
+### Round 15 coverage estimate
 
 * H.263 spec text covered: §4.2.1 (GOB / MB scan layout, per-format
   GOB & MB-row counts) + §5.1.1–§5.1.3 + §5.1.4.1–§5.1.10 (extended
@@ -423,14 +457,18 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   derivation) + Annex F §F.3 (overlapped block motion compensation
   weighted three-prediction average with the Figures F.2 / F.3 / F.4
   weight matrices and the `Zero` / `Current` / `Vector` remote-MV
-  substitution rules), now composed into a full-picture decode driver
-  (`decode_picture` → `YuvFrame`) for the single-MV path and exposed
-  as pure primitives for the §F.2 four-MV path, §F.3 OBMC weighted
-  average, and the §I.3 Table I.2 event-level VLC, plus the
+  substitution rules) + Annex K §K.2 Slice Structured mode
+  slice-layer header parse (SSC + SEPB1/2/3 + optional SSBI per
+  Table K.1 + MBA per Table K.2 + SQUANT + optional SWI per Table K.3
+  + GFID, plus the §K.2 first-slice reduced form), now composed into
+  a full-picture decode driver (`decode_picture` → `YuvFrame`) for
+  the single-MV path and exposed as pure primitives for the §F.2
+  four-MV path, §F.3 OBMC weighted average, the §I.3 Table I.2
+  event-level VLC, and the §K.2 slice-layer header, plus the
   extended-PTYPE (PLUSPTYPE) picture-header parse (`plus_ptype`
   module + `parse_picture_layer` dispatch on PTYPE source-format
-  `"111"`). Roughly 23 pages of the ~144-page recommendation.
-* Tests: 248 unit tests on synthetic buffers built with the spec's
+  `"111"`). Roughly 25 pages of the ~144-page recommendation.
+* Tests: 278 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
   (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
@@ -537,7 +575,23 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   complement, both baseline-forbidden ESCAPE LEVEL codes (`0x00` /
   `0x80`), 13-bits-all-zero → `BadTcoefCode`, empty-buffer →
   `UnexpectedEof`, exact bit-consumption of the 3-bit `10s` entry,
-  and exact bit-consumption of the 22-bit ESCAPE event.
+  and exact bit-consumption of the 22-bit ESCAPE event; plus 30
+  Annex K §K.2 slice-header tests covering `SliceHeaderContext`
+  geometry (Table K.2 MBA field widths for sub-QCIF / QCIF / 16CIF,
+  Table K.3 SWI field widths for QCIF / CIF under RS submode, the
+  Annex Q RRU column for QCIF), SEPB2-presence rule across CPM and
+  picture-size combinations (QCIF-no-CPM absent, 16CIF-no-CPM
+  present, CIF-with-CPM-still-absent, 4CIF-with-CPM-present), the
+  minimal-QCIF non-first parse, max-legal-MBA, MBA-overflow rejection,
+  CPM-on parse with a Table-K.1 SSBI codeword (and the
+  `ssbi_to_subbitstream` mapping for all four codewords plus every
+  non-codeword 4-bit value), illegal-SSBI rejection, RS-submode parse
+  with SWI, SWI-wider-than-picture rejection, 16CIF parse exercising
+  the mandatory SEPB2, bad-SEPB1 / bad-SEPB3 / SQUANT=0 / bad-SSC /
+  short-buffer rejections, the §K.2 first-slice reduced-form parse
+  (minimal QCIF, with-SWI under RS, MBA-overflow, bad-SEPB3), reader-
+  position-after-parse advance, and the SSC-equals-GBSC numerical
+  identity.
 
 ## License
 

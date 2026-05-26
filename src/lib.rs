@@ -114,6 +114,19 @@
 //!   INTRA-block parser with the §I.3 absorbed-INTRADC semantics
 //!   (line 4214) and the DC/AC prediction reconstruction is deferred
 //!   pending the macroblock-grid driver.
+//! * **Round 15** — Annex K Slice Structured mode slice-layer header,
+//!   as the [`slice_header`] module. [`parse_slice_layer`] decodes the
+//!   §K.2 / Figure K.1 layout (SSC + SEPB1 + optional SSBI + MBA +
+//!   optional SEPB2 + SQUANT + optional SWI + SEPB3 + GFID) for slices
+//!   other than the first; [`parse_first_slice_header`] decodes the
+//!   §K.2 reduced form (SEPB1 + MBA + optional SEPB2 + optional SWI +
+//!   SEPB3) for the slice that immediately follows the picture start
+//!   code. Field widths are looked up against Tables K.2 (MBA) and K.3
+//!   (SWI) per the [`SliceHeaderContext`] picture-geometry / CPM /
+//!   RS-submode / RRU inputs, with the §K.1 legal-codeword set for
+//!   SSBI (Table K.1) enforced. Wiring the slice header into the
+//!   `decode_picture` driver (so a slice-structured bitstream actually
+//!   reconstructs a frame) is the next round's work.
 //!
 //! PB-frame / Annex-T / extended-PTYPE paths are still out of scope, as
 //! is the remainder of Annex I (Table I.2 VLC + prediction
@@ -141,6 +154,7 @@ pub mod motion;
 pub mod picture;
 pub mod picture_header;
 pub mod plus_ptype;
+pub mod slice_header;
 
 pub use aic::{
     decode_intra_mode, scan_for_intra_mode, IntraMode, ALT_HORIZONTAL_TO_BLOCK_POS,
@@ -177,6 +191,10 @@ pub use plus_ptype::{
     Opptype, PlusPictureType, PlusPtypeHeader, PlusSourceFormat, SliceStructuredSubmode, Uui,
     CPCFC_BITS, CPFMT_BITS, EPAR_BITS, ETR_BITS, MPPTYPE_BITS, OPPTYPE_BITS, SSS_BITS, UFEP_BITS,
     UFEP_FULL, UFEP_MANDATORY_ONLY,
+};
+pub use slice_header::{
+    parse_first_slice_header, parse_slice_layer, ssbi_to_subbitstream, FirstSliceLayer,
+    SliceHeaderContext, SliceLayer, SEPB_BITS, SQUANT_BITS, SSBI_BITS, SSC_BITS, SSC_VALUE,
 };
 
 /// Crate-local error type. The orphan-rebuild scaffold returns
@@ -258,6 +276,28 @@ pub enum Error {
     /// (§5.4.2 implicit constraint: RUN must keep the scan position
     /// inside the block).
     BadTcoefRunOverflow,
+    /// The 17-bit Slice Start Code (SSC, value
+    /// `0000 0000 0000 0000 1`) was not present at the current
+    /// bitstream position. See §K.2.2.
+    BadSliceStartCode,
+    /// One of the §K.2 slice emulation-prevention bits (SEPB1 / SEPB2
+    /// / SEPB3) was `0` where §K.2.3 / §K.2.6 / §K.2.9 require `1`.
+    BadSliceEmulationPreventionBit,
+    /// The 4-bit SSBI codeword was not one of the four
+    /// Table K.1/H.263 entries (`1001` / `1010` / `1011` / `1101`).
+    /// See §K.2.4.
+    BadSliceSsbiCode,
+    /// The MBA field of a slice header exceeded the picture's
+    /// maximum macroblock number (Table K.2 last column). See §K.2.5.
+    SliceMbaOutOfRange,
+    /// The SWI field of a slice header gave an actual slice width
+    /// (`SWI + 1`) greater than the picture's macroblock-per-row
+    /// count. See §K.2.8.
+    SliceSwiOutOfRange,
+    /// A slice-header parse was attempted against a
+    /// [`SliceHeaderContext`] whose picture geometry is smaller than
+    /// sub-QCIF — Table K.2 / K.3 cannot resolve a field width.
+    UnsupportedPictureGeometry,
 }
 
 impl core::fmt::Display for Error {
@@ -332,6 +372,30 @@ impl core::fmt::Display for Error {
             Error::BadTcoefRunOverflow => write!(
                 f,
                 "oxideav-h263: TCOEF RUN advanced the zigzag scan past coefficient 63"
+            ),
+            Error::BadSliceStartCode => write!(
+                f,
+                "oxideav-h263: slice start code (SSC) not found at expected position"
+            ),
+            Error::BadSliceEmulationPreventionBit => write!(
+                f,
+                "oxideav-h263: slice emulation prevention bit (SEPB1/SEPB2/SEPB3) was 0 (must be 1)"
+            ),
+            Error::BadSliceSsbiCode => write!(
+                f,
+                "oxideav-h263: SSBI was not one of the four Table K.1 codewords"
+            ),
+            Error::SliceMbaOutOfRange => write!(
+                f,
+                "oxideav-h263: slice MBA field exceeded the picture's macroblock count - 1"
+            ),
+            Error::SliceSwiOutOfRange => write!(
+                f,
+                "oxideav-h263: slice SWI field gave an actual slice width above the picture's MB-per-row count"
+            ),
+            Error::UnsupportedPictureGeometry => write!(
+                f,
+                "oxideav-h263: picture geometry too small for the Annex K slice-header tables"
             ),
         }
     }

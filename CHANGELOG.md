@@ -8,6 +8,62 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex K Slice Structured mode slice-layer header parse (round 15),
+  in the new `slice_header` module:
+  - `parse_slice_layer(reader, &SliceHeaderContext) -> Result<SliceLayer>`
+    decodes the §K.2 / Figure K.1 syntax for slices other than the
+    first in a picture: SSC (17 bits) + SEPB1 + optional SSBI (4 bits,
+    Table K.1 codewords) + MBA (variable per Table K.2) + optional
+    SEPB2 + SQUANT (5 bits) + optional SWI (variable per Table K.3) +
+    SEPB3 + GFID (2 bits).
+  - `parse_first_slice_header(reader, &SliceHeaderContext) ->
+    Result<FirstSliceLayer>` decodes the §K.2 reduced form for the
+    slice that immediately follows the picture start code: SEPB1 +
+    MBA + optional SEPB2 + optional SWI + SEPB3 (SSC, SSBI, SQUANT,
+    GFID are absent in this case).
+  - `SliceHeaderContext { picture_width, picture_height, cpm,
+    rectangular_slices, rru }` carries the picture-level inputs the
+    parser needs: CPM gates SSBI / shrinks the SEPB2 MBA-width
+    threshold; `rectangular_slices` (PLUSPTYPE SSS bit 1) gates SWI;
+    RRU (Annex Q) selects the right-hand columns of Tables K.2 / K.3.
+    `SliceHeaderContext::for_standard_format(H263SourceFormat)` is a
+    convenience constructor for the common QCIF / CIF / sub-QCIF
+    baseline-plus-Annex-K case.
+  - `SliceLayer { ssbi, mba, squant, swi_actual_width, gfid,
+    header_bits }` / `FirstSliceLayer { mba, swi_actual_width,
+    header_bits }` carry the decoded fields. `swi_actual_width` is
+    `SWI + 1` per §K.2.8.
+  - `ssbi_to_subbitstream(raw) -> Option<u8>` maps the four legal
+    Table K.1 codewords (`1001` / `1010` / `1011` / `1101`) to the
+    sub-bitstream numbers `0..=3`; all other 4-bit values return
+    `None`.
+  - Six new `Error` variants: `BadSliceStartCode`,
+    `BadSliceEmulationPreventionBit`, `BadSliceSsbiCode`,
+    `SliceMbaOutOfRange`, `SliceSwiOutOfRange`,
+    `UnsupportedPictureGeometry`.
+  - Out of scope (deferred): wiring the slice header into the
+    `decode_picture` driver (still walks GOB headers only); §K.2.1
+    SSTUF byte-aligner stuffing (the caller skips it before invoking
+    the parser, identical contract to the GOB parser for GSTUF);
+    end-of-sequence markers (§5.1.27).
+- Public re-exports from the crate root: `parse_first_slice_header`,
+  `parse_slice_layer`, `ssbi_to_subbitstream`, `FirstSliceLayer`,
+  `SliceHeaderContext`, `SliceLayer`, `SEPB_BITS`, `SQUANT_BITS`,
+  `SSBI_BITS`, `SSC_BITS`, `SSC_VALUE`.
+- 30 unit tests in `slice_header::tests` covering
+  `SliceHeaderContext` geometry (Table K.2 MBA field widths for
+  sub-QCIF / QCIF / 16CIF, Table K.3 SWI widths for QCIF / CIF, RRU
+  column for QCIF), SEPB2-presence across CPM and picture-size
+  combinations, minimal-QCIF non-first parse, max-legal MBA, MBA
+  overflow rejection, CPM-on parse with Table K.1 SSBI (and the
+  `ssbi_to_subbitstream` mapping for all four codewords plus every
+  non-codeword), illegal-SSBI rejection, RS-submode parse with SWI,
+  SWI-wider-than-picture rejection, 16CIF parse with mandatory SEPB2,
+  bad-SEPB1 / bad-SEPB3 / SQUANT=0 / bad-SSC / short-buffer
+  rejections, §K.2 first-slice reduced-form parse (minimal,
+  with-SWI under RS, MBA overflow, bad-SEPB3), reader-position-after-
+  parse advance, and the SSC-equals-GBSC numerical identity.
+
 - Annex I §I.3 / Table I.2 separate INTRA-coefficient VLC (round 14),
   in the new `intra_tcoef` module:
   - `decode_intra_tcoef_event(reader) -> Result<IntraTcoefEvent>`
