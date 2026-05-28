@@ -5,9 +5,34 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 16 — Annex F §F.2 / §F.3 INTER4V four-motion-
+**Orphan-rebuild round 17 — Annex I §I.3 modified inverse-quantization
+primitives (`aic_dequant` module). Three pure functions land the
+dead-zone-free reconstruction residual formula and the §I.3 DC / AC
+clip helpers that the AIC coefficient pipeline composes after the
+round-14 Table I.2 VLC event-decode:
+
+* `aic_dequant_coefficient(level, quant) -> i32` — §I.3 formula
+  `RecC(u,v) = 2 · QUANT · LEVEL(u,v)` applied to a single coefficient
+  slot (DC or AC alike), strictly linear in both inputs and strictly
+  even-valued, contrasting with the §6.2.1 H.261-style odd-fier
+  baseline.
+* `clip_ac(x)` — §I.3 `clipAC` range pin to `[-2048, +2047]` applied
+  to every AC slot post-prediction-sum.
+* `oddify_clip_dc(x)` — §I.3 `oddifyclipDC` combined parity-bump +
+  `clipDC` range pin to `[0, +2047]` applied to the DC slot
+  post-prediction-sum, protecting against the IDCT-mismatch resonance
+  the spec calls out at the (0,0) / (0,4) / (4,0) / (4,4) basis-pattern
+  cross-points.
+
+The companion §I.3 INTRA prediction reconstruction itself (the three
+INTRA_MODE-dependent rules that add `RecA'(u,v)` / `RecB'(u,v)` contributions
+before the final clip) is still deferred to the macroblock-grid driver
+that supplies the live neighbour blocks; round 17's primitives are the
+building blocks the driver will compose.
+
+On top of round 16's Annex F §F.2 / §F.3 INTER4V four-motion-
 vector + Overlapped Block Motion Compensation driver wiring. The
-`decode_picture` driver now reconstructs INTER4V / INTER4V+Q
+`decode_picture` driver reconstructs INTER4V / INTER4V+Q
 macroblocks end-to-end whenever the picture header's Advanced
 Prediction flag is set: the per-macroblock grid carries a full
 `[MotionVector; 4]` per MB (`LumaBlockIndex` / Figure-5 order);
@@ -404,18 +429,22 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   Annex-T EXTENDED-ESCAPE LEVEL prefix (`1000 0000`) is not
   accepted in TCOEF.
 * Annex I (Advanced INTRA Coding) — the remaining parts beyond the
-  round-8 scan-and-mode layer and the round-14 Table I.2 separate
-  INTRA-coefficient VLC: the INTRADC-as-AC-coded-value path (§I.3
+  round-8 scan-and-mode layer, the round-14 Table I.2 separate
+  INTRA-coefficient VLC, and the round-17 §I.3 modified inverse-
+  quantization primitives: the INTRADC-as-AC-coded-value path (§I.3
   line 4214: INTRADC absorbed into the per-block coefficient stream
-  for MCBPC / CBPY purposes), the §I.3 modified inverse quantization
-  (`RecC = 2·QUANT·LEVEL`, no dead-zone) with variable-step INTRADC,
-  and the DC/AC prediction reconstruction + `oddifyclipDC` /
-  `clipAC` clipping (which need the macroblock-grid driver's
-  neighbour blocks). The §I.2 INTRA_MODE VLC, the two §I.3 alternate
-  scans, and the §I.3 scan-selection rule landed in round 8; the
-  Table I.2 event-level VLC primitive landed in round 14. Round-4
-  §5.4.1 is still the baseline 8-bit FLC INTRADC form (the AIC
-  reframing of INTRADC awaits the macroblock-grid driver).
+  for MCBPC / CBPY purposes), and the DC/AC prediction reconstruction
+  itself (the three INTRA_MODE-dependent rules that compose
+  `aic_dequant_coefficient` + `RecA'` / `RecB'` predictor sums +
+  `clip_ac` / `oddify_clip_dc` — all of which need the macroblock-grid
+  driver's neighbour blocks). The §I.2 INTRA_MODE VLC, the two §I.3
+  alternate scans, and the §I.3 scan-selection rule landed in round 8;
+  the Table I.2 event-level VLC primitive landed in round 14; the §I.3
+  no-dead-zone residual formula `RecC(u,v) = 2·QUANT·LEVEL(u,v)` plus
+  the `oddifyclipDC` / `clipAC` clipping helpers landed in round 17
+  (`aic_dequant` module). Round-4 §5.4.1 is still the baseline 8-bit
+  FLC INTRADC form (the AIC reframing of INTRADC awaits the
+  macroblock-grid driver).
 * Annex D — only the §D.2 PLUSPTYPE-absent extended range landed
   (round 10). The PLUSPTYPE / UUI-dependent ranges of Tables D.1 / D.2
   and the Table-D.3 reversible-VLC encoding of the difference (used
@@ -451,7 +480,7 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * `oxideav_core::Decoder` registration; the `register()` function is
   still a no-op pending a frame-yielding decoder.
 
-### Round 16 coverage estimate
+### Round 17 coverage estimate
 
 * H.263 spec text covered: §4.2.1 (GOB / MB scan layout, per-format
   GOB & MB-row counts) + §5.1.1–§5.1.3 + §5.1.4.1–§5.1.10 (extended
@@ -470,7 +499,11 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   scan-selection rule + Annex I §I.3 Table I.2 separate
   INTRA-coefficient VLC (102 regular + ESCAPE entries; reused
   Table-16 bit patterns reinterpreted under the I.2 (RUN, |LEVEL|)
-  reassignment) + Annex D §D.2 (PLUSPTYPE-absent extended
+  reassignment) + Annex I §I.3 modified inverse-quantization residual
+  `RecC(u,v) = 2 · QUANT · LEVEL(u,v)` (no dead-zone) + Annex I §I.3
+  `clipAC` AC reconstruction clip `[-2048, +2047]` + Annex I §I.3
+  `oddifyclipDC` DC oddification and clip `[0, +2047]`
+  (`aic_dequant` module) + Annex D §D.2 (PLUSPTYPE-absent extended
   `[-63, 63]` half-pel range + predictor-dependent difference-pair
   selection) + Annex F §F.2 (four-vector candidate-predictor
   redefinition per Figure F.1 + Table F.1 sixteenth-pixel chroma
@@ -492,7 +525,7 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   module + `parse_picture_layer` dispatch on PTYPE source-format
   `"111"`) and the §K.2 slice-layer header still exposed as a pure
   primitive. Roughly 25 pages of the ~144-page recommendation.
-* Tests: 289 unit tests on synthetic buffers built with the spec's
+* Tests: 308 unit tests on synthetic buffers built with the spec's
   bit layout (round-trip via `oxideav_core::bits::BitWriter`),
   including full-table round-trips for Tables 7 (9 codes), 8
   (21 + 4 codes), 12 (16 codes), 14 (64 codes), 15 spot-check,
@@ -630,7 +663,21 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   `INTRA` neighbour → `Current` rule, and the
   `build_4mv_neighbourhood` collapse of an INTRA / not-coded
   neighbour to `None` versus a coded neighbour exposing its per-block
-  MV array.
+  MV array; plus 19 Annex I §I.3 `aic_dequant` tests covering the
+  reconstruction formula (QUANT=LEVEL=1 spot, sign-symmetry, zero-LEVEL
+  invariant across every QUANT, strict even-valued output across
+  31 × 255 QUANT × LEVEL pairs contrasting with the §6.2.1 odd-valued
+  baseline, linearity in LEVEL and QUANT, the QUANT=31 / LEVEL=±127
+  extreme `±7874` residual, the AIC-residual-strictly-smaller-than-
+  §6.2.1-baseline invariant across the same 31 × 127 grid, and QUANT
+  out-of-range clamping); `clip_ac` identity / upper-saturation /
+  lower-saturation; `oddify_clip_dc` parity preservation on odd inputs,
+  +1 bumping of even inputs, upper-saturation (even 2048 → 2047 via
+  bump then clip; odd 5001 → 2047 via direct clip), lower-saturation
+  (even -2 / -1000 / odd -1 / -999 all → 0), the in-range
+  oddness-or-boundary invariant across the full -100..=3000 sweep, the
+  full -3000..=3000 spec-pseudocode-equivalence cross-check, and a
+  `clip_dc` basic round-trip.
 
 ## License
 

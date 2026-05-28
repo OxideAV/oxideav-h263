@@ -28,17 +28,19 @@
 //!
 //! What this module does **not** yet provide (later rounds):
 //!
-//! * The Table I.2 separate INTRA-coefficient VLC (the dedicated
-//!   |LEVEL|/RUN interpretation that parallels Table 16).
-//! * The §I.3 modified inverse quantization
-//!   (`RecC(u,v) = 2·QUANT·LEVEL(u,v)`, no dead-zone) and the
-//!   variable-step INTRADC reconstruction.
+//! * The Table I.2 separate INTRA-coefficient VLC landed in round 14
+//!   ([`crate::intra_tcoef::decode_intra_tcoef_event`]); the §I.3
+//!   modified inverse-quantisation residual formula
+//!   `RecC(u,v) = 2·QUANT·LEVEL(u,v)` and the `oddifyclipDC` / `clipAC`
+//!   clipping primitives landed in round 17
+//!   ([`crate::aic_dequant`]). The variable-step INTRADC reconstruction
+//!   is a parser-side reframing (§I.3 line 4214: INTRADC absorbed into
+//!   the per-block coefficient stream) and stays deferred.
 //! * The DC/AC prediction reconstruction (modes 0/1/2 add a
-//!   predictor sourced from the block above / to the left), the
-//!   `oddifyclipDC` / `clipAC` clipping, and the "same video picture
-//!   segment" neighbour-availability rule — all of which need the
-//!   macroblock-grid driver to supply the neighbouring reconstructed
-//!   blocks.
+//!   predictor sourced from the block above / to the left) and the
+//!   "same video picture segment" neighbour-availability rule, which
+//!   both need the macroblock-grid driver to supply the neighbouring
+//!   reconstructed blocks.
 
 use crate::block::COEFFS_PER_BLOCK;
 use crate::{Error, Result};

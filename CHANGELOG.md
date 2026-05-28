@@ -8,6 +8,51 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex I §I.3 modified inverse-quantization primitives
+  (round 17, new `aic_dequant` module):
+  - `aic_dequant_coefficient(level: i16, quant: u8) -> i32` — the §I.3
+    "no dead-zone" residual formula `RecC(u,v) = 2 · QUANT · LEVEL(u,v)`,
+    a pure linear-in-both-inputs function applied identically to every
+    coefficient slot (DC and AC alike) before the §I.3 prediction
+    contribution is added. Strictly even-valued by construction (the
+    `2 ·` factor), contrasting with the round-1 §6.2.1 H.261-style
+    odd-fier baseline (`|REC| = QUANT · (2|LEVEL|+1) [-1 for even Q]`).
+  - `clip_ac(x: i32) -> i32` — the §I.3 `clipAC` range pin to
+    `[-2048, +2047]` (constants `AIC_AC_REC_MIN` / `AIC_AC_REC_MAX`),
+    applied per-AC-slot after the prediction-residual sum.
+  - `oddify_clip_dc(x: i32) -> i32` — the §I.3 `oddifyclipDC(x)` step
+    applied to the DC slot post-prediction-sum: `if x is even then
+    clipDC(x + 1) else clipDC(x)`, with `clipDC` pinning the result to
+    the non-negative range `[0, +2047]` (constants `AIC_DC_REC_MIN` /
+    `AIC_DC_REC_MAX`). The +1 bump protects against the IDCT-mismatch
+    resonance the spec calls out at the (0,0) / (0,4) / (4,0) / (4,4)
+    basis-pattern cross-points (`8k + 4` DC values inverse-transform
+    to a constant `k + 0.5` that rounds inconsistently between
+    conforming IDCTs).
+  - These primitives compose with the round-14 Table I.2 separate
+    INTRA-coefficient VLC (`intra_tcoef::decode_intra_tcoef_event`) to
+    cover the §I.3 coefficient pipeline from parsed `(RUN, LEVEL)` event
+    to a reconstructed pre-prediction residual; the only remaining §I.3
+    decode-time gap is the DC/AC prediction reconstruction itself (the
+    three INTRA_MODE-dependent rules that add `RecA'(u,v)` / `RecB'(u,v)`
+    contributions before the final `clip_ac` / `oddify_clip_dc` step),
+    which needs the macroblock-grid driver's live neighbour blocks.
+  - 19 new unit tests covering the §I.3 residual formula
+    (simple / negative-LEVEL / zero-LEVEL invariant / strict
+    even-valued output across 31×255 QUANT×LEVEL pairs /
+    linearity-in-LEVEL / linearity-in-QUANT / max-magnitude `±7874`
+    extreme / AIC-residual-strictly-smaller-than-§6.2.1-baseline
+    invariant / QUANT clamp); `clip_ac` (identity inside range /
+    upper saturation / lower saturation); `oddify_clip_dc` (odd inputs
+    unchanged / even inputs bumped / upper saturation via post-bump
+    clip / lower saturation via post-bump clip / in-range
+    oddness-or-boundary invariant across -100..=3000 / full
+    -3000..=3000 spec-pseudocode-equivalence cross-check); and a
+    `clip_dc` basic round-trip.
+  - `aic` module doc updated to point at the new `aic_dequant` module
+    for the §I.3 residual formula and clipping helpers and to record
+    that only the prediction-reconstruction step remains deferred.
+
 - Annex F §F.2 / §F.3 INTER4V four-motion-vector + Overlapped Block
   Motion Compensation driver wiring (round 16) in the `picture`
   module. The full-picture decode driver `decode_picture` now

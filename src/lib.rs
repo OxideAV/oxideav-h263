@@ -160,6 +160,7 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::RuntimeContext;
 
 pub mod aic;
+pub mod aic_dequant;
 pub mod block;
 pub mod deblock;
 pub mod dequant;
@@ -176,6 +177,10 @@ pub mod slice_header;
 pub use aic::{
     decode_intra_mode, scan_for_intra_mode, IntraMode, ALT_HORIZONTAL_TO_BLOCK_POS,
     ALT_VERTICAL_TO_BLOCK_POS,
+};
+pub use aic_dequant::{
+    aic_dequant_coefficient, clip_ac, oddify_clip_dc, AIC_AC_REC_MAX, AIC_AC_REC_MIN,
+    AIC_DC_REC_MAX, AIC_DC_REC_MIN,
 };
 pub use block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
 pub use deblock::{
