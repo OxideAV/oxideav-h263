@@ -142,14 +142,34 @@
 //!   from [`chroma_mv_4mv`] (sum of the four luma vectors / 8 with
 //!   the Table F.1 sixteenth → half snap). Chroma blocks use standard
 //!   half-pel motion compensation (no OBMC for chroma per §F.2).
+//! * **Round 19** — Annex I §I.3 INTRA DC/AC prediction reconstruction,
+//!   as the pure function [`reconstruct_intra_block_aic`] in the new
+//!   [`aic_predict`] module. Given a current INTRA block's dequantized
+//!   residual `RecC(u,v)` array, the §I.2 `INTRA_MODE`, and an optional
+//!   pair of already-reconstructed neighbour blocks (`RecA'` immediately
+//!   above, `RecB'` immediately to the left), returns the final
+//!   `RecC'(u,v)` array post-`clipAC` for AC slots and post-
+//!   `oddifyclipDC` for the DC slot. The three §I.3 page-79 INTRA_MODE
+//!   rules are encoded directly: Mode 0 averages the two DC neighbours
+//!   with truncation toward zero; Mode 1 / Mode 2 predict DC plus the
+//!   first row / column from `RecA'(u, 0)` / `RecB'(0, v)`. The §I.3
+//!   page-78 "same video picture segment" availability test lives in
+//!   the macroblock-grid driver and is surfaced via the [`Neighbour`]
+//!   tag; the predictor itself takes the availability decision as
+//!   input. The fallback DC predictor `1024` is exposed as
+//!   [`AIC_FALLBACK_DC_PREDICTOR`]. This closes the round-17 / round-18
+//!   "DC/AC prediction deferred" gap as a pure-function primitive; the
+//!   macroblock-grid driver that walks the picture, accumulates `RecA'`
+//!   / `RecB'` arrays, and dispatches this primitive plus the inverse
+//!   DCT remains the next round.
 //!
 //! PB-frame / Annex-T / extended-PTYPE-gated decode paths are still
-//! out of scope, as is the §I.3 AIC prediction reconstruction (the
-//! Table I.2 event-level VLC is exposed in [`intra_tcoef`] and the
-//! absorbed-INTRADC INTRA-block parser in [`block_aic`], but the
-//! macroblock-grid neighbour-block plumbing for the DC/AC prediction
-//! is not yet wired); the driver returns [`Error::NotImplemented`]
-//! for them. The `oxideav_core::Decoder` registration is still a
+//! out of scope, and although the §I.3 AIC prediction reconstruction
+//! primitive itself now exists in [`aic_predict`], the macroblock-grid
+//! driver that walks the picture and dispatches it (along with the
+//! AIC scan + dequant + IDCT) is not yet wired into
+//! [`decode_picture`]; the driver returns [`Error::NotImplemented`]
+//! for those paths. The `oxideav_core::Decoder` registration is still a
 //! no-op — [`decode_picture`] is the frame-yielding surface pending
 //! the full streaming `Decoder` impl.
 //!
@@ -162,6 +182,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod aic;
 pub mod aic_dequant;
+pub mod aic_predict;
 pub mod block;
 pub mod block_aic;
 pub mod deblock;
@@ -184,6 +205,7 @@ pub use aic_dequant::{
     aic_dequant_coefficient, clip_ac, oddify_clip_dc, AIC_AC_REC_MAX, AIC_AC_REC_MIN,
     AIC_DC_REC_MAX, AIC_DC_REC_MIN,
 };
+pub use aic_predict::{reconstruct_intra_block_aic, Neighbour, AIC_FALLBACK_DC_PREDICTOR};
 pub use block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
 pub use block_aic::parse_intra_block_aic;
 pub use deblock::{

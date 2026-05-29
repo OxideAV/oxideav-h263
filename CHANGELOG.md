@@ -8,6 +8,76 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex I §I.3 INTRA DC/AC prediction reconstruction
+  (round 19, new `aic_predict` module):
+  - `reconstruct_intra_block_aic(rec_c_residual, mode, block_a, block_b)
+    -> [i32; 64]` — single pure function that applies the three §I.3
+    page-79 INTRA_MODE prediction rules to a current INTRA block's
+    dequantized residual array and returns the final `RecC'(u,v)`
+    array post-`clipAC` (AC slots) and `oddifyclipDC` (DC slot). All
+    coefficient arrays are in block-position layout (`index = v * 8 + u`,
+    `u` horizontal / `v` vertical), the convention used by the Figure 14
+    / Figure I.2 scan-target tables already in `block` and `aic`.
+  - `Neighbour<'a>` enum — `None` for "neighbour unavailable" (out of
+    picture, INTER-coded, or in a different video picture segment per
+    the §I.3 page-78 availability rule) and `Available(&[i32; 64])` for
+    "neighbour is INTRA and in the same video picture segment, here's
+    its final `RecA'` / `RecB'` array". The driver supplies the
+    availability tag; the predictor module does not encode the
+    same-segment test itself (which belongs in the driver).
+  - `AIC_FALLBACK_DC_PREDICTOR = 1024` constant — the §I.3 fixed
+    no-neighbour DC predictor (used by Mode 0 when neither A nor B is
+    available, by Mode 1 when A is unavailable, and by Mode 2 when B is
+    unavailable).
+  - Per-mode reconstruction:
+    - **Mode 0** (`IntraMode::DcOnly`): AC slots are bare-residual
+      `clipAC`. DC is `oddifyclipDC( RecC(0,0) + predictor )` with
+      predictor = `(RecA'(0,0) + RecB'(0,0)) / 2` (truncation toward
+      zero per the §I.3 "/" division convention) when both A and B are
+      available, a single neighbour's DC if only one is available, and
+      `1024` if neither is.
+    - **Mode 1** (`IntraMode::VerticalDcAc`): When A is available, DC
+      gets `RecA'(0,0)` and AC slots `(u, 0)` for `u = 1..=7` get
+      `RecA'(u, 0)`; rows `v = 1..=7` are bare-residual `clipAC`.
+      When A is unavailable, DC falls back to `+1024` and no AC slot is
+      predicted.
+    - **Mode 2** (`IntraMode::HorizontalDcAc`): When B is available, DC
+      gets `RecB'(0,0)` and AC slots `(0, v)` for `v = 1..=7` get
+      `RecB'(0, v)`; columns `u = 1..=7` are bare-residual `clipAC`.
+      When B is unavailable, DC falls back to `+1024` and no AC slot is
+      predicted.
+  - Composes with the round-14 Table I.2 event decoder
+    (`intra_tcoef::decode_intra_tcoef_event`), the round-18 INTRA-block
+    parser (`block_aic::parse_intra_block_aic`), the round-17 modified
+    inverse-quantization primitives (`aic_dequant_coefficient`), the
+    round-8 scan selection (`aic::scan_for_intra_mode`), and the
+    `aic_dequant::clip_ac` / `oddify_clip_dc` clipping primitives to
+    cover the full §I.3 INTRA-block coefficient pipeline from raw
+    bitstream events to a final reconstructed coefficient array. The
+    only remaining §I.3 gap is the macroblock-grid driver that walks
+    the picture, computes the per-block "same video picture segment"
+    availability bits, accumulates reconstructed `RecA'` / `RecB'`
+    arrays, and dispatches this primitive plus the inverse DCT — that
+    driver is the next round's work.
+  - 23 new unit tests cover: Mode 0 with no neighbours / only A / only
+    B / both (averaging with truncation toward zero, including the
+    negative-sum truncation case); Mode 0 AC slots passing through
+    `clipAC` of the bare residual with neighbour AC values ignored;
+    Mode 1 with A available (DC + first-row prediction wired correctly,
+    rows `v >= 1` left as bare residuals) and with A unavailable (DC
+    falls back to `+1024`); Mode 2 symmetric to Mode 1 but for the
+    first column; AC upper / lower `clipAC` saturation; DC
+    `oddifyclipDC` parity bump and clip-to-`[0, 2047]` range (including
+    a negative-sum case that clips to 0); all-zero-residual /
+    no-neighbour invariant across all three modes (DC = 1025, AC = 0);
+    observational identity of `Neighbour::None` regardless of why it
+    is unavailable; `is_available` accessor; Mode 1 / Mode 2 zero-
+    residual predictor-passthrough; cross-mode invariant that every AC
+    output respects `[AIC_AC_REC_MIN, AIC_AC_REC_MAX]` and every DC
+    output respects `[AIC_DC_REC_MIN, AIC_DC_REC_MAX]`; fallback-DC
+    predictor consistency across modes; and `AIC_FALLBACK_DC_PREDICTOR
+    == 1024` constant guard.
+
 - Annex I §I.3 absorbed-INTRADC INTRA-block parser
   (round 18, new `block_aic` module):
   - `parse_intra_block_aic(reader, has_coefficients) -> Result<H263Block>`

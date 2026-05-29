@@ -5,7 +5,69 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 18 — Annex I §I.3 absorbed-INTRADC INTRA-block
+**Orphan-rebuild round 19 — Annex I §I.3 INTRA DC/AC prediction
+reconstruction (`aic_predict` module). One pure function lands the
+§I.3 page-79 three-mode reconstruction step: given a current INTRA
+block's dequantized residual array `RecC(u,v)`, the `INTRA_MODE`
+decoded from §I.2 (Table I.1), and an optional pair of
+already-reconstructed neighbour blocks (`RecA'` immediately above,
+`RecB'` immediately to the left), returns the final `RecC'(u,v)`
+array post-`clipAC` for AC slots and post-`oddifyclipDC` for the DC
+slot. The driver supplies neighbour availability per the §I.3 page-78
+"same video picture segment" rule via a `Neighbour::None` /
+`Neighbour::Available` tag; the predictor primitive itself does not
+encode that test.
+
+* `reconstruct_intra_block_aic(rec_c_residual, mode, block_a, block_b)
+  -> [i32; 64]` — applies the per-mode rule from §I.3 page 79:
+  * **Mode 0** ([`IntraMode::DcOnly`]): AC slots = `clipAC(RecC(u,v))`,
+    DC = `oddifyclipDC(RecC(0,0) + predictor)` with predictor =
+    `(RecA'(0,0) + RecB'(0,0)) / 2` (truncation toward zero) when both
+    A and B are available, single neighbour's DC if only one is, and
+    `1024` if neither is.
+  * **Mode 1** ([`IntraMode::VerticalDcAc`]): when A is available,
+    DC + first-row AC slots `(u, 0)` for `u = 1..=7` are predicted
+    from `RecA'(u, 0)`; rows `v = 1..=7` pass through as
+    `clipAC(RecC(u, v))`. When A is unavailable, DC falls back to
+    `+1024` and no AC slot is predicted.
+  * **Mode 2** ([`IntraMode::HorizontalDcAc`]): symmetric to Mode 1,
+    using block B and the first column `(0, v)` for `v = 1..=7`.
+* `Neighbour<'a>` enum + `AIC_FALLBACK_DC_PREDICTOR = 1024` constant
+  expose the §I.3 availability + fallback-predictor knobs to callers.
+* All coefficient arrays here are in **block-position** layout
+  (`index = v * 8 + u`) — the caller is expected to have already
+  scattered the zigzag-scan-order output of
+  [`block_aic::parse_intra_block_aic`] through the AIC-selected scan
+  ([`aic::scan_for_intra_mode`]) and dequantized via
+  [`aic_dequant::aic_dequant_coefficient`] before invoking this.
+
+This closes the round-17 / round-18 "DC/AC prediction reconstruction
+deferred to the macroblock-grid driver" gap as far as a pure-function
+primitive is concerned: every §I.3 page-79 branch is now expressible
+as a single call. The driver-side work that remains is the picture-
+walking pass that computes per-block availability bits, accumulates
+`RecA'` / `RecB'` arrays from prior reconstructions, and dispatches
+this primitive plus the inverse DCT — that driver is the next round.
+
+23 new unit tests cover: Mode 0 with no neighbours / only A / only B
+/ both (averaging with truncation toward zero, including the
+negative-sum truncation case); Mode 0 AC slots passing through
+`clipAC` of the bare residual with neighbour AC values ignored; Mode 1
+with A available (DC + first-row prediction wired, rows `v >= 1`
+left as bare residuals) and with A unavailable (DC falls back to
+`+1024`); Mode 2 symmetric for the first column; AC upper / lower
+`clipAC` saturation; DC `oddifyclipDC` parity bump and clip-to-
+`[0, 2047]` range (including a negative-sum case that clips to 0);
+all-zero-residual / no-neighbour invariant across all three modes
+(DC = 1025, AC = 0); observational identity of `Neighbour::None`
+regardless of reason; `is_available` accessor; Mode 1 / Mode 2 zero-
+residual predictor-passthrough; cross-mode invariant that every AC
+output respects `[AIC_AC_REC_MIN, AIC_AC_REC_MAX]` and every DC
+output respects `[AIC_DC_REC_MIN, AIC_DC_REC_MAX]`; fallback-DC
+predictor consistency across modes; and `AIC_FALLBACK_DC_PREDICTOR
+== 1024` constant guard.
+
+On top of round 18's Annex I §I.3 absorbed-INTRADC INTRA-block
 parser (`block_aic` module). One pure function lands the §I.3 (lines
 4213-4217) bitstream-layout change for INTRA blocks when Advanced
 INTRA Coding is in use: the §5.4.1 Table-15 8-bit FLC INTRADC prefix
