@@ -8,6 +8,50 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex I §I.3 absorbed-INTRADC INTRA-block parser
+  (round 18, new `block_aic` module):
+  - `parse_intra_block_aic(reader, has_coefficients) -> Result<H263Block>`
+    — wires the round-14 Table I.2 event decoder into a full INTRA-block
+    parser using the §I.3 (lines 4213-4217) absorbed-INTRADC
+    semantics: the §5.4.1 8-bit FLC INTRADC prefix is gone, and the
+    per-block decode is purely a sequence of Table I.2
+    `(LAST, RUN, LEVEL)` events starting at scan position 0. The DC
+    slot is just slot 0 of the coefficient buffer and is filled by
+    whichever event's cumulative-RUN lands on it (or stays zero when
+    no event does — the §I.3 "a zero INTRADC will not be coded as a
+    LEVEL, but will simply increase the run for the following AC
+    coefficients" semantics).
+  - The `has_coefficients` boolean is the relevant CBP bit (CBPY for
+    luma 0..=3, CBPC for chroma 4 / 5) per the §I.3 redefinition: in
+    AIC mode the CBP bit being 0 is the sole signal that the DC is
+    also zero, since INTRADC is no longer special-cased. The returned
+    `H263Block.had_intradc` is always `false` regardless of whether
+    slot 0 carries a non-zero LEVEL after parsing — no FLC was
+    consumed.
+  - Composes with the round-14 `intra_tcoef::decode_intra_tcoef_event`
+    (event-level VLC), the round-17 `aic_dequant_coefficient` /
+    `clip_ac` / `oddify_clip_dc` (modified inverse-quant + clipping),
+    the round-8 `aic::scan_for_intra_mode` (per-INTRA_MODE scan
+    selection), and the deferred DC/AC prediction reconstruction step
+    (needs the macroblock-grid driver's neighbour blocks) to cover the
+    full §I.3 INTRA-block decode pipeline.
+  - 15 new unit tests cover: no-coefficients path returns an empty
+    block without consuming bits; single LAST=1 RUN=0 event places its
+    LEVEL at the DC slot (the §I.3 absorbed-INTRADC); the §I.3
+    zero-DC-via-RUN invariant for RUN ∈ {1, 3, 7}; a DC-bearing event
+    followed by an AC event lands LEVELs at slots 0 and 3; events at
+    boundary slot 63 (terminating well-formed, non-terminating
+    overflow); cumulative scan-position overflow when two events sum
+    past slot 63; truncated-input → UnexpectedEof; forbidden ESCAPE
+    LEVEL `0x00` and `0x80` reject with BadTcoefEscapeLevel while
+    `0x81` (-127) and `0x7F` (+127) decode correctly; `had_intradc`
+    stays `false` even with a non-zero DC; and an 8-event
+    distribution-integration test placing LEVELs at slots
+    0/2/7/18/19/40/46/63 simultaneously.
+  - `intra_tcoef` module doc updated to point at the new `block_aic`
+    module as the round-18 fulfilment of its "wiring into a full
+    INTRA-block decoder is the next round's job" promise.
+
 - Annex I §I.3 modified inverse-quantization primitives
   (round 17, new `aic_dequant` module):
   - `aic_dequant_coefficient(level: i16, quant: u8) -> i32` — the §I.3

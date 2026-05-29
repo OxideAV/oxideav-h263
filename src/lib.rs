@@ -145,7 +145,8 @@
 //!
 //! PB-frame / Annex-T / extended-PTYPE-gated decode paths are still
 //! out of scope, as is the §I.3 AIC prediction reconstruction (the
-//! Table I.2 event-level VLC is exposed in [`intra_tcoef`] but the
+//! Table I.2 event-level VLC is exposed in [`intra_tcoef`] and the
+//! absorbed-INTRADC INTRA-block parser in [`block_aic`], but the
 //! macroblock-grid neighbour-block plumbing for the DC/AC prediction
 //! is not yet wired); the driver returns [`Error::NotImplemented`]
 //! for them. The `oxideav_core::Decoder` registration is still a
@@ -162,6 +163,7 @@ use oxideav_core::RuntimeContext;
 pub mod aic;
 pub mod aic_dequant;
 pub mod block;
+pub mod block_aic;
 pub mod deblock;
 pub mod dequant;
 pub mod gob_header;
@@ -183,6 +185,7 @@ pub use aic_dequant::{
     AIC_DC_REC_MAX, AIC_DC_REC_MIN,
 };
 pub use block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
+pub use block_aic::parse_intra_block_aic;
 pub use deblock::{
     apply_edge_samples, clipd1, deblock_plane, filter_edge_samples, strength_for_quant,
     up_down_ramp, EdgeCondition, STRENGTH_RRU_INFINITE,

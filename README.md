@@ -5,11 +5,59 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 17 — Annex I §I.3 modified inverse-quantization
-primitives (`aic_dequant` module). Three pure functions land the
-dead-zone-free reconstruction residual formula and the §I.3 DC / AC
-clip helpers that the AIC coefficient pipeline composes after the
-round-14 Table I.2 VLC event-decode:
+**Orphan-rebuild round 18 — Annex I §I.3 absorbed-INTRADC INTRA-block
+parser (`block_aic` module). One pure function lands the §I.3 (lines
+4213-4217) bitstream-layout change for INTRA blocks when Advanced
+INTRA Coding is in use: the §5.4.1 Table-15 8-bit FLC INTRADC prefix
+is gone, and the per-block decode is purely a sequence of Table I.2
+`(LAST, RUN, LEVEL)` events ([`intra_tcoef::decode_intra_tcoef_event`])
+starting at scan position 0 — the DC slot is just slot 0 of the
+coefficient buffer and is filled by whichever event's cumulative-RUN
+lands on it (or stays zero when no event does — the §I.3 "zero
+INTRADC will not be coded as a LEVEL, but will simply increase the
+run for the following AC coefficients" semantics).
+
+* `parse_intra_block_aic(reader, has_coefficients) -> Result<H263Block>`
+  — single-block AIC INTRA parser. `has_coefficients` is the relevant
+  CBP bit (CBPY for luma 0..=3, CBPC for chroma 4 / 5) per the §I.3
+  redefinition: in AIC mode the CBP bit being 0 is the sole signal
+  that the DC is also zero, since INTRADC is no longer special-cased.
+  Returns an [`H263Block`] whose `coefficients[..]` holds the parsed
+  `LEVEL` integers in zigzag-scan-position order and whose
+  `had_intradc` is always `false` (no FLC was consumed regardless of
+  whether slot 0 carries a non-zero LEVEL). The same scan-overflow,
+  truncated-input, and forbidden-ESCAPE-LEVEL guards as
+  `block::parse_block` apply via the underlying event decoder.
+
+This is the §I.3 line 4214 "next round" promised by round 14
+(`intra_tcoef`) — wiring the Table I.2 VLC into a full INTRA-block
+decoder. Composing it with the §I.3 modified inverse-quantization
+(round 17 `aic_dequant_coefficient`), the prediction reconstruction
+(deferred, needs the macroblock-grid driver's neighbour blocks), the
+§I.3 `clipAC` / `oddifyclipDC` post-prediction step (round 17), and
+the §I.3 scan selected by [`aic::scan_for_intra_mode`] gives the full
+§I.3 INTRA-block decode pipeline; the only remaining gap is the
+macroblock-grid driver that supplies the live neighbour blocks for
+the DC/AC prediction.
+
+15 new unit tests cover: the no-coefficients path returns an empty
+block without consuming bits; a single LAST=1 RUN=0 event places its
+LEVEL at the DC slot (the §I.3 absorbed-INTRADC); the §I.3
+zero-DC-via-RUN invariant for RUN ∈ {1, 3, 7}; a DC-bearing event
+followed by an AC event lands LEVELs at slots 0 and 3; events at
+boundary slot 63 (terminating well-formed, non-terminating overflow);
+cumulative scan-position overflow when two events sum past slot 63;
+truncated-input → UnexpectedEof; forbidden ESCAPE LEVEL `0x00` and
+`0x80` reject with BadTcoefEscapeLevel while `0x81` (-127) and `0x7F`
+(+127) decode correctly; `had_intradc` stays `false` even with a
+non-zero DC; and a 8-event distribution-integration test placing
+LEVELs at slots 0/2/7/18/19/40/46/63 simultaneously.
+
+On top of round 17's Annex I §I.3 modified inverse-quantization
+primitives (`aic_dequant` module): the dead-zone-free reconstruction
+residual formula and the §I.3 DC / AC clip helpers that the AIC
+coefficient pipeline composes after the round-14 Table I.2 VLC
+event-decode:
 
 * `aic_dequant_coefficient(level, quant) -> i32` — §I.3 formula
   `RecC(u,v) = 2 · QUANT · LEVEL(u,v)` applied to a single coefficient

@@ -42,8 +42,9 @@
 //!   event (§I.3, line 4214: "INTRADC transform coefficients are no
 //!   longer handled as a separate case, but are instead treated in the
 //!   same way as the AC coefficients in regard to MCBPC and CBPY").
-//!   Wiring that into a full INTRA-block decoder is the next round's
-//!   job.
+//!   This is now exposed as the round-18 [`crate::block_aic::parse_intra_block_aic`]
+//!   primitive; wiring its dispatch into the macroblock-grid driver is
+//!   the next round's job.
 
 // The bit-pattern literals in this module are spec transcriptions of
 // the Table 16 codes (reused by Table I.2 per §I.3), printed in
