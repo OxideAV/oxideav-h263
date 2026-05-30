@@ -6,6 +6,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-h263/releases/tag/v0.0.8) - 2026-05-30
+
+### Other
+
+- §I.3 end-to-end INTRA-block reconstruction pipeline (round 20)
+- Annex I §I.3 INTRA DC/AC prediction reconstruction (round 19)
+- Annex I §I.3 absorbed-INTRADC INTRA-block parser (round 18)
+- Annex I §I.3 modified inverse-quant primitives (round 17)
+- Annex F §F.2 / §F.3 INTER4V + OBMC driver wiring (round 16)
+- Annex K §K.2 slice-layer header parse (round 15)
+- Annex I §I.3 / Table I.2 INTRA-coefficient VLC (round 14)
+- extended-PTYPE (PLUSPTYPE) picture-header parse (round 13)
+- Annex F §F.3 OBMC weighted prediction (round 12)
+- Annex F §F.2 four-MV candidate-predictor + Table F.1 chroma
+- Annex D §D.2 Unrestricted Motion Vector mode (PLUSPTYPE absent)
+- full-picture decode driver wiring layers into a YuvFrame
+- Annex I Advanced INTRA Coding scan + prediction-mode layer
+- Annex J §J.3 in-loop edge filter + Table J.2 STRENGTH
+- inter path: §6.1.1 MV reconstruct + §6.1.2 half-pel interp + §6.3.1 INTER summation
+- intra reconstruct: §6.1 + §6.2.1 dequant + §6.2.3 scatter + §6.2.4 IDCT + §6.3.2 clip
+- §5.4 baseline decode — INTRADC (Table 15) + TCOEF VLC (Table 16)
+- §5.3 baseline header — COD / MCBPC / CBPY / DQUANT / MVD
+- round 2: GOB-layer header parser per ITU-T H.263 §5.2
+- round 1: picture-header parser per ITU-T H.263 §5.1
+- orphan rebuild: clean-room scaffold post 2026-05-18 audit
+
 ### Added
 
 - Annex I §I.3 end-to-end INTRA-block reconstruction pipeline
