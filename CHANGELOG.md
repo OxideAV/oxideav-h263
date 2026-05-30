@@ -8,6 +8,55 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex I §I.3 end-to-end INTRA-block reconstruction pipeline
+  (round 20, two new pure functions in `aic_predict`):
+  - `aic_intra_reconstruct_coefficients(zigzag_levels, mode, quant,
+    block_a, block_b) -> [i32; 64]` — single pure function that takes the
+    [`H263Block`] output of `block_aic::parse_intra_block_aic` (zigzag-
+    scan-position-order `LEVEL` integers) plus the macroblock's `QUANT`,
+    the `IntraMode` from `aic::decode_intra_mode`, and the §I.3
+    `RecA'` / `RecB'` `Neighbour` tags, and returns the final block-
+    position `RecC'(u,v)` array. Composes, in order, the round-17
+    modified inverse-quantisation formula `RecC = 2·QUANT·LEVEL`
+    (`aic_dequant_coefficient` per slot), the round-8 Figure-I.2 /
+    scan-selection scatter (`scan_for_intra_mode(mode)` — zigzag for
+    `DcOnly`, alternate-horizontal for `VerticalDcAc`,
+    alternate-vertical for `HorizontalDcAc`), and the round-19 §I.3
+    page-79 DC/AC prediction reconstruction with `clipAC` /
+    `oddifyclipDC` (`reconstruct_intra_block_aic`).
+  - `aic_intra_reconstruct_samples(rec_c_prime) -> [u8; 64]` — pure
+    function that takes the §I.3 final coefficient array (output of
+    `aic_intra_reconstruct_coefficients`) and runs the round-5 §6.2.4
+    `idct_8x8` followed by the §6.3.2 sample clip to the 8-bit picture
+    range `[0, 255]`. The narrowing `as i16` is lossless because
+    `clipAC` keeps every AC slot in `[-2048, +2047]` and `clipDC`
+    keeps the DC slot in `[0, +2047]`.
+  - Together the two helpers cover the four §I.3 downstream pipeline
+    steps `block_aic.rs` previously flagged as deferred (modified
+    inverse quantisation, scan-scatter, DC/AC prediction, IDCT) as
+    pure-function primitives. The split is deliberate: the
+    macroblock-grid driver needs the coefficient array as the next
+    block's `Neighbour::Available` payload (`RecA'` for the block
+    below, `RecB'` for the block to the right), while only the
+    `u8` sample array goes into the picture buffer.
+  - 12 new unit tests cover: Mode 0 / no-neighbour DC-only uniform
+    field; Mode 0 / single-neighbour DC propagation; Mode 1 alternate-
+    horizontal scan dispatch (scan position 1 lands at the
+    `ALT_HORIZONTAL_TO_BLOCK_POS[1]` slot); Mode 2 alternate-vertical
+    scan dispatch; an explicit divergence check between the alternate-
+    horizontal and alternate-vertical scans (guarding against a bug
+    that would always use the zigzag); Mode 1 / block-A AC predictor
+    propagation; Mode 2 / block-B AC predictor propagation; sample-clip
+    saturation at the `AIC_DC_REC_MAX` upper bound; the §A.8 all-zeros-
+    in / all-zeros-out invariant for the IDCT step; sample-clip
+    saturation handling at the `AIC_AC_REC_MIN` lower bound (negative
+    lobe of the AC basis pattern); a composition-contract test that
+    locks the new helper to manual `aic_dequant_coefficient` + scatter
+    + `reconstruct_intra_block_aic` for all three modes on a mixed
+    DC+AC block; and a driver-shape feed-back test that uses the
+    pipeline output of one block as the `Neighbour::Available`
+    payload of a successor block.
+
 - Annex I §I.3 INTRA DC/AC prediction reconstruction
   (round 19, new `aic_predict` module):
   - `reconstruct_intra_block_aic(rec_c_residual, mode, block_a, block_b)

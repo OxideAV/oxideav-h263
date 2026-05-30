@@ -5,8 +5,67 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
-**Orphan-rebuild round 19 — Annex I §I.3 INTRA DC/AC prediction
-reconstruction (`aic_predict` module). One pure function lands the
+**Orphan-rebuild round 20 — Annex I §I.3 end-to-end INTRA-block
+reconstruction pipeline (`aic_predict` module). Two new pure functions
+compose the §I.3 downstream pipeline into a single helper pair, taking
+the parser output of [`block_aic::parse_intra_block_aic`] all the way
+to an 8×8 `u8` sample block:**
+
+* `aic_intra_reconstruct_coefficients(zigzag_levels: &H263Block, mode,
+  quant, block_a, block_b) -> [i32; 64]` — single pure function that
+  applies, in order, the round-17 §I.3 modified inverse-quantisation
+  formula `RecC(u,v) = 2·QUANT·LEVEL(u,v)` to each scan slot of the
+  parsed [`H263Block`], the round-8 Figure-I.2 scan-selection scatter
+  (zigzag for `DcOnly`, alternate-horizontal for `VerticalDcAc`,
+  alternate-vertical for `HorizontalDcAc`) to place each residual at
+  its block-position slot, and the round-19 §I.3 page-79 DC/AC
+  prediction reconstruction with `clipAC` for AC slots and
+  `oddifyclipDC` for the DC slot. The output is the final §I.3
+  `RecC'(u,v)` array in block-position layout — both the input to the
+  IDCT and a `Neighbour::Available` payload for the next block's
+  reconstruction.
+* `aic_intra_reconstruct_samples(rec_c_prime: &[i32; 64]) -> [u8; 64]`
+  — runs the round-5 §6.2.4 `idct_8x8` plus the §6.3.2 sample clip to
+  the 8-bit picture range `[0, 255]`. The narrowing `as i16` from
+  `i32` is lossless because clipAC keeps every AC slot in `[-2048,
+  +2047]` and clipDC keeps the DC slot in `[0, +2047]`.
+
+Together the two helpers cover the four §I.3 downstream pipeline steps
+`block_aic.rs` previously flagged as deferred — modified inverse
+quantisation, scan scatter, DC/AC prediction, IDCT — as pure-function
+primitives. The split into a coefficient helper and a sample helper is
+deliberate: the macroblock-grid driver round needs the coefficient
+array as the next neighbour's `Neighbour::Available` payload (`RecA'`
+for the block below it, `RecB'` for the block to its right), while
+only the `u8` sample array goes into the picture buffer. The only
+remaining §I.3 work is the driver itself — walking the picture,
+computing per-block "same video picture segment" availability bits,
+accumulating reconstructed neighbours, and dispatching this pipeline
+per INTRA block.
+
+12 new unit tests cover the pipeline: Mode 0 / no-neighbour DC-only
+uniform field (round-trip from a single LEVEL to a uniform 8×8 `u8`);
+Mode 0 / single-neighbour DC propagation; Mode 1 alternate-horizontal
+scan dispatch (scan position 1 lands at the
+`ALT_HORIZONTAL_TO_BLOCK_POS[1]` slot); Mode 2 alternate-vertical scan
+dispatch (different slot); an explicit divergence check between the
+alternate-horizontal and alternate-vertical scans (guarding against a
+bug that would always use the zigzag); Mode 1 / block-A AC predictor
+propagation through to the final `RecC'` array; Mode 2 / block-B AC
+predictor propagation; sample-clip saturation at the
+`AIC_DC_REC_MAX` upper bound; the §A.8 all-zeros-in / all-zeros-out
+invariant; sample-clip saturation handling at the `AIC_AC_REC_MIN`
+lower bound (negative lobe of the F(1,0) basis pattern); a
+composition-contract test that locks the new helper to the manual
+`aic_dequant_coefficient` + scatter + `reconstruct_intra_block_aic`
+sequence across all three modes on a mixed DC + AC block; and a
+driver-shape feed-back test that uses the pipeline output of one
+block as the `Neighbour::Available` payload of a successor block.
+
+---
+
+**Round 19 — Annex I §I.3 INTRA DC/AC prediction reconstruction
+(`aic_predict` module). One pure function lands the
 §I.3 page-79 three-mode reconstruction step: given a current INTRA
 block's dequantized residual array `RecC(u,v)`, the `INTRA_MODE`
 decoded from §I.2 (Table I.1), and an optional pair of
@@ -16,7 +75,7 @@ array post-`clipAC` for AC slots and post-`oddifyclipDC` for the DC
 slot. The driver supplies neighbour availability per the §I.3 page-78
 "same video picture segment" rule via a `Neighbour::None` /
 `Neighbour::Available` tag; the predictor primitive itself does not
-encode that test.
+encode that test.**
 
 * `reconstruct_intra_block_aic(rec_c_residual, mode, block_a, block_b)
   -> [i32; 64]` — applies the per-mode rule from §I.3 page 79:

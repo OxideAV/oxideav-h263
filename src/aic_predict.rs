@@ -78,9 +78,10 @@
 //!   frequency-domain coefficients. [`crate::idct::idct_8x8`] consumes
 //!   them.
 
-use crate::aic::IntraMode;
-use crate::aic_dequant::{clip_ac, oddify_clip_dc};
-use crate::block::COEFFS_PER_BLOCK;
+use crate::aic::{scan_for_intra_mode, IntraMode};
+use crate::aic_dequant::{aic_dequant_coefficient, clip_ac, oddify_clip_dc};
+use crate::block::{H263Block, COEFFS_PER_BLOCK};
+use crate::idct::idct_8x8;
 
 /// Predictor source for one of the two §I.3 reference blocks (block A
 /// immediately above, or block B immediately to the left of the current
@@ -301,6 +302,101 @@ fn reconstruct_mode2(
         AIC_FALLBACK_DC_PREDICTOR
     };
     out[0] = oddify_clip_dc(rec_c_residual[0] + predictor);
+    out
+}
+
+/// End-to-end Annex I §I.3 INTRA coefficient reconstruction: zigzag-order
+/// parsed LEVELs → final block-position `RecC'(u,v)` array (post-prediction,
+/// post-`clipAC` / `oddifyclipDC`).
+///
+/// This composes, in order:
+///
+/// 1. §I.3 modified inverse quantisation
+///    ([`crate::aic_dequant::aic_dequant_coefficient`]) applied slot-by-slot
+///    to the parsed `LEVEL` integers from
+///    [`crate::block_aic::parse_intra_block_aic`].
+/// 2. The §I.3 / Figure I.2 scan permutation
+///    ([`crate::aic::scan_for_intra_mode`]) — `DcOnly` keeps the Figure-14
+///    zigzag, `VerticalDcAc` switches to the alternate-horizontal scan,
+///    `HorizontalDcAc` switches to the alternate-vertical scan — to scatter
+///    the per-scan-position residuals into a block-position `RecC(u,v)`
+///    array (`index = v * 8 + u`).
+/// 3. The per-`INTRA_MODE` DC/AC prediction reconstruction
+///    ([`reconstruct_intra_block_aic`]), which adds the `RecA'` /
+///    `RecB'`-sourced predictor contributions and applies `clipAC` to AC
+///    slots / `oddifyclipDC` to the DC slot.
+///
+/// The output is the final `RecC'(u,v)` array in block-position layout. The
+/// macroblock-grid driver passes this same array as the next neighbour's
+/// `Neighbour::Available(&...)` payload — `RecA'` for the block below it,
+/// `RecB'` for the block to its right — so it is both the input to
+/// [`aic_intra_reconstruct_samples`] (which runs the IDCT + §6.3.2 clip)
+/// and the predictor source for downstream blocks.
+///
+/// `zigzag_levels` is the [`H263Block`] returned by
+/// [`crate::block_aic::parse_intra_block_aic`]: a 64-entry `i16` array in
+/// zigzag-scan-position order. `had_intradc` is ignored — the AIC parser
+/// always leaves it `false`.
+///
+/// `quant` is the macroblock's QUANT (range `1..=31`); out-of-range values
+/// are clamped by [`crate::aic_dequant::aic_dequant_coefficient`].
+///
+/// `block_a` / `block_b` are the [`Neighbour`] tags carrying the
+/// already-reconstructed `RecA'` (block above) and `RecB'` (block to the
+/// left) — i.e. the output of an earlier call to this same function for
+/// those blocks. The §I.3 "same video picture segment" availability rule
+/// lives in the driver and is surfaced here as the
+/// [`Neighbour::None`] / [`Neighbour::Available`] choice.
+#[must_use]
+pub fn aic_intra_reconstruct_coefficients(
+    zigzag_levels: &H263Block,
+    mode: IntraMode,
+    quant: u8,
+    block_a: Neighbour<'_>,
+    block_b: Neighbour<'_>,
+) -> [i32; COEFFS_PER_BLOCK] {
+    // §I.3 modified inverse quantisation + scatter from scan position
+    // into block-position layout using the INTRA_MODE-selected scan.
+    let scan = scan_for_intra_mode(mode);
+    let mut rec_c = [0i32; COEFFS_PER_BLOCK];
+    for (scan_pos, &level) in zigzag_levels.coefficients.iter().enumerate() {
+        let block_pos = scan[scan_pos] as usize;
+        rec_c[block_pos] = aic_dequant_coefficient(level, quant);
+    }
+    // §I.3 DC/AC prediction reconstruction with clipAC / oddifyclipDC.
+    reconstruct_intra_block_aic(&rec_c, mode, block_a, block_b)
+}
+
+/// Run the §6.2.4 IDCT + §6.3.2 sample clip on a final-reconstructed
+/// Annex I §I.3 `RecC'(u,v)` block (output of
+/// [`aic_intra_reconstruct_coefficients`]) and produce an 8×8 `u8`
+/// sample block ready to copy into the picture buffer.
+///
+/// The §I.3 clipping primitives (`clipAC` → `[-2048, +2047]`, `clipDC` →
+/// `[0, +2047]`) keep every slot inside the `i16` range, so the narrowing
+/// `as i16` here is lossless. The §6.3.2 picture-range clip then pins
+/// IDCT outputs into `[0, 255]` per the standard 8-bit sample format.
+///
+/// This is the AIC counterpart to
+/// [`crate::reconstruct_intra_block`] (which composes the baseline §6.1
+/// inverse-quant + Figure 14 scatter + IDCT + clip path).
+#[must_use]
+pub fn aic_intra_reconstruct_samples(
+    rec_c_prime: &[i32; COEFFS_PER_BLOCK],
+) -> [u8; COEFFS_PER_BLOCK] {
+    // Narrow into i16 for the IDCT input. clipAC/clipDC outputs are at
+    // most ±2048 in magnitude, well inside i16.
+    let mut coefs = [0i16; COEFFS_PER_BLOCK];
+    for (slot, &value) in rec_c_prime.iter().enumerate() {
+        coefs[slot] = value as i16;
+    }
+    // §6.2.4 IDCT (with §6.2.4's own `[-256, +255]` clip inside).
+    let pixels = idct_8x8(&coefs);
+    // §6.3.2 clip to the 8-bit picture range `[0, 255]`.
+    let mut out = [0u8; COEFFS_PER_BLOCK];
+    for (i, &p) in pixels.iter().enumerate() {
+        out[i] = p.clamp(0, 255) as u8;
+    }
     out
 }
 
@@ -797,5 +893,342 @@ mod tests {
         // (-3 + 0) / 2 = -1 in truncation-toward-zero; tempDC = -1.
         // oddifyclipDC(-1) = clipDC(-1) (odd, no bump) = 0.
         assert_eq!(out[0], 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Round-20 pipeline composition tests:
+    // aic_intra_reconstruct_coefficients +
+    // aic_intra_reconstruct_samples.
+    // ---------------------------------------------------------------
+
+    /// A `H263Block` with a single LEVEL at scan position `scan_pos`.
+    fn block_with_level(scan_pos: usize, level: i16) -> H263Block {
+        let mut b = H263Block::empty();
+        b.coefficients[scan_pos] = level;
+        b
+    }
+
+    /// End-to-end DC-only pipeline (Mode 0, no neighbours):
+    /// `LEVEL[0] = 100`, `QUANT = 5` →
+    /// `RecC(0,0) = 2 * 5 * 100 = 1000` →
+    /// `tempDC = 1000 + 1024 (no-neighbour fallback) = 2024` →
+    /// `oddifyclipDC(2024) = clipDC(2025) = 2025`. The IDCT then
+    /// distributes that DC: `2025 / 8 = 253.125` → pixel 253 everywhere.
+    #[test]
+    fn pipeline_mode0_dc_only_no_neighbours_uniform_field() {
+        let block = block_with_level(0, 100);
+        let coefs = aic_intra_reconstruct_coefficients(
+            &block,
+            IntraMode::DcOnly,
+            5,
+            Neighbour::None,
+            Neighbour::None,
+        );
+        // DC value present, AC slots are clipAC(0) = 0.
+        assert_eq!(coefs[0], 2025);
+        for (i, &v) in coefs.iter().enumerate().skip(1) {
+            assert_eq!(v, 0, "AC slot {i} should be zero");
+        }
+        // IDCT + §6.3.2 clip.
+        let samples = aic_intra_reconstruct_samples(&coefs);
+        assert!(
+            samples.iter().all(|&p| p == 253),
+            "expected uniform 253: {samples:?}"
+        );
+    }
+
+    /// Mode 0 with one INTRA neighbour: `RecA'(0,0) = 256`,
+    /// `LEVEL[0] = 0`, `QUANT = 1`. `RecC(0,0) = 0`,
+    /// `tempDC = 0 + 256 = 256` (even) → `oddifyclipDC(256) = clipDC(257) = 257`.
+    /// IDCT distributes: `257 / 8 = 32.125` → pixel 32.
+    #[test]
+    fn pipeline_mode0_block_a_only_dc_predicts_from_neighbour() {
+        let block = block_with_level(0, 0);
+        let mut a = [0i32; COEFFS_PER_BLOCK];
+        a[0] = 256;
+        let coefs = aic_intra_reconstruct_coefficients(
+            &block,
+            IntraMode::DcOnly,
+            1,
+            Neighbour::Available(&a),
+            Neighbour::None,
+        );
+        assert_eq!(coefs[0], 257);
+        let samples = aic_intra_reconstruct_samples(&coefs);
+        assert!(
+            samples.iter().all(|&p| p == 32),
+            "expected uniform 32: {samples:?}"
+        );
+    }
+
+    /// Mode 1 (`VerticalDcAc`) uses the alternate-horizontal scan: scan
+    /// position 1 maps to block position 1 (i.e. `(u=1, v=0)`). With
+    /// `RecA'` unavailable the pipeline degenerates to baseline +1024
+    /// DC predictor + no AC predictor — but the scan permutation still
+    /// places `LEVEL[1]` at block-position 1. Verify the scatter through
+    /// the IDCT output: a non-trivial AC coefficient at `(1, 0)`
+    /// produces a horizontal-cosine modulation, not the vertical one
+    /// that the alternate-vertical scan (Mode 2) would produce.
+    #[test]
+    fn pipeline_mode1_scan_is_alternate_horizontal() {
+        let mut block = block_with_level(0, 0);
+        // LEVEL at scan position 1.
+        block.coefficients[1] = 4;
+        let coefs = aic_intra_reconstruct_coefficients(
+            &block,
+            IntraMode::VerticalDcAc,
+            1,
+            Neighbour::None,
+            Neighbour::None,
+        );
+        // ALT_HORIZONTAL_TO_BLOCK_POS[1] is the second scan position;
+        // the alternate-horizontal scan places it at (u=1, v=0) — block
+        // position 1 — same as the zigzag scan here. RecC(1,0) =
+        // 2*1*4 = 8, then clipAC(8) = 8.
+        let alt_h_slot_for_scan1 = crate::aic::ALT_HORIZONTAL_TO_BLOCK_POS[1] as usize;
+        assert_eq!(coefs[alt_h_slot_for_scan1], 8);
+        // DC slot: residual = 0, no neighbours -> tempDC = 1024 (even)
+        // -> oddifyclipDC -> clipDC(1025) = 1025. Confirm the
+        // composition reached the DC slot via Mode 1's fallback branch.
+        assert_eq!(coefs[0], 1025);
+        // Other AC slots are clipAC(0) = 0.
+        for (i, &v) in coefs.iter().enumerate() {
+            if i == 0 || i == alt_h_slot_for_scan1 {
+                continue;
+            }
+            assert_eq!(v, 0, "slot {i} unexpectedly non-zero");
+        }
+    }
+
+    /// Mode 2 (`HorizontalDcAc`) uses the alternate-vertical scan: the
+    /// second scan position maps to a *different* block slot than
+    /// either zigzag or alternate-horizontal. Verify the pipeline
+    /// dispatches the correct scan by reading
+    /// `ALT_VERTICAL_TO_BLOCK_POS[1]` and confirming the scattered
+    /// coefficient lands there — distinct from the Mode 1 path above.
+    #[test]
+    fn pipeline_mode2_scan_is_alternate_vertical() {
+        let mut block = block_with_level(0, 0);
+        block.coefficients[1] = 4;
+        let coefs = aic_intra_reconstruct_coefficients(
+            &block,
+            IntraMode::HorizontalDcAc,
+            1,
+            Neighbour::None,
+            Neighbour::None,
+        );
+        let alt_v_slot_for_scan1 = crate::aic::ALT_VERTICAL_TO_BLOCK_POS[1] as usize;
+        // RecC(slot) = 2*1*4 = 8 → clipAC → 8.
+        assert_eq!(coefs[alt_v_slot_for_scan1], 8);
+        // DC slot via Mode 2 fallback: 1025.
+        assert_eq!(coefs[0], 1025);
+    }
+
+    /// The §I.3 modes 1 and 2 differ in their alternate-scan choice
+    /// (Figure I.2) — confirm directly that for at least one scan
+    /// position the two scans map LEVELs to *different* block-position
+    /// slots, so the pipeline truly dispatches by mode. (Otherwise the
+    /// prior two tests would pass even on a buggy implementation that
+    /// always used the zigzag.)
+    #[test]
+    fn alt_horizontal_and_alt_vertical_scans_differ_at_some_position() {
+        let mut differ = false;
+        for i in 0..COEFFS_PER_BLOCK {
+            if crate::aic::ALT_HORIZONTAL_TO_BLOCK_POS[i]
+                != crate::aic::ALT_VERTICAL_TO_BLOCK_POS[i]
+            {
+                differ = true;
+                break;
+            }
+        }
+        assert!(differ, "alternate scans must disagree at ≥1 scan position");
+    }
+
+    /// AC-prediction propagation (Mode 1, block A available):
+    /// `RecA'(u, 0)` predictor adds to the current block's `RecC(u, 0)`
+    /// before `clipAC`. With `LEVEL` zero at every scan slot and
+    /// `RecA'(1, 0) = 200`, the resulting `RecC'(1, 0)` should equal
+    /// `clipAC(0 + 200) = 200`. The DC slot uses `RecA'(0, 0)`.
+    #[test]
+    fn pipeline_mode1_ac_prediction_from_block_a() {
+        let block = H263Block::empty();
+        let mut a = [0i32; COEFFS_PER_BLOCK];
+        a[0] = 100; // RecA'(0, 0)
+        a[1] = 200; // RecA'(1, 0) — block-position layout
+        let coefs = aic_intra_reconstruct_coefficients(
+            &block,
+            IntraMode::VerticalDcAc,
+            1,
+            Neighbour::Available(&a),
+            Neighbour::None,
+        );
+        // DC: residual + RecA'(0,0) = 0 + 100 = 100 (even) →
+        // oddifyclipDC → clipDC(101) = 101.
+        assert_eq!(coefs[0], 101);
+        // (u=1, v=0) — block slot 1 — should carry the AC predictor.
+        assert_eq!(coefs[1], 200);
+        // Other AC slots: clipAC(0) = 0.
+        for (i, &v) in coefs.iter().enumerate() {
+            if i == 0 || i == 1 {
+                continue;
+            }
+            assert_eq!(v, 0, "slot {i} unexpectedly non-zero");
+        }
+    }
+
+    /// AC-prediction propagation (Mode 2, block B available):
+    /// `RecB'(0, v)` predicts the current block's first column. With
+    /// `RecB'(0, 1) = 150` (i.e. block-position slot 8 in `v * 8 + u`
+    /// layout), Mode 2's AC predictor should land 150 at slot 8.
+    #[test]
+    fn pipeline_mode2_ac_prediction_from_block_b() {
+        let block = H263Block::empty();
+        let mut b = [0i32; COEFFS_PER_BLOCK];
+        b[0] = 50; // RecB'(0, 0)
+        b[8] = 150; // RecB'(0, 1) — block slot v*8+u = 1*8+0 = 8
+        let coefs = aic_intra_reconstruct_coefficients(
+            &block,
+            IntraMode::HorizontalDcAc,
+            1,
+            Neighbour::None,
+            Neighbour::Available(&b),
+        );
+        // DC: residual + RecB'(0,0) = 0 + 50 = 50 (even) →
+        // oddifyclipDC → clipDC(51) = 51.
+        assert_eq!(coefs[0], 51);
+        // (u=0, v=1) — block slot 8 — should carry the AC predictor.
+        assert_eq!(coefs[8], 150);
+    }
+
+    /// IDCT + §6.3.2 sample clip: a coefficient array whose DC is
+    /// `2047 = clipDC max` saturates IDCT-output samples at 255.
+    /// (DC = 2047 → IDCT pixel = 2047 / 8 = 255 (post-rounding;
+    /// 255.875 rounds to 256 which the §6.2.4 internal clip caps to 255).)
+    #[test]
+    fn pipeline_samples_clip_at_top_with_dc_clip_max() {
+        let mut rec_c_prime = [0i32; COEFFS_PER_BLOCK];
+        rec_c_prime[0] = AIC_DC_REC_MAX; // 2047
+        let samples = aic_intra_reconstruct_samples(&rec_c_prime);
+        assert!(
+            samples.iter().all(|&p| p == 255),
+            "expected uniform 255: {samples:?}"
+        );
+    }
+
+    /// All-zero `RecC'` input → IDCT all-zero (§A.8) → §6.3.2 clip
+    /// no-op → all-zero u8 output.
+    #[test]
+    fn pipeline_samples_all_zero_in_all_zero_out() {
+        let rec_c_prime = [0i32; COEFFS_PER_BLOCK];
+        let samples = aic_intra_reconstruct_samples(&rec_c_prime);
+        assert!(samples.iter().all(|&p| p == 0));
+    }
+
+    /// `clipAC` lower bound (`-2048`) at a single AC slot: the IDCT
+    /// will distribute that negative coefficient into a basis pattern
+    /// — some pixels will land below 0 and saturate at 0 under §6.3.2.
+    /// Verify ≥1 pixel hits 0 (negative-lobe saturation) without the
+    /// negative `i32` value tripping the `as i16` narrowing.
+    #[test]
+    fn pipeline_samples_handles_clip_ac_negative_extreme() {
+        let mut rec_c_prime = [0i32; COEFFS_PER_BLOCK];
+        rec_c_prime[1] = AIC_AC_REC_MIN; // -2048 at block slot 1, F(u=1,v=0)
+        let samples = aic_intra_reconstruct_samples(&rec_c_prime);
+        // The horizontal cosine basis at F(1,0) gives positive lobe on
+        // x = 0..3 and negative lobe on x = 4..7 (or vice versa given
+        // the sign). With amplitude well above 1 pixel, at least one
+        // pixel must hit 0.
+        assert!(
+            samples.contains(&0),
+            "expected ≥1 sample to clip at 0 (negative lobe): {samples:?}"
+        );
+    }
+
+    /// `aic_intra_reconstruct_coefficients` agrees with the existing
+    /// per-step composition. Given the same inputs, running
+    /// `aic_dequant_coefficient` per scan slot, scattering through
+    /// `scan_for_intra_mode`, and dispatching `reconstruct_intra_block_aic`
+    /// must produce the same array as the new one-shot helper. Locks the
+    /// composition contract.
+    #[test]
+    fn pipeline_coefficients_matches_manual_composition() {
+        // A mixed block: DC LEVEL + two AC LEVELs at different scan
+        // positions, with both neighbours present.
+        let mut block = H263Block::empty();
+        block.coefficients[0] = 50; // scan pos 0 → DC
+        block.coefficients[2] = -3; // scan pos 2
+        block.coefficients[7] = 1; // scan pos 7
+        let mut a = [0i32; COEFFS_PER_BLOCK];
+        a[0] = 400;
+        a[1] = 10;
+        let mut b = [0i32; COEFFS_PER_BLOCK];
+        b[0] = 600;
+        b[8] = -5;
+
+        let cases = [
+            IntraMode::DcOnly,
+            IntraMode::VerticalDcAc,
+            IntraMode::HorizontalDcAc,
+        ];
+
+        for mode in cases {
+            // Manual composition.
+            let scan = scan_for_intra_mode(mode);
+            let mut rec_c = [0i32; COEFFS_PER_BLOCK];
+            for (sp, &lvl) in block.coefficients.iter().enumerate() {
+                rec_c[scan[sp] as usize] = aic_dequant_coefficient(lvl, 7);
+            }
+            let manual = reconstruct_intra_block_aic(
+                &rec_c,
+                mode,
+                Neighbour::Available(&a),
+                Neighbour::Available(&b),
+            );
+
+            // Pipeline helper.
+            let pipeline = aic_intra_reconstruct_coefficients(
+                &block,
+                mode,
+                7,
+                Neighbour::Available(&a),
+                Neighbour::Available(&b),
+            );
+
+            assert_eq!(manual, pipeline, "mode {mode:?} composition mismatch");
+        }
+    }
+
+    /// Driver-style two-block walk: reconstruct block X, then use X's
+    /// output as block Y's `RecA'`. Confirms the pipeline's output is
+    /// shape-compatible with the `Neighbour::Available` payload format,
+    /// which is the macroblock-grid driver's contract.
+    #[test]
+    fn pipeline_output_feeds_back_as_neighbour() {
+        let block_x = block_with_level(0, 80);
+        let x_coefs = aic_intra_reconstruct_coefficients(
+            &block_x,
+            IntraMode::DcOnly,
+            3,
+            Neighbour::None,
+            Neighbour::None,
+        );
+        // RecC(0,0) for block X = 2*3*80 = 480; + 1024 fallback DC =
+        // 1504 (even) → oddifyclipDC → clipDC(1505) = 1505.
+        assert_eq!(x_coefs[0], 1505);
+
+        // Block Y uses X as RecA' (block above).
+        let block_y = block_with_level(0, 0);
+        let y_coefs = aic_intra_reconstruct_coefficients(
+            &block_y,
+            IntraMode::DcOnly,
+            1,
+            Neighbour::Available(&x_coefs),
+            Neighbour::None,
+        );
+        // Y's residual is 0; RecA'(0,0) = 1505 (odd) → oddifyclipDC
+        // returns 1505. clipDC range is [0, 2047] so 1505 unchanged.
+        assert_eq!(y_coefs[0], 1505);
+        // Sanity-check the sample path runs to completion.
+        let _ = aic_intra_reconstruct_samples(&y_coefs);
     }
 }

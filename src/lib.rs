@@ -163,15 +163,31 @@
 //!   / `RecB'` arrays, and dispatches this primitive plus the inverse
 //!   DCT remains the next round.
 //!
+//! * **Round 20** — Annex I §I.3 end-to-end INTRA-block reconstruction
+//!   pipeline as two pure functions in [`aic_predict`]:
+//!   [`aic_intra_reconstruct_coefficients`] composes §I.3 modified
+//!   inverse quantisation, the [`aic::scan_for_intra_mode`] /
+//!   Figure I.2 scan-permutation scatter, and the §I.3 DC/AC prediction
+//!   reconstruction into a single `H263Block` zigzag-LEVEL →
+//!   `RecC'(u,v)` transformation; [`aic_intra_reconstruct_samples`]
+//!   runs the §6.2.4 IDCT + §6.3.2 sample clip on the resulting
+//!   block-position coefficient array. Together they cover the four
+//!   composition steps `block_aic.rs` flagged as the §I.3 downstream
+//!   pipeline (modified-inverse-quant + scan-scatter + DC/AC
+//!   prediction + IDCT) as pure functions, leaving only the
+//!   macroblock-grid driver's job of walking the picture, accumulating
+//!   neighbour `RecA'` / `RecB'` arrays, and dispatching this pipeline
+//!   per INTRA block.
+//!
 //! PB-frame / Annex-T / extended-PTYPE-gated decode paths are still
 //! out of scope, and although the §I.3 AIC prediction reconstruction
-//! primitive itself now exists in [`aic_predict`], the macroblock-grid
-//! driver that walks the picture and dispatches it (along with the
-//! AIC scan + dequant + IDCT) is not yet wired into
-//! [`decode_picture`]; the driver returns [`Error::NotImplemented`]
-//! for those paths. The `oxideav_core::Decoder` registration is still a
-//! no-op — [`decode_picture`] is the frame-yielding surface pending
-//! the full streaming `Decoder` impl.
+//! pipeline now exists end-to-end in [`aic_predict`], the
+//! macroblock-grid driver that walks the picture and dispatches it is
+//! not yet wired into [`decode_picture`]; the driver returns
+//! [`Error::NotImplemented`] for those paths. The
+//! `oxideav_core::Decoder` registration is still a no-op —
+//! [`decode_picture`] is the frame-yielding surface pending the full
+//! streaming `Decoder` impl.
 //!
 //! [spec]: https://www.itu.int/rec/T-REC-H.263
 
@@ -205,7 +221,10 @@ pub use aic_dequant::{
     aic_dequant_coefficient, clip_ac, oddify_clip_dc, AIC_AC_REC_MAX, AIC_AC_REC_MIN,
     AIC_DC_REC_MAX, AIC_DC_REC_MIN,
 };
-pub use aic_predict::{reconstruct_intra_block_aic, Neighbour, AIC_FALLBACK_DC_PREDICTOR};
+pub use aic_predict::{
+    aic_intra_reconstruct_coefficients, aic_intra_reconstruct_samples, reconstruct_intra_block_aic,
+    Neighbour, AIC_FALLBACK_DC_PREDICTOR,
+};
 pub use block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
 pub use block_aic::parse_intra_block_aic;
 pub use deblock::{
