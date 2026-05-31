@@ -5,6 +5,78 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 21 (workspace round 196) — Annex I §I.2 / §I.3 macroblock-grid
+driver wiring. The `aic_intra_reconstruct_coefficients` +
+`aic_intra_reconstruct_samples` primitives that landed in round 20 are
+now driven from the picture-decode loop end-to-end:**
+
+* `DecodeOptions::aic` is a new opt-in: when set, the picture driver
+  routes every INTRA macroblock to a new `decode_intra_macroblock_aic`
+  helper instead of the baseline §6.1 path. The opt-in is needed
+  because the legacy non-extended-PTYPE picture header cannot signal
+  AIC on the wire — wiring the PLUSPTYPE-side `aic` bit to this option
+  is a follow-up.
+* `MbContext::aic_intra_mode` extends the macroblock parser to read the
+  §I.2 `INTRA_MODE` VLC (Table I.1: `0` / `10` / `11`) between MCBPC
+  and CBPY for INTRA macroblocks; the decoded mode is surfaced on the
+  new `H263Macroblock::intra_mode` field. INTER macroblocks in an AIC
+  picture skip the field, matching the §I.2 "one mode per INTRA MB"
+  rule.
+* A new in-module `AicState` carries one `RecC'(u, v)` array + one
+  `(intra, segment)` metadata tag per 8×8 block per plane. The
+  metadata grid encodes the §I.3 page-78 "same video picture segment"
+  availability rule for the baseline driver — segment id = GOB index,
+  bumped at every GOB header. AIC INTRA neighbours that match both
+  `intra=true` AND the current block's segment surface as
+  `Neighbour::Available`; everything else (out-of-picture, non-INTRA,
+  different segment) collapses to `Neighbour::None`. INTER and skipped
+  macroblocks call `record_non_intra_macroblock` so neighbouring AIC
+  INTRA blocks see the correct availability decision in mixed pictures.
+* For each AIC INTRA macroblock the driver walks blocks 0..3 (Y in
+  Figure-5 order), then Cb (block 5), then Cr (block 6), and for each
+  block: looks up block-A (above) + block-B (left) via the AIC grid;
+  calls `parse_intra_block_aic` for the absorbed-INTRADC event stream;
+  feeds the parsed zigzag-order `LEVEL` array, the per-MB
+  `INTRA_MODE`, and the two neighbour tags into
+  `aic_intra_reconstruct_coefficients` to get `RecC'`; runs
+  `aic_intra_reconstruct_samples` for the IDCT + sample clip; blits to
+  the frame; stores `RecC'` and the `(intra=true, segment)` metadata
+  for downstream blocks.
+
+11 new tests land alongside the wiring: `luma_block_grid_pos` maps
+Figure-5 block indices to per-plane 8×8-block coordinates;
+`AicState::new` initialises every slot to OUTSIDE;
+`record_non_intra_macroblock` updates all six block-slots in one call;
+`aic_luma_neighbour_above` and `_left` collapse at `row==0` / `col==0`;
+a segment-id mismatch collapses an INTRA neighbour to `None`; a
+non-INTRA candidate collapses to `None` even when the segment matches;
+an INTRA candidate in the same segment surfaces as `Available`. Three
+end-to-end tests build synthetic QCIF AIC INTRA pictures and pass
+them through `decode_picture` with `DecodeOptions::aic = true`: a
+zero-residual picture decodes to uniform 128 across all three planes
+(DC fallback `1024` → `oddifyclipDC(1024) = 1025` → IDCT 128); a
+`+1`-DC-LEVEL picture (`MCBPC=011`, `INTRA_MODE=0`, `CBPY=11`,
+`CBPC=11`, six events per MB, `LEVEL=+1` via Table I.2 row 58 `0111s`
+with `sign=0`) produces pixel 130 in the top-left luma block (no
+neighbours, DC `= oddifyclipDC(16 + 1024) = 1041`), pixel 132 in the
+right block (block-B inheritance), pixel 132 in the below block
+(block-A inheritance), and pixel 134 in the diagonal block (both
+neighbours averaged) — the §I.3 prediction is observable in the frame
+buffer; and a segment-isolation test that confirms the first MB of GOB
+1 does NOT pick up GOB 0's bottom block as a predictor and falls back
+to pixel 130. `cargo test -p oxideav-h263` reports 369 passed
+(previously 358).
+
+The wiring closes the "MB-grid driver wiring" item from the workspace
+README. Remaining §I work: connect the PLUSPTYPE-header `aic` bit to
+`DecodeOptions::aic` automatically (a parser-side dispatch task that
+needs the picture-header path to route to `decode_picture` rather than
+`parse_picture_header` directly); Annex K Slice-Structured-mode
+adjustment to the segment-id increment (currently per-GOB); a §I-aware
+deblocking-filter interaction check (Annex J runs after AIC).
+
+---
+
 **Orphan-rebuild round 20 — Annex I §I.3 end-to-end INTRA-block
 reconstruction pipeline (`aic_predict` module). Two new pure functions
 compose the §I.3 downstream pipeline into a single helper pair, taking

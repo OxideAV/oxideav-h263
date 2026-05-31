@@ -985,6 +985,7 @@ mod tests {
             MbContext {
                 picture_coding_type: pic.coding_type,
                 advanced_prediction: pic.advanced_prediction,
+                aic_intra_mode: false,
                 quantiser_before: gob.quantiser,
             },
         )

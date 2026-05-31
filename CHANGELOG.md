@@ -6,6 +6,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Annex I §I.2 / §I.3 macroblock-grid driver wiring (round 196):
+  - `DecodeOptions::aic` opt-in switches the picture driver to the
+    Advanced INTRA Coding code path. When set, every INTRA macroblock
+    is dispatched through a new `decode_intra_macroblock_aic` helper
+    that:
+    - Reads the §I.2 `INTRA_MODE` VLC between MCBPC and CBPY
+      (added to `parse_macroblock` via the new
+      `MbContext::aic_intra_mode` flag and surfaced on the new
+      `H263Macroblock::intra_mode` field).
+    - Parses every 8×8 block with `block_aic::parse_intra_block_aic`
+      (absorbed INTRADC per §I.3 line 4214).
+    - Assembles `Neighbour::Available(rec_a_prime)` from the 8×8 block
+      immediately above and `Neighbour::Available(rec_b_prime)` from
+      the block immediately to the left via a per-block
+      `AicNeighbourGrid`, applying the §I.3 page-78 "same video picture
+      segment" availability rule (segment id = GOB index in the
+      baseline driver). Mismatched-segment or non-INTRA neighbours
+      collapse to `Neighbour::None`.
+    - Composes `aic_intra_reconstruct_coefficients` (modified
+      inverse-quant + Figure-I.2 scan scatter + DC/AC prediction with
+      `clipAC` / `oddifyclipDC`) followed by
+      `aic_intra_reconstruct_samples` (IDCT + §6.3.2 sample clip).
+    - Records each block's final `RecC'(u, v)` into the neighbour
+      grid for downstream blocks; INTER / skipped macroblocks record
+      their slots as non-INTRA so AIC INTRA neighbours of mixed-type
+      macroblocks see the correct availability decision.
+  - 11 new tests cover: `luma_block_grid_pos` Figure-5 mapping;
+    `AicState` initial OUTSIDE state; `record_non_intra_macroblock`
+    field-by-field; `aic_luma_neighbour_above` / `_left` border
+    collapse; segment-id mismatch collapse; non-INTRA-neighbour
+    collapse; intra-same-segment availability; an end-to-end QCIF AIC
+    INTRA picture with zero-residual blocks (uniform 128 output via
+    DC fallback `1024` → `oddifyclipDC` → `1025` → IDCT 128); an
+    end-to-end QCIF AIC INTRA picture with `+1` DC LEVEL on every
+    block (top-left luma block recovers pixel 130; block-1 picks up
+    block-B predictor → 132; block-2 picks up block-A predictor →
+    132; block-3 averages both → 134 — the §I.3 prediction is
+    observable in the frame); GOB-boundary segment isolation test
+    (the first MB of GOB 1 must NOT pick up GOB 0's block as a
+    predictor and falls back to pixel 130).
+- `MbContext::aic_intra_mode` (bool, default `false` for callers via
+  literal construction; must be set to opt the parser into the §I.2
+  INTRA_MODE field).
+- `H263Macroblock::intra_mode` (`Option<IntraMode>`, populated only on
+  the AIC path for INTRA-coded macroblocks).
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-h263/releases/tag/v0.0.8) - 2026-05-30
 
 ### Other

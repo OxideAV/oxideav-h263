@@ -63,7 +63,11 @@
 
 use oxideav_core::bits::BitReader;
 
+use crate::aic_predict::{
+    aic_intra_reconstruct_coefficients, aic_intra_reconstruct_samples, Neighbour,
+};
 use crate::block::{parse_block, BlockContext, COEFFS_PER_BLOCK};
+use crate::block_aic::parse_intra_block_aic;
 use crate::deblock::{deblock_plane, strength_for_quant, EdgeCondition};
 use crate::gob_header::parse_gob_layer;
 use crate::idct::BLOCK_DIM;
@@ -125,16 +129,32 @@ impl YuvFrame {
 
 /// Caller-supplied decode options for the baseline picture driver.
 ///
-/// The non-extended-PTYPE header cannot signal Annex J on the wire, so
-/// the deblocking filter is opt-in here. Annex D / F / G flags read off
-/// the header still gate the relevant parser paths (the driver rejects
-/// the modes it does not implement); this struct only carries the
-/// decisions the wire cannot convey in the baseline header.
+/// The non-extended-PTYPE header cannot signal Annex J or Annex I on
+/// the wire, so those modes are opt-in here. Annex D / F / G flags read
+/// off the header still gate the relevant parser paths (the driver
+/// rejects the modes it does not implement); this struct only carries
+/// the decisions the wire cannot convey in the baseline header. The
+/// PLUSPTYPE header (parsed by [`crate::plus_ptype`]) is not yet wired
+/// to this driver — callers that want to feed an AIC-enabled picture
+/// through must set [`Self::aic`] explicitly.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DecodeOptions {
     /// Run the Annex J §J.3 deblocking filter on the reconstructed
     /// planes after macroblock reconstruction. Off by default.
     pub deblock: bool,
+    /// Decode every INTRA macroblock in the picture under Annex I §I.2 /
+    /// §I.3 Advanced INTRA Coding rules: an `INTRA_MODE` VLC follows
+    /// MCBPC (§I.2 Figure I.1), each block is parsed by
+    /// [`crate::block_aic::parse_intra_block_aic`] (absorbed INTRADC,
+    /// §I.3 line 4214), each block is dequantised by
+    /// [`crate::aic_dequant::aic_dequant_coefficient`], scattered through
+    /// [`crate::aic::scan_for_intra_mode`], DC/AC-predicted from the §I.3
+    /// "same video picture segment" neighbours via
+    /// [`crate::aic_predict::reconstruct_intra_block_aic`], and finally
+    /// transformed by [`crate::idct::idct_8x8`] + the §6.3.2 sample clip.
+    /// Off by default; callers must opt in because the baseline picture
+    /// header cannot signal AIC on the wire.
+    pub aic: bool,
 }
 
 /// Per-macroblock state the §6.1.1 / Figure-12 candidate-predictor
@@ -170,6 +190,140 @@ impl MbGridEntry {
         mv: MotionVector::new(0, 0),
         mvs4: [MotionVector::new(0, 0); 4],
     };
+}
+
+/// Per-8×8-block metadata + reconstructed-coefficient grids the
+/// Annex I §I.3 driver needs to feed the next block's predictor.
+///
+/// One entry per 8×8 block per plane. The luma grid is
+/// `(2 * mb_cols) × (2 * mb_rows)` (Figure 5 numbers each macroblock's
+/// four luma blocks in a 2×2 grid); the two chroma grids are
+/// `mb_cols × mb_rows` each (one chroma block per macroblock per plane,
+/// 4:2:0). For each block we record:
+///
+/// * `rec_c_prime` — the final `RecC'(u,v)` array (block-position
+///   layout) produced by [`aic_intra_reconstruct_coefficients`]. The
+///   array is the [`Neighbour::Available`] payload supplied to the
+///   block directly below it (as its `block_a`) and the block directly
+///   to its right (as its `block_b`). All-zero for blocks that have
+///   not been decoded yet or that live outside the picture.
+/// * `intra` — `true` iff the block was decoded as an INTRA block in
+///   AIC mode (i.e. it is eligible to act as a §I.3 predictor source).
+///   `false` for INTER blocks, skipped blocks, or blocks past the
+///   current decode position.
+/// * `segment` — segment id (incremented at every GOB or slice header).
+///   The §I.3 "same video picture segment" availability rule (page 78)
+///   requires a candidate neighbour to share the current block's
+///   segment id; mismatches collapse the neighbour to
+///   [`Neighbour::None`]. For the baseline driver where every GOB
+///   carries a header the segment id is exactly the GOB index.
+///
+/// The structure is constructed once per picture (zero-initialised) and
+/// mutated in place as the driver walks the macroblock grid in raster
+/// order. Only the AIC INTRA decode path reads it; INTER macroblocks
+/// only WRITE entries (so a later AIC INTRA block knows the neighbour
+/// is not INTRA) and never use the grid as a source.
+#[derive(Debug, Clone)]
+struct AicState {
+    /// Per-luma-block `RecC'` arrays, row-major in
+    /// `(2*mb_cols) × (2*mb_rows)`.
+    luma_rec: Vec<[i32; COEFFS_PER_BLOCK]>,
+    /// Per-Cb-block `RecC'` arrays, row-major in `mb_cols × mb_rows`.
+    cb_rec: Vec<[i32; COEFFS_PER_BLOCK]>,
+    /// Per-Cr-block `RecC'` arrays, row-major in `mb_cols × mb_rows`.
+    cr_rec: Vec<[i32; COEFFS_PER_BLOCK]>,
+    /// Per-luma-block `(intra, segment)` metadata. Indexed identically
+    /// to `luma_rec`.
+    luma_meta: Vec<AicBlockMeta>,
+    /// Per-Cb-block metadata.
+    cb_meta: Vec<AicBlockMeta>,
+    /// Per-Cr-block metadata.
+    cr_meta: Vec<AicBlockMeta>,
+    /// Width of the luma block grid (`2 * mb_cols`).
+    luma_block_cols: usize,
+    /// Width of the chroma block grid (`mb_cols`).
+    chroma_block_cols: usize,
+}
+
+/// Per-8×8-block AIC metadata: was the block INTRA in AIC mode, and
+/// which segment did it live in? Used to compute `Neighbour::Available`
+/// / `Neighbour::None` per the §I.3 page-78 availability rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AicBlockMeta {
+    /// `true` iff the block is a decoded AIC INTRA block — eligible to
+    /// act as a §I.3 predictor source. INTER / skipped / not-yet-decoded
+    /// blocks set `false`.
+    intra: bool,
+    /// Segment identifier — the GOB index in the baseline driver
+    /// (incremented at every GOB header). Annex K Slice-Structured mode
+    /// would increment per slice. Two blocks are in the "same video
+    /// picture segment" iff they share this value.
+    segment: u32,
+}
+
+impl AicBlockMeta {
+    /// Sentinel for blocks that have not been decoded yet / live outside
+    /// the picture — never eligible as a predictor.
+    const OUTSIDE: AicBlockMeta = AicBlockMeta {
+        intra: false,
+        segment: u32::MAX,
+    };
+}
+
+impl AicState {
+    /// Allocate per-plane block grids sized for the picture's macroblock
+    /// dimensions. Every entry is initialised to all-zero coefficients
+    /// and [`AicBlockMeta::OUTSIDE`] metadata.
+    fn new(mb_cols: usize, mb_rows: usize) -> AicState {
+        let luma_block_cols = 2 * mb_cols;
+        let luma_block_rows = 2 * mb_rows;
+        AicState {
+            luma_rec: vec![[0i32; COEFFS_PER_BLOCK]; luma_block_cols * luma_block_rows],
+            cb_rec: vec![[0i32; COEFFS_PER_BLOCK]; mb_cols * mb_rows],
+            cr_rec: vec![[0i32; COEFFS_PER_BLOCK]; mb_cols * mb_rows],
+            luma_meta: vec![AicBlockMeta::OUTSIDE; luma_block_cols * luma_block_rows],
+            cb_meta: vec![AicBlockMeta::OUTSIDE; mb_cols * mb_rows],
+            cr_meta: vec![AicBlockMeta::OUTSIDE; mb_cols * mb_rows],
+            luma_block_cols,
+            chroma_block_cols: mb_cols,
+        }
+    }
+
+    /// Mark every 8×8 block belonging to macroblock `(mb_col, mb_row)`
+    /// as a NON-AIC-INTRA block — recording the current segment id so
+    /// future blocks can compare. Called after every non-INTRA-AIC
+    /// macroblock (INTER, skipped, or the rare INTRA macroblock decoded
+    /// without AIC) so that later AIC blocks see the slot as
+    /// "neighbour not INTRA → fallback predictor".
+    fn record_non_intra_macroblock(&mut self, mb_col: usize, mb_row: usize, segment: u32) {
+        for blk in 0..4 {
+            let (bx, by) = luma_block_grid_pos(mb_col, mb_row, blk);
+            self.luma_meta[by * self.luma_block_cols + bx] = AicBlockMeta {
+                intra: false,
+                segment,
+            };
+        }
+        let cidx = mb_row * self.chroma_block_cols + mb_col;
+        self.cb_meta[cidx] = AicBlockMeta {
+            intra: false,
+            segment,
+        };
+        self.cr_meta[cidx] = AicBlockMeta {
+            intra: false,
+            segment,
+        };
+    }
+}
+
+/// Block-grid position `(col, row)` of luma block `blk` (0..=3) of the
+/// macroblock at MB-grid position `(mb_col, mb_row)`. Mirrors the
+/// Figure-5 numbering used by [`luma_block_origin`] for the pixel
+/// origin: blk 0 = top-left, blk 1 = top-right, blk 2 = bottom-left,
+/// blk 3 = bottom-right.
+fn luma_block_grid_pos(mb_col: usize, mb_row: usize, blk: usize) -> (usize, usize) {
+    let dx = blk & 1;
+    let dy = blk >> 1;
+    (2 * mb_col + dx, 2 * mb_row + dy)
 }
 
 /// §6.1.1 / Figure-12 candidate-predictor selection for the baseline
@@ -348,6 +502,10 @@ pub fn decode_picture(
     // STRENGTH lookup. Indexed by grid position.
     let mut mb_quant = vec![0u8; mb_cols * mb_rows_total];
 
+    // Annex I §I.3 per-8×8-block reconstructed-coefficient + metadata
+    // grid. Always allocated; only read/written by the AIC code path.
+    let mut aic_state = AicState::new(mb_cols, mb_rows_total);
+
     // Walk GOBs top-to-bottom (§4.2.1 vertical scan). Every GOB —
     // including the topmost — is expected to carry a GOB header in the
     // baseline driver. The spec permits "GOB 0" to omit its header
@@ -362,6 +520,11 @@ pub fn decode_picture(
         let gob = parse_gob_layer(&mut reader)?;
         let gob_quant = gob.quantiser;
         let gob_top_row = gob_index * mb_rows_per_gob as usize;
+        // Every GOB header opens a fresh §I.3 "video picture segment"
+        // for the baseline (no Annex K) driver — a candidate neighbour
+        // in a different GOB is collapsed to `Neighbour::None` by the
+        // segment-id mismatch check.
+        let aic_segment = gob_index as u32;
 
         for local_row in 0..mb_rows_per_gob as usize {
             let row = gob_top_row + local_row;
@@ -381,6 +544,7 @@ pub fn decode_picture(
                         MbContext {
                             picture_coding_type: header.coding_type,
                             advanced_prediction: header.advanced_prediction,
+                            aic_intra_mode: options.aic,
                             quantiser_before: current_quant,
                         },
                     )?;
@@ -405,6 +569,9 @@ pub fn decode_picture(
                     header.umv_mode,
                     header.advanced_prediction,
                     &mut current_quant,
+                    options,
+                    &mut aic_state,
+                    aic_segment,
                 )?;
                 record_grid(
                     &mut grid,
@@ -485,6 +652,9 @@ fn decode_one_macroblock(
     umv_mode: bool,
     advanced_prediction: bool,
     current_quant: &mut u8,
+    options: DecodeOptions,
+    aic_state: &mut AicState,
+    aic_segment: u32,
 ) -> Result<(MotionVector, Mb4Mv)> {
     let luma_stride = frame.luma_width;
     let chroma_stride = frame.chroma_width();
@@ -508,6 +678,9 @@ fn decode_one_macroblock(
             c_y,
             MotionVector::new(0, 0),
         );
+        if options.aic {
+            aic_state.record_non_intra_macroblock(col, row, aic_segment);
+        }
         let zero = MotionVector::new(0, 0);
         return Ok((zero, [zero; 4]));
     }
@@ -534,6 +707,9 @@ fn decode_one_macroblock(
             umv_mode,
             advanced_prediction,
             current_quant,
+            options,
+            aic_state,
+            aic_segment,
         );
     }
 
@@ -544,6 +720,22 @@ fn decode_one_macroblock(
     let cbpc = mb.cbpc.unwrap_or(0);
 
     if mb_type.is_intra() {
+        if options.aic {
+            // Annex I §I.2 / §I.3 INTRA path: per-block INTRA_MODE +
+            // absorbed INTRADC + §I.3 reconstruction.
+            return decode_intra_macroblock_aic(
+                reader,
+                mb,
+                frame,
+                col,
+                row,
+                quant,
+                cbpy,
+                cbpc,
+                aic_state,
+                aic_segment,
+            );
+        }
         // INTRA / INTRA+Q: every block has INTRADC; CBPY/CBPC govern AC.
         // CBPY is in CBPY(INTRA) orientation: bit 3 (0b1000) = block 1,
         // bit 0 (0b0001) = block 4 (§5.3.5, Figure 5).
@@ -667,10 +859,260 @@ fn decode_one_macroblock(
     };
     blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
 
+    if options.aic {
+        aic_state.record_non_intra_macroblock(col, row, aic_segment);
+    }
+
     // §F.2 last paragraph: a single-MV macroblock is "defined as four
     // vectors with the same value" for the purpose of neighbour-grid
     // predictor lookups by adjacent INTER4V macroblocks.
     Ok((luma_mv, [luma_mv; 4]))
+}
+
+/// Decode and reconstruct one Annex I §I.2 / §I.3 INTRA macroblock —
+/// the AIC counterpart to the baseline INTRA branch of
+/// [`decode_one_macroblock`].
+///
+/// The macroblock layer has already been parsed (with INTRA_MODE read
+/// between MCBPC and CBPY by [`parse_macroblock`] under the AIC context
+/// flag) — this function decodes the six 8×8 blocks of the macroblock
+/// in Figure-5 order (Y0..Y3, Cb, Cr), running each through the §I.3
+/// pipeline:
+///
+/// 1. [`parse_intra_block_aic`] reads the absorbed-INTRADC event stream
+///    using the Table I.2 INTRA-coefficient VLC.
+/// 2. [`aic_intra_reconstruct_coefficients`] dequantises, scatters
+///    through the [`crate::aic::scan_for_intra_mode`] permutation,
+///    and adds the §I.3 page-79 DC/AC prediction sourced from the
+///    block immediately above (block A → `RecA'`) and the block
+///    immediately to the left (block B → `RecB'`). The per-block
+///    "same video picture segment" availability test (§I.3 page 78) is
+///    applied here using the [`AicState`] per-block metadata grid: a
+///    neighbour is `Neighbour::Available` iff it has already been
+///    decoded as an AIC INTRA block AND its segment id matches the
+///    current block's segment.
+/// 3. [`aic_intra_reconstruct_samples`] runs the §6.2.4 IDCT plus the
+///    §6.3.2 `[0, 255]` sample clip.
+///
+/// The final `RecC'(u, v)` coefficient array is stored into the
+/// [`AicState`] grid so downstream blocks can pick it up as their own
+/// `RecA'` / `RecB'`. The 8×8 sample block is blitted into the frame.
+///
+/// INTRA macroblocks have no motion vector — the function returns
+/// `(0, [0; 4])` for the §6.1.1 / Figure-12 predictor recording, the
+/// same convention as the baseline INTRA branch.
+#[allow(clippy::too_many_arguments)]
+fn decode_intra_macroblock_aic(
+    reader: &mut BitReader<'_>,
+    mb: &H263Macroblock,
+    frame: &mut YuvFrame,
+    col: usize,
+    row: usize,
+    quant: u8,
+    cbpy: u8,
+    cbpc: u8,
+    aic_state: &mut AicState,
+    aic_segment: u32,
+) -> Result<(MotionVector, Mb4Mv)> {
+    let luma_stride = frame.luma_width;
+    let chroma_stride = frame.chroma_width();
+
+    let mb_x = col * 16;
+    let mb_y = row * 16;
+    let c_x = col * 8;
+    let c_y = row * 8;
+
+    // §I.2: one INTRA_MODE per INTRA macroblock — applied to every block
+    // of the macroblock. The parser already read it; we read it back.
+    let intra_mode = mb.intra_mode.ok_or(Error::NotImplemented)?;
+
+    // CBPY orientation is the same as the baseline INTRA path: bit 3
+    // (`0b1000`) = block 0 (B1), bit 0 (`0b0001`) = block 3 (B4)
+    // (§5.3.5, Figure 5). In AIC mode the CBPY-INTRA bit value also
+    // gates DC presence (§I.3 "absorbed INTRADC"): bit=0 means the
+    // entire block, DC included, is all zero on the wire.
+    for blk in 0..4 {
+        let cbpy_bit = (cbpy >> (3 - blk)) & 1 == 1;
+        let block = parse_intra_block_aic(reader, cbpy_bit)?;
+
+        let (bx, by) = luma_block_grid_pos(col, row, blk);
+        let neigh_a = aic_luma_neighbour_above(aic_state, bx, by, aic_segment);
+        let neigh_b = aic_luma_neighbour_left(aic_state, bx, by, aic_segment);
+
+        let rec_c_prime =
+            aic_intra_reconstruct_coefficients(&block, intra_mode, quant, neigh_a, neigh_b);
+        let samples = aic_intra_reconstruct_samples(&rec_c_prime);
+
+        // Store the reconstructed block + mark the slot as AIC INTRA in
+        // the current segment so downstream blocks can pick it up.
+        let slot = by * aic_state.luma_block_cols + bx;
+        aic_state.luma_rec[slot] = rec_c_prime;
+        aic_state.luma_meta[slot] = AicBlockMeta {
+            intra: true,
+            segment: aic_segment,
+        };
+
+        let (px, py) = luma_block_origin(mb_x, mb_y, blk);
+        blit_block(&mut frame.y, luma_stride, px, py, &samples);
+    }
+
+    // Cb (block 5): CBPC bit 0b10. One chroma block per MB per plane,
+    // so the chroma neighbour grid lives at MB resolution.
+    let cb_has = cbpc & 0b10 != 0;
+    let cb_block = parse_intra_block_aic(reader, cb_has)?;
+    let cb_a = aic_chroma_neighbour_above(
+        &aic_state.cb_rec,
+        &aic_state.cb_meta,
+        col,
+        row,
+        mb_cols_of(aic_state),
+        aic_segment,
+    );
+    let cb_b = aic_chroma_neighbour_left(
+        &aic_state.cb_rec,
+        &aic_state.cb_meta,
+        col,
+        row,
+        mb_cols_of(aic_state),
+        aic_segment,
+    );
+    let cb_rec = aic_intra_reconstruct_coefficients(&cb_block, intra_mode, quant, cb_a, cb_b);
+    let cb_samples = aic_intra_reconstruct_samples(&cb_rec);
+    let cb_slot = row * mb_cols_of(aic_state) + col;
+    aic_state.cb_rec[cb_slot] = cb_rec;
+    aic_state.cb_meta[cb_slot] = AicBlockMeta {
+        intra: true,
+        segment: aic_segment,
+    };
+    blit_block(&mut frame.cb, chroma_stride, c_x, c_y, &cb_samples);
+
+    // Cr (block 6): CBPC bit 0b01.
+    let cr_has = cbpc & 0b01 != 0;
+    let cr_block = parse_intra_block_aic(reader, cr_has)?;
+    let cr_a = aic_chroma_neighbour_above(
+        &aic_state.cr_rec,
+        &aic_state.cr_meta,
+        col,
+        row,
+        mb_cols_of(aic_state),
+        aic_segment,
+    );
+    let cr_b = aic_chroma_neighbour_left(
+        &aic_state.cr_rec,
+        &aic_state.cr_meta,
+        col,
+        row,
+        mb_cols_of(aic_state),
+        aic_segment,
+    );
+    let cr_rec = aic_intra_reconstruct_coefficients(&cr_block, intra_mode, quant, cr_a, cr_b);
+    let cr_samples = aic_intra_reconstruct_samples(&cr_rec);
+    let cr_slot = row * mb_cols_of(aic_state) + col;
+    aic_state.cr_rec[cr_slot] = cr_rec;
+    aic_state.cr_meta[cr_slot] = AicBlockMeta {
+        intra: true,
+        segment: aic_segment,
+    };
+    blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
+
+    // INTRA macroblocks have no motion vector.
+    let zero = MotionVector::new(0, 0);
+    Ok((zero, [zero; 4]))
+}
+
+/// MB-cols width recoverable from the AIC state (its chroma-block grid
+/// width equals the macroblock-column count for 4:2:0).
+fn mb_cols_of(state: &AicState) -> usize {
+    state.chroma_block_cols
+}
+
+/// §I.3 page 78 — fetch the `RecA'` neighbour (block immediately above
+/// the current luma block at grid position `(bx, by)`) from
+/// [`AicState`], collapsed to [`Neighbour::None`] when the slot is
+/// outside the picture, was not decoded as an AIC INTRA block, or sits
+/// in a different video picture segment than the current block.
+fn aic_luma_neighbour_above<'a>(
+    state: &'a AicState,
+    bx: usize,
+    by: usize,
+    current_segment: u32,
+) -> Neighbour<'a> {
+    if by == 0 {
+        return Neighbour::None;
+    }
+    let slot = (by - 1) * state.luma_block_cols + bx;
+    let meta = state.luma_meta[slot];
+    if meta.intra && meta.segment == current_segment {
+        Neighbour::Available(&state.luma_rec[slot])
+    } else {
+        Neighbour::None
+    }
+}
+
+/// §I.3 page 78 — fetch the `RecB'` neighbour (block immediately to the
+/// left of the current luma block) from [`AicState`], with the same
+/// availability rules as [`aic_luma_neighbour_above`].
+fn aic_luma_neighbour_left<'a>(
+    state: &'a AicState,
+    bx: usize,
+    by: usize,
+    current_segment: u32,
+) -> Neighbour<'a> {
+    if bx == 0 {
+        return Neighbour::None;
+    }
+    let slot = by * state.luma_block_cols + (bx - 1);
+    let meta = state.luma_meta[slot];
+    if meta.intra && meta.segment == current_segment {
+        Neighbour::Available(&state.luma_rec[slot])
+    } else {
+        Neighbour::None
+    }
+}
+
+/// §I.3 page 78 — `RecA'` neighbour for a chroma block (one chroma
+/// block per macroblock per plane in 4:2:0): the chroma block of the
+/// macroblock immediately above.
+fn aic_chroma_neighbour_above<'a>(
+    rec: &'a [[i32; COEFFS_PER_BLOCK]],
+    meta: &[AicBlockMeta],
+    col: usize,
+    row: usize,
+    chroma_cols: usize,
+    current_segment: u32,
+) -> Neighbour<'a> {
+    if row == 0 {
+        return Neighbour::None;
+    }
+    let slot = (row - 1) * chroma_cols + col;
+    let m = meta[slot];
+    if m.intra && m.segment == current_segment {
+        Neighbour::Available(&rec[slot])
+    } else {
+        Neighbour::None
+    }
+}
+
+/// §I.3 page 78 — `RecB'` neighbour for a chroma block: the chroma
+/// block of the macroblock immediately to the left.
+fn aic_chroma_neighbour_left<'a>(
+    rec: &'a [[i32; COEFFS_PER_BLOCK]],
+    meta: &[AicBlockMeta],
+    col: usize,
+    row: usize,
+    chroma_cols: usize,
+    current_segment: u32,
+) -> Neighbour<'a> {
+    if col == 0 {
+        return Neighbour::None;
+    }
+    let slot = row * chroma_cols + (col - 1);
+    let m = meta[slot];
+    if m.intra && m.segment == current_segment {
+        Neighbour::Available(&rec[slot])
+    } else {
+        Neighbour::None
+    }
 }
 
 /// Decode and reconstruct one Annex F §F.2 INTER4V / INTER4V+Q
@@ -699,6 +1141,9 @@ fn decode_inter4v_macroblock(
     umv_mode: bool,
     advanced_prediction: bool,
     current_quant: &mut u8,
+    options: DecodeOptions,
+    aic_state: &mut AicState,
+    aic_segment: u32,
 ) -> Result<(MotionVector, Mb4Mv)> {
     // The macroblock parser only emits MVD2-4 when AP is set, so
     // INTER4V outside AP would mean PLUSPTYPE Deblocking-Filter mode —
@@ -910,6 +1355,10 @@ fn decode_inter4v_macroblock(
         cr_pred
     };
     blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
+
+    if options.aic {
+        aic_state.record_non_intra_macroblock(col, row, aic_segment);
+    }
 
     Ok((mvs4[LumaBlockIndex::B1.index()], mvs4))
 }
@@ -1485,7 +1934,15 @@ mod tests {
         // smooth, so the §J.3 filter must leave every sample unchanged
         // (d = (A−4B+4C−D)/8 = 0 when A=B=C=D).
         let data = build_qcif_intra_dc_picture(0x10);
-        let frame = decode_picture(&data, None, DecodeOptions { deblock: true }).expect("decode");
+        let frame = decode_picture(
+            &data,
+            None,
+            DecodeOptions {
+                deblock: true,
+                aic: false,
+            },
+        )
+        .expect("decode");
         assert!(frame.y.iter().all(|&p| p == 16));
         assert!(frame.cb.iter().all(|&p| p == 16));
         assert!(frame.cr.iter().all(|&p| p == 16));
@@ -2402,5 +2859,395 @@ mod tests {
         // their `take` returns Some([0; 4]) (not None — OUTSIDE is
         // neither INTRA nor not-coded).
         assert_eq!(n.above, Some([MotionVector::default(); 4]));
+    }
+
+    // ---- Annex I §I.3 AIC MB-grid driver ---------------------------
+
+    /// `luma_block_grid_pos` maps Figure-5 block indices to per-plane
+    /// 8×8-block coordinates. MB (3, 5) has its top-left luma block at
+    /// (6, 10) in the luma-block grid and the four blocks at consecutive
+    /// `(6..=7, 10..=11)` positions.
+    #[test]
+    fn luma_block_grid_pos_figure5() {
+        assert_eq!(luma_block_grid_pos(3, 5, 0), (6, 10));
+        assert_eq!(luma_block_grid_pos(3, 5, 1), (7, 10));
+        assert_eq!(luma_block_grid_pos(3, 5, 2), (6, 11));
+        assert_eq!(luma_block_grid_pos(3, 5, 3), (7, 11));
+    }
+
+    /// A fresh `AicState` reports every slot as OUTSIDE — never eligible
+    /// as a §I.3 predictor source.
+    #[test]
+    fn aic_state_initially_outside_everywhere() {
+        let state = AicState::new(4, 3);
+        for m in state.luma_meta.iter() {
+            assert_eq!(*m, AicBlockMeta::OUTSIDE);
+        }
+        for m in state.cb_meta.iter().chain(state.cr_meta.iter()) {
+            assert_eq!(*m, AicBlockMeta::OUTSIDE);
+        }
+        assert_eq!(state.luma_block_cols, 8);
+        assert_eq!(state.chroma_block_cols, 4);
+    }
+
+    /// `record_non_intra_macroblock` marks all six slots of an MB as
+    /// non-INTRA in the current segment — so a later AIC INTRA block
+    /// next to it sees the neighbour as "not a predictor source".
+    #[test]
+    fn record_non_intra_macroblock_clears_intra_flag() {
+        let mut state = AicState::new(4, 3);
+        // Plant an INTRA neighbour above where the non-intra MB will be.
+        state.luma_meta[2 * 8 + 1] = AicBlockMeta {
+            intra: true,
+            segment: 0,
+        };
+        // Now record MB (1, 1) as non-intra in segment 0.
+        state.record_non_intra_macroblock(1, 1, 0);
+        // All four luma blocks of MB (1, 1) — positions (2, 2), (3, 2),
+        // (2, 3), (3, 3) — should now report `intra=false`.
+        let positions = [(2, 2), (3, 2), (2, 3), (3, 3)];
+        for (bx, by) in positions {
+            let m = state.luma_meta[by * 8 + bx];
+            assert!(
+                !m.intra,
+                "block ({}, {}) should be marked non-intra",
+                bx, by
+            );
+            assert_eq!(m.segment, 0);
+        }
+        // Chroma slot for MB (1, 1) (single block per plane per MB).
+        let chroma_idx = 4 + 1; // row=1 × chroma_cols=4 + col=1
+        assert!(!state.cb_meta[chroma_idx].intra);
+        assert!(!state.cr_meta[chroma_idx].intra);
+        // The previously-planted INTRA neighbour ABOVE is untouched.
+        assert!(state.luma_meta[2 * 8 + 1].intra);
+    }
+
+    /// §I.3 page 78 — `aic_luma_neighbour_above` collapses to
+    /// `Neighbour::None` when the candidate block lives outside the
+    /// picture (row 0).
+    #[test]
+    fn aic_neighbour_above_at_row0_is_none() {
+        let state = AicState::new(4, 3);
+        let n = aic_luma_neighbour_above(&state, 2, 0, 0);
+        assert!(!n.is_available());
+    }
+
+    /// §I.3 page 78 — `aic_luma_neighbour_left` collapses to
+    /// `Neighbour::None` when the candidate block lives outside the
+    /// picture (col 0).
+    #[test]
+    fn aic_neighbour_left_at_col0_is_none() {
+        let state = AicState::new(4, 3);
+        let n = aic_luma_neighbour_left(&state, 0, 1, 0);
+        assert!(!n.is_available());
+    }
+
+    /// §I.3 page 78 — a candidate neighbour that was DECODED but lives
+    /// in a DIFFERENT video picture segment collapses to
+    /// `Neighbour::None`.
+    #[test]
+    fn aic_neighbour_segment_mismatch_collapses_to_none() {
+        let mut state = AicState::new(4, 3);
+        // Plant an INTRA-decoded neighbour above (4, 0) carrying DC=900
+        // in segment 0; the current block is decoded in segment 1.
+        state.luma_meta[2] = AicBlockMeta {
+            intra: true,
+            segment: 0,
+        };
+        state.luma_rec[2][0] = 900;
+        let n = aic_luma_neighbour_above(&state, 2, 1, /*current_segment=*/ 1);
+        assert!(
+            !n.is_available(),
+            "segment mismatch must collapse the candidate"
+        );
+    }
+
+    /// §I.3 page 78 — a non-INTRA candidate neighbour (an INTER block in
+    /// an AIC picture) collapses to `Neighbour::None` even when the
+    /// segment matches.
+    #[test]
+    fn aic_neighbour_non_intra_collapses_to_none() {
+        let mut state = AicState::new(4, 3);
+        state.luma_meta[2] = AicBlockMeta {
+            intra: false,
+            segment: 0,
+        };
+        state.luma_rec[2][0] = 900;
+        let n = aic_luma_neighbour_above(&state, 2, 1, 0);
+        assert!(!n.is_available());
+    }
+
+    /// §I.3 page 78 — a candidate neighbour that is INTRA-coded AND in
+    /// the same segment surfaces as `Neighbour::Available` carrying the
+    /// neighbour's full `RecC'` array.
+    #[test]
+    fn aic_neighbour_intra_same_segment_is_available() {
+        let mut state = AicState::new(4, 3);
+        state.luma_meta[2] = AicBlockMeta {
+            intra: true,
+            segment: 0,
+        };
+        state.luma_rec[2][0] = 900;
+        let n = aic_luma_neighbour_above(&state, 2, 1, 0);
+        match n {
+            Neighbour::Available(arr) => assert_eq!(arr[0], 900),
+            Neighbour::None => panic!("expected Available, got None"),
+        }
+    }
+
+    /// Build a minimal QCIF AIC INTRA picture where every macroblock
+    /// has INTRA_MODE = 0 (DcOnly), CBPY = 0 (all four luma blocks
+    /// carry no coefficients per §I.3 absorbed-INTRADC — bit=0 means the
+    /// entire block is zero), and CBPC = 0 (same for chroma). Every
+    /// block dequantises to all-zero residual, and with no neighbours
+    /// available the DC fallback `1024` kicks in for the first MB, then
+    /// propagates through `oddifyclipDC` and Mode 0 averaging across
+    /// the picture.
+    ///
+    /// Used by `decode_qcif_aic_intra_dc_only_zero_residuals` below.
+    fn build_qcif_aic_intra_zero_picture() -> Vec<u8> {
+        let mut w = BitWriter::new();
+        // Picture header: QCIF, INTRA, all flags off.
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true); // PTYPE bit1
+        w.write_bit(false); // PTYPE bit2
+        w.write_bit(false); // split-screen
+        w.write_bit(false); // doc-camera
+        w.write_bit(false); // freeze
+        w.write_u32(0b010, 3); // QCIF
+        w.write_bit(false); // coding type INTRA
+        w.write_bit(false); // umv
+        w.write_bit(false); // sac
+        w.write_bit(false); // ap
+        w.write_bit(false); // pb
+
+        for _gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for _mb in 0..11 {
+                // MCBPC = `1` → I-picture INTRA, cbpc = 00.
+                w.write_bit(true);
+                // INTRA_MODE: `0` → DcOnly (the AIC code path reads
+                // this after MCBPC in I-pictures because COD is absent
+                // for I-pictures).
+                w.write_bit(false);
+                // CBPY = `0011` (Table 12 index 0): CBPY(INTRA) = 0000,
+                // i.e. no AC in any luma block. Per §I.3 absorbed
+                // INTRADC, CBPY bit = 0 means "block carries no
+                // coefficients" — DC stays 0 too.
+                w.write_bit(false);
+                w.write_bit(false);
+                w.write_bit(true);
+                w.write_bit(true);
+                // No block data at all — CBPY/CBPC all zero in AIC mode.
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// End-to-end §I.3 driver smoke test: a QCIF AIC INTRA picture with
+    /// every block carrying zero coefficients should reconstruct to a
+    /// uniform field whose value is set entirely by the DC fallback
+    /// predictor (`1024`) propagated through `oddifyclipDC` (which bumps
+    /// the even `1024` to `1025`) and IDCT-distributed to every pixel.
+    ///
+    /// IDCT of a DC-only `(0, 0) = 1025` block: `pixel = 0.25 * 0.5 *
+    /// 1025 = 128.125 → 128`. The driver clips to `[0, 255]`, leaving
+    /// 128 as the uniform output value.
+    #[test]
+    fn decode_qcif_aic_intra_dc_only_zero_residuals() {
+        let data = build_qcif_aic_intra_zero_picture();
+        let frame = decode_picture(
+            &data,
+            None,
+            DecodeOptions {
+                deblock: false,
+                aic: true,
+            },
+        )
+        .expect("AIC driver should decode the zero-residual picture");
+        assert_eq!(frame.luma_width, 176);
+        assert_eq!(frame.luma_height, 144);
+        // After §I.3 fallback DC + oddify + IDCT + clip, every sample
+        // is 128 (mid-grey).
+        let bad_luma = frame.y.iter().filter(|&&p| p != 128).count();
+        let bad_cb = frame.cb.iter().filter(|&&p| p != 128).count();
+        let bad_cr = frame.cr.iter().filter(|&&p| p != 128).count();
+        assert_eq!(bad_luma, 0, "luma is not uniform 128");
+        assert_eq!(bad_cb, 0, "cb is not uniform 128");
+        assert_eq!(bad_cr, 0, "cr is not uniform 128");
+    }
+
+    /// Build a QCIF AIC INTRA picture where every block carries a single
+    /// non-zero LEVEL at scan position 0 (the absorbed DC) using the
+    /// Table I.2 row-58 VLC `0111s` with sign 0 — i.e. each block's
+    /// `LEVEL(0, 0) = +1`. INTRA_MODE = 0 (DcOnly). CBPY / CBPC bits are
+    /// all 1 so every block reads its event.
+    ///
+    /// Dequantisation: `RecC(0, 0) = 2 * 8 * 1 = 16`. Top-left luma
+    /// block: no neighbours, DC = `oddifyclipDC(16 + 1024) =
+    /// oddifyclipDC(1040)` → `1041` (1040 is even, bump to 1041). IDCT
+    /// distributes `1041 * 0.25 * 0.5 = 130.125 → 130` to every pixel.
+    /// The block to its RIGHT picks up block-B (the just-decoded
+    /// block) as a predictor: DC = `oddifyclipDC(16 + 1041) = 1057`
+    /// (odd) → pixel `1057 * 0.125 = 132.125 → 132`. The §I.3 driver is
+    /// exercised end-to-end here.
+    fn build_qcif_aic_intra_dc_plus1_picture() -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8);
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_u32(0b010, 3);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+
+        for _gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for _mb in 0..11 {
+                // MCBPC = `011` (Table 7 row idx 3 — INTRA type with
+                // CBPC `11`, both chroma blocks carry coefficients).
+                w.write_u32(0b011, 3);
+                // INTRA_MODE: `0` (DcOnly).
+                w.write_bit(false);
+                // CBPY(INTRA) = `1111` — every luma block carries
+                // coefficients. Table 12 row 15 codes this as `11`.
+                w.write_u32(0b11, 2);
+                // Six blocks, each with one event: row 58 `0111s`
+                // (LAST=1, RUN=0, |LEVEL|=1) with sign 0 → +1 at DC.
+                for _blk in 0..6 {
+                    w.write_u32(0b0111, 4); // LAST=1, RUN=0, LEVEL=1
+                    w.write_bit(false); // sign = 0 → +1
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// End-to-end §I.3 driver: AIC INTRA picture with a uniform `+1`
+    /// DC LEVEL on every block. The decoder must (a) parse the
+    /// per-MB INTRA_MODE (b) parse each block with
+    /// `parse_intra_block_aic`, (c) dequant via the AIC formula
+    /// (`2·QUANT·LEVEL = 16`), (d) add the §I.3 DC predictor from the
+    /// already-reconstructed neighbour blocks via the AIC neighbour
+    /// grid, (e) IDCT + clip into the frame buffer.
+    ///
+    /// The top-left luma block of the top-left macroblock has NO
+    /// neighbours → DC = `oddifyclipDC(16 + 1024) = 1041` → pixel 130.
+    /// The block immediately to its right has block B available (the
+    /// just-decoded block, DC=1041 in segment 0); block A is None
+    /// (above row 0). Mode 0 DC = `oddifyclipDC(16 + 1041) = 1057` →
+    /// pixel 132. The prediction is observable in the frame.
+    #[test]
+    fn decode_qcif_aic_intra_dc_plus1_predicts_across_blocks() {
+        let data = build_qcif_aic_intra_dc_plus1_picture();
+        let frame = decode_picture(
+            &data,
+            None,
+            DecodeOptions {
+                deblock: false,
+                aic: true,
+            },
+        )
+        .expect("AIC driver should decode the +1-DC picture");
+        // The very first luma block (top-left 8×8 of the picture) sees
+        // no neighbours and reconstructs to pixel 130.
+        let luma_w = frame.luma_width;
+        let top_left_block0_value = frame.y[0];
+        assert_eq!(top_left_block0_value, 130, "top-left luma block pixel");
+        // Same value across the entire 8×8 (it is a DC-only block).
+        for row in 0..8 {
+            for col in 0..8 {
+                assert_eq!(
+                    frame.y[row * luma_w + col],
+                    130,
+                    "top-left block ({}, {}) should be 130",
+                    col,
+                    row
+                );
+            }
+        }
+        // The block immediately to the right (the same MB's block 1)
+        // picks up block-B as a predictor → pixel 132.
+        let block1_value = frame.y[8];
+        assert_eq!(
+            block1_value, 132,
+            "MB(0,0) block-1 should see block-B predictor → 132"
+        );
+        for row in 0..8 {
+            for col in 8..16 {
+                assert_eq!(
+                    frame.y[row * luma_w + col],
+                    132,
+                    "block 1 sample at ({}, {}) should be 132",
+                    col,
+                    row
+                );
+            }
+        }
+        // Block 2 (bottom-left of MB(0,0)) picks up block-A (top-left,
+        // DC=1041) as predictor → DC = `oddifyclipDC(16 + 1041) = 1057`
+        // → pixel 132. (Mode 0 with single neighbour A.)
+        let block2_value = frame.y[8 * luma_w];
+        assert_eq!(block2_value, 132, "block 2 should mirror block 1's 132");
+        // Block 3 (bottom-right of MB(0,0)) has BOTH block-A (block 1,
+        // DC=1057) and block-B (block 2, DC=1057) available. Mode 0
+        // averages: tempDC = 16 + (1057 + 1057) / 2 = 1073, odd →
+        // pixel 1073 / 8 = 134.125 → 134.
+        let block3_value = frame.y[8 * luma_w + 8];
+        assert_eq!(
+            block3_value, 134,
+            "block 3 should see averaged A+B predictor → 134"
+        );
+    }
+
+    /// §I.3 "same video picture segment" rule: an AIC INTRA block in
+    /// GOB N must NOT pick up an AIC INTRA neighbour in GOB N-1 as a
+    /// predictor — the segment ids differ. We verify this by decoding
+    /// the second GOB's first MB and confirming its top-left luma block
+    /// recovers DC = `oddifyclipDC(16 + 1024) = 1041 → pixel 130`,
+    /// the no-neighbour fallback, NOT the cross-GOB inheritance value
+    /// the lack of segmentation would give.
+    #[test]
+    fn decode_qcif_aic_intra_segment_isolates_gobs() {
+        let data = build_qcif_aic_intra_dc_plus1_picture();
+        let frame = decode_picture(
+            &data,
+            None,
+            DecodeOptions {
+                deblock: false,
+                aic: true,
+            },
+        )
+        .expect("decode");
+        // GOB 1 starts at MB row 1. The top-left luma block of MB (0, 1)
+        // is in segment 1, immediately below MB (0, 0) block 2 (which
+        // is in segment 0). The §I.3 segment-isolation rule must
+        // collapse block-A to None → fallback predictor → pixel 130.
+        let luma_w = frame.luma_width;
+        let across_gob_block0 = frame.y[16 * luma_w];
+        assert_eq!(
+            across_gob_block0, 130,
+            "AIC INTRA top-left of GOB 1 must NOT pick up GOB 0's neighbour"
+        );
     }
 }

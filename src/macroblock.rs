@@ -77,6 +77,7 @@
 
 use oxideav_core::bits::BitReader;
 
+use crate::aic::{decode_intra_mode, IntraMode};
 use crate::{Error, H263PictureCodingType, Result};
 
 /// Picture-level context the macroblock parser needs.
@@ -102,6 +103,11 @@ pub struct MbContext {
     /// `true`, INTER4V macroblocks (MB type 2) carry MVD2-4 after
     /// the primary MVD (§5.3.8).
     pub advanced_prediction: bool,
+    /// Annex I §I.2 — Advanced INTRA Coding mode. When `true`, an
+    /// `INTRA_MODE` VLC (Table I.1) is read between MCBPC and CBPY
+    /// for every INTRA macroblock (MB type 3 or 4). The decoded
+    /// mode is surfaced on [`H263Macroblock::intra_mode`].
+    pub aic_intra_mode: bool,
     /// Current QUANT from the most recent GOB-layer header (or
     /// the picture-layer's PQUANT in the no-GOB case). Used to
     /// compute [`H263Macroblock::quantiser_after`] after any
@@ -222,6 +228,12 @@ pub struct H263Macroblock {
     /// use and the MB type carries them (INTER4V / INTER4V+Q).
     /// Always all-or-nothing — either three entries or empty.
     pub mvd234: [Option<Mvd>; 3],
+    /// Annex I §I.2 — `INTRA_MODE` from Table I.1. `Some` iff
+    /// [`MbContext::aic_intra_mode`] is set AND the macroblock is
+    /// INTRA-coded (MCBPC type 3 or 4); the same mode applies to
+    /// every block of the macroblock. `None` for all non-AIC paths
+    /// and for INTER macroblocks in AIC pictures.
+    pub intra_mode: Option<IntraMode>,
 }
 
 /// Parse an H.263 macroblock header starting at the current
@@ -257,6 +269,7 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
             quantiser_after: ctx.quantiser_before,
             mvd: None,
             mvd234: [None; 3],
+            intra_mode: None,
         });
     }
 
@@ -277,8 +290,19 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
             quantiser_after: ctx.quantiser_before,
             mvd: None,
             mvd234: [None; 3],
+            intra_mode: None,
         });
     }
+
+    // §I.2 — INTRA_MODE field (Table I.1) lives between MCBPC and
+    // CBPY for INTRA macroblocks when Advanced INTRA Coding is on.
+    // Outside AIC, or for INTER macroblocks in an AIC picture, no
+    // bits are read here.
+    let intra_mode = if ctx.aic_intra_mode && mb_type.is_intra() {
+        Some(decode_intra_mode(reader)?)
+    } else {
+        None
+    };
 
     // §5.3.5 — CBPY (variable length, Table 12).
     let cbpy = decode_cbpy(reader)?;
@@ -331,6 +355,7 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
         quantiser_after,
         mvd,
         mvd234,
+        intra_mode,
     })
 }
 
@@ -736,6 +761,7 @@ mod tests {
         MbContext {
             picture_coding_type: H263PictureCodingType::Intra,
             advanced_prediction: false,
+            aic_intra_mode: false,
             quantiser_before: q,
         }
     }
@@ -744,6 +770,7 @@ mod tests {
         MbContext {
             picture_coding_type: H263PictureCodingType::Inter,
             advanced_prediction: advanced,
+            aic_intra_mode: false,
             quantiser_before: q,
         }
     }
@@ -1370,6 +1397,7 @@ mod tests {
             MbContext {
                 picture_coding_type: pic.coding_type,
                 advanced_prediction: pic.advanced_prediction,
+                aic_intra_mode: false,
                 quantiser_before: gob.quantiser,
             },
         )
