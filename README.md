@@ -5,6 +5,73 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 22 (workspace round 202) — PLUSPTYPE → `DecodeOptions`
+auto-wiring driver entry point. A new `decode_picture_layer` public
+function dispatches `parse_picture_layer` between the baseline and
+extended-PTYPE paths, automatically activating Annex I AIC and
+Annex J deblocking from the wire's OPPTYPE bits 8 and 9 — the
+previous round's `DecodeOptions::aic` opt-in is no longer the only
+way to drive an AIC-coded picture through the decoder:**
+
+* `decode_picture_layer(data, reference, options)` (new public
+  entry point in `picture.rs`): calls `parse_picture_layer` with
+  `InheritedExtendedState::default()`. On the `Baseline` arm it
+  routes through the same inner driver as `decode_picture`; on the
+  `Extended` arm it calls a new `plus_ptype_to_baseline_shim` that
+  validates the picture against the driver's supported-layer-set
+  (UFEP=001, one of the five standardised source formats, no
+  custom-PCF, no CPM, no SAC, no SS, no IS, no AIV, no MQ, no RRU,
+  INTRA/INTER picture type only, UMV either off or with `UUI = "1"`),
+  refusing anything else with `Error::NotImplemented` rather than
+  mis-framing, and reduces the supported case to an equivalent
+  `H263PictureHeader` + augmented `DecodeOptions`.
+* The shim performs the §5.1.4 → baseline-PTYPE flag mapping:
+  `umv_mode = opptype.umv`, `advanced_prediction =
+  opptype.advanced_prediction`, `pb_frames = sac_mode = false` (both
+  refused above), source format mapped one-for-one from
+  `PlusSourceFormat` to `H263SourceFormat`. Wire-signalled
+  AIC / DF flags **OR-merge** into the caller's options
+  (`options.aic = options.aic || opptype.advanced_intra`,
+  `options.deblock = options.deblock || opptype.deblocking`) — the
+  wire can switch a mode on, the caller can force it on, but neither
+  can switch the other off through this entry point.
+* The inner driver was refactored: the body of `decode_picture` after
+  `parse_picture_header` became a shared `decode_after_picture_header`
+  helper. `decode_picture` now wraps `parse_picture_header` +
+  `decode_after_picture_header`; `decode_picture_layer` wraps
+  `parse_picture_layer` (+ optional shim) + `decode_after_picture_header`.
+  The legacy `decode_picture` entry point keeps its
+  `Error::ExtendedPtypeNotSupported` rejection of `"111"` source-format
+  pictures (forwarded from `parse_picture_header`).
+
+9 new tests land alongside the wiring: a synthetic QCIF PLUSPTYPE AIC
+INTRA picture (`UFEP="001"`, OPPTYPE source-format `"010"` QCIF, AIC
+bit set, all other modes off) decoded through `decode_picture_layer`
+with `DecodeOptions::default()` reproduces the same observable §I.3
+prediction footprint as round 21's baseline-header AIC test
+(`pixel 130 / 132 / 132 / 134` at the top-left macroblock); a
+PLUSPTYPE non-AIC INTRA picture decodes through the §5.3 + §6.1
+baseline body (asserting AIC was NOT silently activated by verifying
+the output is not one of the AIC predictor footprints); a baseline-
+header passthrough test asserts `decode_picture_layer` produces an
+identical `YuvFrame` to `decode_picture` for the existing QCIF INTRA
+fixture; a caller-on-wire-on AIC OR-merge test; an OPPTYPE DF auto-
+wiring test (uniform AIC INTRA picture survives deblocking unchanged);
+and four explicit `Error::NotImplemented` refusals for SAC,
+slice-structured, custom-format, and `UFEP="000"` PLUSPTYPE pictures
+(each test writes a minimally valid PLUSPTYPE header with the
+relevant bit set and asserts the shim refuses cleanly). `cargo test
+-p oxideav-h263` reports 378 passed (previously 369).
+
+The new entry point closes the "PLUSPTYPE→aic auto-wiring" item from
+the workspace README's r196 "lacks" tail. The remaining §I work and
+its dependencies stay the same: Annex K Slice-Structured driver
+dispatch (the §K.2 slice-header parser lands per-macroblock-row
+rather than per GOB and would mis-frame the GOB-walker; refused by
+the shim) and PB-frames.
+
+---
+
 **Round 21 (workspace round 196) — Annex I §I.2 / §I.3 macroblock-grid
 driver wiring. The `aic_intra_reconstruct_coefficients` +
 `aic_intra_reconstruct_samples` primitives that landed in round 20 are

@@ -8,6 +8,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- PLUSPTYPE → `DecodeOptions` auto-wiring driver entry point
+  (round 202):
+  - `decode_picture_layer(data, reference, options)` new public
+    function in `picture.rs`. Dispatches `parse_picture_layer` between
+    the baseline and extended-PTYPE paths and runs the shared
+    `decode_after_picture_header` inner driver. On the `Extended` arm,
+    `plus_ptype_to_baseline_shim` validates the picture against the
+    driver's supported-layer-set (UFEP=001, one of the five standardised
+    source formats, no custom-PCF, no CPM, no SAC, no SS, no IS, no
+    AIV, no MQ, no RRU, INTRA/INTER picture type only, UMV either off
+    or with `UUI = "1"`) and refuses anything else with
+    `Error::NotImplemented` rather than mis-framing.
+  - The shim OR-merges the wire-signalled `advanced_intra` and
+    `deblocking` flags into the caller's `DecodeOptions` so an AIC- or
+    DF-mode picture decodes correctly without the caller having to
+    pre-set the option flags. UMV / Advanced Prediction wire flags
+    drive the matching parser paths through the synthetic baseline
+    header (no `DecodeOptions` plumbing needed).
+  - The inner driver was refactored: the body of `decode_picture`
+    after `parse_picture_header` became a shared
+    `decode_after_picture_header(reader, header, reference, options)`
+    helper. `decode_picture` now wraps `parse_picture_header` +
+    `decode_after_picture_header`. The legacy entry point retains its
+    `Error::ExtendedPtypeNotSupported` rejection of `"111"`
+    source-format pictures.
+  - 9 new tests: a synthetic QCIF PLUSPTYPE AIC INTRA picture decoded
+    through `decode_picture_layer` with `DecodeOptions::default()`
+    reproduces the round-21 baseline-header AIC `+1` prediction
+    footprint (pixel 130 / 132 / 132 / 134); a PLUSPTYPE non-AIC INTRA
+    picture decodes through the §5.3 / §6.1 baseline body and does
+    NOT exhibit any AIC-predictor pixel value; a baseline-header
+    passthrough test asserts `decode_picture_layer` produces an
+    identical frame to `decode_picture` for the existing QCIF INTRA
+    fixture; a caller-on-wire-on OR-merge test for AIC; an OPPTYPE-DF
+    auto-wiring test (uniform AIC picture survives the deblocking
+    filter unchanged); and four explicit `Error::NotImplemented`
+    refusals for SAC, slice-structured, custom-format, and
+    `UFEP="000"` PLUSPTYPE pictures.
+- `decode_picture_layer` re-exported from the crate root alongside
+  `decode_picture` / `DecodeOptions` / `YuvFrame`.
+
 - Annex I §I.2 / §I.3 macroblock-grid driver wiring (round 196):
   - `DecodeOptions::aic` opt-in switches the picture driver to the
     Advanced INTRA Coding code path. When set, every INTRA macroblock
