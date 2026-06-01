@@ -247,7 +247,10 @@ pub use motion::{
     RemoteMv, H0, H1, H2, MV_HALF_MAX, MV_HALF_MIN, MV_HALF_SPAN, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN,
     OBMC_WEIGHT_SUM, RCONTROL_DEFAULT,
 };
-pub use picture::{decode_picture, decode_picture_layer, DecodeOptions, YuvFrame};
+pub use picture::{
+    decode_picture, decode_picture_layer, decode_picture_layer_with_inherited, DecodeOptions,
+    DecodePictureOutcome, YuvFrame,
+};
 pub use picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
     H263PictureHeader, H263PictureLayer, H263SourceFormat, PSC_BITS, PSC_VALUE,

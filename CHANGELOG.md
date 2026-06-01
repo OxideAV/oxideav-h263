@@ -8,6 +8,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §5.1.4.4 / §5.1.4.5 PLUSPTYPE inherited-state stream driver
+  (round 208):
+  - `decode_picture_layer_with_inherited(data, reference, options,
+    inherited)` new public function in `picture.rs`. Stream-aware
+    counterpart to `decode_picture_layer`: accepts caller-supplied
+    [`InheritedExtendedState`] and returns a `DecodePictureOutcome`
+    carrying the decoded frame and the next-inherited snapshot the
+    caller should thread into the following picture's decode.
+  - `InheritedExtendedState` extended from the single-field
+    `custom_pcf` snapshot into a full §5.1.4.4 mode + source-format
+    capture: `source_format: Option<PlusSourceFormat>` (None when no
+    prior UFEP=001 has been seen — UFEP=000 picture refused in that
+    case), `umv`, `advanced_prediction`, `advanced_intra`, `deblocking`
+    (refused-mode bits SAC / SS / IS / AIV / MQ / RPS are not retained
+    because a follow-up UFEP=000 inheriting any of them would have
+    already been refused at the prior UFEP=001 picture).
+    `InheritedExtendedState::from_opptype` captures the snapshot from a
+    parsed `Opptype`.
+  - `plus_ptype_to_baseline_shim` extended to take `inherited`; on a
+    UFEP=000 picture it falls back to the snapshot for source-format
+    and OPPTYPE mode bits instead of refusing immediately.
+  - §5.1.4.5 rule 1 — UMV (Annex D) and Advanced Prediction (Annex F)
+    are inferred-off in I-pictures even when the inherited snapshot
+    has them on. The override is applied to the synthetic baseline
+    header the shim builds; the returned snapshot preserves the
+    un-overridden stream state so a subsequent P-picture re-enables
+    the modes without needing another UFEP=001.
+  - §5.1.4.5 rule 3 — a baseline-PTYPE picture resets the outgoing
+    snapshot to `InheritedExtendedState::default()` (all modes off,
+    `source_format: None`).
+  - `DecodePictureOutcome { frame, inherited }` new public struct
+    re-exported from the crate root alongside the new entry point.
+  - 7 new tests: UFEP=000 INTRA PLUSPTYPE picture with caller-supplied
+    AIC-on snapshot reproduces the round-21 baseline-header AIC `+1`
+    prediction footprint (130/132/132/134) and passes the snapshot
+    through unchanged; UFEP=000 with no prior UFEP=001 (`source_format
+    = None`) refused with `Error::NotImplemented`; UFEP=001 picture
+    captures the OPPTYPE into `outcome.inherited`; baseline-PTYPE
+    picture clears the snapshot to default; `decode_picture_layer`
+    matches the new entry point's frame on a UFEP=001 PLUSPTYPE AIC
+    picture; §5.1.4.5 rule-1 override (UFEP=000 INTRA inheriting
+    UMV=on / AP=on decodes cleanly, snapshot preserved un-overridden);
+    `InheritedExtendedState::from_opptype` captures only the driver-
+    staged bits.
+- `decode_picture_layer_with_inherited` / `DecodePictureOutcome`
+  re-exported from the crate root alongside `decode_picture` /
+  `decode_picture_layer` / `DecodeOptions` / `YuvFrame`.
+
 - PLUSPTYPE → `DecodeOptions` auto-wiring driver entry point
   (round 202):
   - `decode_picture_layer(data, reference, options)` new public

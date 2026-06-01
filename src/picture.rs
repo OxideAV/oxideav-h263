@@ -519,15 +519,112 @@ pub fn decode_picture_layer(
     reference: Option<&YuvFrame>,
     options: DecodeOptions,
 ) -> Result<YuvFrame> {
+    decode_picture_layer_with_inherited(data, reference, options, InheritedExtendedState::default())
+        .map(|outcome| outcome.frame)
+}
+
+/// Decoded picture together with the inherited-state snapshot that the
+/// next UFEP=000 picture in the same bitstream should be decoded with
+/// (§5.1.4.4 / §5.1.4.5).
+///
+/// Returned by [`decode_picture_layer_with_inherited`] so callers driving
+/// a multi-picture stream can thread the snapshot forward without
+/// re-implementing the §5.1.4.4 inheritance rules. The snapshot reflects
+/// the *just-decoded* picture: on a UFEP=001 picture it is captured from
+/// the parsed OPPTYPE; on a UFEP=000 picture it equals the input
+/// `inherited` unchanged (UFEP=000 cannot redefine the mode state); on a
+/// baseline-PTYPE picture it is reset to the spec default (§5.1.4.5
+/// rule 3 — a non-PLUSPTYPE picture clears all inferred mode state).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodePictureOutcome {
+    /// The decoded planar YUV 4:2:0 frame.
+    pub frame: YuvFrame,
+    /// The inherited-state snapshot the next picture in this bitstream
+    /// should be decoded with (§5.1.4.4).
+    pub inherited: InheritedExtendedState,
+}
+
+/// Decode a single H.263 picture from `data`, threading caller-supplied
+/// inherited-state through the PLUSPTYPE path so a `UFEP = "000"`
+/// extended picture can be decoded by inheriting its OPPTYPE mode bits
+/// and source-format from the prior `UFEP = "001"` picture (§5.1.4.4).
+///
+/// This is the stream-aware counterpart to [`decode_picture_layer`]:
+/// where that function pins `inherited` to [`InheritedExtendedState::default`]
+/// and only accepts UFEP=001 PLUSPTYPE pictures, this one accepts both
+/// UFEP variants and returns the next-inherited snapshot the caller
+/// should thread into the following picture's decode. Callers driving
+/// a multi-picture bitstream construct the snapshot like:
+///
+/// ```ignore
+/// let mut inherited = InheritedExtendedState::default();
+/// for picture_data in pictures {
+///     let outcome = decode_picture_layer_with_inherited(
+///         picture_data, prev_frame.as_ref(), options, inherited,
+///     )?;
+///     inherited = outcome.inherited;
+///     prev_frame = Some(outcome.frame);
+/// }
+/// ```
+///
+/// `inherited` supplies:
+/// * the source format the UFEP=000 picture takes from the prior
+///   UFEP=001 OPPTYPE (§5.1.4.4 / §5.1.4.5),
+/// * the Annex D UMV, Annex F Advanced Prediction, Annex I Advanced
+///   INTRA Coding, and Annex J Deblocking bits the UFEP=000 picture
+///   inherits,
+/// * the custom-PCF gate the parser needs to know whether the §5.1.8
+///   ETR field follows.
+///
+/// §5.1.4.5 rule 1 ("UMV / Advanced Prediction do not apply within
+/// I-pictures") is applied *after* inheritance: the snapshot keeps the
+/// stream-level state so a subsequent P-picture re-enables the mode
+/// without needing another UFEP=001 picture.
+///
+/// §5.1.4.5 rule 3 ("a picture without PLUSPTYPE clears all inferred
+/// mode state") is applied to the returned snapshot: passing a
+/// baseline-PTYPE picture resets the outgoing `inherited` to
+/// [`InheritedExtendedState::default`].
+///
+/// Errors are the union of [`decode_picture_layer`]'s, plus
+/// [`Error::NotImplemented`] for a UFEP=000 picture whose `inherited`
+/// has `source_format == None` (the caller has not yet seen a UFEP=001
+/// picture to inherit from).
+pub fn decode_picture_layer_with_inherited(
+    data: &[u8],
+    reference: Option<&YuvFrame>,
+    options: DecodeOptions,
+    inherited: InheritedExtendedState,
+) -> Result<DecodePictureOutcome> {
     let mut reader = BitReader::new(data);
-    let layer = parse_picture_layer(&mut reader, InheritedExtendedState::default())?;
+    let layer = parse_picture_layer(&mut reader, inherited)?;
     match layer {
         H263PictureLayer::Baseline(header) => {
-            decode_after_picture_header(&mut reader, &header, reference, options)
+            let frame = decode_after_picture_header(&mut reader, &header, reference, options)?;
+            // §5.1.4.5 rule 3 — a picture without PLUSPTYPE clears all
+            // inferred mode state.
+            Ok(DecodePictureOutcome {
+                frame,
+                inherited: InheritedExtendedState::default(),
+            })
         }
         H263PictureLayer::Extended(extended) => {
-            let (header, options) = plus_ptype_to_baseline_shim(&extended, options)?;
-            decode_after_picture_header(&mut reader, &header, reference, options)
+            let next_inherited = match extended.plus.opptype {
+                // §5.1.4.4 rule — UFEP=001 establishes the inherited
+                // state. We snapshot the OPPTYPE for the next picture.
+                Some(o) => InheritedExtendedState::from_opptype(o),
+                // UFEP=000 picture: inherited state passes through
+                // unchanged (the spec keeps the snapshot until the next
+                // UFEP=001 or non-PLUSPTYPE picture).
+                None => inherited,
+            };
+            let (header, shim_options) =
+                plus_ptype_to_baseline_shim(&extended, options, inherited)?;
+            let frame = decode_after_picture_header(&mut reader, &header, reference, shim_options)?;
+            Ok(DecodePictureOutcome {
+                frame,
+                inherited: next_inherited,
+            })
         }
     }
 }
@@ -547,25 +644,11 @@ pub fn decode_picture_layer(
 fn plus_ptype_to_baseline_shim(
     extended: &H263ExtendedPicture,
     options: DecodeOptions,
+    inherited: InheritedExtendedState,
 ) -> Result<(H263PictureHeader, DecodeOptions)> {
-    // We need an OPPTYPE to know the source format; UFEP="000" inherits
-    // state this single-picture API does not retain.
-    let opptype = extended.plus.opptype.ok_or(Error::NotImplemented)?;
-
-    // §5.1.4.2 — refuse the modes the driver does not stage.
-    if opptype.sac
-        || opptype.slice_structured
-        || opptype.independent_segment_decoding
-        || opptype.alternative_inter_vlc
-        || opptype.modified_quantization
-        || opptype.custom_pcf
-        || extended.plus.cpm
-        || extended.plus.mpptype.reduced_resolution_update
-    {
-        return Err(Error::NotImplemented);
-    }
-
     // §5.1.4.3 — only INTRA / INTER picture types are decodable here.
+    // Resolve this first because §5.1.4.5 rule 1 inference (UMV / AP
+    // off in I-pictures) needs the picture-type code below.
     let coding_type = match extended.plus.mpptype.picture_type {
         PlusPictureType::Intra => H263PictureCodingType::Intra,
         PlusPictureType::Inter => H263PictureCodingType::Inter,
@@ -575,11 +658,102 @@ fn plus_ptype_to_baseline_shim(
         _ => return Err(Error::NotImplemented),
     };
 
+    // §5.1.4.4 — resolve the effective OPPTYPE mode bits + source
+    // format. UFEP=001 reads them straight from the parsed OPPTYPE;
+    // UFEP=000 inherits them from the snapshot the caller threads
+    // through. A UFEP=000 picture with no prior snapshot (the
+    // `source_format = None` default) is undecodable: refuse per the
+    // "single-picture API does not retain inherited state" boundary
+    // unless the caller has explicitly supplied state.
+    let (
+        source_format_plus,
+        opptype_custom_pcf,
+        opptype_umv,
+        opptype_advanced_prediction,
+        opptype_advanced_intra,
+        opptype_deblocking,
+        // Refused-mode bits — we still need to short-circuit when an
+        // inherited OPPTYPE had them set, even though the only way to
+        // reach this code path with such a snapshot is for the prior
+        // UFEP=001 picture to also have been refused. The check is
+        // defence-in-depth.
+        opptype_sac,
+        opptype_slice_structured,
+        opptype_independent_segment_decoding,
+        opptype_alternative_inter_vlc,
+        opptype_modified_quantization,
+    ) = match extended.plus.opptype {
+        Some(o) => (
+            o.source_format,
+            o.custom_pcf,
+            o.umv,
+            o.advanced_prediction,
+            o.advanced_intra,
+            o.deblocking,
+            o.sac,
+            o.slice_structured,
+            o.independent_segment_decoding,
+            o.alternative_inter_vlc,
+            o.modified_quantization,
+        ),
+        None => {
+            let src = inherited.source_format.ok_or(Error::NotImplemented)?;
+            (
+                src,
+                inherited.custom_pcf,
+                inherited.umv,
+                inherited.advanced_prediction,
+                false, // AIC inherited bit (see below)
+                false, // DF inherited bit (see below)
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+        }
+    };
+
+    // §5.1.4.2 — refuse the modes the driver does not stage.
+    if opptype_sac
+        || opptype_slice_structured
+        || opptype_independent_segment_decoding
+        || opptype_alternative_inter_vlc
+        || opptype_modified_quantization
+        || opptype_custom_pcf
+        || extended.plus.cpm
+        || extended.plus.mpptype.reduced_resolution_update
+    {
+        return Err(Error::NotImplemented);
+    }
+
+    // §5.1.4.4 / §5.1.4.5: capture the AIC / DF bits separately. On
+    // UFEP=001 they come from the just-parsed OPPTYPE; on UFEP=000 they
+    // are inherited from the snapshot.
+    let advanced_intra_effective = match extended.plus.opptype {
+        Some(_) => opptype_advanced_intra,
+        None => inherited.advanced_intra,
+    };
+    let deblocking_effective = match extended.plus.opptype {
+        Some(_) => opptype_deblocking,
+        None => inherited.deblocking,
+    };
+
+    // §5.1.4.5 rule 1 — UMV (Annex D) and Advanced Prediction (Annex F)
+    // do not apply within I-pictures. Apply the inferred-off override
+    // *after* inheritance: the snapshot keeps the stream-level state so
+    // a subsequent P-picture re-enables the mode without needing
+    // another UFEP=001.
+    let (umv_effective, ap_effective) = match coding_type {
+        H263PictureCodingType::Intra => (false, false),
+        H263PictureCodingType::Inter => (opptype_umv, opptype_advanced_prediction),
+    };
+
     // §5.1.4.2 — map the standardised PLUSPTYPE source-format codes
     // onto their baseline `H263SourceFormat` equivalents. The Custom
     // variant needs CPFMT-driven GOB-layout tables this driver does
     // not stage.
-    let source_format = match opptype.source_format {
+    let source_format = match source_format_plus {
         PlusSourceFormat::SubQcif => H263SourceFormat::SubQcif,
         PlusSourceFormat::Qcif => H263SourceFormat::Qcif,
         PlusSourceFormat::Cif => H263SourceFormat::Cif,
@@ -589,8 +763,12 @@ fn plus_ptype_to_baseline_shim(
     };
 
     // §5.1.9 — when UMV is on, only the `"1"` (Limited) UUI form maps
-    // onto the existing [`reconstruct_mv_umv`] extended range.
-    if opptype.umv {
+    // onto the existing [`reconstruct_mv_umv`] extended range. UUI is
+    // present iff UMV is on AND UFEP=001 (parse_plus_ptype gate); on a
+    // UFEP=000 inheritance path the parser already consumed no UUI and
+    // we trust the prior UFEP=001 to have established a `Limited` range
+    // for that to have decoded successfully.
+    if umv_effective && extended.plus.opptype.is_some() {
         match extended.plus.uui {
             Some(Uui::Limited) => {}
             _ => return Err(Error::NotImplemented),
@@ -604,9 +782,9 @@ fn plus_ptype_to_baseline_shim(
         freeze_release: extended.prefix.freeze_release,
         source_format,
         coding_type,
-        umv_mode: opptype.umv,
+        umv_mode: umv_effective,
         sac_mode: false,
-        advanced_prediction: opptype.advanced_prediction,
+        advanced_prediction: ap_effective,
         pb_frames: false,
     };
 
@@ -614,10 +792,11 @@ fn plus_ptype_to_baseline_shim(
     // wire can switch them on, the caller can force them on, but
     // neither can turn the other off (callers wanting to suppress the
     // wire flags must go through the lower-level
-    // [`parse_picture_layer`] + bespoke driver).
+    // [`parse_picture_layer`] + bespoke driver). For UFEP=000 the
+    // "wire-signalled" value is the inherited snapshot.
     let options = DecodeOptions {
-        deblock: options.deblock || opptype.deblocking,
-        aic: options.aic || opptype.advanced_intra,
+        deblock: options.deblock || deblocking_effective,
+        aic: options.aic || advanced_intra_effective,
     };
 
     Ok((header, options))
@@ -3834,10 +4013,13 @@ mod tests {
         assert!(matches!(r, Err(Error::NotImplemented)));
     }
 
-    /// `UFEP = "000"` (MPPTYPE-only, no OPPTYPE) is refused: without
-    /// the OPPTYPE source-format field we have no in-band signal for
-    /// the picture dimensions. This is the documented "single-picture
-    /// API does not retain inherited state" boundary.
+    /// `UFEP = "000"` (MPPTYPE-only, no OPPTYPE) is refused by
+    /// [`decode_picture_layer`]: without an inherited-state snapshot
+    /// the source-format field is not in band. This is the documented
+    /// "single-picture API does not retain inherited state" boundary;
+    /// callers driving a multi-picture stream use
+    /// [`decode_picture_layer_with_inherited`] instead (see the
+    /// `decode_picture_layer_with_inherited_*` tests below).
     #[test]
     fn decode_picture_layer_plus_refuses_mandatory_only_ufep() {
         let mut w = BitWriter::new();
@@ -3863,5 +4045,288 @@ mod tests {
         let data = w.finish();
         let r = decode_picture_layer(&data, None, DecodeOptions::default());
         assert!(matches!(r, Err(Error::NotImplemented)));
+    }
+
+    /// Build a QCIF UFEP=000 PLUSPTYPE INTRA picture body matching the
+    /// existing `build_qcif_plus_aic_intra_dc_plus1_picture` /
+    /// `build_qcif_intra_dc_picture` shapes:
+    ///
+    /// * When `aic_in_body == true` — every block carries a single
+    ///   absorbed-DC LEVEL=+1 event (AIC §I.3), mirroring the
+    ///   `build_qcif_plus_aic_intra_dc_plus1_picture(true, _)` body.
+    /// * When `aic_in_body == false` — every block carries an INTRADC
+    ///   FLC byte = 0x10 (DC = 128), mirroring the
+    ///   `build_qcif_intra_dc_picture(0x10)` body, suitable for the
+    ///   "inherited state activates the baseline §6.1 path" case.
+    fn build_qcif_plus_ufep0_intra_dc_plus1_picture(aic_in_body: bool) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_u32(0b111, 3); // extended PTYPE
+        w.write_u32(0b000, 3); // UFEP = "000" — no OPPTYPE
+                               // MPPTYPE: INTRA, RPR=0, RRU=0, RTYPE=0, reserved 0,0,
+                               // SCE-guard bit 9 = 1.
+        w.write_u32(0b000, 3); // picture type
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+        w.write_bit(false); // CPM
+                            // No CPFMT / EPAR / CPCFC / ETR / UUI / SSS — those are
+                            // UFEP=001-only or gated off in this configuration.
+                            //
+                            // 9 GOBs × 11 MBs.
+        for _gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for _mb in 0..11 {
+                if aic_in_body {
+                    // MCBPC = `011` (Table 7 idx 3 — INTRA + CBPC = "11").
+                    w.write_u32(0b011, 3);
+                    // INTRA_MODE = `0` (DcOnly).
+                    w.write_bit(false);
+                    // CBPY(INTRA) = "1111" → Table-12 row 15 = `11`.
+                    w.write_u32(0b11, 2);
+                    // Six blocks, each a single absorbed-DC LEVEL=+1
+                    // event (Table I.2 LAST=1 RUN=0 |LEVEL|=1 = `0111`
+                    // then sign bit = 0 → +1).
+                    for _blk in 0..6 {
+                        w.write_u32(0b0111, 4);
+                        w.write_bit(false);
+                    }
+                } else {
+                    // Baseline INTRA path (no INTRA_MODE field).
+                    // MCBPC = `1` -> I-picture INTRA, cbpc 00.
+                    w.write_bit(true);
+                    // CBPY = "0011" (Table 12 idx 0 → CBPY(INTRA)=0000).
+                    w.write_bit(false);
+                    w.write_bit(false);
+                    w.write_bit(true);
+                    w.write_bit(true);
+                    // Six blocks, each just INTRADC FLC = 0x10 → DC=128.
+                    for _blk in 0..6 {
+                        w.write_u32(0x10, 8);
+                    }
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// `UFEP = "000"` PLUSPTYPE picture with caller-supplied inherited
+    /// state decodes through the §5.1.4.4 inheritance path: the source
+    /// format and the OPPTYPE AIC bit are inherited from the prior
+    /// UFEP=001 OPPTYPE, and the picture is decoded as an AIC INTRA
+    /// QCIF picture identical to the round-22 wire-on PLUSPTYPE AIC
+    /// case (`pixel 130 / 132 / 132 / 134` at the top-left macroblock).
+    #[test]
+    fn decode_picture_layer_with_inherited_ufep0_intra_aic_uses_inherited_state() {
+        let data = build_qcif_plus_ufep0_intra_dc_plus1_picture(true);
+        let inherited = InheritedExtendedState {
+            custom_pcf: false,
+            source_format: Some(PlusSourceFormat::Qcif),
+            umv: false,
+            advanced_prediction: false,
+            advanced_intra: true,
+            deblocking: false,
+        };
+        let outcome =
+            decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited)
+                .expect("UFEP=000 PLUSPTYPE AIC picture with inherited state should decode");
+        // Top-left macroblock AIC §I.3 prediction footprint (matches
+        // the round-21 `decode_qcif_aic_intra_dc_plus1_predicts_across_blocks`
+        // expectations).
+        assert_eq!(outcome.frame.y[0], 130, "block 0 top-left luma sample");
+        assert_eq!(outcome.frame.y[8], 132, "block 1 top-left luma sample");
+        assert_eq!(
+            outcome.frame.y[176 * 8],
+            132,
+            "block 2 top-left luma sample"
+        );
+        assert_eq!(
+            outcome.frame.y[176 * 8 + 8],
+            134,
+            "block 3 top-left luma sample"
+        );
+        // §5.1.4.4 — UFEP=000 picture leaves the inherited snapshot
+        // untouched for the next picture.
+        assert_eq!(
+            outcome.inherited, inherited,
+            "UFEP=000 passes the snapshot through unchanged"
+        );
+    }
+
+    /// `UFEP = "000"` PLUSPTYPE picture with no prior `UFEP = "001"`
+    /// (the [`InheritedExtendedState::default`] / `source_format = None`
+    /// case) is refused with [`Error::NotImplemented`] — there is no
+    /// in-band source-format field and no inherited one to fall back to.
+    #[test]
+    fn decode_picture_layer_with_inherited_ufep0_no_prior_refused() {
+        let data = build_qcif_plus_ufep0_intra_dc_plus1_picture(false);
+        let r = decode_picture_layer_with_inherited(
+            &data,
+            None,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        );
+        assert!(matches!(r, Err(Error::NotImplemented)));
+    }
+
+    /// `UFEP = "001"` PLUSPTYPE picture captures its OPPTYPE into the
+    /// returned [`DecodePictureOutcome::inherited`] so the caller can
+    /// thread the snapshot into the next UFEP=000 picture (§5.1.4.4).
+    #[test]
+    fn decode_picture_layer_with_inherited_ufep1_captures_snapshot_for_next_picture() {
+        let data = build_qcif_plus_aic_intra_dc_plus1_picture(true, true);
+        let outcome = decode_picture_layer_with_inherited(
+            &data,
+            None,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("UFEP=001 picture decodes");
+        assert_eq!(
+            outcome.inherited,
+            InheritedExtendedState {
+                custom_pcf: false,
+                source_format: Some(PlusSourceFormat::Qcif),
+                umv: false,
+                advanced_prediction: false,
+                advanced_intra: true,
+                deblocking: true,
+            },
+            "UFEP=001 OPPTYPE snapshot captured into outcome.inherited"
+        );
+    }
+
+    /// Baseline-PTYPE picture clears the inherited snapshot per §5.1.4.5
+    /// rule 3 — once a non-PLUSPTYPE picture appears, all inferred mode
+    /// state resets to the spec default ("off").
+    #[test]
+    fn decode_picture_layer_with_inherited_baseline_clears_snapshot() {
+        let data = build_qcif_intra_dc_picture(0x10);
+        let primed = InheritedExtendedState {
+            custom_pcf: true,
+            source_format: Some(PlusSourceFormat::Cif),
+            umv: true,
+            advanced_prediction: true,
+            advanced_intra: true,
+            deblocking: true,
+        };
+        let outcome =
+            decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), primed)
+                .expect("baseline picture decodes regardless of inherited snapshot");
+        assert_eq!(
+            outcome.inherited,
+            InheritedExtendedState::default(),
+            "§5.1.4.5 rule 3 — baseline PTYPE clears all inferred mode state"
+        );
+    }
+
+    /// `decode_picture_layer` (the snapshot-less convenience wrapper)
+    /// matches `decode_picture_layer_with_inherited` on its frame output
+    /// for a UFEP=001 PLUSPTYPE AIC INTRA picture — the new entry point
+    /// is a strict superset that returns the same frame plus the
+    /// outgoing snapshot.
+    #[test]
+    fn decode_picture_layer_with_inherited_matches_legacy_entry_on_ufep1() {
+        let data = build_qcif_plus_aic_intra_dc_plus1_picture(true, false);
+        let legacy = decode_picture_layer(&data, None, DecodeOptions::default()).expect("legacy");
+        let outcome = decode_picture_layer_with_inherited(
+            &data,
+            None,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("new entry");
+        assert_eq!(outcome.frame, legacy, "frames match");
+    }
+
+    /// §5.1.4.5 rule 1 — UMV / Advanced Prediction do not apply within
+    /// I-pictures. A UFEP=000 INTRA picture inheriting UMV=on from a
+    /// prior UFEP=001 P-picture must decode with UMV disabled in the
+    /// effective header (otherwise the I-picture body that does NOT
+    /// carry UMV motion bits would mis-frame). We verify the rule by
+    /// noting that the UFEP=000 INTRA picture decodes cleanly even when
+    /// the snapshot carries `umv: true` — the rule-1 override forces UMV
+    /// off in the synthetic baseline header the shim builds, and the
+    /// returned snapshot preserves the un-overridden stream state so a
+    /// subsequent P-picture re-enables the mode.
+    #[test]
+    fn decode_picture_layer_with_inherited_ufep0_intra_overrides_inherited_umv() {
+        let data = build_qcif_plus_ufep0_intra_dc_plus1_picture(true);
+        let inherited = InheritedExtendedState {
+            custom_pcf: false,
+            source_format: Some(PlusSourceFormat::Qcif),
+            // UMV / AP from a prior P-picture's OPPTYPE — both must be
+            // §5.1.4.5-rule-1-overridden to `off` for this INTRA picture
+            // even though they remain `on` in the snapshot.
+            umv: true,
+            advanced_prediction: true,
+            advanced_intra: true,
+            deblocking: false,
+        };
+        let outcome =
+            decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited)
+                .expect(
+                "UFEP=000 INTRA picture inheriting UMV=on should still decode (rule 1 override)",
+            );
+        assert_eq!(outcome.frame.y[0], 130, "AIC prediction footprint intact");
+        // Snapshot preserved un-overridden (so the next P-picture
+        // re-enables UMV / AP without needing another UFEP=001).
+        assert!(
+            outcome.inherited.umv,
+            "rule 1 override does not mutate the snapshot"
+        );
+        assert!(
+            outcome.inherited.advanced_prediction,
+            "rule 1 override does not mutate the snapshot"
+        );
+    }
+
+    /// [`InheritedExtendedState::from_opptype`] captures only the bits
+    /// the driver stages; refused mode bits (SAC / SS / IS / AIV / MQ /
+    /// RPS) are dropped because a UFEP=000 picture inheriting any of
+    /// them would have already been refused at the prior UFEP=001
+    /// picture.
+    #[test]
+    fn inherited_extended_state_from_opptype_captures_only_staged_bits() {
+        let snap = InheritedExtendedState::from_opptype(crate::plus_ptype::Opptype {
+            source_format: PlusSourceFormat::Cif,
+            custom_pcf: true,
+            umv: true,
+            sac: false,
+            advanced_prediction: true,
+            advanced_intra: true,
+            deblocking: true,
+            slice_structured: false,
+            reference_picture_selection: false,
+            independent_segment_decoding: false,
+            alternative_inter_vlc: false,
+            modified_quantization: false,
+        });
+        assert_eq!(
+            snap,
+            InheritedExtendedState {
+                custom_pcf: true,
+                source_format: Some(PlusSourceFormat::Cif),
+                umv: true,
+                advanced_prediction: true,
+                advanced_intra: true,
+                deblocking: true,
+            }
+        );
     }
 }

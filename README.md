@@ -5,6 +5,92 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 23 (workspace round 208) — §5.1.4.4 / §5.1.4.5 PLUSPTYPE
+inherited-state stream driver. The single-picture `decode_picture_layer`
+entry point gets a stream-aware counterpart that retains the OPPTYPE
+mode bits across pictures so a `UFEP = "000"` PLUSPTYPE header (which
+omits OPPTYPE on the wire and inherits its mode flags + source format
+from the prior `UFEP = "001"` picture) can be decoded:**
+
+* `decode_picture_layer_with_inherited(data, reference, options,
+  inherited)` (new public entry point in `picture.rs`): takes a
+  caller-supplied [`InheritedExtendedState`] snapshot and returns a
+  `DecodePictureOutcome { frame, inherited }` carrying the decoded
+  frame plus the next-inherited snapshot the caller should thread into
+  the following picture's decode. Callers driving a multi-picture
+  bitstream initialise `inherited` to
+  `InheritedExtendedState::default()` and re-thread `outcome.inherited`
+  from each call into the next.
+* `InheritedExtendedState` extended from the round-21 single-field
+  `custom_pcf` snapshot to a full §5.1.4.4 mode + source-format capture:
+  `source_format: Option<PlusSourceFormat>` (None when no prior
+  UFEP=001 has been seen), `umv`, `advanced_prediction`,
+  `advanced_intra`, `deblocking`. Refused-mode bits (SAC / SS / IS /
+  AIV / MQ / RPS) are not retained — a UFEP=000 inheriting any of them
+  would already have been refused at the prior UFEP=001 picture, so
+  carrying them adds no information.
+* `InheritedExtendedState::from_opptype` builds the snapshot from a
+  parsed `Opptype` (used by the new driver to capture the snapshot
+  whenever a UFEP=001 picture decodes successfully).
+* `plus_ptype_to_baseline_shim` extended to consult the snapshot on
+  UFEP=000: instead of refusing immediately, it pulls source format
+  and OPPTYPE mode bits from `inherited.source_format`,
+  `inherited.umv`, `inherited.advanced_prediction`,
+  `inherited.advanced_intra`, `inherited.deblocking`. A UFEP=000
+  picture with `inherited.source_format == None` is still refused
+  (the boundary "no prior UFEP=001 → no inheritable state" survives).
+* §5.1.4.5 rule 1 — "UMV / Advanced Prediction do not apply within
+  I-pictures" is applied **after** inheritance: the shim forces both
+  bits off in the synthetic baseline header it builds for an
+  I-picture, but the returned snapshot preserves the un-overridden
+  stream state. A subsequent P-picture inheriting the same snapshot
+  picks up the unmodified UMV / AP bits and re-enables the modes
+  without needing another UFEP=001 picture.
+* §5.1.4.5 rule 3 — "a picture without PLUSPTYPE clears all inferred
+  mode state" is applied to the returned snapshot: passing a
+  baseline-PTYPE picture into the new entry point resets
+  `outcome.inherited` to `InheritedExtendedState::default()`
+  regardless of the input snapshot's contents.
+* `DecodePictureOutcome` re-exported from the crate root alongside the
+  new entry point.
+
+The legacy `decode_picture_layer` is now a thin wrapper that pins
+`inherited = InheritedExtendedState::default()` and unwraps the
+outcome's `frame` field, so its single-picture contract is unchanged:
+UFEP=000 PLUSPTYPE pictures are still refused with
+`Error::NotImplemented` through that entry point (callers wanting
+UFEP=000 must use the new stream-aware entry point).
+
+7 new tests land alongside the wiring: a synthetic QCIF UFEP=000
+PLUSPTYPE INTRA picture with a caller-supplied AIC-on snapshot decodes
+through `decode_picture_layer_with_inherited`, reproducing the
+round-21 baseline-header AIC `+1` prediction footprint (`pixel 130 /
+132 / 132 / 134`) at the top-left macroblock; the same picture
+decoded against `InheritedExtendedState::default()` (no prior UFEP=001)
+is refused with `Error::NotImplemented`; a UFEP=001 picture captures
+its OPPTYPE bits into `outcome.inherited` so the next picture's
+inheritance is correctly seeded (the snapshot matches every OPPTYPE
+mode bit field-by-field); a baseline-PTYPE picture decoded with a
+pre-primed snapshot returns `outcome.inherited ==
+InheritedExtendedState::default()` (§5.1.4.5 rule-3 reset);
+`decode_picture_layer` matches `decode_picture_layer_with_inherited`'s
+`outcome.frame` for a UFEP=001 PLUSPTYPE AIC INTRA picture (the new
+entry point is a strict superset of the legacy one); a UFEP=000 INTRA
+picture inheriting `umv: true, advanced_prediction: true` from a
+prior P-picture's OPPTYPE decodes cleanly under the §5.1.4.5 rule-1
+override and the returned snapshot still has both flags set (so the
+next P-picture re-enables UMV / AP); and
+`InheritedExtendedState::from_opptype` captures only the driver-
+staged bits (SAC / SS / IS / AIV / MQ / RPS are dropped). `cargo test
+-p oxideav-h263` reports 385 passed (previously 378).
+
+The round closes the "UFEP=000 inherited-state" item from the
+workspace README's r202 "lacks" tail. The remaining "lacks" items
+stay the same: Annex K Slice-Structured driver, PB-frames (Annex G /
+M), custom-format (CPFMT / EPAR-driven dimensions).
+
+---
+
 **Round 22 (workspace round 202) — PLUSPTYPE → `DecodeOptions`
 auto-wiring driver entry point. A new `decode_picture_layer` public
 function dispatches `parse_picture_layer` between the baseline and

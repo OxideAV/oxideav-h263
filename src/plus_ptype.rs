@@ -94,19 +94,70 @@ pub const OPPTYPE_SRCFMT_CUSTOM: u32 = 0b110;
 pub const PAR_CODE_EXTENDED: u32 = 0b1111;
 
 /// State carried from a prior `UFEP = "001"` picture header that a
-/// `UFEP = "000"` header inherits (§5.1.4.4 / §5.1.8).
+/// `UFEP = "000"` header inherits (§5.1.4.4 / §5.1.4.5 / §5.1.8).
 ///
-/// When `UFEP = "000"` the OPPTYPE bits are absent, so whether a custom
-/// PCF is in use (which gates the §5.1.8 ETR field) cannot be read from
-/// the current header — it is inferred from the last `UFEP = "001"`
-/// picture. The caller supplies that inherited state; for a fresh
-/// stream where no prior `UFEP = "001"` was seen, the spec default of
-/// "no custom PCF" applies (`Default`).
+/// When `UFEP = "000"` the OPPTYPE bits are absent, so the optional-mode
+/// flags and the source-format field cannot be read from the current
+/// header — they are inferred from the last `UFEP = "001"` picture
+/// (§5.1.4.4). The caller maintains that snapshot between picture
+/// decodes; for a fresh stream where no prior `UFEP = "001"` was seen,
+/// the spec default ("no modes in use") applies via [`Default`].
+///
+/// Only the modes the driver actually stages are retained: source
+/// format, the Annex D UMV bit, the Annex F Advanced Prediction bit,
+/// the Annex I Advanced INTRA Coding bit, the Annex J Deblocking bit,
+/// and the §5.1.8 custom-PCF gate. Mode bits the driver refuses (SAC,
+/// SS, IS, AIV, MQ, RPS) are not carried; a UFEP=000 inheriting one of
+/// them would have already been refused at the prior UFEP=001 picture.
+///
+/// Capture the snapshot from a parsed [`Opptype`] via [`Self::from_opptype`]
+/// after a UFEP=001 picture decodes successfully, then thread it into
+/// the next call's [`Self::default`] slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InheritedExtendedState {
     /// Whether a custom picture clock frequency was last signalled in
     /// use (gates §5.1.8 ETR presence when `UFEP = "000"`).
     pub custom_pcf: bool,
+    /// §5.1.4.4 — source format from the last UFEP=001 OPPTYPE, used to
+    /// size the inherited picture. `None` means no prior UFEP=001 has
+    /// been seen (a UFEP=000 picture is undecodable in that case).
+    pub source_format: Option<PlusSourceFormat>,
+    /// §5.1.4.4 / §5.1.4.5 — Annex D UMV mode bit from the last
+    /// UFEP=001 OPPTYPE. §5.1.4.5 rule 1 inhibits UMV inside an I-picture
+    /// (the rule applies *after* inheritance, so this field is the
+    /// uninhibited stream state; the picture driver applies the rule).
+    pub umv: bool,
+    /// §5.1.4.4 / §5.1.4.5 — Annex F Advanced Prediction mode bit from
+    /// the last UFEP=001 OPPTYPE. §5.1.4.5 rule 1 inhibits AP inside an
+    /// I-picture.
+    pub advanced_prediction: bool,
+    /// §5.1.4.4 — Annex I Advanced INTRA Coding mode bit from the last
+    /// UFEP=001 OPPTYPE.
+    pub advanced_intra: bool,
+    /// §5.1.4.4 — Annex J Deblocking Filter mode bit from the last
+    /// UFEP=001 OPPTYPE.
+    pub deblocking: bool,
+}
+
+impl InheritedExtendedState {
+    /// Build the inherited snapshot the next UFEP=000 picture needs from
+    /// the just-parsed [`Opptype`] of a UFEP=001 picture (§5.1.4.4).
+    ///
+    /// Only the mode bits the [`crate::decode_picture_layer`] driver
+    /// honours are retained; mode bits the driver refuses (SAC, SS, IS,
+    /// AIV, MQ, RPS) are dropped since a follow-up UFEP=000 inheriting
+    /// any of them would already have been refused at this UFEP=001
+    /// picture.
+    pub fn from_opptype(opptype: Opptype) -> Self {
+        Self {
+            custom_pcf: opptype.custom_pcf,
+            source_format: Some(opptype.source_format),
+            umv: opptype.umv,
+            advanced_prediction: opptype.advanced_prediction,
+            advanced_intra: opptype.advanced_intra,
+            deblocking: opptype.deblocking,
+        }
+    }
 }
 
 /// Picture-type code from MPPTYPE bits 1-3 (§5.1.4.3).
@@ -867,7 +918,10 @@ mod tests {
         while !w.is_byte_aligned() {
             w.write_bit(false);
         }
-        let inherited = InheritedExtendedState { custom_pcf: true };
+        let inherited = InheritedExtendedState {
+            custom_pcf: true,
+            ..InheritedExtendedState::default()
+        };
         let hdr = parse(&w.finish(), inherited).expect("parse");
         assert_eq!(hdr.ufep, 0b000);
         assert!(hdr.opptype.is_none());
