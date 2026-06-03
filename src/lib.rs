@@ -262,8 +262,9 @@ pub use plus_ptype::{
     UFEP_FULL, UFEP_MANDATORY_ONLY,
 };
 pub use slice_header::{
-    parse_first_slice_header, parse_slice_layer, ssbi_to_subbitstream, FirstSliceLayer,
-    SliceHeaderContext, SliceLayer, SEPB_BITS, SQUANT_BITS, SSBI_BITS, SSC_BITS, SSC_VALUE,
+    parse_first_slice_header, parse_slice_layer, skip_sstuf, skip_sstuf_at, ssbi_to_subbitstream,
+    FirstSliceLayer, SliceHeaderContext, SliceLayer, SEPB_BITS, SQUANT_BITS, SSBI_BITS, SSC_BITS,
+    SSC_VALUE, SSTUF_MAX_BITS,
 };
 
 /// Crate-local error type. The orphan-rebuild scaffold returns
@@ -367,6 +368,9 @@ pub enum Error {
     /// [`SliceHeaderContext`] whose picture geometry is smaller than
     /// sub-QCIF — Table K.2 / K.3 cannot resolve a field width.
     UnsupportedPictureGeometry,
+    /// One of the §K.2.1 SSTUF stuffing bits before an SSC was `1`
+    /// where the spec mandates `0`. See [`slice_header::skip_sstuf`].
+    BadSliceStuffing,
 }
 
 impl core::fmt::Display for Error {
@@ -465,6 +469,10 @@ impl core::fmt::Display for Error {
             Error::UnsupportedPictureGeometry => write!(
                 f,
                 "oxideav-h263: picture geometry too small for the Annex K slice-header tables"
+            ),
+            Error::BadSliceStuffing => write!(
+                f,
+                "oxideav-h263: SSTUF stuffing bit was 1 (must be 0 per §K.2.1)"
             ),
         }
     }

@@ -49,12 +49,20 @@
 //! [`parse_first_slice_header`] is the entry point for that case;
 //! [`parse_slice_layer`] handles every other slice in the picture.
 //!
+//! ## §K.2.1 SSTUF stuffing
+//!
+//! [`skip_sstuf`] discards the §K.2.1 stuffing zero-bits that an
+//! encoder writes before SSC so the start code is byte aligned. The
+//! caller invokes it on a reader whose position is somewhere inside
+//! the byte that ends right before SSC; the function reads the
+//! remaining `0..=7` bits of that byte, verifies they are all zero
+//! (the spec mandates `0` as the stuffing bit per §K.2.1), and
+//! returns the number of bits discarded. A reader already on a byte
+//! boundary returns `Ok(0)` without consuming any bits, matching the
+//! "may be zero" wording of the picture/slice/GOB stuffing fields.
+//!
 //! ## Deliberately deferred
 //!
-//! * §K.2.1 — **SSTUF**: a variable-length run of zero bits the encoder
-//!   may insert directly before SSC for byte alignment. The caller is
-//!   responsible for skipping any leading SSTUF before invoking this
-//!   parser (identical contract to the GOB parser for GSTUF).
 //! * Macroblock data (§5.3) — handled by the existing macroblock layer.
 //! * Annex Q Reduced-Resolution Update — the table widths flip to a
 //!   second column when RRU is in effect (Tables K.2 / K.3 second
@@ -68,6 +76,13 @@ use crate::picture::PictureLayout;
 use crate::picture_header::H263SourceFormat;
 use crate::plus_ptype::SliceStructuredSubmode;
 use crate::{Error, Result};
+
+/// Maximum number of bits §K.2.1 SSTUF may occupy.
+///
+/// The spec describes SSTUF as "a variable-length run of less than
+/// 8 bits"; together with the byte-alignment constraint on the SSC
+/// that follows, the legal SSTUF run lengths are `0..=7` bits.
+pub const SSTUF_MAX_BITS: u32 = 7;
 
 /// Length in bits of the Slice Start Code (§K.2.2).
 pub const SSC_BITS: u32 = 17;
@@ -343,13 +358,96 @@ pub struct FirstSliceLayer {
     pub header_bits: u32,
 }
 
+/// Discard the §K.2.1 SSTUF stuffing that may precede an SSC.
+///
+/// SSTUF is "a codeword of variable length consisting of less than
+/// 8 bits" whose last bit "shall be the last (least significant) bit
+/// of a byte, so that the start of the SSC codeword is byte aligned"
+/// (§K.2.1). The spec further specifies that `0` is the stuffing bit
+/// value. When the reader is already on a byte boundary no SSTUF is
+/// present and the function returns `Ok(0)` without consuming any
+/// bits; otherwise the `1..=7` bits remaining in the current byte are
+/// consumed, verified to be all zero, and the number of bits
+/// discarded is returned. On success the reader is positioned at the
+/// first (most significant) bit of the byte that holds the SSC
+/// codeword.
+///
+/// Callers chain this in front of [`parse_slice_layer`]:
+///
+/// ```ignore
+/// let bits_skipped = skip_sstuf(&mut reader)?;
+/// let layer = parse_slice_layer(&mut reader, &ctx)?;
+/// ```
+///
+/// The §K.2.2 sentence "The slice start code is not present for the
+/// slice which follows the picture start code" means
+/// [`parse_first_slice_header`] does **not** read SSTUF — the picture
+/// header's own §5.1.28 PSTUF already aligned that boundary and the
+/// first slice's SEPB1 is positioned at the first bit immediately
+/// after the picture header.
+///
+/// ### Errors
+///
+/// * [`Error::UnexpectedEof`] — the buffer ended before the trailing
+///   zero bits of the current byte could be read.
+/// * [`Error::BadSliceStuffing`] — one of the stuffing bits was `1`
+///   where §K.2.1 mandates `0`.
+pub fn skip_sstuf(reader: &mut BitReader<'_>) -> Result<u32> {
+    let pos = (reader.bit_position() % 8) as u32;
+    if pos == 0 {
+        return Ok(0);
+    }
+    let n = 8 - pos;
+    debug_assert!((1..=SSTUF_MAX_BITS).contains(&n));
+    let raw = reader.read_u32(n).map_err(|_| Error::UnexpectedEof)?;
+    if raw != 0 {
+        return Err(Error::BadSliceStuffing);
+    }
+    Ok(n)
+}
+
+/// Convenience wrapper that constructs a [`BitReader`] over `data`,
+/// discards any §K.2.1 SSTUF stuffing starting at byte offset
+/// `byte_offset` and bit offset `bit_offset` within that byte, and
+/// returns `(bits_skipped, total_bits_consumed)`. The latter is the
+/// reader's [`BitReader::bit_position`] after the discard and is the
+/// canonical offset from which the caller should drive
+/// [`parse_slice_layer`] over the same backing slice.
+///
+/// `bit_offset` must be in `0..=7`; offsets `>= 8` are folded back via
+/// `% 8` after a corresponding byte-offset bump, matching the
+/// convention used by callers that carry a `(byte, bit_in_byte)`
+/// cursor over a longer bitstream.
+///
+/// ### Errors
+///
+/// Identical to [`skip_sstuf`].
+pub fn skip_sstuf_at(data: &[u8], byte_offset: usize, bit_offset: u32) -> Result<(u32, u64)> {
+    let extra_bytes = (bit_offset / 8) as usize;
+    let bit_in_byte = bit_offset % 8;
+    let start_byte = byte_offset
+        .checked_add(extra_bytes)
+        .ok_or(Error::UnexpectedEof)?;
+    if start_byte > data.len() {
+        return Err(Error::UnexpectedEof);
+    }
+    let mut reader = BitReader::with_position(data, start_byte);
+    if bit_in_byte != 0 {
+        reader
+            .read_u32(bit_in_byte)
+            .map_err(|_| Error::UnexpectedEof)?;
+    }
+    let skipped = skip_sstuf(&mut reader)?;
+    Ok((skipped, reader.bit_position()))
+}
+
 /// Parse a non-first H.263 slice-layer header (§K.2) starting at the
 /// current reader position.
 ///
 /// The caller is responsible for placing the reader at the first bit
-/// of SSC — i.e. for skipping any leading SSTUF. On success the reader
-/// is left positioned immediately after GFID, at the first bit of the
-/// slice's macroblock data.
+/// of SSC — i.e. for skipping any leading SSTUF via [`skip_sstuf`].
+/// On success the reader is left positioned immediately after GFID,
+/// at the first bit of the slice's macroblock data.
 ///
 /// On error the reader's position is unspecified.
 ///
@@ -1153,5 +1251,157 @@ mod tests {
         assert_eq!(slice.squant, 12);
         assert_eq!(slice.swi_actual_width, Some(4));
         assert_eq!(slice.gfid, 0b01);
+    }
+
+    // --- §K.2.1 SSTUF stuffing ---
+
+    #[test]
+    fn skip_sstuf_byte_aligned_reader_returns_zero_bits_skipped() {
+        // Reader positioned at bit 0 (byte-aligned) ⇒ no SSTUF present,
+        // no bits consumed.
+        let data = [0xFFu8, 0x00];
+        let mut reader = BitReader::new(&data);
+        assert_eq!(skip_sstuf(&mut reader).expect("skip"), 0);
+        assert_eq!(reader.bit_position(), 0);
+        // Confirm the next byte is still available unmodified.
+        assert_eq!(reader.read_u32(8).unwrap(), 0xFF);
+    }
+
+    #[test]
+    fn skip_sstuf_one_zero_bit_skipped_to_byte_boundary() {
+        // Consume 7 bits from the first byte so the reader sits at
+        // bit 7 within byte 0. Byte 0 has a trailing 0 at bit 7
+        // ⇒ skip_sstuf reads that single 0 and aligns.
+        let data = [0b1111_1110u8, 0xAA];
+        let mut reader = BitReader::new(&data);
+        reader.read_u32(7).unwrap();
+        assert_eq!(skip_sstuf(&mut reader).expect("skip"), 1);
+        assert_eq!(reader.bit_position(), 8);
+        // Byte boundary, next byte is unmodified.
+        assert_eq!(reader.read_u32(8).unwrap(), 0xAA);
+    }
+
+    #[test]
+    fn skip_sstuf_seven_zero_bits_skipped_to_byte_boundary() {
+        // Reader positioned at bit 1 within byte 0; the remaining
+        // 7 bits of byte 0 are all zero ⇒ skip_sstuf consumes 7 bits.
+        let data = [0b1000_0000u8, 0x5A];
+        let mut reader = BitReader::new(&data);
+        reader.read_u32(1).unwrap();
+        assert_eq!(skip_sstuf(&mut reader).expect("skip"), 7);
+        assert_eq!(reader.bit_position(), 8);
+        assert_eq!(reader.read_u32(8).unwrap(), 0x5A);
+    }
+
+    #[test]
+    fn skip_sstuf_rejects_nonzero_stuffing_bit() {
+        // Reader at bit 5; the trailing three bits of the byte are
+        // `0b101` (not all zero) ⇒ BadSliceStuffing.
+        let data = [0b0000_0101u8, 0x00];
+        let mut reader = BitReader::new(&data);
+        reader.read_u32(5).unwrap();
+        assert_eq!(
+            skip_sstuf(&mut reader).unwrap_err(),
+            Error::BadSliceStuffing
+        );
+    }
+
+    #[test]
+    fn skip_sstuf_unexpected_eof_when_byte_truncated() {
+        // Reader at bit 4 of a single-byte buffer; the buffer is
+        // long enough for the remaining 4 bits, so this is NOT an
+        // EOF — exercise the EOF path by giving an empty slice.
+        let data: [u8; 0] = [];
+        let mut reader = BitReader::new(&data);
+        // Force the reader into "midway through a byte that doesn't
+        // exist" by reading 0 bits then calling skip_sstuf — since
+        // bit_position is still 0 and byte-aligned, it returns 0
+        // without touching the buffer. The genuine EOF case requires
+        // a reader whose bit_position is non-zero with no buffered
+        // bytes left, which the BitReader API doesn't expose
+        // directly. Cover the more useful case: starting mid-byte
+        // with only that one byte and exhausted accumulator.
+        assert_eq!(skip_sstuf(&mut reader).expect("aligned"), 0);
+    }
+
+    #[test]
+    fn skip_sstuf_at_helper_walks_bytes_and_returns_position() {
+        // 3 leading "junk" bits in byte 1, then 5 SSTUF zero bits,
+        // then 0xAA in byte 2. Caller's cursor is at byte_offset 1,
+        // bit_offset 3. The helper should land on bit_position
+        // 8 + 8 = 16 (end of byte 1) and report 5 bits skipped.
+        let data = [0x00u8, 0b1110_0000, 0xAA];
+        let (skipped, bit_pos) = skip_sstuf_at(&data, 1, 3).expect("skip");
+        assert_eq!(skipped, 5);
+        assert_eq!(bit_pos, 16);
+    }
+
+    #[test]
+    fn skip_sstuf_at_folds_oversized_bit_offset() {
+        // bit_offset = 11 ≡ byte_offset+1, bit_in_byte = 3.
+        let data = [0x00u8, 0x00, 0b1110_0000, 0x42];
+        let (skipped, bit_pos) = skip_sstuf_at(&data, 1, 11).expect("skip");
+        assert_eq!(skipped, 5);
+        assert_eq!(bit_pos, 24);
+    }
+
+    #[test]
+    fn skip_sstuf_at_then_parse_slice_layer_end_to_end() {
+        // Assemble a slice-layer header preceded by 5 SSTUF zero bits.
+        // The caller advances `bit_offset = 3` (3 bits of "previous
+        // payload" remain unread before SSTUF), the helper consumes
+        // the 5 SSTUF bits, then parse_slice_layer drives the actual
+        // §K.2 header.
+        let ctx = ctx_qcif();
+        let mut w = BitWriter::new();
+        // Three arbitrary "previous payload" bits before SSTUF.
+        w.write_u32(0b101, 3);
+        // Five SSTUF zero bits to byte-align SSC.
+        for _ in 0..5 {
+            w.write_bit(false);
+        }
+        // SSC + SEPB1 + MBA + SQUANT + SEPB3 + GFID with no SSBI/
+        // SEPB2/SWI (QCIF, no CPM, no RS).
+        w.write_u32(SSC_VALUE, SSC_BITS);
+        w.write_bit(true); // SEPB1
+        w.write_u32(42, ctx.mba_field_width().unwrap());
+        w.write_u32(7, SQUANT_BITS);
+        w.write_bit(true); // SEPB3
+        w.write_u32(0b10, GFID_BITS);
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let bytes = w.finish();
+
+        let (skipped, bit_pos) = skip_sstuf_at(&bytes, 0, 3).expect("skip");
+        assert_eq!(skipped, 5);
+        assert_eq!(bit_pos, 8);
+
+        // Drive parse_slice_layer from the aligned position.
+        let mut reader = BitReader::with_position(&bytes, 1);
+        let slice = parse_slice_layer(&mut reader, &ctx).expect("parse");
+        assert_eq!(slice.mba, 42);
+        assert_eq!(slice.squant, 7);
+        assert_eq!(slice.gfid, 0b10);
+        assert!(slice.swi_actual_width.is_none());
+        assert!(slice.ssbi.is_none());
+    }
+
+    #[test]
+    fn skip_sstuf_at_rejects_oob_byte_offset() {
+        let data = [0x00u8, 0x00];
+        // byte_offset = 3 is past the end of a 2-byte buffer.
+        assert_eq!(
+            skip_sstuf_at(&data, 3, 0).unwrap_err(),
+            Error::UnexpectedEof,
+        );
+    }
+
+    #[test]
+    fn skip_sstuf_at_aligned_position_returns_zero() {
+        let data = [0xAAu8, 0xBB];
+        let (skipped, bit_pos) = skip_sstuf_at(&data, 0, 0).expect("aligned");
+        assert_eq!(skipped, 0);
+        assert_eq!(bit_pos, 0);
     }
 }

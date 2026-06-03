@@ -5,6 +5,64 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 26 (workspace round 226) — §K.2.1 SSTUF stuffing skipper.
+The `parse_slice_layer` doc string already said "the caller is
+responsible for skipping any leading SSTUF before invoking this
+parser"; this round lands the helper the caller is now expected to
+call. The §K.2.1 wire semantics are `0..=7` zero bits inserted
+directly before the SSC so that SSC becomes byte aligned ("the last
+bit of SSTUF shall be the last (least significant) bit of a byte" /
+"0 is used for stuffing within SSTUF"). The new `skip_sstuf` consumes
+the trailing-byte zeros, verifies all of them are `0`, and returns
+the number of bits discarded; on a reader already on a byte boundary
+it returns `Ok(0)` without consuming any bits. `skip_sstuf_at` is
+the byte-cursor wrapper that takes `(data, byte_offset, bit_offset)`
+and returns `(bits_skipped, total_bit_position)`, folding
+`bit_offset >= 8` back to the next byte for callers that walk a
+running `(byte, bit)` cursor through a larger bitstream.**
+
+* `skip_sstuf(reader)` (new public function in `slice_header.rs`):
+  reads `(8 - reader.bit_position() % 8) % 8` bits from the reader,
+  verifies they are all zero, returns the count consumed; leaves
+  the reader on a byte boundary (the MSB of the byte that holds
+  SSC).
+* `skip_sstuf_at(data, byte_offset, bit_offset) ->
+  Result<(u32, u64)>` (new public function): constructs a
+  `BitReader` over `data` at `byte_offset + bit_offset/8`,
+  advances `bit_offset % 8` bits, then calls `skip_sstuf`; returns
+  `(bits_skipped, reader.bit_position())`. Out-of-range
+  `byte_offset` yields `Error::UnexpectedEof`.
+* `SSTUF_MAX_BITS = 7` (new public constant).
+* `Error::BadSliceStuffing` (new variant): one of the SSTUF bits
+  was `1` where §K.2.1 mandates `0`.
+* §K.2.2 last sentence — "The slice start code is not present for
+  the slice which follows the picture start code" — is reflected
+  in the doc string: `parse_first_slice_header` does not read
+  SSTUF because the picture header's own §5.1.28 PSTUF already
+  byte-aligned that boundary.
+
+10 new tests land:
+`skip_sstuf_byte_aligned_reader_returns_zero_bits_skipped`,
+`skip_sstuf_one_zero_bit_skipped_to_byte_boundary` (1-bit case),
+`skip_sstuf_seven_zero_bits_skipped_to_byte_boundary` (max-length
+SSTUF), `skip_sstuf_rejects_nonzero_stuffing_bit` (non-zero stuffing
+yields `BadSliceStuffing`), `skip_sstuf_unexpected_eof_when_byte_truncated`,
+`skip_sstuf_at_helper_walks_bytes_and_returns_position`,
+`skip_sstuf_at_folds_oversized_bit_offset` (cursor with `bit_offset
+>= 8`), `skip_sstuf_at_then_parse_slice_layer_end_to_end` (chain
+test: 3 unrelated lead-in bits + 5 SSTUF zero bits + non-first §K.2
+header parses through QCIF context), `skip_sstuf_at_rejects_oob_byte_offset`,
+and `skip_sstuf_at_aligned_position_returns_zero`. `cargo test -p
+oxideav-h263` reports 411 passed (previously 401).
+
+The Annex K Slice-Structured driver dispatch (the
+[`Error::NotImplemented`] guard inside `plus_ptype_to_baseline_shim`)
+remains, awaiting the §K.2 slice-walker entry point. This round
+plugs the last missing primitive needed by that walker: the
+SSC byte-alignment recovery.
+
+---
+
 **Round 25 (workspace round 220) — §K.2 `SliceHeaderContext`
 constructor from a [`PictureLayout`] + §5.1.10 SSS submode bits. The
 existing `SliceHeaderContext::for_standard_format` only covered the

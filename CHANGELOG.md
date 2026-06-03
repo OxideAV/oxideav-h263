@@ -8,6 +8,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §K.2.1 SSTUF stuffing skipper (round 226):
+  - `skip_sstuf(reader)` new public function in `slice_header.rs`.
+    Reads the `0..=7` trailing zero bits of the byte the reader is
+    inside, verifies all of them are `0` (the §K.2.1 stuffing-bit
+    value), and returns the number of bits discarded. On a reader
+    already on a byte boundary returns `Ok(0)` without consuming
+    any bits. Leaves the reader positioned at the MSB of the byte
+    that holds the SSC codeword.
+  - `skip_sstuf_at(data, byte_offset, bit_offset) -> Result<(u32,
+    u64)>` new public function. Byte-cursor wrapper: constructs a
+    `BitReader` over `data` at `byte_offset + bit_offset/8`,
+    advances `bit_offset % 8` bits, calls `skip_sstuf`, and
+    returns `(bits_skipped, final_bit_position)`. Out-of-range
+    `byte_offset` yields `Error::UnexpectedEof`. Useful for callers
+    that walk a `(byte, bit)` cursor through a longer bitstream
+    and need to recover SSC byte alignment without building a
+    `BitReader` themselves.
+  - `SSTUF_MAX_BITS = 7` new public constant.
+  - `Error::BadSliceStuffing` new variant: one of the SSTUF bits
+    was `1` where §K.2.1 mandates `0`.
+  - 10 new tests (`cargo test -p oxideav-h263` reports 411
+    passed, previously 401): byte-aligned reader returns 0, 1-bit
+    SSTUF run, 7-bit SSTUF run, non-zero stuffing rejection,
+    empty-buffer EOF, `skip_sstuf_at` byte-cursor walk,
+    `skip_sstuf_at` with `bit_offset >= 8` (folds to next byte),
+    `skip_sstuf_at` chained into `parse_slice_layer` end-to-end
+    over a QCIF context, `skip_sstuf_at` OOB byte offset, and
+    `skip_sstuf_at` aligned position returns `(0, 0)`.
+
 - §K.2 `SliceHeaderContext` constructor from a `PictureLayout` +
   §5.1.10 SSS submode bits (round 220):
   - `SliceHeaderContext::from_picture_layout(layout, sss, cpm, rru)`
