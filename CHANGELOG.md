@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §K.2 `SliceHeaderContext` constructor from a `PictureLayout` +
+  §5.1.10 SSS submode bits (round 220):
+  - `SliceHeaderContext::from_picture_layout(layout, sss, cpm, rru)`
+    new public constructor in `slice_header.rs`. Takes the canonical
+    `PictureLayout` (both the baseline and §4.2.1 / §5.1.5
+    custom-format luma-dimension carrier post-r214) plus the four
+    orthogonal mode flags the §K.2 syntax depends on
+    (`Option<SliceStructuredSubmode>`, CPM, RRU). The §K.2.5 /
+    §K.2.8 field-width lookups inside `SliceHeaderContext` already
+    pick the "first table entry that has an equal or larger number
+    of macroblocks" / "next standard format size which is equal or
+    larger in width" rule per §K.2.5 / §K.2.8 for custom picture
+    sizes, so the constructor is a shape adapter — no new table
+    data lands.
+  - The `arbitrary_order` bit of `SliceStructuredSubmode` does not
+    affect any §K.2 field width or value range — it only influences
+    slice scheduling at the driver layer — so it is intentionally
+    ignored by the constructor; only the `rectangular` bit
+    propagates to `rectangular_slices`.
+
 - §4.2.1 / §5.1.5 custom-source-format GOB-layout driver wiring
   (round 214):
   - `PictureLayout { luma_width, luma_height, num_gobs,

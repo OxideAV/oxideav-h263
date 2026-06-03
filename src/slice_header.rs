@@ -64,7 +64,9 @@
 
 use oxideav_core::bits::BitReader;
 
+use crate::picture::PictureLayout;
 use crate::picture_header::H263SourceFormat;
+use crate::plus_ptype::SliceStructuredSubmode;
 use crate::{Error, Result};
 
 /// Length in bits of the Slice Start Code (§K.2.2).
@@ -180,6 +182,47 @@ impl SliceHeaderContext {
             rectangular_slices: false,
             rru: false,
         })
+    }
+
+    /// Build a context from a [`PictureLayout`] + PLUSPTYPE-level
+    /// optional-mode bits.
+    ///
+    /// The slice-layer §K.2 syntax depends only on the picture's
+    /// **luma dimensions** plus the four orthogonal mode flags below;
+    /// the GOB-grid (`num_gobs` / `mb_rows_per_gob`) carried by
+    /// [`PictureLayout`] is irrelevant to the per-slice parse, but
+    /// [`PictureLayout`] is the canonical luma-dimension carrier for
+    /// both the fixed baseline source formats and the §4.2.1 / §5.1.5
+    /// PLUSPTYPE custom-format path, so accepting it lets one
+    /// constructor cover every wire-resolvable layout.
+    ///
+    /// * `sss` — §5.1.10 SSS submode bits (`None` ⇔ Slice-Structured
+    ///   mode is off; the caller should not be parsing slice headers
+    ///   at all in that case but the constructor still accepts it,
+    ///   returning a `rectangular_slices = false` context).
+    /// * `cpm` — picture-layer CPM (§5.1.20). Drives SSBI presence
+    ///   (§K.2.4) and the SEPB2 threshold (§K.2.6).
+    /// * `rru` — `true` iff the picture is in Reduced-Resolution
+    ///   Update mode (§Annex Q); selects the right-hand columns of
+    ///   Tables K.2 / K.3 for the MBA / SWI lookups.
+    ///
+    /// The `arbitrary_order` bit of [`SliceStructuredSubmode`] does
+    /// not affect any §K.2 field width or value range — it only
+    /// influences slice scheduling at the driver layer — so it is
+    /// not captured in the returned context.
+    pub fn from_picture_layout(
+        layout: &PictureLayout,
+        sss: Option<SliceStructuredSubmode>,
+        cpm: bool,
+        rru: bool,
+    ) -> SliceHeaderContext {
+        SliceHeaderContext {
+            picture_width: layout.luma_width,
+            picture_height: layout.luma_height,
+            cpm,
+            rectangular_slices: sss.map(|s| s.rectangular).unwrap_or(false),
+            rru,
+        }
     }
 
     /// §K.2.5 — width of the MBA field for this picture (bits).
@@ -980,5 +1023,135 @@ mod tests {
         use crate::gob_header::{GBSC_BITS, GBSC_VALUE};
         assert_eq!(SSC_VALUE, GBSC_VALUE);
         assert_eq!(SSC_BITS, GBSC_BITS);
+    }
+
+    // --- from_picture_layout constructor ---
+
+    #[test]
+    fn from_picture_layout_qcif_matches_for_standard_format() {
+        let layout = PictureLayout::for_source_format(H263SourceFormat::Qcif).unwrap();
+        let ctx = SliceHeaderContext::from_picture_layout(&layout, None, false, false);
+        let baseline = SliceHeaderContext::for_standard_format(H263SourceFormat::Qcif).unwrap();
+        // Same dimensions ⇒ same MBA / SWI / SEPB2 decisions.
+        assert_eq!(ctx.picture_width, baseline.picture_width);
+        assert_eq!(ctx.picture_height, baseline.picture_height);
+        assert_eq!(ctx.mba_field_width(), baseline.mba_field_width());
+        assert_eq!(ctx.mba_max_value(), baseline.mba_max_value());
+        assert_eq!(ctx.sepb2_present(), baseline.sepb2_present());
+    }
+
+    #[test]
+    fn from_picture_layout_cif_matches_for_standard_format() {
+        let layout = PictureLayout::for_source_format(H263SourceFormat::Cif).unwrap();
+        let ctx = SliceHeaderContext::from_picture_layout(&layout, None, false, false);
+        let baseline = SliceHeaderContext::for_standard_format(H263SourceFormat::Cif).unwrap();
+        assert_eq!(ctx.picture_width, baseline.picture_width);
+        assert_eq!(ctx.picture_height, baseline.picture_height);
+        assert_eq!(ctx.mba_field_width(), baseline.mba_field_width());
+    }
+
+    #[test]
+    fn from_picture_layout_none_sss_keeps_rs_off() {
+        let layout = PictureLayout::for_source_format(H263SourceFormat::Qcif).unwrap();
+        let ctx = SliceHeaderContext::from_picture_layout(&layout, None, false, false);
+        assert!(!ctx.rectangular_slices);
+        // RS off ⇒ SWI absent from the wire.
+        assert_eq!(ctx.swi_field_width(), None);
+    }
+
+    #[test]
+    fn from_picture_layout_rs_bit_enables_swi() {
+        let layout = PictureLayout::for_source_format(H263SourceFormat::Qcif).unwrap();
+        let sss = SliceStructuredSubmode {
+            rectangular: true,
+            arbitrary_order: false,
+        };
+        let ctx = SliceHeaderContext::from_picture_layout(&layout, Some(sss), false, false);
+        assert!(ctx.rectangular_slices);
+        // QCIF RS ⇒ SWI = 4 bits (Table K.3 row "QCIF").
+        assert_eq!(ctx.swi_field_width(), Some(4));
+    }
+
+    #[test]
+    fn from_picture_layout_arbitrary_order_alone_keeps_rs_off() {
+        // ASO bit set but RS bit cleared: §K.2 fields stay in the
+        // RS-off configuration (the ASO bit only affects slice
+        // scheduling at the driver layer, not per-slice parsing).
+        let layout = PictureLayout::for_source_format(H263SourceFormat::Qcif).unwrap();
+        let sss = SliceStructuredSubmode {
+            rectangular: false,
+            arbitrary_order: true,
+        };
+        let ctx = SliceHeaderContext::from_picture_layout(&layout, Some(sss), false, false);
+        assert!(!ctx.rectangular_slices);
+        assert_eq!(ctx.swi_field_width(), None);
+    }
+
+    #[test]
+    fn from_picture_layout_cpm_flag_propagates() {
+        // 4CIF + CPM: MBA width is 11, which makes SEPB2 present at the
+        // > 9 threshold for CPM = 1 per §K.2.6.
+        let layout = PictureLayout::for_source_format(H263SourceFormat::Cif4).unwrap();
+        let ctx = SliceHeaderContext::from_picture_layout(&layout, None, true, false);
+        assert!(ctx.cpm);
+        assert!(ctx.sepb2_present());
+    }
+
+    #[test]
+    fn from_picture_layout_rru_flag_propagates() {
+        let layout = PictureLayout::for_source_format(H263SourceFormat::Qcif).unwrap();
+        let ctx = SliceHeaderContext::from_picture_layout(&layout, None, false, true);
+        assert!(ctx.rru);
+        // Table K.2 QCIF RRU column ⇒ MBA = 6 bits (vs default 7).
+        assert_eq!(ctx.mba_field_width(), Some(6));
+    }
+
+    #[test]
+    fn from_picture_layout_custom_dimensions_pick_smallest_covering_row() {
+        // 240 × 176 — custom format. § K.2.5: "the field width is given
+        // by the first entry in the table that has an equal or larger
+        // number of macroblocks". 240 × 176 ⇒ 15 × 11 = 165 MBs;
+        // CIF (396) is the smallest covering entry ⇒ MBA width = 9.
+        let layout = PictureLayout::for_custom_dimensions(240, 176).unwrap();
+        let ctx = SliceHeaderContext::from_picture_layout(&layout, None, false, false);
+        assert_eq!(ctx.picture_width, 240);
+        assert_eq!(ctx.picture_height, 176);
+        assert_eq!(ctx.mba_field_width(), Some(9));
+        // Max MBA = (mb_count - 1) = 164.
+        assert_eq!(ctx.mba_max_value(), Some(164));
+    }
+
+    #[test]
+    fn from_picture_layout_custom_rs_swi_picks_next_standard_width() {
+        // 240 pixels wide. § K.2.8: "the field width is given by the
+        // next standard format size which is equal or larger in width".
+        // QCIF (176) is too narrow; CIF (352) is the next standard
+        // width ≥ 240 ⇒ SWI width = 5 bits (Table K.3 row "CIF").
+        let layout = PictureLayout::for_custom_dimensions(240, 176).unwrap();
+        let sss = SliceStructuredSubmode {
+            rectangular: true,
+            arbitrary_order: false,
+        };
+        let ctx = SliceHeaderContext::from_picture_layout(&layout, Some(sss), false, false);
+        assert_eq!(ctx.swi_field_width(), Some(5));
+    }
+
+    #[test]
+    fn from_picture_layout_parses_slice_header_end_to_end() {
+        // Round-trip: build a non-first slice header against the
+        // constructor's context, parse it back via parse_slice_layer.
+        let layout = PictureLayout::for_source_format(H263SourceFormat::Qcif).unwrap();
+        let sss = SliceStructuredSubmode {
+            rectangular: true,
+            arbitrary_order: false,
+        };
+        let ctx = SliceHeaderContext::from_picture_layout(&layout, Some(sss), false, false);
+        // SWI raw = 3 ⇒ actual slice width = 4 MBs.
+        let bytes = build_slice_header(&ctx, None, 7, 12, Some(3), 0b01);
+        let slice = parse_slice_layer(&mut BitReader::new(&bytes), &ctx).expect("parse");
+        assert_eq!(slice.mba, 7);
+        assert_eq!(slice.squant, 12);
+        assert_eq!(slice.swi_actual_width, Some(4));
+        assert_eq!(slice.gfid, 0b01);
     }
 }

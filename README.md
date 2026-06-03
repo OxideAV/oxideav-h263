@@ -5,6 +5,69 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 25 (workspace round 220) — §K.2 `SliceHeaderContext`
+constructor from a [`PictureLayout`] + §5.1.10 SSS submode bits. The
+existing `SliceHeaderContext::for_standard_format` only covered the
+five fixed baseline formats; the §K.2 slice-layer parser had no
+wire-driven constructor for the §4.2.1 / §5.1.5 PLUSPTYPE
+custom-format path or for the RS / ASO submodes signalled by §5.1.10
+SSS. The new `SliceHeaderContext::from_picture_layout` plugs that
+gap, taking the canonical [`PictureLayout`] (now both the baseline
+and custom-format luma-dimension carrier post-r214) plus the
+parsed `Option<SliceStructuredSubmode>` / CPM / RRU bits, and
+returning a context the §K.2 parser drives unmodified.**
+
+* `SliceHeaderContext::from_picture_layout(layout, sss, cpm, rru)`
+  (new public constructor in `slice_header.rs`): builds a context
+  from a [`PictureLayout`] plus the four orthogonal mode flags
+  the §K.2 syntax depends on (SSS / CPM / RRU). The §K.2.5 /
+  §K.2.8 field-width lookups inside [`SliceHeaderContext`] already
+  pick the "first table entry that has an equal or larger number
+  of macroblocks" / "next standard format size which is equal or
+  larger in width" per §K.2.5 / §K.2.8 for custom sizes, so the
+  constructor is just a shape adapter — no new table data lands.
+* The `arbitrary_order` bit of [`SliceStructuredSubmode`] does not
+  affect any §K.2 field width or value range — it only influences
+  slice scheduling at the driver layer — so it is intentionally
+  ignored by the constructor; only the `rectangular` bit propagates.
+  This is documented and pinned by a dedicated test
+  (`from_picture_layout_arbitrary_order_alone_keeps_rs_off`).
+
+10 new tests land alongside the constructor:
+`from_picture_layout_qcif_matches_for_standard_format` /
+`from_picture_layout_cif_matches_for_standard_format` (the new
+constructor matches the existing baseline path for the QCIF / CIF
+fixed formats); `from_picture_layout_none_sss_keeps_rs_off` /
+`from_picture_layout_rs_bit_enables_swi` /
+`from_picture_layout_arbitrary_order_alone_keeps_rs_off` (SSS bit
+propagation); `from_picture_layout_cpm_flag_propagates` (4CIF + CPM
+crosses the §K.2.6 `MBA > 9 with CPM=1` threshold ⇒ SEPB2 present);
+`from_picture_layout_rru_flag_propagates` (QCIF + RRU picks the
+Table K.2 right-hand column ⇒ MBA width = 6);
+`from_picture_layout_custom_dimensions_pick_smallest_covering_row`
+(240×176 custom picture lands in the CIF-covering row ⇒ MBA = 9 bits,
+max = 164) and `from_picture_layout_custom_rs_swi_picks_next_standard_width`
+(same custom size with RS on ⇒ SWI = 5 bits, the CIF row of Table
+K.3); plus `from_picture_layout_parses_slice_header_end_to_end`
+(round-trip: build a non-first RS slice header against the
+constructor's context, parse it back via `parse_slice_layer`).
+`cargo test -p oxideav-h263` reports 401 passed (previously 391).
+
+The constructor is the missing wiring between the canonical
+[`PictureLayout`] layout type and the §K.2 slice-layer parser. The
+parser itself (§K.2.2 SSC, §K.2.3 SEPB1, §K.2.4 SSBI, §K.2.5 MBA,
+§K.2.6 SEPB2, §K.2.7 SQUANT, §K.2.8 SWI, §K.2.9 SEPB3, §5.2.5 GFID),
+the [`PictureLayout`] dimensions, the §5.1.10 SSS parse, the CPM
+flag and the RRU bit all already exist — only the constructor was
+missing. The Annex K Slice-Structured driver dispatch (the
+[`Error::NotImplemented`] guard inside `plus_ptype_to_baseline_shim`)
+remains, awaiting a §K.2 slice-walker entry point and the §K.2.1
+SSTUF stripping; this round is the infrastructure under that walker,
+not the walker itself. The workspace README "lacks" tail still names
+the full SS driver dispatch and PB-frames (Annex G / M).
+
+---
+
 **Round 24 (workspace round 214) — §4.2.1 / §5.1.5 custom-source-format
 GOB-layout driver wiring. PLUSPTYPE pictures carrying source-format
 `"110"` (Custom) now decode end-to-end through `decode_picture_layer` /
