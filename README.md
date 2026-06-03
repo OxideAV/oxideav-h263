@@ -5,6 +5,79 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 24 (workspace round 214) — §4.2.1 / §5.1.5 custom-source-format
+GOB-layout driver wiring. PLUSPTYPE pictures carrying source-format
+`"110"` (Custom) now decode end-to-end through `decode_picture_layer` /
+`decode_picture_layer_with_inherited`, sized from the on-wire CPFMT
+(UFEP=001) or from the inherited snapshot (UFEP=000):**
+
+* `PictureLayout` (new public struct in `picture.rs`): captures the
+  `(luma_width, luma_height, num_gobs, mb_rows_per_gob)` the §4.2.1 GOB
+  walker needs. Decouples `decode_after_picture_header` from
+  `H263SourceFormat` so the same inner driver runs both the fixed
+  baseline formats and the custom-format path.
+* `PictureLayout::for_source_format(H263SourceFormat)` (new): resolves
+  the five fixed baseline formats to their §4.2.1 grids (`6 × 1` for
+  sub-QCIF, `9 × 1` for QCIF, `18 × 1` for CIF, `18 × 2` for 4CIF,
+  `18 × 4` for 16CIF).
+* `PictureLayout::for_custom_dimensions(luma_w, luma_h)` (new):
+  resolves a custom-format size to the §4.2.1 + Table-4 `k`-parameter
+  GOB grid. Table 4 maps the line count to `k = 1` for ≤400 lines,
+  `k = 2` for 404..=800, `k = 4` for 804..=1152; the number of GOBs is
+  `ceil(luma_h / (k * 16))` per the §4.2.1 truncated-bottom-GOB rule
+  (the last GOB may carry fewer than `k * 16` lines when the height is
+  not divisible by `k * 16`). Returns `None` for sizes outside the
+  `[4, 2048] × [4, 1152]` range and for spec-legal 4-aligned sizes
+  that are not 16-aligned (the per-MB raster requires
+  macroblock-aligned dimensions; spec-legal but non-MB-aligned sizes
+  remain refused at the driver boundary even though the parser
+  accepts them).
+* `plus_ptype_to_baseline_shim` rebuilt to return
+  `(H263PictureHeader, PictureLayout, DecodeOptions)`: on
+  `PlusSourceFormat::Custom` it reads CPFMT off
+  `extended.plus.cpfmt` when UFEP=001 or falls back to
+  `inherited.custom_dimensions` when UFEP=000, then derives the layout
+  through `PictureLayout::for_custom_dimensions`. The header's
+  `source_format` field is pinned to the reserved `H263SourceFormat::Reserved110`
+  placeholder in the custom-format path; the inner driver reads
+  dimensions exclusively from the `PictureLayout` argument and never
+  re-derives them from this field.
+* `InheritedExtendedState` extended with a new
+  `custom_dimensions: Option<(u32, u32)>` field — `Some` iff the
+  prior UFEP=001 picture carried `PlusSourceFormat::Custom`, holding
+  the parsed CPFMT `(width, height)`. UFEP=000 inheriting Custom
+  recovers the size from this field (CPFMT is absent on the wire for
+  UFEP=000). `InheritedExtendedState::from_opptype_with_cpfmt`
+  (new constructor) populates the field;
+  `InheritedExtendedState::from_opptype` leaves it `None`.
+
+7 new tests land alongside the wiring: a CPFMT-described 176×144
+PLUSPTYPE INTRA picture decodes through `decode_picture_layer` to a
+frame sample-bit-identical to the same body decoded under the fixed
+QCIF source format; `PictureLayout::for_custom_dimensions` table-4
+boundary tests for `k = 1`/`2`/`4` at the 400 / 416 / 800 / 816 /
+1152-line transitions and the truncated-bottom-GOB case at 432 lines;
+out-of-range / non-16-aligned rejection; `PictureLayout::for_source_format`
+resolves the five fixed baseline formats and refuses the reserved
+`"110"` code; a UFEP=001 picture carrying `PlusSourceFormat::Custom`
+captures its CPFMT-derived `(176, 144)` into the
+`outcome.inherited.custom_dimensions`; a UFEP=000 picture inheriting
+`PlusSourceFormat::Custom` + `custom_dimensions = Some((176, 144))`
+decodes the same body sample-bit-identically to the baseline QCIF
+path; and a UFEP=000 picture inheriting Custom with
+`custom_dimensions = None` is refused (no on-wire CPFMT, no inherited
+size → undecodable). `cargo test -p oxideav-h263` reports 391 passed
+(previously 385).
+
+The round closes the "custom-format (CPFMT / EPAR-driven dimensions)"
+item from the workspace README's r208 "lacks" tail. The remaining
+"lacks" items shrink to two: Annex K Slice-Structured driver dispatch
+and PB-frames (Annex G / M). Annex K's §K.2 slice-layer header parse
+landed in round 15 but the picture driver still walks GOB headers
+only; PB-frames need the §5.3.3 MODB / CBPB / MVDB layers.
+
+---
+
 **Round 23 (workspace round 208) — §5.1.4.4 / §5.1.4.5 PLUSPTYPE
 inherited-state stream driver. The single-picture `decode_picture_layer`
 entry point gets a stream-aware counterpart that retains the OPPTYPE

@@ -8,6 +8,51 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4.2.1 / §5.1.5 custom-source-format GOB-layout driver wiring
+  (round 214):
+  - `PictureLayout { luma_width, luma_height, num_gobs,
+    mb_rows_per_gob }` new public struct in `picture.rs`. Captures
+    the §4.2.1 GOB grid + dimensions the picture-decode walker uses;
+    decouples the inner driver from `H263SourceFormat`.
+  - `PictureLayout::for_source_format(H263SourceFormat)` resolves the
+    five fixed baseline formats to their §4.2.1 grids.
+  - `PictureLayout::for_custom_dimensions(luma_width, luma_height)`
+    resolves a custom-source-format size to the §4.2.1 + Table-4
+    `k`-parameter GOB grid (`k = 1` for ≤400 lines, `k = 2` for
+    404..=800, `k = 4` for 804..=1152; `num_gobs = ceil(height /
+    (k * 16))` with the §4.2.1 truncated-bottom-GOB rule when the
+    height is not an integer multiple of `k * 16`). Returns `None`
+    for sizes outside `[4, 2048] × [4, 1152]` and for spec-legal
+    4-aligned sizes that are not 16-aligned (the per-MB raster
+    requires macroblock-aligned dimensions).
+  - `decode_picture_layer` and `decode_picture_layer_with_inherited`
+    decode PLUSPTYPE pictures carrying source-format `"110"`
+    (Custom) end-to-end: UFEP=001 sizes the GOB grid from the
+    on-wire CPFMT; UFEP=000 sizes it from the inherited snapshot
+    (see below).
+  - `InheritedExtendedState` extended with a new
+    `custom_dimensions: Option<(u32, u32)>` field captured from the
+    last UFEP=001 picture's CPFMT (`Some` iff the prior UFEP=001
+    carried `PlusSourceFormat::Custom`).
+    `InheritedExtendedState::from_opptype_with_cpfmt(opptype, cpfmt)`
+    new constructor populates the field;
+    `InheritedExtendedState::from_opptype` continues to set it to
+    `None` for the fixed-format inheritance path.
+  - 7 new tests (`cargo test -p oxideav-h263` reports 391 passed,
+    previously 385): a CPFMT-described 176×144 PLUSPTYPE INTRA
+    picture decodes through `decode_picture_layer` to a frame
+    sample-bit-identical to the same body decoded under the fixed
+    QCIF source format; `PictureLayout::for_custom_dimensions`
+    table-4 boundary tests for `k = 1`/`2`/`4` at 400 / 416 / 800 /
+    816 / 1152 lines and the truncated-bottom-GOB case at 432 lines;
+    out-of-range / non-16-aligned rejection; UFEP=001 +
+    `PlusSourceFormat::Custom` captures the CPFMT-derived
+    `(176, 144)` into the snapshot's `custom_dimensions`; UFEP=000 +
+    inherited `PlusSourceFormat::Custom` + `custom_dimensions =
+    Some((176, 144))` decodes the same body sample-bit-identically;
+    and UFEP=000 + inherited Custom with `custom_dimensions = None`
+    is refused.
+
 - §5.1.4.4 / §5.1.4.5 PLUSPTYPE inherited-state stream driver
   (round 208):
   - `decode_picture_layer_with_inherited(data, reference, options,

@@ -122,6 +122,21 @@ pub struct InheritedExtendedState {
     /// size the inherited picture. `None` means no prior UFEP=001 has
     /// been seen (a UFEP=000 picture is undecodable in that case).
     pub source_format: Option<PlusSourceFormat>,
+    /// §5.1.4.4 / §5.1.5 — custom-format luma dimensions `(width, height)`
+    /// inherited from the last UFEP=001 picture's CPFMT.
+    ///
+    /// `Some` iff the prior UFEP=001 carried
+    /// [`PlusSourceFormat::Custom`] (with a CPFMT field on the wire).
+    /// `None` for fixed-format inheritance and for the
+    /// [`InheritedExtendedState::default`] "no prior UFEP=001" state.
+    ///
+    /// The dimensions are the parsed CPFMT values per §5.1.5
+    /// (`(PWI + 1) * 4` luma pixels by `PHI * 4` lines). A subsequent
+    /// UFEP=000 picture inheriting [`PlusSourceFormat::Custom`] reuses
+    /// these dimensions to size its GOB grid (§4.2.1 / Table 4); CPFMT
+    /// is absent from the wire on UFEP=000 so this is the only path
+    /// to recover the size.
+    pub custom_dimensions: Option<(u32, u32)>,
     /// §5.1.4.4 / §5.1.4.5 — Annex D UMV mode bit from the last
     /// UFEP=001 OPPTYPE. §5.1.4.5 rule 1 inhibits UMV inside an I-picture
     /// (the rule applies *after* inheritance, so this field is the
@@ -152,11 +167,28 @@ impl InheritedExtendedState {
         Self {
             custom_pcf: opptype.custom_pcf,
             source_format: Some(opptype.source_format),
+            custom_dimensions: None,
             umv: opptype.umv,
             advanced_prediction: opptype.advanced_prediction,
             advanced_intra: opptype.advanced_intra,
             deblocking: opptype.deblocking,
         }
+    }
+
+    /// Like [`Self::from_opptype`] but also captures the §5.1.5 CPFMT
+    /// when the OPPTYPE signalled a [`PlusSourceFormat::Custom`] source
+    /// format. The resulting snapshot can size a follow-up UFEP=000
+    /// inherited-Custom picture (CPFMT is absent on the wire there).
+    ///
+    /// When `opptype.source_format != PlusSourceFormat::Custom` the
+    /// `cpfmt` argument is ignored and the snapshot leaves
+    /// `custom_dimensions == None`.
+    pub fn from_opptype_with_cpfmt(opptype: Opptype, cpfmt: Option<CustomPictureFormat>) -> Self {
+        let mut state = Self::from_opptype(opptype);
+        if opptype.source_format == PlusSourceFormat::Custom {
+            state.custom_dimensions = cpfmt.map(|c| (c.luma_width(), c.luma_height()));
+        }
+        state
     }
 }
 

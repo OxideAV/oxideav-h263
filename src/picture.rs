@@ -52,8 +52,17 @@
 //!   structured mode (Annex K)**, the Annex-I prediction
 //!   reconstruction, and **GSTUF** auto-detection — all rejected /
 //!   skipped exactly as the per-layer parsers do.
-//! * **Custom picture formats** (the `"110"` / `"111"` source formats)
-//!   — the driver needs the standardized GOB/MB layout tables.
+//! * **Custom picture formats** — the `"110"` source format (PLUSPTYPE
+//!   path with CPFMT) lands via [`PictureLayout::for_custom_dimensions`]
+//!   for spec-legal sizes that are macroblock-aligned (both luma
+//!   dimensions divisible by 16) within the §4.2.1 range; the
+//!   §4.2.1 / Table-4 `k`-parameter selects the GOB grid (`k=1` for
+//!   <=400 lines, `k=2` for 404..=800, `k=4` for 804..=1152) and the
+//!   bottom-most GOB is truncated when the height is not an integer
+//!   multiple of `k * 16`. Spec-legal sizes that are 4-aligned but not
+//!   16-aligned are refused (the per-macroblock raster needs a
+//!   16-pixel grid). The reserved `"111"` baseline source-format code
+//!   is the PLUSPTYPE escape and not itself a source format.
 
 // Synthetic test bitstreams group bits to mirror the spec's printed
 // MSB-first field layout (e.g. the 7-bit TCOEF ESCAPE prefix
@@ -159,6 +168,114 @@ pub struct DecodeOptions {
     /// Off by default; callers must opt in because the baseline picture
     /// header cannot signal AIC on the wire.
     pub aic: bool,
+}
+
+/// Picture-level layout the §4.2.1 GOB walker needs: total luma
+/// dimensions and the GOB grid the bitstream is divided into.
+///
+/// For the five standardised baseline source formats (sub-QCIF, QCIF,
+/// CIF, 4CIF, 16CIF) the layout is fixed and resolved by
+/// [`PictureLayout::for_source_format`]. For the PLUSPTYPE
+/// "custom picture format" path (OPPTYPE source-format code `"110"`
+/// with CPFMT carrying the dimensions, §5.1.5) the layout is derived
+/// from the §4.2.1 + Table-4 rules by
+/// [`PictureLayout::for_custom_dimensions`].
+///
+/// **§4.2.1 GOB-count rule for custom formats.** A GOB comprises up to
+/// `k * 16` lines where `k` depends on the picture height
+/// (Table 4/H.263, with RRU not in use):
+///
+/// * `k = 1` for 4..=400 lines,
+/// * `k = 2` for 404..=800 lines,
+/// * `k = 4` for 804..=1152 lines.
+///
+/// The number of GOBs per picture is `ceil(height / (k * 16))`. The
+/// last GOB may carry fewer than `k * 16` lines when the picture
+/// height is not an integer multiple of `k * 16`. Every other GOB
+/// covers exactly `mb_rows_per_gob = k` macroblock rows; the driver
+/// handles the truncated last GOB by clamping its row iteration to the
+/// picture's bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PictureLayout {
+    /// Luma plane width in pixels (divisible by 16 for the baseline
+    /// formats; divisible by 4 in the §4.2.1 custom-format range).
+    pub luma_width: u32,
+    /// Luma plane height in lines (divisible by 16 for the baseline
+    /// formats; divisible by 4 in the §4.2.1 custom-format range).
+    pub luma_height: u32,
+    /// Total number of GOBs in the picture (§4.2.1 vertical scan
+    /// order, top to bottom).
+    pub num_gobs: u32,
+    /// Number of 16×16 macroblock rows one **non-truncated** GOB
+    /// spans. For sub-QCIF / QCIF / CIF and every custom format under
+    /// 401 lines this is `1`; for 4CIF and every custom format in the
+    /// 404..=800 line range it is `2`; for 16CIF and every custom
+    /// format above 800 lines it is `4`.
+    pub mb_rows_per_gob: u32,
+}
+
+impl PictureLayout {
+    /// Resolve a [`PictureLayout`] from one of the five standardised
+    /// baseline source formats. Returns `None` for the reserved
+    /// [`H263SourceFormat::Reserved110`] code, which the spec assigns
+    /// to the PLUSPTYPE custom-format path (use
+    /// [`PictureLayout::for_custom_dimensions`] there).
+    pub fn for_source_format(format: H263SourceFormat) -> Option<PictureLayout> {
+        let (luma_width, luma_height) = format.luma_dimensions()?;
+        let num_gobs = format.num_gobs()?;
+        let mb_rows_per_gob = format.mb_rows_per_gob()?;
+        Some(PictureLayout {
+            luma_width,
+            luma_height,
+            num_gobs,
+            mb_rows_per_gob,
+        })
+    }
+
+    /// Resolve a [`PictureLayout`] from a CPFMT-supplied custom
+    /// picture size per §4.2.1 + Table 4/H.263 (RRU not in use).
+    ///
+    /// Returns `None` when the dimensions fall outside the spec's
+    /// custom-format range or are not a multiple of 4:
+    ///
+    /// * `luma_width` ∈ `[4, 2048]` and `luma_width % 4 == 0`,
+    /// * `luma_height` ∈ `[4, 1152]` and `luma_height % 4 == 0`.
+    ///
+    /// Additionally, this driver requires both dimensions to be
+    /// macroblock-aligned (a multiple of 16) — the per-macroblock
+    /// raster loop walks 16×16 cells, and a non-aligned size would
+    /// leave a partial macroblock row or column the driver does not
+    /// stage. Spec-legal custom sizes that are 4-aligned but not
+    /// 16-aligned (e.g. 180×144) round-trip through the parser
+    /// successfully but [`Self::for_custom_dimensions`] returns
+    /// `None` to keep the boundary at the driver layer.
+    pub fn for_custom_dimensions(luma_width: u32, luma_height: u32) -> Option<PictureLayout> {
+        if !(4..=2048).contains(&luma_width) || luma_width % 16 != 0 {
+            return None;
+        }
+        if !(4..=1152).contains(&luma_height) || luma_height % 16 != 0 {
+            return None;
+        }
+        // §4.2.1 / Table 4 — parameter k for the GOB size definition.
+        let k: u32 = if luma_height <= 400 {
+            1
+        } else if luma_height <= 800 {
+            2
+        } else {
+            4
+        };
+        let gob_lines = k * 16;
+        // §4.2.1: "the number of lines in the last (bottom-most) GOB
+        // may be less than k * 16 if the number of lines in the
+        // picture is not divisible by k * 16." — `ceil(h / gob_lines)`.
+        let num_gobs = luma_height.div_ceil(gob_lines);
+        Some(PictureLayout {
+            luma_width,
+            luma_height,
+            num_gobs,
+            mb_rows_per_gob: k,
+        })
+    }
 }
 
 /// Per-macroblock state the §6.1.1 / Figure-12 candidate-predictor
@@ -454,7 +571,9 @@ pub fn decode_picture(
 ) -> Result<YuvFrame> {
     let mut reader = BitReader::new(data);
     let header = parse_picture_header(&mut reader)?;
-    decode_after_picture_header(&mut reader, &header, reference, options)
+    let layout =
+        PictureLayout::for_source_format(header.source_format).ok_or(Error::NotImplemented)?;
+    decode_after_picture_header(&mut reader, &header, &layout, reference, options)
 }
 
 /// Decode a single H.263 picture from `data`, dispatching on the
@@ -600,7 +719,10 @@ pub fn decode_picture_layer_with_inherited(
     let layer = parse_picture_layer(&mut reader, inherited)?;
     match layer {
         H263PictureLayer::Baseline(header) => {
-            let frame = decode_after_picture_header(&mut reader, &header, reference, options)?;
+            let layout = PictureLayout::for_source_format(header.source_format)
+                .ok_or(Error::NotImplemented)?;
+            let frame =
+                decode_after_picture_header(&mut reader, &header, &layout, reference, options)?;
             // §5.1.4.5 rule 3 — a picture without PLUSPTYPE clears all
             // inferred mode state.
             Ok(DecodePictureOutcome {
@@ -611,16 +733,23 @@ pub fn decode_picture_layer_with_inherited(
         H263PictureLayer::Extended(extended) => {
             let next_inherited = match extended.plus.opptype {
                 // §5.1.4.4 rule — UFEP=001 establishes the inherited
-                // state. We snapshot the OPPTYPE for the next picture.
-                Some(o) => InheritedExtendedState::from_opptype(o),
+                // state. We snapshot the OPPTYPE (plus its CPFMT for
+                // the Custom source-format case) for the next picture.
+                Some(o) => InheritedExtendedState::from_opptype_with_cpfmt(o, extended.plus.cpfmt),
                 // UFEP=000 picture: inherited state passes through
                 // unchanged (the spec keeps the snapshot until the next
                 // UFEP=001 or non-PLUSPTYPE picture).
                 None => inherited,
             };
-            let (header, shim_options) =
+            let (header, layout, shim_options) =
                 plus_ptype_to_baseline_shim(&extended, options, inherited)?;
-            let frame = decode_after_picture_header(&mut reader, &header, reference, shim_options)?;
+            let frame = decode_after_picture_header(
+                &mut reader,
+                &header,
+                &layout,
+                reference,
+                shim_options,
+            )?;
             Ok(DecodePictureOutcome {
                 frame,
                 inherited: next_inherited,
@@ -641,11 +770,18 @@ pub fn decode_picture_layer_with_inherited(
 /// (we refuse SAC above). The decode driver reads exactly these fields
 /// when stepping macroblocks; PLUSPTYPE-only flags (AIC / deblocking)
 /// are routed through `options` instead.
+///
+/// The returned [`PictureLayout`] carries the luma dimensions + GOB
+/// grid the §4.2.1 walker uses. For one of the five fixed source
+/// formats it resolves via [`PictureLayout::for_source_format`]; for
+/// [`PlusSourceFormat::Custom`] it resolves via
+/// [`PictureLayout::for_custom_dimensions`] against the parsed CPFMT
+/// (UFEP=001) or the inherited `(width, height)` snapshot (UFEP=000).
 fn plus_ptype_to_baseline_shim(
     extended: &H263ExtendedPicture,
     options: DecodeOptions,
     inherited: InheritedExtendedState,
-) -> Result<(H263PictureHeader, DecodeOptions)> {
+) -> Result<(H263PictureHeader, PictureLayout, DecodeOptions)> {
     // §5.1.4.3 — only INTRA / INTER picture types are decodable here.
     // Resolve this first because §5.1.4.5 rule 1 inference (UMV / AP
     // off in I-pictures) needs the picture-type code below.
@@ -750,16 +886,54 @@ fn plus_ptype_to_baseline_shim(
     };
 
     // §5.1.4.2 — map the standardised PLUSPTYPE source-format codes
-    // onto their baseline `H263SourceFormat` equivalents. The Custom
-    // variant needs CPFMT-driven GOB-layout tables this driver does
-    // not stage.
-    let source_format = match source_format_plus {
-        PlusSourceFormat::SubQcif => H263SourceFormat::SubQcif,
-        PlusSourceFormat::Qcif => H263SourceFormat::Qcif,
-        PlusSourceFormat::Cif => H263SourceFormat::Cif,
-        PlusSourceFormat::Cif4 => H263SourceFormat::Cif4,
-        PlusSourceFormat::Cif16 => H263SourceFormat::Cif16,
-        PlusSourceFormat::Custom => return Err(Error::NotImplemented),
+    // onto their baseline `H263SourceFormat` equivalents. For the
+    // [`PlusSourceFormat::Custom`] code (§5.1.5) we resolve the layout
+    // from CPFMT instead and use a placeholder
+    // [`H263SourceFormat::Reserved110`] in the header (the decode
+    // driver reads the layout out of the [`PictureLayout`] argument
+    // and never re-derives it from this field — see
+    // `decode_after_picture_header`).
+    let (source_format, layout) = match source_format_plus {
+        PlusSourceFormat::SubQcif => (
+            H263SourceFormat::SubQcif,
+            PictureLayout::for_source_format(H263SourceFormat::SubQcif)
+                .ok_or(Error::NotImplemented)?,
+        ),
+        PlusSourceFormat::Qcif => (
+            H263SourceFormat::Qcif,
+            PictureLayout::for_source_format(H263SourceFormat::Qcif)
+                .ok_or(Error::NotImplemented)?,
+        ),
+        PlusSourceFormat::Cif => (
+            H263SourceFormat::Cif,
+            PictureLayout::for_source_format(H263SourceFormat::Cif).ok_or(Error::NotImplemented)?,
+        ),
+        PlusSourceFormat::Cif4 => (
+            H263SourceFormat::Cif4,
+            PictureLayout::for_source_format(H263SourceFormat::Cif4)
+                .ok_or(Error::NotImplemented)?,
+        ),
+        PlusSourceFormat::Cif16 => (
+            H263SourceFormat::Cif16,
+            PictureLayout::for_source_format(H263SourceFormat::Cif16)
+                .ok_or(Error::NotImplemented)?,
+        ),
+        PlusSourceFormat::Custom => {
+            // §5.1.5 — UFEP=001 reads dimensions straight from the
+            // CPFMT on the wire; UFEP=000 falls back to the inherited
+            // snapshot (`extended.plus.cpfmt` is `None` on UFEP=000).
+            let (w, h) = match extended.plus.cpfmt {
+                Some(cpfmt) => (cpfmt.luma_width(), cpfmt.luma_height()),
+                None => inherited.custom_dimensions.ok_or(Error::NotImplemented)?,
+            };
+            let layout = PictureLayout::for_custom_dimensions(w, h).ok_or(Error::NotImplemented)?;
+            // The header's `source_format` field is unused by the
+            // decode driver in the custom-format path (the layout
+            // arg carries the dimensions). Pin it to the reserved
+            // baseline value so a stale read would fail loudly
+            // rather than silently mis-sizing.
+            (H263SourceFormat::Reserved110, layout)
+        }
     };
 
     // §5.1.9 — when UMV is on, only the `"1"` (Limited) UUI form maps
@@ -799,7 +973,7 @@ fn plus_ptype_to_baseline_shim(
         aic: options.aic || advanced_intra_effective,
     };
 
-    Ok((header, options))
+    Ok((header, layout, options))
 }
 
 /// Decode the macroblock layers of a picture given an already-parsed
@@ -813,6 +987,7 @@ fn plus_ptype_to_baseline_shim(
 fn decode_after_picture_header(
     reader: &mut BitReader<'_>,
     header: &H263PictureHeader,
+    layout: &PictureLayout,
     reference: Option<&YuvFrame>,
     options: DecodeOptions,
 ) -> Result<YuvFrame> {
@@ -821,18 +996,10 @@ fn decode_after_picture_header(
         return Err(Error::NotImplemented);
     }
 
-    let (luma_w, luma_h) = header
-        .source_format
-        .luma_dimensions()
-        .ok_or(Error::NotImplemented)?;
-    let num_gobs = header
-        .source_format
-        .num_gobs()
-        .ok_or(Error::NotImplemented)?;
-    let mb_rows_per_gob = header
-        .source_format
-        .mb_rows_per_gob()
-        .ok_or(Error::NotImplemented)?;
+    let luma_w = layout.luma_width;
+    let luma_h = layout.luma_height;
+    let num_gobs = layout.num_gobs;
+    let mb_rows_per_gob = layout.mb_rows_per_gob;
     let mb_cols = (luma_w / 16) as usize;
     let mb_rows_total = (luma_h / 16) as usize;
 
@@ -3961,38 +4128,257 @@ mod tests {
         assert!(matches!(r, Err(Error::NotImplemented)));
     }
 
-    /// Custom-format source-format code (OPPTYPE source `"110"`) is
-    /// refused with `NotImplemented`. The GOB-layout tables the driver
-    /// runs are keyed off the standardised five formats; CPFMT-driven
-    /// custom dimensions need the §K.2 macroblock-per-row layout the
-    /// SS driver supplies.
+    /// Write a PLUSPTYPE INTRA picture-layer header with the OPPTYPE
+    /// source-format `"110"` (Custom) and a CPFMT carrying
+    /// `(luma_width, luma_height)` lifted from the §5.1.5
+    /// `(PWI + 1) * 4` / `PHI * 4` encoding. Picture-level mode bits are
+    /// all off; UFEP=001. The reader is left positioned at the first
+    /// bit of the first GOB header.
+    fn write_plus_custom_intra_header(w: &mut BitWriter, luma_width: u32, luma_height: u32) {
+        assert!(luma_width % 4 == 0 && (4..=2048).contains(&luma_width));
+        assert!(luma_height % 4 == 0 && (4..=1152).contains(&luma_height));
+        // §5.1.1 / §5.1.2 — PSC + TR.
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+                           // §5.1.3 PTYPE bits 1-2 = "10".
+        w.write_bit(true);
+        w.write_bit(false);
+        // PTYPE bits 3-5: split-screen / doc-camera / freeze all off.
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        // PTYPE bits 6-8 = "111" → extended PTYPE.
+        w.write_u32(0b111, 3);
+        // §5.1.4.1 — UFEP = "001" (OPPTYPE present).
+        w.write_u32(0b001, 3);
+        // §5.1.4.2 — OPPTYPE (18 bits). Source format = "110" (Custom).
+        w.write_u32(0b110, 3);
+        // Bits 4-14: all modes off.
+        for _ in 0..11 {
+            w.write_bit(false);
+        }
+        // Bit 15 SCE-guard = 1.
+        w.write_bit(true);
+        // Bits 16-18 reserved = "000".
+        w.write_u32(0b000, 3);
+        // §5.1.4.3 — MPPTYPE (9 bits): INTRA (000), RPR/RRU/RTYPE off,
+        // reserved 0,0, SCE-guard bit 9 = 1.
+        w.write_u32(0b000, 3); // picture type
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+                           // §5.1.20 — CPM = 0.
+        w.write_bit(false);
+        // §5.1.5 — CPFMT (23 bits): PAR = "0001" (1:1, Table 5),
+        // PWI = (luma_width / 4) - 1, SCE = "1", PHI = luma_height / 4.
+        let pwi = (luma_width / 4) - 1;
+        let phi = luma_height / 4;
+        w.write_u32(0b0001, 4); // PAR = 1:1
+        w.write_u32(pwi, 9);
+        w.write_bit(true); // SCE-guard
+        w.write_u32(phi, 9);
+        // CPCFC / ETR / UUI / SSS / EPAR are all absent in this
+        // configuration (custom_pcf=0, UMV=0, SS=0, PAR != "1111").
+    }
+
+    /// Build a 176×144 (QCIF-sized) PLUSPTYPE INTRA picture using the
+    /// **custom source format** path (OPPTYPE source `"110"` + CPFMT),
+    /// with a body identical to
+    /// [`build_qcif_intra_dc_picture`]: every macroblock is an INTRA
+    /// MB with INTRADC = `dc_byte` (FLC) and all-zero AC. The picture
+    /// has 9 GOBs of 1 MB-row × 11 MB-cols each.
+    fn build_custom_176x144_intra_dc_picture(dc_byte: u32) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        write_plus_custom_intra_header(&mut w, 176, 144);
+        for _gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for _mb in 0..11 {
+                // MCBPC = `1` → I-picture INTRA, CBPC = 00.
+                w.write_bit(true);
+                // CBPY = `0011` → CBPY(INTRA) = 0000.
+                w.write_bit(false);
+                w.write_bit(false);
+                w.write_bit(true);
+                w.write_bit(true);
+                // Six blocks, each carrying an 8-bit §5.4.1 INTRADC FLC.
+                for _blk in 0..6 {
+                    w.write_u32(dc_byte, 8);
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// A CPFMT-described 176×144 picture (PWI=43, PHI=36) decodes
+    /// through [`decode_picture_layer`] under the PLUSPTYPE
+    /// custom-source-format path: §5.1.5 supplies the dimensions and
+    /// §4.2.1 + Table 4 (`k = 1` for ≤400 lines) derives the same
+    /// 9-GOB × 1-MB-row × 11-MB-col layout the baseline QCIF format
+    /// has. The output frame must therefore be sample-bit-identical to
+    /// the same body decoded under the fixed QCIF source format.
     #[test]
-    fn decode_picture_layer_plus_refuses_custom_format() {
+    fn decode_picture_layer_plus_custom_176x144_matches_qcif() {
+        let custom_data = build_custom_176x144_intra_dc_picture(0x10);
+        let qcif_data = build_qcif_intra_dc_picture(0x10);
+        let custom_frame = decode_picture_layer(&custom_data, None, DecodeOptions::default())
+            .expect("custom 176x144 PLUSPTYPE picture should decode");
+        let qcif_frame = decode_picture_layer(&qcif_data, None, DecodeOptions::default())
+            .expect("baseline QCIF picture should decode");
+        assert_eq!(custom_frame.luma_width, 176);
+        assert_eq!(custom_frame.luma_height, 144);
+        assert_eq!(custom_frame, qcif_frame);
+    }
+
+    /// §4.2.1 / Table 4 boundaries: the GOB-grid derivation honours
+    /// `k = 1` for ≤400 lines, `k = 2` for 404..=800, `k = 4` for
+    /// 804..=1152. We exercise the public [`PictureLayout`] derivation
+    /// at the table boundaries and at a non-multiple-of-`k*16` height
+    /// to confirm the §4.2.1 truncated-bottom-GOB rule
+    /// (`ceil(height / (k * 16))`).
+    #[test]
+    fn picture_layout_custom_dimensions_table4_boundaries() {
+        // k = 1 region.
+        let l = PictureLayout::for_custom_dimensions(176, 144).expect("176x144 legal");
+        assert_eq!(l.num_gobs, 9);
+        assert_eq!(l.mb_rows_per_gob, 1);
+        // k = 1 at the upper boundary (≤ 400 lines).
+        let l = PictureLayout::for_custom_dimensions(176, 400).expect("176x400 legal");
+        assert_eq!(l.mb_rows_per_gob, 1);
+        assert_eq!(l.num_gobs, 25); // 400 / 16
+                                    // k = 2 at the lower boundary (404 lines is the table's
+                                    // first row of the k=2 column; round to 16-aligned 416).
+        let l = PictureLayout::for_custom_dimensions(176, 416).expect("176x416 legal");
+        assert_eq!(l.mb_rows_per_gob, 2);
+        assert_eq!(l.num_gobs, 13); // ceil(416 / 32)
+                                    // k = 2 upper boundary (≤ 800 lines, 16-aligned 800).
+        let l = PictureLayout::for_custom_dimensions(176, 800).expect("176x800 legal");
+        assert_eq!(l.mb_rows_per_gob, 2);
+        assert_eq!(l.num_gobs, 25); // 800 / 32
+                                    // k = 4 at the lower boundary (804 lines round to
+                                    // 16-aligned 816).
+        let l = PictureLayout::for_custom_dimensions(176, 816).expect("176x816 legal");
+        assert_eq!(l.mb_rows_per_gob, 4);
+        assert_eq!(l.num_gobs, 13); // ceil(816 / 64)
+                                    // k = 4 upper boundary (1152 lines, exactly 18 GOBs).
+        let l = PictureLayout::for_custom_dimensions(176, 1152).expect("176x1152 legal");
+        assert_eq!(l.mb_rows_per_gob, 4);
+        assert_eq!(l.num_gobs, 18); // 1152 / 64
+                                    // §4.2.1 truncated-bottom-GOB rule. A 432-line picture in
+                                    // the k = 2 (`32`-line GOB) region yields
+                                    // `ceil(432 / 32) = 14` GOBs of which the last covers only
+                                    // `432 - 13 * 32 = 16` lines.
+        let l = PictureLayout::for_custom_dimensions(176, 432).expect("176x432 legal");
+        assert_eq!(l.mb_rows_per_gob, 2);
+        assert_eq!(l.num_gobs, 14);
+    }
+
+    /// [`PictureLayout::for_custom_dimensions`] rejects spec-illegal
+    /// custom sizes (zero / out-of-range) AND spec-legal 4-aligned
+    /// sizes that are not macroblock-aligned (the per-MB raster loop
+    /// requires 16-aligned). These boundary checks keep the driver
+    /// from silently mis-sizing on a non-conforming bitstream.
+    #[test]
+    fn picture_layout_custom_dimensions_rejects_out_of_range() {
+        // Zero is forbidden (out of [4, 2048] / [4, 1152]).
+        assert!(PictureLayout::for_custom_dimensions(0, 144).is_none());
+        assert!(PictureLayout::for_custom_dimensions(176, 0).is_none());
+        // Above the §4.2.1 maximums.
+        assert!(PictureLayout::for_custom_dimensions(2064, 144).is_none());
+        assert!(PictureLayout::for_custom_dimensions(176, 1168).is_none());
+        // Spec-legal 4-aligned but not 16-aligned: §4.2.1 allows the
+        // size but this driver requires macroblock-aligned dimensions.
+        assert!(PictureLayout::for_custom_dimensions(180, 144).is_none());
+        assert!(PictureLayout::for_custom_dimensions(176, 148).is_none());
+        // Spec-illegal non-4-aligned must also be rejected.
+        assert!(PictureLayout::for_custom_dimensions(177, 144).is_none());
+        assert!(PictureLayout::for_custom_dimensions(176, 145).is_none());
+    }
+
+    /// [`PictureLayout::for_source_format`] resolves the five fixed
+    /// baseline source formats to the §4.2.1-defined GOB grids, and
+    /// returns `None` for the reserved `"110"` code (which is the
+    /// PLUSPTYPE custom-format escape, handled separately).
+    #[test]
+    fn picture_layout_for_source_format_returns_baseline_grids() {
+        let l = PictureLayout::for_source_format(H263SourceFormat::SubQcif).unwrap();
+        assert_eq!((l.luma_width, l.luma_height), (128, 96));
+        assert_eq!((l.num_gobs, l.mb_rows_per_gob), (6, 1));
+        let l = PictureLayout::for_source_format(H263SourceFormat::Qcif).unwrap();
+        assert_eq!((l.luma_width, l.luma_height), (176, 144));
+        assert_eq!((l.num_gobs, l.mb_rows_per_gob), (9, 1));
+        let l = PictureLayout::for_source_format(H263SourceFormat::Cif).unwrap();
+        assert_eq!((l.luma_width, l.luma_height), (352, 288));
+        assert_eq!((l.num_gobs, l.mb_rows_per_gob), (18, 1));
+        let l = PictureLayout::for_source_format(H263SourceFormat::Cif4).unwrap();
+        assert_eq!((l.luma_width, l.luma_height), (704, 576));
+        assert_eq!((l.num_gobs, l.mb_rows_per_gob), (18, 2));
+        let l = PictureLayout::for_source_format(H263SourceFormat::Cif16).unwrap();
+        assert_eq!((l.luma_width, l.luma_height), (1408, 1152));
+        assert_eq!((l.num_gobs, l.mb_rows_per_gob), (18, 4));
+        assert!(PictureLayout::for_source_format(H263SourceFormat::Reserved110).is_none());
+    }
+
+    /// A UFEP=001 picture carrying [`PlusSourceFormat::Custom`]
+    /// captures its CPFMT dimensions into the returned snapshot's
+    /// `custom_dimensions` field so a follow-up UFEP=000 picture can
+    /// recover the size from inheritance (CPFMT is absent on UFEP=000).
+    #[test]
+    fn decode_picture_layer_with_inherited_ufep1_custom_format_captures_dimensions() {
+        let data = build_custom_176x144_intra_dc_picture(0x10);
+        let outcome = decode_picture_layer_with_inherited(
+            &data,
+            None,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("UFEP=001 custom-format picture should decode");
+        assert_eq!(outcome.frame.luma_width, 176);
+        assert_eq!(outcome.frame.luma_height, 144);
+        assert_eq!(
+            outcome.inherited.source_format,
+            Some(PlusSourceFormat::Custom),
+            "snapshot carries Custom source-format code"
+        );
+        assert_eq!(
+            outcome.inherited.custom_dimensions,
+            Some((176, 144)),
+            "snapshot carries the CPFMT-derived luma dimensions"
+        );
+    }
+
+    /// `UFEP = "000"` picture inheriting [`PlusSourceFormat::Custom`]
+    /// uses the snapshot's `custom_dimensions` field to size its GOB
+    /// grid (CPFMT is absent on the wire for UFEP=000). This proves
+    /// the round's inheritance gap is closed end-to-end: a multi-
+    /// picture stream of custom-format pictures only carries CPFMT on
+    /// the leading UFEP=001 picture and threads the dimensions through
+    /// the snapshot thereafter.
+    #[test]
+    fn decode_picture_layer_with_inherited_ufep0_custom_format_uses_inherited_dimensions() {
+        // Build a UFEP=000 PLUSPTYPE picture (no OPPTYPE, no CPFMT) with
+        // a body matching the 176x144 custom-format picture (9 GOBs × 11
+        // MBs each, INTRADC FLC = 0x10, all-zero AC).
         let mut w = BitWriter::new();
         w.write_u32(PSC_VALUE, PSC_BITS);
-        w.write_u32(0, 8);
+        w.write_u32(0, 8); // TR
+                           // PTYPE bits 1-5.
         w.write_bit(true);
         w.write_bit(false);
         w.write_bit(false);
         w.write_bit(false);
         w.write_bit(false);
-        w.write_u32(0b111, 3);
-        w.write_u32(0b001, 3);
-        // Source format = "110" (custom).
-        w.write_u32(0b110, 3);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(true);
-        w.write_u32(0, 3);
+        w.write_u32(0b111, 3); // extended PTYPE
+        w.write_u32(0b000, 3); // UFEP = "000"
+                               // MPPTYPE: INTRA (000), all off, SCE-guard bit 9.
         w.write_u32(0b000, 3);
         w.write_bit(false);
         w.write_bit(false);
@@ -4000,16 +4386,76 @@ mod tests {
         w.write_bit(false);
         w.write_bit(false);
         w.write_bit(true);
-        w.write_bit(false); // CPM
-                            // §5.1.5 CPFMT (23 bits) follows; we write a valid one so
-                            // parse_plus_ptype does not reject. PAR=`0001` (1:1), PWI=43
-                            // (→ 176 luma width), SCE=1, PHI=36 (→ 144 luma height).
-        w.write_u32(0b0001, 4);
-        w.write_u32(43, 9);
-        w.write_bit(true);
-        w.write_u32(36, 9);
+        // CPM = 0.
+        w.write_bit(false);
+        // No CPFMT / EPAR / CPCFC / ETR / UUI / SSS on UFEP=000.
+        // 9 GOBs × 11 MBs, each MB an INTRA-DC=128 baseline MB.
+        for _gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for _mb in 0..11 {
+                w.write_bit(true); // MCBPC = "1"
+                w.write_bit(false); // CBPY = "0011"
+                w.write_bit(false);
+                w.write_bit(true);
+                w.write_bit(true);
+                for _blk in 0..6 {
+                    w.write_u32(0x10, 8);
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
         let data = w.finish();
-        let r = decode_picture_layer(&data, None, DecodeOptions::default());
+        let inherited = InheritedExtendedState {
+            custom_pcf: false,
+            source_format: Some(PlusSourceFormat::Custom),
+            custom_dimensions: Some((176, 144)),
+            umv: false,
+            advanced_prediction: false,
+            advanced_intra: false,
+            deblocking: false,
+        };
+        let outcome =
+            decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited)
+                .expect(
+                    "UFEP=000 PLUSPTYPE custom-format picture should decode with inherited dims",
+                );
+        assert_eq!(outcome.frame.luma_width, 176);
+        assert_eq!(outcome.frame.luma_height, 144);
+        // The same body decoded through the baseline QCIF path yields
+        // exactly the same frame.
+        let qcif_data = build_qcif_intra_dc_picture(0x10);
+        let qcif_frame =
+            decode_picture(&qcif_data, None, DecodeOptions::default()).expect("baseline QCIF");
+        assert_eq!(outcome.frame, qcif_frame);
+        // UFEP=000 leaves the snapshot unchanged.
+        assert_eq!(outcome.inherited, inherited);
+    }
+
+    /// UFEP=000 PLUSPTYPE picture inheriting
+    /// [`PlusSourceFormat::Custom`] with `custom_dimensions == None` is
+    /// refused: there is no on-wire CPFMT and no inherited size, so the
+    /// driver cannot size the picture.
+    #[test]
+    fn decode_picture_layer_with_inherited_ufep0_custom_format_no_dims_refused() {
+        let data = build_qcif_plus_ufep0_intra_dc_plus1_picture(false);
+        let inherited = InheritedExtendedState {
+            custom_pcf: false,
+            source_format: Some(PlusSourceFormat::Custom),
+            // Inherited Custom format but no dimensions captured —
+            // pathological but well-defined: must refuse.
+            custom_dimensions: None,
+            umv: false,
+            advanced_prediction: false,
+            advanced_intra: false,
+            deblocking: false,
+        };
+        let r =
+            decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited);
         assert!(matches!(r, Err(Error::NotImplemented)));
     }
 
@@ -4137,6 +4583,7 @@ mod tests {
         let inherited = InheritedExtendedState {
             custom_pcf: false,
             source_format: Some(PlusSourceFormat::Qcif),
+            custom_dimensions: None,
             umv: false,
             advanced_prediction: false,
             advanced_intra: true,
@@ -4202,6 +4649,7 @@ mod tests {
             InheritedExtendedState {
                 custom_pcf: false,
                 source_format: Some(PlusSourceFormat::Qcif),
+                custom_dimensions: None,
                 umv: false,
                 advanced_prediction: false,
                 advanced_intra: true,
@@ -4220,6 +4668,7 @@ mod tests {
         let primed = InheritedExtendedState {
             custom_pcf: true,
             source_format: Some(PlusSourceFormat::Cif),
+            custom_dimensions: None,
             umv: true,
             advanced_prediction: true,
             advanced_intra: true,
@@ -4270,6 +4719,7 @@ mod tests {
         let inherited = InheritedExtendedState {
             custom_pcf: false,
             source_format: Some(PlusSourceFormat::Qcif),
+            custom_dimensions: None,
             // UMV / AP from a prior P-picture's OPPTYPE — both must be
             // §5.1.4.5-rule-1-overridden to `off` for this INTRA picture
             // even though they remain `on` in the snapshot.
@@ -4322,6 +4772,7 @@ mod tests {
             InheritedExtendedState {
                 custom_pcf: true,
                 source_format: Some(PlusSourceFormat::Cif),
+                custom_dimensions: None,
                 umv: true,
                 advanced_prediction: true,
                 advanced_intra: true,

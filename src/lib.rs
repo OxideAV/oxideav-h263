@@ -249,7 +249,7 @@ pub use motion::{
 };
 pub use picture::{
     decode_picture, decode_picture_layer, decode_picture_layer_with_inherited, DecodeOptions,
-    DecodePictureOutcome, YuvFrame,
+    DecodePictureOutcome, PictureLayout, YuvFrame,
 };
 pub use picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
