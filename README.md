@@ -5,6 +5,70 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 27 (workspace round 231) — §5.3.3 / §5.3.4 PB-frame B-block
+field parsers as the new `pb_layer` module. PB-frame mode (Annex G)
+inserts two extra fields between MCBPC and CBPY in the §5.3
+macroblock layer: MODB (a 1- or 2-bit Table 11 variable-length code
+declaring whether CBPB and/or MVDB are on the wire for the
+B-block half) and CBPB (a 6-bit fixed-length pattern naming which
+of the six B-blocks carry a non-zero coefficient). Both land as
+pure-parser primitives that the future PB-mode macroblock driver
+composes; MVDB itself is the existing §5.3.7 MVD-component decoder
+reused per §5.3.9, so no new VLC table is needed for the third
+field.**
+
+* `parse_modb(reader) -> Result<ModbPresence>` (new public function
+  in `pb_layer.rs`): decodes the Table 11 VLC into the new
+  `ModbPresence` tag (`None` / `MvdbOnly` / `CbpbAndMvdb`). Leading
+  `0` resolves `None`; leading `1` consumes one more bit (`0` →
+  `MvdbOnly`, `1` → `CbpbAndMvdb`). Only `Error::UnexpectedEof` is
+  possible (every legal 1- or 2-bit prefix is a Table-11 codeword).
+* `parse_cbpb(reader) -> Result<u8>` (new public function): decodes
+  the §5.3.4 6-bit fixed-length CBPB Coded Block Pattern. Returns
+  the raw six bits in the low bits of a `u8`. Per §5.3.4 / Figure 5
+  "the utmost left bit of CBPB corresponds with block number 1",
+  bit 5 of the returned `u8` carries CBPBN for B-block 1, …, bit 0
+  carries CBPBN for B-block 6.
+* `cbpb_block_present(cbpb, block_number) -> bool` (new public
+  function): queries an individual B-block's CBPBN bit by 1-based
+  block number (`1..=4` luma in Y raster, `5` = Cb, `6` = Cr).
+  Returns `false` defensively for `block_number` outside `1..=6`.
+* `ModbPresence` (new public enum): variants collapse the Table 11
+  CBPB-and-MVDB presence columns onto a tag. `has_cbpb()`,
+  `has_mvdb()`, `code_bits()` accessors.
+* `CBPB_BITS = 6` (new public constant).
+
+14 new tests land:
+`modb_code_0_is_none` / `modb_code_10_is_mvdb_only` /
+`modb_code_11_is_cbpb_and_mvdb` (Table 11 round-trip per row);
+`modb_truncated_after_lead_one_returns_eof` and
+`modb_empty_buffer_returns_eof` (EOF paths);
+`modb_code_bits_matches_reader_advance` (cross-check the tag's
+self-reported width against the reader's bit advance for every
+Table 11 entry); `cbpb_all_zero_pattern` /
+`cbpb_all_one_pattern` (FLC endpoints round-trip);
+`cbpb_single_bit_per_block_isolates_correct_block` (six-position
+parameterised check that each block's CBPBN bit isolates the
+correct block);
+`cbpb_block_1_is_msb_block_6_is_lsb` (static pin on the §5.3.4
+endpoint mapping); `cbpb_truncated_returns_eof` and
+`cbpb_empty_buffer_returns_eof` (EOF paths);
+`cbpb_block_present_out_of_range_is_false` (defensive accessor
+domain); `modb_cbpb_chain_advances_reader_by_8_bits` (end-to-end
+chain: `11` MODB + `10_1010` CBPB consumes exactly 8 bits and
+isolates B-blocks 1, 3, 5). `cargo test -p oxideav-h263` reports
+425 passed (previously 411).
+
+This is wire-level scaffolding for PB-frame mode; the macroblock
+driver gate that refuses PB-mode bitstreams up front (`PB-frames
+mode not yet supported`) remains, awaiting the §5.3.3-gating MB
+walker that composes the new primitives with the existing MVD
+decoder. The Annex M (Improved PB-frames) MODB Table M.1 7-entry
+form is a separate primitive that a future round will add; this
+round covers the 3-entry Annex G form only.
+
+---
+
 **Round 26 (workspace round 226) — §K.2.1 SSTUF stuffing skipper.
 The `parse_slice_layer` doc string already said "the caller is
 responsible for skipping any leading SSTUF before invoking this

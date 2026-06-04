@@ -179,6 +179,19 @@
 //!   neighbour `RecA'` / `RecB'` arrays, and dispatching this pipeline
 //!   per INTRA block.
 //!
+//! * **Round 27** — §5.3.3 / §5.3.4 PB-frame B-block field parsers as
+//!   the new [`pb_layer`] module. [`parse_modb`] decodes the Table 11
+//!   3-entry MODB variable-length codeword into a [`ModbPresence`] tag
+//!   (`None` / `MvdbOnly` / `CbpbAndMvdb`); [`parse_cbpb`] decodes the
+//!   6-bit fixed-length CBPB coded-block-pattern; [`cbpb_block_present`]
+//!   queries an individual B-block's CBPBN bit by the §5.3.4 / Figure 5
+//!   "utmost left bit ↔ block number 1" mapping. These are the wire
+//!   primitives the future macroblock-driver wiring for PB-frame mode
+//!   (Annex G) will compose with the existing MVD-component decoder
+//!   (which §5.3.9 reuses verbatim for MVDB). The Annex-M (Improved
+//!   PB-frames) MODB Table M.1 7-entry form remains a separate
+//!   primitive a future round will add.
+//!
 //! PB-frame / Annex-T / extended-PTYPE-gated decode paths are still
 //! out of scope, and although the §I.3 AIC prediction reconstruction
 //! pipeline now exists end-to-end in [`aic_predict`], the
@@ -208,6 +221,7 @@ pub mod idct;
 pub mod intra_tcoef;
 pub mod macroblock;
 pub mod motion;
+pub mod pb_layer;
 pub mod picture;
 pub mod picture_header;
 pub mod plus_ptype;
@@ -247,6 +261,7 @@ pub use motion::{
     RemoteMv, H0, H1, H2, MV_HALF_MAX, MV_HALF_MIN, MV_HALF_SPAN, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN,
     OBMC_WEIGHT_SUM, RCONTROL_DEFAULT,
 };
+pub use pb_layer::{cbpb_block_present, parse_cbpb, parse_modb, ModbPresence, CBPB_BITS};
 pub use picture::{
     decode_picture, decode_picture_layer, decode_picture_layer_with_inherited, DecodeOptions,
     DecodePictureOutcome, PictureLayout, YuvFrame,

@@ -8,6 +8,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §5.3.3 / §5.3.4 PB-frame B-block field parsers (round 231):
+  - `pb_layer` new public module.
+  - `ModbPresence` new public enum (variants `None` / `MvdbOnly` /
+    `CbpbAndMvdb`) collapses the §5.3.3 Table 11 CBPB-and-MVDB
+    presence columns onto a tag. `has_cbpb()`, `has_mvdb()`, and
+    `code_bits()` accessors.
+  - `parse_modb(reader) -> Result<ModbPresence>` new public function
+    decoding the Table 11 1-or-2-bit variable-length codeword.
+    Leading bit `0` resolves `None` immediately; leading bit `1`
+    consumes one more bit (`0` → `MvdbOnly`, `1` → `CbpbAndMvdb`).
+    Only `Error::UnexpectedEof` is possible — every legal Table 11
+    prefix shape is non-empty.
+  - `parse_cbpb(reader) -> Result<u8>` new public function decoding
+    the §5.3.4 6-bit fixed-length CBPB Coded Block Pattern. Returns
+    the raw six bits in the low bits of a `u8`. Bit 5 (MSB of the
+    field) carries B-block number 1's CBPBN per §5.3.4 / Figure 5
+    "the utmost left bit of CBPB corresponding with block number 1".
+  - `cbpb_block_present(cbpb, block_number) -> bool` new public
+    function queries an individual B-block's CBPBN bit by 1-based
+    block number; defensively returns `false` for `block_number`
+    outside `1..=6`.
+  - `CBPB_BITS = 6` new public constant.
+  - 14 new tests (`cargo test -p oxideav-h263` reports 425 passed,
+    previously 411): the three Table 11 codewords round-trip
+    (`None` ← `0`, `MvdbOnly` ← `10`, `CbpbAndMvdb` ← `11`); MODB
+    truncated after the leading `1` returns `UnexpectedEof`; MODB
+    on an empty buffer returns `UnexpectedEof`; CBPB all-zero and
+    all-one patterns round-trip; CBPB single-bit-per-block
+    isolation across all six block positions; CBPB block-1-is-MSB
+    / block-6-is-LSB endpoint pin test; CBPB truncated and empty
+    buffer EOFs; out-of-range block-number queries return `false`;
+    `code_bits()` agrees with the reader's bit advance; end-to-end
+    chain test that an `11` MODB followed by a CBPB of `10_1010`
+    advances the reader exactly 8 bits and isolates B-blocks 1, 3,
+    5 as carrying coefficients.
+
 - §K.2.1 SSTUF stuffing skipper (round 226):
   - `skip_sstuf(reader)` new public function in `slice_header.rs`.
     Reads the `0..=7` trailing zero bits of the byte the reader is
