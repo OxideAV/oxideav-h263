@@ -36,10 +36,15 @@
 //! present in PB-frames mode if indicated by MODB").
 //!
 //! The Annex M (Improved PB-frames) MODB table is **different** from
-//! Table 11 — Annex M defines a 7-entry table (Table M.1) where this
-//! module's parser covers only the 3-entry Annex G form. Annex-M
-//! support is a separate primitive that the future Annex-M driver
-//! will add.
+//! Table 11 — Annex M defines a 6-entry table (Table M.1) where the
+//! Annex G [`parse_modb`] primitive covers only the 3-entry form.
+//! [`parse_modb_annex_m`] is the sibling primitive for the Annex M
+//! 6-entry form; it returns a [`ModbAnnexM`] tag combining the
+//! `(CBPB, MVDB)` presence pair with the per-row coding mode
+//! ([`BpbCodingMode`]) Table M.1 attaches to each row. The Annex M
+//! "BPB" terminology (B-Part of an Improved PB-frame, per §M.1) is
+//! used in the tag and its accessors; per §M.1 "B-picture, B-macroblock
+//! and B-block will not be used in this annex".
 //!
 //! Per §5.3.9, MVDB is "a variable length codeword for the horizontal
 //! component followed by a variable length codeword for the vertical
@@ -134,6 +139,163 @@ pub fn parse_modb(reader: &mut BitReader<'_>) -> Result<ModbPresence> {
     } else {
         Ok(ModbPresence::MvdbOnly)
     }
+}
+
+/// §M.2 Improved PB-frames BPB-macroblock coding modes. Each Table M.1
+/// row carries one of these three values in its "Coding mode" column;
+/// the §M.2 sub-sections give the per-mode prediction recipe the
+/// decoder applies once the mode is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BpbCodingMode {
+    /// §M.2.1 — prediction uses the reference pictures before and
+    /// after the BPB-picture. Equivalent to the Annex G prediction
+    /// when MVD = 0. Table M.1 rows 0 and 1.
+    Bidirectional,
+    /// §M.2.2 — the BPB-macroblock has a single 16×16 forward MVDB
+    /// vector pointing into the previous reference picture; no
+    /// backward reference is used. Table M.1 rows 2 and 3.
+    Forward,
+    /// §M.2.3 — prediction is identical to PREC (defined in §G.5);
+    /// no MVDB on the wire. Table M.1 rows 4 and 5.
+    Backward,
+}
+
+/// Per-Table M.1 row tag returned by [`parse_modb_annex_m`]. The tag
+/// collapses the table's three columns — `CBPB` presence, `MVDB`
+/// presence, and the §M.2 coding mode — onto a single value matched
+/// 1:1 with one of Table M.1's six rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModbAnnexM {
+    /// Table M.1 row 0 — CBPB absent, MVDB absent, §M.2.1
+    /// bidirectional. Code `0`, 1 bit.
+    BidirNoCbpbNoMvdb,
+    /// Table M.1 row 1 — CBPB present, MVDB absent, §M.2.1
+    /// bidirectional. Code `10`, 2 bits.
+    BidirCbpbNoMvdb,
+    /// Table M.1 row 2 — CBPB absent, MVDB present, §M.2.2 forward.
+    /// Code `110`, 3 bits.
+    ForwardNoCbpbMvdb,
+    /// Table M.1 row 3 — CBPB present, MVDB present, §M.2.2 forward.
+    /// Code `1110`, 4 bits.
+    ForwardCbpbMvdb,
+    /// Table M.1 row 4 — CBPB absent, MVDB absent, §M.2.3 backward.
+    /// Code `11110`, 5 bits.
+    BackwardNoCbpbNoMvdb,
+    /// Table M.1 row 5 — CBPB present, MVDB absent, §M.2.3 backward.
+    /// Code `11111`, 5 bits.
+    BackwardCbpbNoMvdb,
+}
+
+impl ModbAnnexM {
+    /// `true` iff Table M.1 marks CBPB as present (`x` in the CBPB
+    /// column). Rows 1, 3 and 5.
+    pub fn has_cbpb(self) -> bool {
+        matches!(
+            self,
+            ModbAnnexM::BidirCbpbNoMvdb
+                | ModbAnnexM::ForwardCbpbMvdb
+                | ModbAnnexM::BackwardCbpbNoMvdb
+        )
+    }
+
+    /// `true` iff Table M.1 marks MVDB as present (`x` in the MVDB
+    /// column). Rows 2 and 3 only — §M.2.2 forward prediction is the
+    /// only mode that carries MVDB on the wire under Annex M.
+    pub fn has_mvdb(self) -> bool {
+        matches!(
+            self,
+            ModbAnnexM::ForwardNoCbpbMvdb | ModbAnnexM::ForwardCbpbMvdb
+        )
+    }
+
+    /// §M.2 coding mode signalled by this row's Table M.1 entry.
+    pub fn coding_mode(self) -> BpbCodingMode {
+        match self {
+            ModbAnnexM::BidirNoCbpbNoMvdb | ModbAnnexM::BidirCbpbNoMvdb => {
+                BpbCodingMode::Bidirectional
+            }
+            ModbAnnexM::ForwardNoCbpbMvdb | ModbAnnexM::ForwardCbpbMvdb => BpbCodingMode::Forward,
+            ModbAnnexM::BackwardNoCbpbNoMvdb | ModbAnnexM::BackwardCbpbNoMvdb => {
+                BpbCodingMode::Backward
+            }
+        }
+    }
+
+    /// Length in bits of the Table M.1 codeword that produced this
+    /// tag. Useful for tests and for any caller that needs the
+    /// post-parse bit cursor without re-running the bitreader.
+    pub fn code_bits(self) -> u32 {
+        match self {
+            ModbAnnexM::BidirNoCbpbNoMvdb => 1,
+            ModbAnnexM::BidirCbpbNoMvdb => 2,
+            ModbAnnexM::ForwardNoCbpbMvdb => 3,
+            ModbAnnexM::ForwardCbpbMvdb => 4,
+            ModbAnnexM::BackwardNoCbpbNoMvdb | ModbAnnexM::BackwardCbpbNoMvdb => 5,
+        }
+    }
+}
+
+/// Decode an §M.4 / Table M.1 Improved PB-frames MODB variable-length
+/// codeword.
+///
+/// This is the Annex M sibling of [`parse_modb`]. Annex M replaces
+/// Table 11 with the 6-entry Table M.1 when the picture-header
+/// PLUSPTYPE indicates "Improved PB-frame" (versus Annex G's plain
+/// "PB-frame" carried by the legacy PTYPE bit 13). The decoder picks
+/// the parser per-picture based on the picture-coding type; the
+/// macroblock-layer driver dispatches between [`parse_modb`] and
+/// [`parse_modb_annex_m`] accordingly.
+///
+/// The reader is left positioned at the first bit following the MODB
+/// code on success. On `Err(Error::UnexpectedEof)` the reader's
+/// position is unspecified (every legal Table M.1 codeword starts
+/// with a run of 1..=4 leading `1` bits terminated by a `0`, except
+/// for the 5-bit rows which use the run length 4 plus a tail bit;
+/// any of those reads can run off the buffer end).
+///
+/// Table M.1 layout:
+///
+/// | Index | CBPB | MVDB | Bits | Code    | Coding mode    |
+/// |-------|------|------|------|---------|----------------|
+/// | 0     |      |      | 1    | `0`     | Bidirectional  |
+/// | 1     | x    |      | 2    | `10`    | Bidirectional  |
+/// | 2     |      | x    | 3    | `110`   | Forward        |
+/// | 3     | x    | x    | 4    | `1110`  | Forward        |
+/// | 4     |      |      | 5    | `11110` | Backward       |
+/// | 5     | x    |      | 5    | `11111` | Backward       |
+///
+/// The decode is a count of leading `1` bits up to 4: 0 → row 0;
+/// 1 → row 1; 2 → row 2; 3 → row 3; 4 → consult one more bit
+/// (`0` → row 4, `1` → row 5). Every legal 1..=5 bit prefix is a
+/// Table M.1 codeword; there is no unknown / forbidden prefix shape
+/// for any leading bit pattern that terminates the run of `1`s within
+/// four reads. The only error this function returns is
+/// [`Error::UnexpectedEof`].
+pub fn parse_modb_annex_m(reader: &mut BitReader<'_>) -> Result<ModbAnnexM> {
+    // Count the leading `1` bits up to 4. A terminating `0` within
+    // that run resolves rows 0..=3. A full run of four `1` bits
+    // requires one more bit to disambiguate rows 4 vs 5.
+    let mut ones = 0u32;
+    while ones < 4 {
+        let bit = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+        if !bit {
+            return Ok(match ones {
+                0 => ModbAnnexM::BidirNoCbpbNoMvdb,
+                1 => ModbAnnexM::BidirCbpbNoMvdb,
+                2 => ModbAnnexM::ForwardNoCbpbMvdb,
+                3 => ModbAnnexM::ForwardCbpbMvdb,
+                _ => unreachable!("ones is < 4 in this branch"),
+            });
+        }
+        ones += 1;
+    }
+    // Four leading `1` bits consumed; tail bit selects rows 4 / 5.
+    let tail = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    Ok(if tail {
+        ModbAnnexM::BackwardCbpbNoMvdb
+    } else {
+        ModbAnnexM::BackwardNoCbpbNoMvdb
+    })
 }
 
 /// Decode a §5.3.4 CBPB 6-bit fixed-length codeword.
@@ -386,6 +548,270 @@ mod tests {
             assert_eq!(modb.code_bits(), code_bits);
             assert_eq!(r.bit_position() as u32, code_bits);
         }
+    }
+
+    /// Table M.1 row 0 (`0`, 1 bit) → bidirectional, no CBPB, no MVDB.
+    #[test]
+    fn modb_annex_m_row_0_bidir_no_cbpb_no_mvdb() {
+        let mut w = BitWriter::new();
+        w.write_bit(false);
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let tag = parse_modb_annex_m(&mut r).expect("parse");
+        assert_eq!(tag, ModbAnnexM::BidirNoCbpbNoMvdb);
+        assert!(!tag.has_cbpb());
+        assert!(!tag.has_mvdb());
+        assert_eq!(tag.coding_mode(), BpbCodingMode::Bidirectional);
+        assert_eq!(tag.code_bits(), 1);
+        assert_eq!(r.bit_position(), 1);
+    }
+
+    /// Table M.1 row 1 (`10`, 2 bits) → bidirectional, CBPB only.
+    #[test]
+    fn modb_annex_m_row_1_bidir_cbpb_only() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b10, 2);
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let tag = parse_modb_annex_m(&mut r).expect("parse");
+        assert_eq!(tag, ModbAnnexM::BidirCbpbNoMvdb);
+        assert!(tag.has_cbpb());
+        assert!(!tag.has_mvdb());
+        assert_eq!(tag.coding_mode(), BpbCodingMode::Bidirectional);
+        assert_eq!(tag.code_bits(), 2);
+        assert_eq!(r.bit_position(), 2);
+    }
+
+    /// Table M.1 row 2 (`110`, 3 bits) → forward, MVDB only.
+    #[test]
+    fn modb_annex_m_row_2_forward_mvdb_only() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b110, 3);
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let tag = parse_modb_annex_m(&mut r).expect("parse");
+        assert_eq!(tag, ModbAnnexM::ForwardNoCbpbMvdb);
+        assert!(!tag.has_cbpb());
+        assert!(tag.has_mvdb());
+        assert_eq!(tag.coding_mode(), BpbCodingMode::Forward);
+        assert_eq!(tag.code_bits(), 3);
+        assert_eq!(r.bit_position(), 3);
+    }
+
+    /// Table M.1 row 3 (`1110`, 4 bits) → forward with CBPB + MVDB.
+    #[test]
+    fn modb_annex_m_row_3_forward_cbpb_and_mvdb() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b1110, 4);
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let tag = parse_modb_annex_m(&mut r).expect("parse");
+        assert_eq!(tag, ModbAnnexM::ForwardCbpbMvdb);
+        assert!(tag.has_cbpb());
+        assert!(tag.has_mvdb());
+        assert_eq!(tag.coding_mode(), BpbCodingMode::Forward);
+        assert_eq!(tag.code_bits(), 4);
+        assert_eq!(r.bit_position(), 4);
+    }
+
+    /// Table M.1 row 4 (`11110`, 5 bits) → backward, no CBPB, no MVDB.
+    #[test]
+    fn modb_annex_m_row_4_backward_no_cbpb_no_mvdb() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b11110, 5);
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let tag = parse_modb_annex_m(&mut r).expect("parse");
+        assert_eq!(tag, ModbAnnexM::BackwardNoCbpbNoMvdb);
+        assert!(!tag.has_cbpb());
+        assert!(!tag.has_mvdb());
+        assert_eq!(tag.coding_mode(), BpbCodingMode::Backward);
+        assert_eq!(tag.code_bits(), 5);
+        assert_eq!(r.bit_position(), 5);
+    }
+
+    /// Table M.1 row 5 (`11111`, 5 bits) → backward with CBPB.
+    /// §M.2.3 backward prediction does not carry MVDB on the wire, so
+    /// even this row leaves MVDB off — only CBPB is present.
+    #[test]
+    fn modb_annex_m_row_5_backward_cbpb_only() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b11111, 5);
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let tag = parse_modb_annex_m(&mut r).expect("parse");
+        assert_eq!(tag, ModbAnnexM::BackwardCbpbNoMvdb);
+        assert!(tag.has_cbpb());
+        assert!(!tag.has_mvdb());
+        assert_eq!(tag.coding_mode(), BpbCodingMode::Backward);
+        assert_eq!(tag.code_bits(), 5);
+        assert_eq!(r.bit_position(), 5);
+    }
+
+    /// Sweep every Table M.1 row and assert the parser's bit advance
+    /// agrees with the tag's self-reported width, the parsed tag, and
+    /// the §M.2 coding-mode column. Six rows, single oracle.
+    #[test]
+    fn modb_annex_m_table_m1_round_trip_all_rows() {
+        let rows: [(u32, u32, ModbAnnexM, BpbCodingMode, bool, bool); 6] = [
+            (
+                0b0,
+                1,
+                ModbAnnexM::BidirNoCbpbNoMvdb,
+                BpbCodingMode::Bidirectional,
+                false,
+                false,
+            ),
+            (
+                0b10,
+                2,
+                ModbAnnexM::BidirCbpbNoMvdb,
+                BpbCodingMode::Bidirectional,
+                true,
+                false,
+            ),
+            (
+                0b110,
+                3,
+                ModbAnnexM::ForwardNoCbpbMvdb,
+                BpbCodingMode::Forward,
+                false,
+                true,
+            ),
+            (
+                0b1110,
+                4,
+                ModbAnnexM::ForwardCbpbMvdb,
+                BpbCodingMode::Forward,
+                true,
+                true,
+            ),
+            (
+                0b11110,
+                5,
+                ModbAnnexM::BackwardNoCbpbNoMvdb,
+                BpbCodingMode::Backward,
+                false,
+                false,
+            ),
+            (
+                0b11111,
+                5,
+                ModbAnnexM::BackwardCbpbNoMvdb,
+                BpbCodingMode::Backward,
+                true,
+                false,
+            ),
+        ];
+        for (code, bits, expected_tag, mode, has_cbpb, has_mvdb) in rows {
+            let mut w = BitWriter::new();
+            w.write_u32(code, bits);
+            let data = finish_aligned(w);
+            let mut r = BitReader::new(&data);
+            let tag = parse_modb_annex_m(&mut r).expect("parse");
+            assert_eq!(tag, expected_tag, "code {:b}", code);
+            assert_eq!(tag.code_bits(), bits, "code {:b} width", code);
+            assert_eq!(r.bit_position() as u32, bits, "reader advance {:b}", code);
+            assert_eq!(tag.coding_mode(), mode, "coding mode {:b}", code);
+            assert_eq!(tag.has_cbpb(), has_cbpb, "has_cbpb {:b}", code);
+            assert_eq!(tag.has_mvdb(), has_mvdb, "has_mvdb {:b}", code);
+        }
+    }
+
+    /// Annex M MODB on an empty buffer yields UnexpectedEof immediately.
+    #[test]
+    fn modb_annex_m_empty_buffer_returns_eof() {
+        let data: [u8; 0] = [];
+        let mut r = BitReader::new(&data);
+        let err = parse_modb_annex_m(&mut r).expect_err("empty");
+        assert_eq!(err, Error::UnexpectedEof);
+    }
+
+    /// Annex M MODB starting with three `1` bits followed by EOF
+    /// truncates while waiting for the run-terminator bit. Construct
+    /// a 1-byte buffer whose last three bits are the leading `111`
+    /// of MODB and burn the five preceding bits, so we read `1` /
+    /// `1` / `1` then run off the end.
+    #[test]
+    fn modb_annex_m_truncated_in_run_returns_eof() {
+        let data = [0b0000_0111u8];
+        let mut r = BitReader::new(&data);
+        r.read_u32(5).expect("burn five padding bits");
+        let err = parse_modb_annex_m(&mut r).expect_err("run truncated");
+        assert_eq!(err, Error::UnexpectedEof);
+    }
+
+    /// Annex M MODB with four `1` bits but no tail bit truncates on
+    /// the row 4 / row 5 disambiguator. Two-byte buffer with eleven
+    /// bits burned leaves five bits before EOF; we then write four
+    /// `1` bits as the lead, read all four, and run off the end on
+    /// the tail bit read. To set this up cleanly we instead build a
+    /// fresh `1111`-then-EOF buffer at byte alignment by burning a
+    /// known prefix.
+    #[test]
+    fn modb_annex_m_truncated_at_tail_returns_eof() {
+        // Construct a single byte whose last four bits are `1111` and
+        // burn the first four bits so the reader sits on the run of
+        // four leading `1` bits with nothing after.
+        let data = [0b0000_1111u8];
+        let mut r = BitReader::new(&data);
+        r.read_u32(4).expect("burn four padding bits");
+        let err = parse_modb_annex_m(&mut r).expect_err("tail bit missing");
+        assert_eq!(err, Error::UnexpectedEof);
+    }
+
+    /// End-to-end Annex M chain: MODB row 3 (`1110`, forward
+    /// CBPB+MVDB) immediately followed by a CBPB pattern that lights
+    /// only blocks 2 and 4. Reader sits at bit 10 (4 + 6) after both
+    /// parses; CBPB queries return the expected per-block presence.
+    #[test]
+    fn modb_annex_m_then_cbpb_chain_advances_by_10_bits() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b1110, 4); // row 3
+        w.write_u32(0b01_0100, 6); // CBPB: block 2 (bit 4) + block 4 (bit 2)
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let modb = parse_modb_annex_m(&mut r).expect("modb");
+        assert_eq!(modb, ModbAnnexM::ForwardCbpbMvdb);
+        assert!(modb.has_cbpb());
+        assert!(modb.has_mvdb());
+        let cbpb = parse_cbpb(&mut r).expect("cbpb");
+        assert_eq!(cbpb, 0b01_0100);
+        assert!(!cbpb_block_present(cbpb, 1));
+        assert!(cbpb_block_present(cbpb, 2));
+        assert!(!cbpb_block_present(cbpb, 3));
+        assert!(cbpb_block_present(cbpb, 4));
+        assert!(!cbpb_block_present(cbpb, 5));
+        assert!(!cbpb_block_present(cbpb, 6));
+        assert_eq!(r.bit_position(), 10);
+    }
+
+    /// Cross-check: the Annex M parser is independent of the Annex G
+    /// parser. Feeding the Annex G "code = 11" (Table 11 row 2) to
+    /// the Annex M parser interprets the same bits as a partial
+    /// Annex M codeword — specifically the first two bits of row 3
+    /// (`1110`), so the Annex M parser will continue reading. Drive
+    /// the bytes deliberately so we can pin the divergence between
+    /// the two tables.
+    #[test]
+    fn modb_annex_m_does_not_share_codewords_with_annex_g() {
+        // Annex G code `11` = CbpbAndMvdb (2 bits). Annex M code `1110`
+        // is row 3 (4 bits) — extending the Annex G `11` with `10`
+        // yields the Annex M row 3 codeword. Feed `11` then `10` to
+        // the Annex M parser and assert it consumes all four bits.
+        let mut w = BitWriter::new();
+        w.write_u32(0b1110, 4);
+        let data = finish_aligned(w);
+        let mut r_m = BitReader::new(&data);
+        let tag_m = parse_modb_annex_m(&mut r_m).expect("annex m");
+        assert_eq!(tag_m, ModbAnnexM::ForwardCbpbMvdb);
+        assert_eq!(r_m.bit_position(), 4);
+
+        // Same bytes through the Annex G parser stop at bit 2.
+        let mut r_g = BitReader::new(&data);
+        let tag_g = parse_modb(&mut r_g).expect("annex g");
+        assert_eq!(tag_g, ModbPresence::CbpbAndMvdb);
+        assert_eq!(r_g.bit_position(), 2);
     }
 
     /// End-to-end: MODB row 2 (`11`) immediately followed by a CBPB

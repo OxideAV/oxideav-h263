@@ -8,6 +8,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §M.4 Improved PB-frames Table M.1 MODB parser (round 237):
+  - `BpbCodingMode` new public enum (`Bidirectional` / `Forward` /
+    `Backward`) carries the §M.2 BPB-macroblock prediction mode
+    each Table M.1 row attaches via its "Coding mode" column.
+  - `ModbAnnexM` new public enum collapsing the six Table M.1 rows
+    onto a single tag combining `(CBPB, MVDB)` presence with the
+    `BpbCodingMode` value. `has_cbpb()`, `has_mvdb()`,
+    `coding_mode()`, and `code_bits()` accessors.
+  - `parse_modb_annex_m(reader) -> Result<ModbAnnexM>` new public
+    function decoding the §M.4 / Table M.1 variable-length codeword
+    used by Improved PB-frames (PLUSPTYPE picture-coding code
+    `"010"` per §5.1.4.3). Decode counts leading `1` bits up to 4
+    (0 / 1 / 2 / 3 → rows 0..=3); a full run of four `1` bits
+    consults one more bit (`0` → row 4 / `1` → row 5). All six
+    Table M.1 codewords (`0` / `10` / `110` / `1110` / `11110` /
+    `11111`) round-trip; only `Error::UnexpectedEof` is possible.
+  - 12 new tests (`cargo test -p oxideav-h263` reports 437 passed,
+    previously 425): the six Table M.1 codewords round-trip with
+    independent assertions on the `CBPB` / `MVDB` presence and
+    `coding_mode()` column (`modb_annex_m_row_0..=row_5`); a sweep
+    over all six rows pinning `code_bits()` and the reader-advance
+    invariant (`modb_annex_m_table_m1_round_trip_all_rows`); EOF
+    paths on an empty buffer, truncated mid-run, and truncated
+    at the row-4-vs-5 disambiguator
+    (`modb_annex_m_empty_buffer_returns_eof` /
+    `modb_annex_m_truncated_in_run_returns_eof` /
+    `modb_annex_m_truncated_at_tail_returns_eof`); an end-to-end
+    `parse_modb_annex_m` + `parse_cbpb` chain advancing the reader
+    by 4 + 6 = 10 bits with per-block CBPB queries
+    (`modb_annex_m_then_cbpb_chain_advances_by_10_bits`); and a
+    cross-check pinning that the Annex M parser is independent of
+    the Annex G `parse_modb` parser — feeding the four bits `1110`
+    consumes all four through Annex M but only the first two
+    through Annex G
+    (`modb_annex_m_does_not_share_codewords_with_annex_g`).
+  - Updated `pb_layer` module-level doc string from "Annex M is a
+    separate primitive a future round will add" to naming
+    `parse_modb_annex_m` as that primitive plus the §M.1 "BPB"
+    naming rationale.
+
 - §5.3.3 / §5.3.4 PB-frame B-block field parsers (round 231):
   - `pb_layer` new public module.
   - `ModbPresence` new public enum (variants `None` / `MvdbOnly` /

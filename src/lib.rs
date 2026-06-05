@@ -261,7 +261,10 @@ pub use motion::{
     RemoteMv, H0, H1, H2, MV_HALF_MAX, MV_HALF_MIN, MV_HALF_SPAN, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN,
     OBMC_WEIGHT_SUM, RCONTROL_DEFAULT,
 };
-pub use pb_layer::{cbpb_block_present, parse_cbpb, parse_modb, ModbPresence, CBPB_BITS};
+pub use pb_layer::{
+    cbpb_block_present, parse_cbpb, parse_modb, parse_modb_annex_m, BpbCodingMode, ModbAnnexM,
+    ModbPresence, CBPB_BITS,
+};
 pub use picture::{
     decode_picture, decode_picture_layer, decode_picture_layer_with_inherited, DecodeOptions,
     DecodePictureOutcome, PictureLayout, YuvFrame,

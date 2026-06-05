@@ -5,6 +5,75 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 28 (workspace round 237) — §M.4 / Table M.1 Improved PB-frames
+MODB parser. The macroblock-layer driver needs a separate MODB parser
+for PLUSPTYPE picture-coding code `"010"` (Improved PB-frame, per
+§5.1.4.3); §5.3.3's "MODB is coded differently for Improved PB-frames,
+as specified in Annex M" footnote and §M.4 itself spell out that the
+Annex G Table 11 (3 entries) is *replaced* by the Annex M Table M.1
+(6 entries) under PLUSPTYPE Improved PB-frame mode. The new
+`parse_modb_annex_m` is the sibling of the existing `parse_modb` for
+that case; it returns the new `ModbAnnexM` tag that names which Table
+M.1 row matched plus the §M.2 `BpbCodingMode` the row attaches via the
+table's "Coding mode" column (the Annex G tag did not need this column
+because Annex G has no per-row mode distinction).**
+
+* `BpbCodingMode` (new public enum in `pb_layer.rs`): variants
+  `Bidirectional` / `Forward` / `Backward` per §M.2.1 / §M.2.2 /
+  §M.2.3. The §M.1 "BPB" naming ("B-Part of an Improved PB-frame")
+  is used in the enum name and doc strings; per §M.1 the legacy
+  Annex G terms "B-picture / B-macroblock / B-block" are not used
+  in Annex M.
+* `ModbAnnexM` (new public enum): six variants
+  (`BidirNoCbpbNoMvdb` / `BidirCbpbNoMvdb` / `ForwardNoCbpbMvdb` /
+  `ForwardCbpbMvdb` / `BackwardNoCbpbNoMvdb` / `BackwardCbpbNoMvdb`)
+  enumerate Table M.1 rows 0..=5 1:1. `has_cbpb()` returns `true`
+  for rows 1, 3, 5; `has_mvdb()` returns `true` for rows 2, 3 only
+  (§M.2.3 backward prediction does not carry MVDB on the wire even
+  in the CBPB-present row 5); `coding_mode()` returns the row's
+  `BpbCodingMode`; `code_bits()` returns 1 / 2 / 3 / 4 / 5 / 5 per
+  the table's "Number of bits" column.
+* `parse_modb_annex_m(reader) -> Result<ModbAnnexM>` (new public
+  function): counts the leading `1` bits up to four (0 → row 0;
+  1 → row 1; 2 → row 2; 3 → row 3); a full run of four `1` bits
+  consults one more tail bit (`0` → row 4 / `1` → row 5). Every
+  legal 1..=5 bit prefix is a Table M.1 codeword; the only error
+  returned is `Error::UnexpectedEof` from truncated reads.
+
+12 new tests land:
+`modb_annex_m_row_0_bidir_no_cbpb_no_mvdb` /
+`modb_annex_m_row_1_bidir_cbpb_only` /
+`modb_annex_m_row_2_forward_mvdb_only` /
+`modb_annex_m_row_3_forward_cbpb_and_mvdb` /
+`modb_annex_m_row_4_backward_no_cbpb_no_mvdb` /
+`modb_annex_m_row_5_backward_cbpb_only` (the six Table M.1 codewords
+round-trip with independent assertions on `CBPB` / `MVDB` presence,
+the §M.2 coding mode, `code_bits()`, and the post-parse reader
+position); `modb_annex_m_table_m1_round_trip_all_rows` (sweep over
+all six rows pinning `code_bits()` and reader-advance equality);
+`modb_annex_m_empty_buffer_returns_eof` and
+`modb_annex_m_truncated_in_run_returns_eof` and
+`modb_annex_m_truncated_at_tail_returns_eof` (EOF paths covering the
+empty-buffer case, mid-run truncation after `111`, and tail-bit
+truncation after a full `1111` run);
+`modb_annex_m_then_cbpb_chain_advances_by_10_bits` (end-to-end:
+row 3 (`1110`) followed by a CBPB pattern lighting only blocks 2
+and 4 consumes 4 + 6 = 10 bits and isolates the correct B-blocks);
+and `modb_annex_m_does_not_share_codewords_with_annex_g` (pinning
+the parsers' independence: the four bits `1110` consume all four
+through Annex M but only the first two through Annex G).
+`cargo test -p oxideav-h263` reports 437 passed (previously 425).
+
+`parse_modb` (the Annex G Table 11 parser) and `parse_cbpb` /
+`cbpb_block_present` remain unchanged. The macroblock-layer driver
+that gates these primitives behind the picture-coding mode (Annex G
+"PB-frame" via PTYPE bit 13 vs Annex M "Improved PB-frame" via
+PLUSPTYPE picture-coding code `"010"`) is still the next-round step;
+this round plugs the last missing wire-level primitive needed by
+that walker — the Annex M MODB codeword.
+
+---
+
 **Round 27 (workspace round 231) — §5.3.3 / §5.3.4 PB-frame B-block
 field parsers as the new `pb_layer` module. PB-frame mode (Annex G)
 inserts two extra fields between MCBPC and CBPY in the §5.3
