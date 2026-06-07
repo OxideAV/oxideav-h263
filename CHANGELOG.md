@@ -8,6 +8,48 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §G.4 PB-frame B-picture motion-vector calculator (round 249):
+  - `pb_b_vectors(p_mv, mvd, trb, trd) -> (i32, i32)` new public
+    function in `pb_layer.rs`: per-component §G.4 formula
+    `MVF = (TRB × MV) / TRD + MVD`; `MVB = ((TRB - TRD) × MV) /
+    TRD` if MVD == 0 else `MVB = MVF - MV`. `mvd: Option<i32>`
+    encodes "MVDB absent" (`None`) vs "MVDB present" (`Some(d)`);
+    `Some(0)` falls through to the same MVD-zero branch as `None`.
+    Rust's signed `/` matches §G.4 "/ means division by
+    truncation". Panics on `trd == 0` (§G.4 undefined for a zero
+    TR increment).
+  - `pb_b_vector(p_mv, mvd, trb, trd) -> (MotionVector,
+    MotionVector)` new public function: two-axis composition of
+    `pb_b_vectors` on a `MotionVector` / `Option<Mvd>` pair,
+    returning the (MVF, MVB) pair for one 8×8 luminance block of
+    the B-picture. Per §G.4 paragraph 4 the same MVDB pair is
+    reused across all four luma B-blocks; the caller selects the
+    per-block `p_mv`.
+  - `pb_b_chroma_vector(luma_mvf, luma_mvb) -> (MotionVector,
+    MotionVector)` new public function: §G.4 paragraphs 5-6
+    chroma vector derivation, summing the four luma MVF / MVB
+    half-pel components and snapping via Table F.1
+    sixteenth-pel positions through the existing §F.2
+    `chroma_mv_component_4mv` primitive (since §G.4 and §F.2
+    share the same "sum of 4 luma half-pel → snap" transform).
+  - 16 new tests (`cargo test -p oxideav-h263` reports 462 passed,
+    previously 446): per-component formula coverage
+    (zero/symmetric-split/three-quarter/one-quarter splits at
+    representative (TRB, TRD) ratios), MVD-branch coverage
+    (positive / negative MVD with the MVF-minus-MV path; explicit
+    `Some(0)` matching `None`), Rust signed `/` truncation
+    behaviour pin (`pb_b_vectors_division_truncates_toward_zero`),
+    `trd == 0` panic path, two-axis composition
+    (`pb_b_vector_composes_per_axis` /
+    `_no_mvdb_takes_zero_branch_on_both_axes` /
+    `_some_zero_mvd_matches_none`), end-to-end MODB +
+    MVDB + §G.4 calculation chain
+    (`pb_b_vector_chained_after_modb_annex_m_and_mvdb_parse`),
+    and chroma collapse
+    (`pb_b_chroma_vector_uniform_luma_collapses_via_table_f1` /
+    `_all_zero_is_zero` /
+    `_matches_chroma_mv_component_4mv`).
+
 - §5.3.9 MVDB (Motion Vector Data for B-macroblock) parser
   (round 248):
   - `parse_mvdb(reader) -> Result<Mvd>` new public function in

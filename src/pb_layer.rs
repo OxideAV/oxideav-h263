@@ -54,10 +54,42 @@
 //! component decoder; no new VLC table lands for MVDB itself. The
 //! macroblock driver wires the existing `decode_mvd_component` into
 //! MVDB when MODB indicates MVDB presence.
+//!
+//! ## §G.4 — Calculation of vectors for the B-picture
+//!
+//! Once the §5.3.9 MVDB has been parsed (or determined absent from the
+//! §5.3.3 / §M.4 MODB tag), §G.4 derives the per-luminance-block
+//! forward and backward motion vectors `(MVF, MVB)` of the B-picture
+//! from three inputs: the P-picture's vector `MV` for the 8×8 luma
+//! block, the §5.3.9 delta `MVD` (zero if MVDB absent), and the
+//! temporal-reference scalars `TRB` (§5.1.22) and `TRD` (the §5.1.2 TR
+//! increment from the last picture header). The spec specifies the
+//! pair via:
+//!
+//! ```text
+//!   MVF = (TRB × MV) / TRD + MVD
+//!   MVB = ((TRB - TRD) × MV) / TRD      if MVD == 0
+//!   MVB = MVF - MV                      if MVD != 0
+//! ```
+//!
+//! with "/" meaning division by truncation (Rust's signed-integer `/`
+//! operator). Both `MVF` and `MVB` are returned in half-pel units;
+//! [`pb_b_vectors`] computes one component pair (horizontal or
+//! vertical), and [`pb_b_vector`] composes the two components into a
+//! [`MotionVector`] pair for the full 8×8 luma block. §G.4 also
+//! prescribes the chroma B-vector derivation: sum the four luma MVF
+//! (resp. MVB) components and divide by 8, then snap toward the
+//! nearest half-pel position per Table F.1 — the existing
+//! [`crate::motion::chroma_mv_component_4mv`] / `chroma_mv_4mv`
+//! primitive performs exactly that sum-of-4-luma-half-pel /
+//! Table-F.1-snap transform, so [`pb_b_chroma_vector`] composes it
+//! over the four luma B-vectors directly without duplicating the
+//! Table F.1 logic.
 
 use oxideav_core::bits::BitReader;
 
 use crate::macroblock::{decode_mvd_component, Mvd};
+use crate::motion::{chroma_mv_component_4mv, MotionVector};
 use crate::{Error, Result};
 
 /// Field width of the §5.3.4 CBPB Coded Block Pattern for B-blocks.
@@ -365,6 +397,161 @@ pub fn parse_mvdb(reader: &mut BitReader<'_>) -> Result<Mvd> {
     let dx_half = decode_mvd_component(reader)?;
     let dy_half = decode_mvd_component(reader)?;
     Ok(Mvd { dx_half, dy_half })
+}
+
+/// §G.4 forward / backward motion-vector pair for one B-picture
+/// 8×8 luminance block, **per component** (called once for the
+/// horizontal component and once for the vertical).
+///
+/// Inputs:
+///
+/// * `p_mv` — the P-picture vector component for the corresponding
+///   luminance block, in half-pel units (§6.1.1 / §F.2 convention).
+///   "If only one vector per macroblock is transmitted, MV has the
+///   same value for each of the four 8 × 8 luminance blocks" — the
+///   caller is responsible for selecting the correct per-block value
+///   (the macroblock-layer driver dispatches per [`crate::motion::LumaBlockIndex`]
+///   when Annex F §F.2 INTER4V is active and replicates the single
+///   MV across all four blocks otherwise).
+/// * `mvd` — the §5.3.9 MVDB delta component. `None` covers the
+///   "MVDB is not present, MVD is set to zero" branch (§G.4 first
+///   half: MODB row 0 of Table 11 or MODB rows 0 / 1 / 3 / 4 / 5 of
+///   the Annex M Table M.1 with `has_mvdb() == false`). `Some(d)`
+///   carries the delta from a successful [`parse_mvdb`] (or the
+///   replicated single-MVDB pair §G.4 paragraph 4 prescribes: "If
+///   MVDB is present, the same MVD given by MVDB is used for each of
+///   the four luminance B-blocks").
+/// * `trb` — §5.1.22 Temporal Reference for B-pictures in PB-frames,
+///   3 or 5 bits wide on the wire (`trb` in `[1, 7]` for CIF clock
+///   frequency, `[1, 31]` for a custom picture clock frequency per
+///   §5.1.22 last sentence).
+/// * `trd` — the §G.4 P-to-P temporal-reference increment. Per §G.4
+///   first paragraph: "If TRD is negative, then TRD = TRD + d where
+///   d = 256 for CIF picture frequency and 1024 for any custom
+///   picture clock frequency"; this wrap is the caller's
+///   responsibility — `trd` here must be positive (the spec's
+///   formulas are undefined for non-positive TRD, and a zero TRD
+///   would yield a division-by-zero).
+///
+/// Returns `(mvf, mvb)` in half-pel units. The wrap of `MVF` into the
+/// §6.1.1 permitted range `[-32, 31]` (or `[-63, 63]` under UMV) is
+/// **not** applied here — §G.4 paragraph 4 says "Advantage is taken
+/// of the fact that the range of values for MVF is constrained";
+/// that constraint is enforced by the encoder choosing the MVDB pair
+/// that lands within range, and decoders simply compute the formula
+/// as-is. Callers that need the §6.1.1 wrapped form can post-process
+/// via [`crate::motion::reconstruct_mv_component`] /
+/// [`crate::motion::reconstruct_mv_component_umv`] but §G.4 itself
+/// does not require it.
+///
+/// # Panics
+///
+/// Panics if `trd == 0`. §G.4 does not define behaviour for a zero
+/// temporal-reference increment (the formula's denominator would be
+/// zero); the panic surfaces this caller-error rather than silently
+/// returning a garbage half-pel pair.
+pub fn pb_b_vectors(p_mv: i32, mvd: Option<i32>, trb: i32, trd: i32) -> (i32, i32) {
+    assert!(trd != 0, "§G.4 requires non-zero TRD");
+    // Rust signed `/` is truncation toward zero, matching §G.4's
+    // "/ means division by truncation".
+    let mvf = (trb * p_mv) / trd + mvd.unwrap_or(0);
+    let mvb = if mvd.is_some_and(|d| d != 0) {
+        // §G.4: "MVB = MVF - MV   if MVD is unequal to 0".
+        mvf - p_mv
+    } else {
+        // §G.4: "MVB = ((TRB - TRD) × MV) / TRD   if MVD is equal to 0".
+        // This branch also covers the §G.4 "If MVDB is not present,
+        // MVD is set to zero" case (caller passes `None`).
+        ((trb - trd) * p_mv) / trd
+    };
+    (mvf, mvb)
+}
+
+/// §G.4 forward / backward vector pair for one B-picture 8×8
+/// luminance block as a [`MotionVector`] pair. Two-component
+/// composition of [`pb_b_vectors`] — `pb_b_vectors(p_mv.dx_half, …)`
+/// for the horizontal axis and `pb_b_vectors(p_mv.dy_half, …)` for
+/// the vertical. Both `MVF` and `MVB` come back in half-pel units.
+///
+/// Per §G.4 paragraph 4 ("If MVDB is present, the same MVD given by
+/// MVDB is used for each of the four luminance B-blocks within the
+/// macroblock"), the same `mvd` value is intended to be reused for
+/// each of the four 8×8 luma block invocations under both the
+/// one-MV-per-MB and the §F.2 four-MV-per-MB cases. The caller (the
+/// macroblock-layer driver) selects the per-block `p_mv` and applies
+/// the same `mvd` across all four invocations.
+///
+/// See [`pb_b_vectors`] for the per-component formulas and for the
+/// `trd == 0` panic condition (which propagates from the underlying
+/// per-component routine).
+pub fn pb_b_vector(
+    p_mv: MotionVector,
+    mvd: Option<Mvd>,
+    trb: i32,
+    trd: i32,
+) -> (MotionVector, MotionVector) {
+    let (dx_mvd, dy_mvd) = match mvd {
+        Some(m) => (Some(m.dx_half as i32), Some(m.dy_half as i32)),
+        None => (None, None),
+    };
+    let (mvf_dx, mvb_dx) = pb_b_vectors(p_mv.dx_half, dx_mvd, trb, trd);
+    let (mvf_dy, mvb_dy) = pb_b_vectors(p_mv.dy_half, dy_mvd, trb, trd);
+    (
+        MotionVector {
+            dx_half: mvf_dx,
+            dy_half: mvf_dy,
+        },
+        MotionVector {
+            dx_half: mvb_dx,
+            dy_half: mvb_dy,
+        },
+    )
+}
+
+/// §G.4 final two paragraphs — chroma B-vector for a macroblock,
+/// derived from the four luminance B-vectors. Per §G.4:
+///
+/// > For chrominance blocks, MVF is derived by calculating the sum of
+/// > the four corresponding luminance MVF vectors and dividing this
+/// > sum by 8; the resulting sixteenth pixel resolution vector
+/// > components are modified towards the nearest half-pixel position
+/// > as indicated in Table F.1. MVB for chrominance is derived by
+/// > calculating the sum of the four corresponding luminance MVB
+/// > vectors and dividing this sum by 8; …
+///
+/// The "sum of four luma half-pel components → Table F.1 nearest
+/// half-pel" transform is exactly the §F.2 chroma vector for a
+/// four-MV macroblock, so this function delegates per-component to
+/// [`crate::motion::chroma_mv_component_4mv`] (which sums in half-pel
+/// units, recovers the sixteenth-pel fraction via `mag % 16`, and
+/// snaps via the in-tree Table F.1 transcription). Returns the chroma
+/// MVF / MVB pair, both in [`MotionVector`] half-pel units, applied
+/// uniformly to both Cb and Cr blocks of the macroblock per §G.4's
+/// invocation ("for chrominance blocks").
+///
+/// The two `&[MotionVector; 4]` slices are the §G.4 "four
+/// corresponding luminance MVF vectors" and "four corresponding
+/// luminance MVB vectors" respectively, in the [`crate::motion::LumaBlockIndex`]
+/// ordering (block 0 top-left, block 1 top-right, block 2
+/// bottom-left, block 3 bottom-right) the §F.2 four-MV neighbourhood
+/// uses.
+pub fn pb_b_chroma_vector(
+    luma_mvf: &[MotionVector; 4],
+    luma_mvb: &[MotionVector; 4],
+) -> (MotionVector, MotionVector) {
+    let sum_x_mvf = luma_mvf.iter().map(|mv| mv.dx_half).sum::<i32>();
+    let sum_y_mvf = luma_mvf.iter().map(|mv| mv.dy_half).sum::<i32>();
+    let sum_x_mvb = luma_mvb.iter().map(|mv| mv.dx_half).sum::<i32>();
+    let sum_y_mvb = luma_mvb.iter().map(|mv| mv.dy_half).sum::<i32>();
+    let mvf = MotionVector {
+        dx_half: chroma_mv_component_4mv(sum_x_mvf),
+        dy_half: chroma_mv_component_4mv(sum_y_mvf),
+    };
+    let mvb = MotionVector {
+        dx_half: chroma_mv_component_4mv(sum_x_mvb),
+        dy_half: chroma_mv_component_4mv(sum_y_mvb),
+    };
+    (mvf, mvb)
 }
 
 #[cfg(test)]
@@ -1034,5 +1221,240 @@ mod tests {
         assert!(cbpb_block_present(cbpb, 5));
         assert!(!cbpb_block_present(cbpb, 6));
         assert_eq!(r.bit_position(), 8);
+    }
+
+    // ---- §G.4 — Calculation of vectors for the B-picture ---------------
+
+    /// §G.4 baseline — when MV == 0 and MVDB is absent, both MVF and
+    /// MVB are zero regardless of (TRB, TRD). The formula reduces to
+    /// `(TRB × 0) / TRD == 0` for MVF and `((TRB - TRD) × 0) / TRD == 0`
+    /// for MVB.
+    #[test]
+    fn pb_b_vectors_zero_p_mv_no_mvdb_is_zero_pair() {
+        let (mvf, mvb) = pb_b_vectors(0, None, 2, 4);
+        assert_eq!(mvf, 0);
+        assert_eq!(mvb, 0);
+    }
+
+    /// §G.4 middle-of-interval (TRB exactly half of TRD): MVF =
+    /// (TRB × MV) / TRD = (1 × 8) / 2 = 4; MVB = ((TRB - TRD) × MV) /
+    /// TRD = (-1 × 8) / 2 = -4. The B-picture sits midway between the
+    /// previous P-picture and the next P-picture, so MVF and MVB are
+    /// equal in magnitude with opposite signs.
+    #[test]
+    fn pb_b_vectors_mid_interval_symmetric_split() {
+        let (mvf, mvb) = pb_b_vectors(8, None, 1, 2);
+        assert_eq!(mvf, 4);
+        assert_eq!(mvb, -4);
+    }
+
+    /// §G.4 close-to-next-P (TRB near TRD): MVF leans toward the full
+    /// MV, MVB toward zero. TRB = 3, TRD = 4 → MVF = (3 × 16) / 4 =
+    /// 12; MVB = ((3 - 4) × 16) / 4 = -4. The B-picture is closer to
+    /// the next P-picture than to the previous one, so the forward
+    /// vector is larger than the backward.
+    #[test]
+    fn pb_b_vectors_three_quarters_split() {
+        let (mvf, mvb) = pb_b_vectors(16, None, 3, 4);
+        assert_eq!(mvf, 12);
+        assert_eq!(mvb, -4);
+    }
+
+    /// §G.4 close-to-previous-P (TRB near 0): MVF leans toward zero,
+    /// MVB toward -MV. TRB = 1, TRD = 4 → MVF = (1 × 16) / 4 = 4;
+    /// MVB = ((1 - 4) × 16) / 4 = -12.
+    #[test]
+    fn pb_b_vectors_one_quarter_split() {
+        let (mvf, mvb) = pb_b_vectors(16, None, 1, 4);
+        assert_eq!(mvf, 4);
+        assert_eq!(mvb, -12);
+    }
+
+    /// §G.4 with non-zero MVDB: the MVB branch flips from the
+    /// "((TRB - TRD) × MV) / TRD" formula (used when MVD == 0) to
+    /// "MVF - MV" (used when MVD ≠ 0). TRB = 1, TRD = 2, MV = 8,
+    /// MVD = 2 → MVF = (1 × 8) / 2 + 2 = 6; MVB = MVF - MV =
+    /// 6 - 8 = -2.
+    #[test]
+    fn pb_b_vectors_nonzero_mvd_uses_mvf_minus_mv_branch() {
+        let (mvf, mvb) = pb_b_vectors(8, Some(2), 1, 2);
+        assert_eq!(mvf, 6);
+        assert_eq!(mvb, -2);
+    }
+
+    /// §G.4 with negative MVD: same MVB-branch flip, sign carries
+    /// through. MV = 10, MVD = -3, TRB = 1, TRD = 2 → MVF =
+    /// (1 × 10) / 2 + (-3) = 5 - 3 = 2; MVB = 2 - 10 = -8.
+    #[test]
+    fn pb_b_vectors_negative_mvd() {
+        let (mvf, mvb) = pb_b_vectors(10, Some(-3), 1, 2);
+        assert_eq!(mvf, 2);
+        assert_eq!(mvb, -8);
+    }
+
+    /// §G.4 explicit "MVD == 0" branch: `Some(0)` matches "MVDB is
+    /// present but its value is zero" and therefore takes the
+    /// `((TRB - TRD) × MV) / TRD` path, **not** the `MVF - MV` path.
+    /// The result must match the `None` (MVDB-absent) case exactly.
+    #[test]
+    fn pb_b_vectors_explicit_zero_mvd_matches_absent_mvdb() {
+        let with_zero = pb_b_vectors(8, Some(0), 1, 2);
+        let without = pb_b_vectors(8, None, 1, 2);
+        assert_eq!(with_zero, without);
+        assert_eq!(with_zero, (4, -4));
+    }
+
+    /// §G.4 division-by-truncation behaviour matches Rust's signed
+    /// `/`. Negative MV with non-exact TRB/TRD division: MV = -5,
+    /// TRB = 1, TRD = 2 → (1 × -5) / 2 = -2 (truncation toward zero,
+    /// **not** floor). MVB = ((1 - 2) × -5) / 2 = 5 / 2 = 2.
+    #[test]
+    fn pb_b_vectors_division_truncates_toward_zero() {
+        let (mvf, mvb) = pb_b_vectors(-5, None, 1, 2);
+        assert_eq!(mvf, -2); // would be -3 if floor; -2 is truncation
+        assert_eq!(mvb, 2);
+    }
+
+    /// §G.4 panics on TRD == 0 (the spec's formula is undefined for a
+    /// zero temporal-reference increment; a division by zero would
+    /// otherwise occur).
+    #[test]
+    #[should_panic(expected = "non-zero TRD")]
+    fn pb_b_vectors_panics_on_zero_trd() {
+        let _ = pb_b_vectors(8, None, 1, 0);
+    }
+
+    /// [`pb_b_vector`] composes [`pb_b_vectors`] on each axis with
+    /// the same (TRB, TRD) and the per-axis Mvd component split. MV
+    /// = (8, 16), MVD = (+2, -3), TRB = 1, TRD = 2 → MVF.x = 6, MVF.y
+    /// = 5, MVB.x = -2, MVB.y = -11 (MVF - MV per axis since MVD ≠
+    /// 0 on both axes).
+    #[test]
+    fn pb_b_vector_composes_per_axis() {
+        let p_mv = MotionVector::new(8, 16);
+        let mvd = Mvd {
+            dx_half: 2,
+            dy_half: -3,
+        };
+        let (mvf, mvb) = pb_b_vector(p_mv, Some(mvd), 1, 2);
+        assert_eq!(mvf, MotionVector::new(6, 5));
+        assert_eq!(mvb, MotionVector::new(-2, -11));
+    }
+
+    /// [`pb_b_vector`] with `None` MVDB takes the §G.4 MVB =
+    /// ((TRB - TRD) × MV) / TRD path on each axis. MV = (8, -16),
+    /// TRB = 1, TRD = 2 → MVF = (4, -8); MVB = (-4, 8).
+    #[test]
+    fn pb_b_vector_no_mvdb_takes_zero_branch_on_both_axes() {
+        let p_mv = MotionVector::new(8, -16);
+        let (mvf, mvb) = pb_b_vector(p_mv, None, 1, 2);
+        assert_eq!(mvf, MotionVector::new(4, -8));
+        assert_eq!(mvb, MotionVector::new(-4, 8));
+    }
+
+    /// [`pb_b_vector`] with a zero Mvd struct (Some(Mvd{0,0})) must
+    /// behave identically to `None` MVDB on both axes (the per-axis
+    /// "MVD == 0" check selects the no-MVD branch independently).
+    #[test]
+    fn pb_b_vector_some_zero_mvd_matches_none() {
+        let p_mv = MotionVector::new(10, 14);
+        let with_zero = pb_b_vector(
+            p_mv,
+            Some(Mvd {
+                dx_half: 0,
+                dy_half: 0,
+            }),
+            1,
+            2,
+        );
+        let without = pb_b_vector(p_mv, None, 1, 2);
+        assert_eq!(with_zero, without);
+    }
+
+    /// End-to-end: parse §M.4 MODB row 2 (`110`, forward + MVDB no
+    /// CBPB), then §5.3.9 MVDB `(+1, -1)`, then call [`pb_b_vector`]
+    /// with the parsed Mvd applied to a (16, 0) P-MV at TRB = 1,
+    /// TRD = 2. Verifies the round-trip parse → calculate chain
+    /// the macroblock-layer driver will exercise.
+    #[test]
+    fn pb_b_vector_chained_after_modb_annex_m_and_mvdb_parse() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b110, 3); // §M.4 Table M.1 row 2 (forward + MVDB)
+                               // MVDB dx = +1 — Table 14 entry "+1 in half-pel" sits at
+                               // VLC `010` per the established §5.3.7 transcription used in
+                               // earlier MVDB tests of this module.
+        w.write_u32(0b010, 3);
+        // MVDB dy = -1 — Table 14 entry "-1 in half-pel" is VLC `011`.
+        w.write_u32(0b011, 3);
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let modb = parse_modb_annex_m(&mut r).expect("modb");
+        assert!(modb.has_mvdb());
+        let mvdb = parse_mvdb(&mut r).expect("mvdb");
+        assert_eq!(mvdb.dx_half, 1);
+        assert_eq!(mvdb.dy_half, -1);
+        let p_mv = MotionVector::new(16, 0);
+        let (mvf, mvb) = pb_b_vector(p_mv, Some(mvdb), 1, 2);
+        // dx axis: MVF = (1 × 16) / 2 + 1 = 9; MVB = 9 - 16 = -7.
+        // dy axis: MVF = (1 × 0) / 2 + (-1) = -1; MVB = -1 - 0 = -1.
+        assert_eq!(mvf, MotionVector::new(9, -1));
+        assert_eq!(mvb, MotionVector::new(-7, -1));
+    }
+
+    /// [`pb_b_chroma_vector`] §G.4 paragraph 5 / 6 — four uniform
+    /// luma MVF / MVB vectors collapse to the §F.2 chroma-of-4-MV
+    /// transform: sum / 16 + sixteenth-pel snap. Four MVF of (8, 0)
+    /// sum to dx_sum = 32 → mag = 32, full_chroma_pixels = 2,
+    /// sixteenth = 0 → chroma dx = 4. Four MVB of (-4, 0) sum to
+    /// dx_sum = -16 → chroma dx = -2.
+    #[test]
+    fn pb_b_chroma_vector_uniform_luma_collapses_via_table_f1() {
+        let luma_mvf = [MotionVector::new(8, 0); 4];
+        let luma_mvb = [MotionVector::new(-4, 0); 4];
+        let (chroma_mvf, chroma_mvb) = pb_b_chroma_vector(&luma_mvf, &luma_mvb);
+        assert_eq!(chroma_mvf, MotionVector::new(4, 0));
+        assert_eq!(chroma_mvb, MotionVector::new(-2, 0));
+    }
+
+    /// [`pb_b_chroma_vector`] zero-input identity — all-zero luma
+    /// vectors yield all-zero chroma vectors on both planes.
+    #[test]
+    fn pb_b_chroma_vector_all_zero_is_zero() {
+        let zero = [MotionVector::default(); 4];
+        let (chroma_mvf, chroma_mvb) = pb_b_chroma_vector(&zero, &zero);
+        assert_eq!(chroma_mvf, MotionVector::default());
+        assert_eq!(chroma_mvb, MotionVector::default());
+    }
+
+    /// [`pb_b_chroma_vector`] mixed-magnitude luma exercises the
+    /// Table F.1 sixteenth-pel snap. Four luma MVFs with dx sum 6
+    /// (4+0+0+2): mag=6, full_chroma_pixels=0, sixteenth=6 → the
+    /// Table F.1 row-6 snap (encoded in `chroma_mv_component_4mv`)
+    /// drives the fractional component. Validate by computing the
+    /// expected value through the public §F.2 primitive on the
+    /// same sum.
+    #[test]
+    fn pb_b_chroma_vector_matches_chroma_mv_component_4mv() {
+        let luma_mvf = [
+            MotionVector::new(4, 1),
+            MotionVector::new(0, 3),
+            MotionVector::new(0, -2),
+            MotionVector::new(2, 0),
+        ];
+        let luma_mvb = [
+            MotionVector::new(-1, -1),
+            MotionVector::new(-2, 0),
+            MotionVector::new(1, 2),
+            MotionVector::new(0, -3),
+        ];
+        let (chroma_mvf, chroma_mvb) = pb_b_chroma_vector(&luma_mvf, &luma_mvb);
+        let expected_mvf_dx = chroma_mv_component_4mv(6);
+        let expected_mvf_dy = chroma_mv_component_4mv(2);
+        let expected_mvb_dx = chroma_mv_component_4mv(-2);
+        let expected_mvb_dy = chroma_mv_component_4mv(-2);
+        assert_eq!(chroma_mvf.dx_half, expected_mvf_dx);
+        assert_eq!(chroma_mvf.dy_half, expected_mvf_dy);
+        assert_eq!(chroma_mvb.dx_half, expected_mvb_dx);
+        assert_eq!(chroma_mvb.dy_half, expected_mvb_dy);
     }
 }

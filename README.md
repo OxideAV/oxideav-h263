@@ -5,6 +5,85 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 30 (workspace round 249) — §G.4 PB-frame B-picture motion
+vector calculator. With the §5.3.9 MVDB primitive landed in r248,
+the remaining gap in the PB-mode B-macroblock walk was the §G.4
+derivation of the per-luminance-block forward / backward vector
+pair `(MVF, MVB)` from the P-picture vector `MV`, the §5.3.9 MVDB
+delta `MVD`, and the temporal-reference scalars TRB (§5.1.22) and
+TRD (§G.4 first paragraph, the §5.1.2 TR increment from the last
+picture header). §G.4 specifies the per-component formula
+`MVF = (TRB × MV) / TRD + MVD`; `MVB = ((TRB - TRD) × MV) / TRD`
+if MVD == 0 else `MVB = MVF - MV`. The new `pb_b_vectors` (per
+component), `pb_b_vector` (per 8×8 luminance block — composes the
+horizontal and vertical components), and `pb_b_chroma_vector`
+(per macroblock — collapses four luma B-vectors to one chroma
+B-vector via Table F.1 sixteenth-pel snap) primitives plug the
+calculation gap, returning everything in half-pel units to match
+the existing `MotionVector` convention.**
+
+* `pb_b_vectors(p_mv, mvd, trb, trd) -> (mvf, mvb)` (new public
+  function in `pb_layer.rs`): per-component §G.4 calculation,
+  returning a `(i32, i32)` pair of half-pel values. `mvd: Option<i32>`
+  encodes "MVDB absent" (`None`, §G.4 "if MVDB is not present,
+  MVD is set to zero") vs "MVDB present" (`Some(d)`); the
+  `Some(0)` case falls through to the same `((TRB - TRD) × MV) /
+  TRD` branch as `None`. Rust's signed `/` is truncation toward
+  zero, matching §G.4's "/ means division by truncation". Panics
+  on `trd == 0` (§G.4 is undefined for a zero TR increment).
+* `pb_b_vector(p_mv, mvd, trb, trd) -> (MotionVector, MotionVector)`
+  (new public function): two-axis composition of `pb_b_vectors`
+  on a `MotionVector` / `Option<Mvd>` pair, returning the (MVF,
+  MVB) pair for one 8×8 luminance block of the B-picture. Per §G.4
+  paragraph 4 the same MVDB pair is reused across all four luma
+  B-blocks of the macroblock; the caller (the macroblock-layer
+  driver) replicates `mvd` and selects the per-block `p_mv`
+  (whether from the single MV in baseline mode or the four §F.2
+  INTER4V MVs).
+* `pb_b_chroma_vector(luma_mvf, luma_mvb) -> (MotionVector,
+  MotionVector)` (new public function): §G.4 paragraphs 5–6
+  chroma vector derivation, summing the four luma MVF (resp. MVB)
+  half-pel components and snapping via Table F.1 sixteenth-pel
+  positions. Delegates per axis to the existing §F.2
+  `chroma_mv_component_4mv` primitive (the Table F.1 transcription
+  the §F.2 four-MV chroma vector already uses), since §G.4 and
+  §F.2 share the same "sum of 4 luma half-pel → snap" transform.
+
+16 new tests land: per-component formula coverage
+(`pb_b_vectors_zero_p_mv_no_mvdb_is_zero_pair`,
+`pb_b_vectors_mid_interval_symmetric_split` at TRB = 1 / TRD = 2,
+`pb_b_vectors_three_quarters_split` at TRB = 3 / TRD = 4,
+`pb_b_vectors_one_quarter_split` at TRB = 1 / TRD = 4); MVD-branch
+coverage (`pb_b_vectors_nonzero_mvd_uses_mvf_minus_mv_branch`,
+`pb_b_vectors_negative_mvd`,
+`pb_b_vectors_explicit_zero_mvd_matches_absent_mvdb` pinning that
+`Some(0)` matches `None`); rounding behaviour
+(`pb_b_vectors_division_truncates_toward_zero` pinning Rust's
+signed `/` semantics against §G.4 "/ means division by
+truncation"); panic path
+(`pb_b_vectors_panics_on_zero_trd`); two-axis composition
+(`pb_b_vector_composes_per_axis`,
+`pb_b_vector_no_mvdb_takes_zero_branch_on_both_axes`,
+`pb_b_vector_some_zero_mvd_matches_none`); end-to-end chain
+(`pb_b_vector_chained_after_modb_annex_m_and_mvdb_parse` parsing
+the §M.4 MODB row 2 + §5.3.9 MVDB pair then computing the §G.4
+formula); and chroma collapse
+(`pb_b_chroma_vector_uniform_luma_collapses_via_table_f1`,
+`pb_b_chroma_vector_all_zero_is_zero`,
+`pb_b_chroma_vector_matches_chroma_mv_component_4mv`).
+`cargo test -p oxideav-h263` reports 462 passed (previously 446).
+
+The macroblock-layer PB-mode driver that gates `pb_b_vector` /
+`pb_b_chroma_vector` behind PTYPE bit 13 (Annex G) or PLUSPTYPE
+picture-coding code `"010"` (Annex M), wires the existing P-MV
+reconstruction (one MV per MB in baseline mode, four-MV §F.2
+INTER4V otherwise) into its `p_mv` input, and steps the B-block
+prediction (§G.5 — bidirectional inside PREC, forward elsewhere)
+remains the next-round step. This round closes the calculation
+gap that driver needs once it has parsed the §5.3.9 MVDB pair.
+
+---
+
 **Round 29 (workspace round 248) — §5.3.9 MVDB (Motion Vector Data
 for B-macroblock) parser. Per §5.3.9, "MVDB is only present in
 PB-frames or Improved PB-frames mode if indicated by MODB, and
