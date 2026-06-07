@@ -655,7 +655,7 @@ fn decode_cbpy(reader: &mut BitReader<'_>) -> Result<u8> {
 /// motion-vector predictor). Round 3 returns the natural-range
 /// half-pel `Vector` column; mapping to the wrap-around branch is
 /// deferred to the (future) MV-reconstruction stage.
-fn decode_mvd_component(reader: &mut BitReader<'_>) -> Result<i8> {
+pub(crate) fn decode_mvd_component(reader: &mut BitReader<'_>) -> Result<i8> {
     // 64-row literal transcription of Table 14, kept in
     // index-order so the row layout matches the printed spec
     // line-by-line. Decoder reads the codeword bits

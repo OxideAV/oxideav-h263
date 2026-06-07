@@ -57,6 +57,7 @@
 
 use oxideav_core::bits::BitReader;
 
+use crate::macroblock::{decode_mvd_component, Mvd};
 use crate::{Error, Result};
 
 /// Field width of the §5.3.4 CBPB Coded Block Pattern for B-blocks.
@@ -331,6 +332,39 @@ pub fn cbpb_block_present(cbpb: u8, block_number: u32) -> bool {
     // block 6 → bit 0.
     let bit_index = 6 - block_number;
     ((cbpb >> bit_index) & 1) != 0
+}
+
+/// Decode the §5.3.9 MVDB (Motion Vector Data for B-macroblock) pair.
+///
+/// Per §5.3.9: "MVDB is only present in PB-frames or Improved PB-frames
+/// mode if indicated by MODB, and consists of a variable length codeword
+/// for the horizontal component followed by a variable length codeword
+/// for the vertical component of each vector. Variable length codes are
+/// given in Table 14." Table 14 is the same MVD VLC the baseline
+/// §5.3.7 MVD parser already decodes; this function composes that
+/// primitive twice (horizontal first, then vertical) and packs the
+/// result into the existing [`Mvd`] type.
+///
+/// The returned components are in **half-pel units** (the spec's
+/// "Vector Differences" column scaled by 2 to keep the type integral),
+/// matching the convention [`Mvd`] uses for §5.3.7 MVD and the
+/// Annex F §F.2 MVD2-4 fields.
+///
+/// The caller (the macroblock-layer driver) is responsible for gating
+/// the invocation per §5.3.9 — i.e. only calling this primitive after
+/// MODB indicates MVDB presence ([`ModbPresence::has_mvdb`] or the
+/// Annex M [`ModbAnnexM::has_mvdb`] accessor returns `true`). This
+/// primitive itself does not consult MODB.
+///
+/// On `Err(Error::UnexpectedEof)` the reader's position is unspecified;
+/// truncation may occur mid-horizontal-component or mid-vertical. On
+/// `Err(Error::BadMvdCode)` an unknown Table 14 prefix was encountered
+/// (the read MVD VLC machinery scans the full 13-bit codeword domain
+/// before giving up).
+pub fn parse_mvdb(reader: &mut BitReader<'_>) -> Result<Mvd> {
+    let dx_half = decode_mvd_component(reader)?;
+    let dy_half = decode_mvd_component(reader)?;
+    Ok(Mvd { dx_half, dy_half })
 }
 
 #[cfg(test)]
@@ -812,6 +846,167 @@ mod tests {
         let tag_g = parse_modb(&mut r_g).expect("annex g");
         assert_eq!(tag_g, ModbPresence::CbpbAndMvdb);
         assert_eq!(r_g.bit_position(), 2);
+    }
+
+    /// §5.3.9 MVDB single-bit per component round-trip. The §5.3.7
+    /// MVD VLC has the `1` codeword mapped to half-pel value `0`, so
+    /// the MVDB pair (`1`, `1`) decodes to `(0, 0)` and consumes
+    /// exactly two bits.
+    #[test]
+    fn mvdb_zero_zero_pair_consumes_two_bits() {
+        let mut w = BitWriter::new();
+        w.write_bit(true); // dx
+        w.write_bit(true); // dy
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let mvdb = parse_mvdb(&mut r).expect("parse");
+        assert_eq!(mvdb.dx_half, 0);
+        assert_eq!(mvdb.dy_half, 0);
+        assert_eq!(r.bit_position(), 2);
+    }
+
+    /// §5.3.9 MVDB asymmetric pair: dx = +1 (3-bit code `010`),
+    /// dy = -1 (3-bit code `011`). Six bits consumed total.
+    #[test]
+    fn mvdb_plus_one_minus_one_round_trip() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b010, 3); // dx = +1 per Table 14 idx 33
+        w.write_u32(0b011, 3); // dy = -1 per Table 14 idx 31
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let mvdb = parse_mvdb(&mut r).expect("parse");
+        assert_eq!(mvdb.dx_half, 1);
+        assert_eq!(mvdb.dy_half, -1);
+        assert_eq!(r.bit_position(), 6);
+    }
+
+    /// §5.3.9 MVDB symmetric non-zero pair: dx = dy = -2 (4-bit code
+    /// `0011`). Eight bits consumed total.
+    #[test]
+    fn mvdb_minus_two_minus_two_pair() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b0011, 4); // dx = -2 per Table 14 idx 30
+        w.write_u32(0b0011, 4); // dy = -2
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let mvdb = parse_mvdb(&mut r).expect("parse");
+        assert_eq!(mvdb.dx_half, -2);
+        assert_eq!(mvdb.dy_half, -2);
+        assert_eq!(r.bit_position(), 8);
+    }
+
+    /// §5.3.9 MVDB on an empty buffer yields [`Error::UnexpectedEof`]
+    /// from the horizontal-component read.
+    #[test]
+    fn mvdb_empty_buffer_returns_eof() {
+        let data: [u8; 0] = [];
+        let mut r = BitReader::new(&data);
+        let err = parse_mvdb(&mut r).expect_err("empty");
+        assert_eq!(err, Error::UnexpectedEof);
+    }
+
+    /// §5.3.9 MVDB with horizontal present but vertical truncated:
+    /// burn seven bits then feed the single `1` bit (dx = 0); the
+    /// vertical-component read runs off the end. The error is
+    /// [`Error::UnexpectedEof`].
+    #[test]
+    fn mvdb_truncated_between_components_returns_eof() {
+        let data = [0b0000_0001u8];
+        let mut r = BitReader::new(&data);
+        r.read_u32(7).expect("burn seven padding bits");
+        // r is now at bit 7; the next read sees the `1` (dx = 0),
+        // then dy_half tries to read from EOF.
+        let err = parse_mvdb(&mut r).expect_err("dy missing");
+        assert_eq!(err, Error::UnexpectedEof);
+    }
+
+    /// §5.3.9 MVDB end-to-end chain composed with the §5.3.3 MODB
+    /// row 1 (`10`, MVDB only) primitive: the macroblock-layer
+    /// driver's PB-mode wire sequence for MB-type 0..=4 when only
+    /// MVDB is present is `MODB(2 bits) + MVDB(dx + dy)`. Feed
+    /// MODB `10` plus dx = +1 (`010`) and dy = 0 (`1`) — the reader
+    /// consumes exactly 2 + 3 + 1 = 6 bits and reports the expected
+    /// `(dx, dy)` pair.
+    #[test]
+    fn mvdb_after_modb_mvdb_only_chain_advances_by_six_bits() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b10, 2); // MODB row 1: MVDB only
+        w.write_u32(0b010, 3); // dx = +1
+        w.write_bit(true); // dy = 0
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let modb = parse_modb(&mut r).expect("modb");
+        assert_eq!(modb, ModbPresence::MvdbOnly);
+        assert!(modb.has_mvdb());
+        assert!(!modb.has_cbpb());
+        let mvdb = parse_mvdb(&mut r).expect("mvdb");
+        assert_eq!(mvdb.dx_half, 1);
+        assert_eq!(mvdb.dy_half, 0);
+        assert_eq!(r.bit_position(), 6);
+    }
+
+    /// §5.3.9 MVDB end-to-end chain with the §5.3.3 MODB row 2 / §5.3.4
+    /// CBPB. Both CBPB and MVDB are present: the wire layout is
+    /// `MODB(2 bits) + CBPB(6 bits) + MVDB(dx + dy)`. Pin the cursor
+    /// position after each parser.
+    #[test]
+    fn mvdb_after_modb_cbpb_and_mvdb_chain() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b11, 2); // MODB row 2: CBPB + MVDB
+        w.write_u32(0b10_1010, 6); // CBPB pattern: blocks 1, 3, 5
+        w.write_bit(true); // dx = 0
+        w.write_u32(0b010, 3); // dy = +1
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let modb = parse_modb(&mut r).expect("modb");
+        assert_eq!(modb, ModbPresence::CbpbAndMvdb);
+        assert!(modb.has_cbpb());
+        assert!(modb.has_mvdb());
+        assert_eq!(r.bit_position(), 2);
+        let cbpb = parse_cbpb(&mut r).expect("cbpb");
+        assert_eq!(cbpb, 0b10_1010);
+        assert_eq!(r.bit_position(), 8);
+        let mvdb = parse_mvdb(&mut r).expect("mvdb");
+        assert_eq!(mvdb.dx_half, 0);
+        assert_eq!(mvdb.dy_half, 1);
+        assert_eq!(r.bit_position(), 12);
+    }
+
+    /// §5.3.9 MVDB end-to-end through the Annex M MODB primitive: row
+    /// 2 (`110`, forward, MVDB only) followed by a non-zero MVDB pair.
+    /// Demonstrates that the §5.3.9 primitive composes identically with
+    /// both the §5.3.3 / Table 11 and §M.4 / Table M.1 MODB tags — the
+    /// MVDB wire format itself does not change between Annex G and
+    /// Annex M (§M.2.2 / §5.3.9 explicitly reuse the §5.3.7 / Table 14
+    /// VLC).
+    #[test]
+    fn mvdb_after_modb_annex_m_forward_chain() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b110, 3); // Annex M row 2: forward, MVDB only
+        w.write_u32(0b010, 3); // dx = +1
+        w.write_u32(0b011, 3); // dy = -1
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let modb = parse_modb_annex_m(&mut r).expect("modb m");
+        assert_eq!(modb, ModbAnnexM::ForwardNoCbpbMvdb);
+        assert!(modb.has_mvdb());
+        assert_eq!(modb.coding_mode(), BpbCodingMode::Forward);
+        assert_eq!(r.bit_position(), 3);
+        let mvdb = parse_mvdb(&mut r).expect("mvdb");
+        assert_eq!(mvdb.dx_half, 1);
+        assert_eq!(mvdb.dy_half, -1);
+        assert_eq!(r.bit_position(), 9);
+    }
+
+    /// §5.3.9 MVDB on a malformed Table 14 codeword returns
+    /// [`Error::BadMvdCode`]. Construct a horizontal prefix that
+    /// never resolves: thirteen zero bits with no leading `1`.
+    #[test]
+    fn mvdb_unknown_codeword_returns_bad_mvd_code() {
+        let data = [0u8; 2];
+        let mut r = BitReader::new(&data);
+        let err = parse_mvdb(&mut r).expect_err("all-zero prefix");
+        assert_eq!(err, Error::BadMvdCode);
     }
 
     /// End-to-end: MODB row 2 (`11`) immediately followed by a CBPB

@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §5.3.9 MVDB (Motion Vector Data for B-macroblock) parser
+  (round 248):
+  - `parse_mvdb(reader) -> Result<Mvd>` new public function in
+    `pb_layer.rs` decoding the §5.3.9 dx/dy half-pel pair via the
+    §5.3.7 / Table 14 MVD VLC (the same primitive the baseline
+    macroblock parser already uses for §5.3.7 MVD / §5.3.8
+    MVD2-4). Per §5.3.9 ("a variable length codeword for the
+    horizontal component followed by a variable length codeword
+    for the vertical component"), horizontal is read first; the
+    returned `Mvd` carries `(dx_half, dy_half)` in half-pel units.
+    Composes identically with the §5.3.3 `parse_modb` /
+    `ModbPresence::has_mvdb` gate and the §M.4 `parse_modb_annex_m`
+    / `ModbAnnexM::has_mvdb` gate; the wire format does not change
+    between Annex G and Annex M (§M.2.2 / §5.3.9 share Table 14).
+  - The shared `decode_mvd_component` primitive in `macroblock.rs`
+    is now `pub(crate)` so `pb_layer.rs` can call it without
+    duplicating the 64-row Table 14 transcription.
+  - 9 new tests (`cargo test -p oxideav-h263` reports 446 passed,
+    previously 437): zero-pair round-trip
+    (`mvdb_zero_zero_pair_consumes_two_bits`), asymmetric
+    `(+1, -1)` pair (`mvdb_plus_one_minus_one_round_trip`),
+    symmetric `(-2, -2)` pair (`mvdb_minus_two_minus_two_pair`),
+    EOF paths on an empty buffer and mid-pair truncation
+    (`mvdb_empty_buffer_returns_eof` /
+    `mvdb_truncated_between_components_returns_eof`), three
+    end-to-end chains composing MVDB after MODB (MVDB-only
+    `parse_modb` + `parse_mvdb` at 6 bits; CBPB+MVDB
+    `parse_modb` + `parse_cbpb` + `parse_mvdb` at 12 bits;
+    Annex M forward `parse_modb_annex_m` + `parse_mvdb` at 9
+    bits), and a malformed-codeword path
+    (`mvdb_unknown_codeword_returns_bad_mvd_code`) covering
+    `Error::BadMvdCode` on a thirteen-zero prefix.
+
 - §M.4 Improved PB-frames Table M.1 MODB parser (round 237):
   - `BpbCodingMode` new public enum (`Bidirectional` / `Forward` /
     `Backward`) carries the §M.2 BPB-macroblock prediction mode

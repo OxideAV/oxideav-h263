@@ -262,8 +262,8 @@ pub use motion::{
     OBMC_WEIGHT_SUM, RCONTROL_DEFAULT,
 };
 pub use pb_layer::{
-    cbpb_block_present, parse_cbpb, parse_modb, parse_modb_annex_m, BpbCodingMode, ModbAnnexM,
-    ModbPresence, CBPB_BITS,
+    cbpb_block_present, parse_cbpb, parse_modb, parse_modb_annex_m, parse_mvdb, BpbCodingMode,
+    ModbAnnexM, ModbPresence, CBPB_BITS,
 };
 pub use picture::{
     decode_picture, decode_picture_layer, decode_picture_layer_with_inherited, DecodeOptions,

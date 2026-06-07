@@ -5,6 +5,79 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 29 (workspace round 248) — §5.3.9 MVDB (Motion Vector Data
+for B-macroblock) parser. Per §5.3.9, "MVDB is only present in
+PB-frames or Improved PB-frames mode if indicated by MODB, and
+consists of a variable length codeword for the horizontal component
+followed by a variable length codeword for the vertical component of
+each vector. Variable length codes are given in Table 14." Table 14
+is the §5.3.7 MVD VLC the baseline macroblock parser already decodes
+via the shared `decode_mvd_component`, so the new `parse_mvdb`
+primitive simply composes that twice (horizontal then vertical) and
+packs the half-pel pair into the existing public `Mvd` type. The
+macroblock-layer PB-mode driver, once landed, will gate the call per
+§5.3.9 on `ModbPresence::has_mvdb()` (Annex G) or
+`ModbAnnexM::has_mvdb()` (Annex M); this round plugs the last
+missing wire-level primitive that driver needs to step the B-half of
+a PB-macroblock.**
+
+* `parse_mvdb(reader) -> Result<Mvd>` (new public function in
+  `pb_layer.rs`): decodes the §5.3.9 dx/dy pair via the §5.3.7
+  Table 14 VLC, horizontal first. The returned `Mvd` carries
+  `(dx_half, dy_half)` in half-pel units (the same convention the
+  existing `Mvd` uses for §5.3.7 baseline MVD and the Annex F §F.2
+  MVD2-4 fields). The macroblock-layer driver is responsible for
+  gating the call per §5.3.9 — the primitive itself does not
+  consult MODB.
+* `decode_mvd_component` in `macroblock.rs` is now `pub(crate)`
+  so `pb_layer.rs` reuses the existing 64-row Table 14
+  transcription without duplicating it. No new table data lands
+  this round; only the composition is new.
+* §M.2.2 / §5.3.9 reuse Table 14 verbatim — there is no separate
+  MVDB VLC for Annex M. The same `parse_mvdb` primitive serves
+  both Annex G PB-frame mode (`ModbPresence::MvdbOnly` and
+  `ModbPresence::CbpbAndMvdb` rows of Table 11) and Annex M
+  Improved PB-frame mode (`ModbAnnexM::ForwardNoCbpbMvdb` and
+  `ModbAnnexM::ForwardCbpbMvdb` rows of Table M.1; per §M.2.3
+  backward prediction does not carry MVDB on the wire even in the
+  CBPB-present row 5, so `ModbAnnexM::has_mvdb()` returns `false`
+  for both backward rows).
+
+9 new tests land:
+`mvdb_zero_zero_pair_consumes_two_bits` (the `(1, 1)` codeword
+pair decodes to `(0, 0)` and consumes exactly two bits);
+`mvdb_plus_one_minus_one_round_trip` (asymmetric `(+1, -1)` pair
+via Table 14 indices 33 and 31, six bits consumed);
+`mvdb_minus_two_minus_two_pair` (symmetric `(-2, -2)` pair via
+Table 14 index 30, eight bits consumed);
+`mvdb_empty_buffer_returns_eof` and
+`mvdb_truncated_between_components_returns_eof` (EOF paths
+covering empty-buffer and mid-pair truncation, where the
+horizontal-component read succeeds but the vertical-component
+read runs off the end); three end-to-end chain tests pinning the
+MVDB primitive's composition with MODB:
+`mvdb_after_modb_mvdb_only_chain_advances_by_six_bits` (MODB
+row 1 `10` + dx `010` + dy `1` = 6 bits, MVDB-only Annex G case),
+`mvdb_after_modb_cbpb_and_mvdb_chain` (MODB row 2 `11` + CBPB
+6 bits + MVDB pair = 12 bits, full-presence Annex G case), and
+`mvdb_after_modb_annex_m_forward_chain` (Annex M MODB row 2
+`110` + MVDB pair = 9 bits, forward-prediction Improved PB
+case); and `mvdb_unknown_codeword_returns_bad_mvd_code` covering
+the `Error::BadMvdCode` path on a thirteen-zero prefix that
+never resolves to a Table 14 entry.
+`cargo test -p oxideav-h263` reports 446 passed (previously 437).
+
+`parse_modb`, `parse_modb_annex_m`, `parse_cbpb`,
+`cbpb_block_present`, and the `ModbPresence` / `ModbAnnexM` /
+`BpbCodingMode` tags remain unchanged. The macroblock-layer driver
+that gates these primitives behind PTYPE bit 13 (Annex G) vs
+PLUSPTYPE picture-coding code `"010"` (Annex M) and composes them
+into the full §5.3 PB-macroblock walk remains the next-round step;
+this round closes the last gap in that walker's primitive set —
+the §5.3.9 MVDB codeword pair.
+
+---
+
 **Round 28 (workspace round 237) — §M.4 / Table M.1 Improved PB-frames
 MODB parser. The macroblock-layer driver needs a separate MODB parser
 for PLUSPTYPE picture-coding code `"010"` (Improved PB-frame, per
