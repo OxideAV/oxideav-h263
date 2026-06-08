@@ -262,8 +262,10 @@ pub use motion::{
     OBMC_WEIGHT_SUM, RCONTROL_DEFAULT,
 };
 pub use pb_layer::{
-    cbpb_block_present, parse_cbpb, parse_modb, parse_modb_annex_m, parse_mvdb, pb_b_chroma_vector,
-    pb_b_vector, pb_b_vectors, BpbCodingMode, ModbAnnexM, ModbPresence, CBPB_BITS,
+    cbpb_block_present, parse_cbpb, parse_modb, parse_modb_annex_m, parse_mvdb,
+    pb_b_bidir_chroma_extent, pb_b_bidir_extent_component, pb_b_bidir_luma_block_extent,
+    pb_b_chroma_vector, pb_b_vector, pb_b_vectors, BpbCodingMode, ModbAnnexM, ModbPresence,
+    CBPB_BITS,
 };
 pub use picture::{
     decode_picture, decode_picture_layer, decode_picture_layer_with_inherited, DecodeOptions,

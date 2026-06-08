@@ -5,6 +5,83 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 31 (workspace round 258) — §G.5 PB-frame B-block
+bidirectional-prediction mask. With the §G.4 forward / backward
+vector calculator landed in r249, the next step toward the
+macroblock-layer PB-mode driver is the §G.5 prediction-region
+selector — the per-pixel split a B-block walks between (a)
+bidirectional prediction (the spec-prescribed truncated average of
+forward and backward predictions) where the §G.4 backward vector
+MVB points inside the just-reconstructed P-macroblock PREC, and
+(b) forward-only prediction (using only the §G.4 MVF) for the
+remaining pixels. §G.5 prescribes the split with two C-language
+loop nests (one for the four 8×8 luma sub-blocks, one for the
+single 8×8 chroma block of the macroblock). Reading the nests
+algebraically, the per-axis bidirectional pixel range factorises
+as `i ∈ [max(block_lo, (-mvb+1)/2), min(block_hi, ref_max -
+(mvb+1)/2)]`, with `ref_max = 15` for luma (the macroblock-wide
+pixel bound) and `ref_max = 7` for chroma; "/" is truncation
+toward zero, matching Rust's signed `/` operator. The §G.5 mask
+factorises as the Cartesian product of the two axes' ranges, so
+the new primitives return the pair of 1-D inclusive ranges
+directly — empty either axis short-circuits the whole sub-block
+to forward-only.**
+
+* `pb_b_bidir_extent_component(mvb_component, block_lo, block_hi,
+  ref_max) -> Option<(i32, i32)>` (new public function in
+  `pb_layer.rs`): the per-axis §G.5 primitive, returning
+  `Some((lo, hi))` for the inclusive pixel-coordinate range of
+  bidirectional prediction or `None` if empty. The `ref_max`
+  parameter unifies the luma (`15`) and chroma (`7`) §G.5 forms.
+  Panics on `block_lo > block_hi` (§G.5 invokes the primitive only
+  for non-empty 8×8 blocks).
+* `pb_b_bidir_luma_block_extent(mvb, nh, nv) -> Option<((i32,
+  i32), (i32, i32))>` (new public function): composition for one
+  of the four 8×8 luma sub-blocks of a PB-frame macroblock at
+  `(nh, nv) ∈ {0, 1}²`. Returns the 2-D inclusive rectangle in
+  macroblock-local coordinates `(0..=15, 0..=15)` or `None` if
+  the §G.5 bidirectional region is empty along either axis.
+  Panics on `nh > 1` or `nv > 1` (§G.5 only enumerates the four
+  sub-blocks).
+* `pb_b_bidir_chroma_extent(mvc) -> Option<((i32, i32), (i32,
+  i32))>` (new public function): chroma counterpart over the
+  single 0..=7 chroma block per macroblock, with `ref_max = 7`
+  per §G.5 chroma form.
+
+19 new tests land: full-block coverage on each of the four
+`(nh, nv)` luma sub-blocks with zero MVB; per-component shrink
+coverage (`pb_b_bidir_extent_component_left_mvb_shrinks_nh0_range`
+verifying a -4 half-pel MVB → `[2, 7]`,
+`_right_mvb_shrinks_nh1_range` verifying +8 → `[8, 11]`,
+`_small_positive_mvb_keeps_full_block` verifying +2 →
+`[0, 7]`); empty-axis short-circuit
+(`_large_positive_mvb_empties_nh1` with MVB +16 →
+`None`, `pb_b_bidir_luma_block_extent_empty_axis_yields_none` /
+`_empty_vertical_axis_yields_none`); chroma full
+(`pb_b_bidir_chroma_extent_zero_mvc_is_full_chroma_block`),
+shrink-top-left (mvc=+4 → `[0..=5]²`), shrink-bottom-right
+(mvc=-4 → `[2..=7]²`), outside (mvc=+16 → `None`), and per-axis
+factorisation check (`_factorises_per_axis`); the
+division-truncation-toward-zero pin
+(`_division_truncates_toward_zero` with mh=-3 → `[2, 7]`);
+end-to-end §G.4 → §G.5 chain (`pb_b_bidir_chained_after_g4`
+composing `pb_b_vector` for a P-MV `(8, 0)` + MVDB `(+2, -2)` at
+TRB=1 / TRD=2, then `pb_b_bidir_luma_block_extent` on the
+resulting MVB `(-2, -2)` to get `[1..=7] × [1..=7]`); and panic
+paths (`_panics_on_invalid_nh` / `_panics_on_invalid_nv`).
+`cargo test -p oxideav-h263` reports 481 passed (previously 462).
+
+The macroblock-layer PB-mode driver that gates these primitives,
+composes the §G.4 (MVF, MVB) per-luma-block / per-chroma pair, and
+steps the §G.5 split for actual pixel writing into the B-block
+output (truncated-average bidirectional vs forward-only branches
+each running through the existing §6.1.2 half-pel bilinear
+prediction primitive) remains the next-round step. This round
+closes the geometry gap that driver needs once it has the §G.4
+vectors in hand.
+
+---
+
 **Round 30 (workspace round 249) — §G.4 PB-frame B-picture motion
 vector calculator. With the §5.3.9 MVDB primitive landed in r248,
 the remaining gap in the PB-mode B-macroblock walk was the §G.4

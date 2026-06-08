@@ -8,6 +8,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §G.5 PB-frame B-block bidirectional-prediction mask (round 258):
+  - `pb_b_bidir_extent_component(mvb_component, block_lo, block_hi,
+    ref_max) -> Option<(i32, i32)>` new public function in
+    `pb_layer.rs`: per-axis inclusive `[lo, hi]` pixel-coordinate
+    range for which the §G.5 backward vector `MVB` points inside
+    PREC (bidirectional-prediction region). Returns `None` if the
+    range is empty (whole axis falls outside PREC; per §G.5 the
+    bidirectional rectangle factorises as the Cartesian product of
+    horizontal and vertical 1-D ranges, so any empty axis makes
+    the whole sub-block forward-only). `ref_max` parameter
+    generalises the §G.5 luma `15` vs chroma `7` upper bound.
+    "/" is Rust signed `/` (truncation toward zero, matching
+    §G.5's C expression `(-mh+1)/2`).
+  - `pb_b_bidir_luma_block_extent(mvb, nh, nv) -> Option<((i32,
+    i32), (i32, i32))>` new public function: composition of
+    `pb_b_bidir_extent_component` for one of the four 8×8 luma
+    sub-blocks of a B-block's macroblock. Returns the inclusive
+    2-D pixel rectangle in macroblock-local coordinates 0..=15,
+    or `None` if §G.5's bidirectional region is empty. Panics on
+    `nh > 1` or `nv > 1` (§G.5 only enumerates the four sub-blocks).
+  - `pb_b_bidir_chroma_extent(mvc) -> Option<((i32, i32), (i32,
+    i32))>` new public function: chroma counterpart over the
+    single 0..=7 chroma block per macroblock, with `ref_max = 7`
+    per §G.5 chroma form.
+  - 19 new tests (`cargo test -p oxideav-h263` reports 481
+    passed, previously 462): full-block coverage on each of the
+    four `(nh, nv)` luma sub-blocks with zero MVB; per-component
+    shrink coverage on nh=0 left-pointing MVB and nh=1
+    right-pointing MVB; empty-axis short-circuit (MVB outside PREC
+    for nh=0 / nh=1 / nv=0 / nv=1); chroma full / shrink-top-left /
+    shrink-bottom-right / outside coverage and per-axis
+    factorisation check; division-truncation-toward-zero pin;
+    end-to-end §G.4 → §G.5 chain (`pb_b_bidir_chained_after_g4`
+    composing `pb_b_vector` then `pb_b_bidir_luma_block_extent`);
+    and panic paths for invalid `nh` / `nv`.
+
 - §G.4 PB-frame B-picture motion-vector calculator (round 249):
   - `pb_b_vectors(p_mv, mvd, trb, trd) -> (i32, i32)` new public
     function in `pb_layer.rs`: per-component §G.4 formula

@@ -85,6 +85,77 @@
 //! Table-F.1-snap transform, so [`pb_b_chroma_vector`] composes it
 //! over the four luma B-vectors directly without duplicating the
 //! Table F.1 logic.
+//!
+//! ## §G.5 — Bidirectional-prediction mask for a B-block
+//!
+//! §G.5 prescribes that, once the §G.4 vector pair `(MVF, MVB)` is
+//! known, the per-pixel prediction of a B-block in a PB-frame splits
+//! into two regions:
+//!
+//! * pixels where `MVB` points **inside** the just-reconstructed
+//!   P-macroblock (PREC) are predicted bidirectionally — the average
+//!   of the forward prediction (MVF, relative to the previous decoded
+//!   picture) and the backward prediction (MVB, relative to PREC);
+//!   the average is by truncation;
+//! * all other pixels of the B-block are predicted by forward
+//!   prediction only (MVF, relative to the previous decoded picture).
+//!
+//! §G.5 specifies the per-pixel split with two C-language loop nests
+//! (one for luminance, one for chrominance), reproduced verbatim here
+//! for cross-reference:
+//!
+//! ```text
+//!   /* luminance: per 8 × 8 luma block (nh, nv) in the macroblock */
+//!   for (nh = 0; nh <= 1; nh++) {
+//!     for (nv = 0; nv <= 1; nv++) {
+//!       for (i = nh*8 + max(0, (-mh(nh,nv)+1)/2 - nh*8);
+//!            i <= nh*8 + min(7, 15 - (mh(nh,nv)+1)/2 - nh*8); i++) {
+//!         for (j = nv*8 + max(0, (-mv(nh,nv)+1)/2 - nv*8);
+//!              j <= nv*8 + min(7, 15 - (mv(nh,nv)+1)/2 - nv*8); j++) {
+//!           predict pixel (i,j) bidirectionally
+//!         }
+//!       }
+//!     }
+//!   }
+//!
+//!   /* chrominance: one 8 × 8 chroma block per macroblock */
+//!   for (i = max(0, (-mhc+1)/2); i <= min(7, 7 - (mhc+1)/2); i++) {
+//!     for (j = max(0, (-mvc+1)/2); j <= min(7, 7 - (mvc+1)/2); j++) {
+//!       predict pixel (i,j) bidirectionally;
+//!     }
+//!   }
+//! ```
+//!
+//! Reading the two nests algebraically: per axis, the §G.5
+//! bidirectional pixels of a luma block at (nh, nv) are those `i`
+//! satisfying
+//!
+//! * `i ≥ nh*8` and `i ≥ (-mh+1)/2` (lower bound)
+//! * `i ≤ nh*8 + 7` and `i ≤ 15 - (mh+1)/2` (upper bound)
+//!
+//! i.e. `i ∈ [max(nh*8, (-mh+1)/2), min(nh*8+7, 15 - (mh+1)/2)]` in
+//! macroblock-local pixel coordinates 0..=15; the range is empty
+//! when the lower bound exceeds the upper. For chrominance the
+//! same shape applies inside a single 8 × 8 chroma block:
+//! `i ∈ [max(0, (-mhc+1)/2), min(7, 7 - (mhc+1)/2)]` in 0..=7.
+//!
+//! "/" is integer division by truncation (matching Rust's signed
+//! `/`). Per §G.5 each axis is independent — a pixel is
+//! bidirectional if and only if **both** axes' ranges include its
+//! coordinate. The mask thus factorises as the Cartesian product of
+//! a horizontal and a vertical 1-D inclusive range, which is what the
+//! primitives below return.
+//!
+//! [`pb_b_bidir_extent_component`] is the per-axis pure function: it
+//! takes one half-pel `MVB` component and the inclusive `[lo, hi]`
+//! block extent (`[0, 7]` for chroma or the nh=0 / nv=0 luma
+//! sub-block, `[8, 15]` for nh=1 / nv=1) and returns the §G.5
+//! inclusive range or `None` if empty. [`pb_b_bidir_luma_block_extent`]
+//! composes it for one of the four 8 × 8 luma sub-blocks at
+//! `(nh, nv)`, returning the 2-D rectangle of bidirectional pixels.
+//! [`pb_b_bidir_chroma_extent`] is the chroma counterpart over the
+//! single 0..=7 block. Pixels outside the returned rectangle are
+//! forward-only per §G.5's "all other pixels" clause.
 
 use oxideav_core::bits::BitReader;
 
@@ -552,6 +623,153 @@ pub fn pb_b_chroma_vector(
         dy_half: chroma_mv_component_4mv(sum_y_mvb),
     };
     (mvf, mvb)
+}
+
+/// §G.5 per-axis bidirectional-prediction extent for a B-block, in
+/// macroblock-local (luminance) or block-local (chrominance) pixel
+/// coordinates.
+///
+/// Returns the inclusive `[lo, hi]` range of pixel positions along
+/// one axis for which the §G.5 backward vector points **inside**
+/// PREC (i.e. for which §G.5 prescribes bidirectional prediction),
+/// or `None` if the range is empty (no bidirectional pixels along
+/// this axis for this block, so the whole block is forward-only by
+/// the §G.5 axis-product rule).
+///
+/// Inputs:
+///
+/// * `mvb_component` — one component of the §G.4 backward vector
+///   `MVB` for this 8 × 8 block, in half-pel units (§6.1.1
+///   convention); the same component is passed for both luma and
+///   chroma blocks.
+/// * `block_lo` / `block_hi` — the inclusive pixel-coordinate
+///   bounds of the 8 × 8 block along this axis, in the relevant
+///   coordinate space:
+///   - luma sub-block `(nh, nv)` of a macroblock: `block_lo = n*8`,
+///     `block_hi = n*8 + 7` where `n` is `nh` (for the horizontal
+///     axis) or `nv` (for the vertical axis); coordinates run
+///     0..=15 inside the macroblock;
+///   - chroma block of a macroblock: `block_lo = 0`, `block_hi = 7`;
+///     coordinates run 0..=7 inside the chroma block.
+///
+/// The returned range is `i ∈ [max(block_lo, (-mvb+1)/2),
+/// min(block_hi, REF_MAX - (mvb+1)/2)]` where `REF_MAX` is `15` for
+/// luma blocks (§G.5's `15` is the macroblock-wide pixel bound, the
+/// same for both nh=0 and nh=1 luma sub-blocks since both belong to
+/// the same 16-pixel macroblock) and `7` for the 8 × 8 chroma block
+/// (the 8-pixel chroma block is the whole PREC chroma plane).
+///
+/// This asymmetry between luma and chroma comes straight from §G.5:
+/// for luma the §G.5 `15` is the macroblock-wide upper pixel bound
+/// (the four 8 × 8 luma blocks together span 0..=15, so PREC has a
+/// "right edge" at 15 for both nh=0 and nh=1 blocks); for chroma
+/// the upper pixel bound is `7` because the 8 × 8 chroma block is
+/// the whole PREC chroma plane.
+///
+/// To spare the caller the §G.5 reading lift, [`pb_b_bidir_luma_block_extent`]
+/// and [`pb_b_bidir_chroma_extent`] wrap this primitive with the
+/// correct block bounds for the two cases.
+///
+/// "/" is signed integer division by truncation toward zero
+/// (matching the §G.5 C expression `(-mh+1)/2`).
+///
+/// # Panics
+///
+/// Panics if `block_lo > block_hi`. §G.5 invokes the primitive only
+/// for non-empty 8 × 8 blocks.
+pub fn pb_b_bidir_extent_component(
+    mvb_component: i32,
+    block_lo: i32,
+    block_hi: i32,
+    ref_max: i32,
+) -> Option<(i32, i32)> {
+    assert!(block_lo <= block_hi, "§G.5 block extent must be non-empty");
+    // §G.5: lower bound is `nh*8 + max(0, (-mh+1)/2 - nh*8)`, which
+    // equals `max(nh*8, (-mh+1)/2)`. Upper bound is `nh*8 + min(7,
+    // 15 - (mh+1)/2 - nh*8)`, which equals `min(nh*8 + 7, 15 -
+    // (mh+1)/2)`. Generalising `15` to `ref_max` covers chroma's
+    // 0..=7 form (where `7` plays the role of `15`).
+    //
+    // The `(-mh+1)/2` and `(mh+1)/2` C expressions evaluate with
+    // truncation toward zero, the same as Rust's signed `/`.
+    let lo = block_lo.max((-mvb_component + 1) / 2);
+    let hi = block_hi.min(ref_max - (mvb_component + 1) / 2);
+    if lo <= hi {
+        Some((lo, hi))
+    } else {
+        None
+    }
+}
+
+/// §G.5 bidirectional-prediction rectangle for one 8 × 8 luma
+/// sub-block at `(nh, nv)` of a B-block's macroblock.
+///
+/// Returns `Some(((i_lo, i_hi), (j_lo, j_hi)))` — the inclusive 2-D
+/// pixel-coordinate rectangle in macroblock-local coordinates
+/// `(0..=15, 0..=15)` for which §G.5 prescribes bidirectional
+/// prediction; the row count is `i_hi - i_lo + 1` and the column
+/// count is `j_hi - j_lo + 1`. Pixels of the 8 × 8 block outside
+/// this rectangle are forward-predicted only per §G.5's "all other
+/// pixels" clause.
+///
+/// Returns `None` if the rectangle is empty along either axis —
+/// i.e. the §G.5 backward vector `MVB` points fully outside PREC
+/// for this sub-block. In that case the whole 8 × 8 sub-block is
+/// forward-predicted only.
+///
+/// `mvb` is the §G.4 backward vector for the 8 × 8 luma sub-block
+/// (each of the four sub-blocks has its own pair of §G.4 vectors
+/// even in single-MV-per-MB mode, per §G.4 paragraph 4 — the four
+/// luma blocks share one P-MV but the §G.4 formula is applied
+/// per-block); per §G.5's `mh(nh,nv)` / `mv(nh,nv)` notation the
+/// `(nh, nv)` argument selects which sub-block is being processed.
+///
+/// # Panics
+///
+/// Panics if `nh > 1` or `nv > 1`. §G.5 only enumerates the four
+/// `(0, 0)`, `(0, 1)`, `(1, 0)`, `(1, 1)` sub-blocks.
+pub fn pb_b_bidir_luma_block_extent(
+    mvb: MotionVector,
+    nh: u8,
+    nv: u8,
+) -> Option<((i32, i32), (i32, i32))> {
+    assert!(nh <= 1, "§G.5 luma sub-block nh must be 0 or 1");
+    assert!(nv <= 1, "§G.5 luma sub-block nv must be 0 or 1");
+    // §G.5 luma: `REF_MAX = 15` (right-edge bound of the 16-pixel
+    // macroblock; same for both nh=0 and nh=1 since both luma
+    // sub-blocks belong to the same macroblock and the §G.5
+    // bidirectional region is bounded by the macroblock as a whole,
+    // not by the 8-pixel sub-block).
+    let nh_i = nh as i32;
+    let nv_i = nv as i32;
+    let i_range = pb_b_bidir_extent_component(mvb.dx_half, nh_i * 8, nh_i * 8 + 7, 15)?;
+    let j_range = pb_b_bidir_extent_component(mvb.dy_half, nv_i * 8, nv_i * 8 + 7, 15)?;
+    Some((i_range, j_range))
+}
+
+/// §G.5 bidirectional-prediction rectangle for the 8 × 8 chroma
+/// block of a B-block's macroblock.
+///
+/// Returns `Some(((i_lo, i_hi), (j_lo, j_hi)))` — the inclusive 2-D
+/// pixel-coordinate rectangle in chroma-block-local coordinates
+/// `(0..=7, 0..=7)` for which §G.5 prescribes bidirectional
+/// prediction. Pixels of the 8 × 8 chroma block outside this
+/// rectangle are forward-predicted only per §G.5's "all other
+/// pixels" clause.
+///
+/// Returns `None` if the §G.5 chroma backward vector points fully
+/// outside the 8 × 8 PREC chroma block along either axis.
+///
+/// `mvc` is the §G.4 chroma backward vector for the macroblock
+/// (one chroma vector per macroblock, applied uniformly to both Cb
+/// and Cr blocks per §G.4 final paragraph); the same `mvc` is
+/// invoked once for Cb and once for Cr with this primitive.
+pub fn pb_b_bidir_chroma_extent(mvc: MotionVector) -> Option<((i32, i32), (i32, i32))> {
+    // §G.5 chroma: block extent is [0, 7] and REF_MAX is 7 (the
+    // 8-pixel chroma block is the whole PREC chroma plane).
+    let i_range = pb_b_bidir_extent_component(mvc.dx_half, 0, 7, 7)?;
+    let j_range = pb_b_bidir_extent_component(mvc.dy_half, 0, 7, 7)?;
+    Some((i_range, j_range))
 }
 
 #[cfg(test)]
@@ -1456,5 +1674,229 @@ mod tests {
         assert_eq!(chroma_mvf.dy_half, expected_mvf_dy);
         assert_eq!(chroma_mvb.dx_half, expected_mvb_dx);
         assert_eq!(chroma_mvb.dy_half, expected_mvb_dy);
+    }
+
+    // ---- §G.5 bidirectional-prediction mask tests --------------------
+
+    /// §G.5 zero-MVB on a luma sub-block (nh=0): both axes' inclusive
+    /// ranges become `[max(0, (0+1)/2), min(7, 15-(0+1)/2)] = [0, 7]`,
+    /// so the whole 8 × 8 sub-block is bidirectionally predicted.
+    #[test]
+    fn pb_b_bidir_extent_component_zero_mvb_luma_nh0_is_full_block() {
+        let r = pb_b_bidir_extent_component(0, 0, 7, 15);
+        assert_eq!(r, Some((0, 7)));
+    }
+
+    /// §G.5 with the same zero MVB on the nh=1 luma sub-block: range
+    /// is `[max(8, 0), min(15, 15-0)] = [8, 15]`, the full nh=1 block.
+    #[test]
+    fn pb_b_bidir_extent_component_zero_mvb_luma_nh1_is_full_block() {
+        let r = pb_b_bidir_extent_component(0, 8, 15, 15);
+        assert_eq!(r, Some((8, 15)));
+    }
+
+    /// §G.5 right-pointing MVB on nh=0 (mh=+2 half-pel = 1 luma pixel):
+    /// lo = max(0, (-2+1)/2) = max(0, 0) = 0;
+    /// hi = min(7, 15 - (2+1)/2) = min(7, 14) = 7. Full block — a
+    /// 1-pixel right shift inside the macroblock still keeps the
+    /// nh=0 sub-block entirely inside PREC.
+    #[test]
+    fn pb_b_bidir_extent_component_small_positive_mvb_keeps_full_block() {
+        let r = pb_b_bidir_extent_component(2, 0, 7, 15);
+        assert_eq!(r, Some((0, 7)));
+    }
+
+    /// §G.5 large left-pointing MVB on the nh=0 luma sub-block
+    /// (mh=-4 half-pel = 2 luma pixels): lo = max(0, (4+1)/2) =
+    /// max(0, 2) = 2; hi = min(7, 15 - (-4+1)/2) = min(7, 15 - (-1)) =
+    /// min(7, 16) = 7. Range `[2, 7]` — the leftmost two columns of
+    /// the nh=0 sub-block are forward-only since MVB points outside
+    /// PREC to their left.
+    #[test]
+    fn pb_b_bidir_extent_component_left_mvb_shrinks_nh0_range() {
+        let r = pb_b_bidir_extent_component(-4, 0, 7, 15);
+        assert_eq!(r, Some((2, 7)));
+    }
+
+    /// §G.5 large right-pointing MVB on the nh=1 luma sub-block
+    /// (mh=+8 half-pel = 4 luma pixels): lo = max(8, (-8+1)/2) =
+    /// max(8, -3) = 8; hi = min(15, 15 - (8+1)/2) = min(15, 11) = 11.
+    /// Range `[8, 11]` — the rightmost 4 columns of the nh=1
+    /// sub-block are forward-only because MVB points outside PREC.
+    #[test]
+    fn pb_b_bidir_extent_component_right_mvb_shrinks_nh1_range() {
+        let r = pb_b_bidir_extent_component(8, 8, 15, 15);
+        assert_eq!(r, Some((8, 11)));
+    }
+
+    /// §G.5 with MVB so large the bidirectional rectangle is empty:
+    /// nh=1 sub-block with mh=+16 half-pel (8 luma pixels right) →
+    /// lo = max(8, -7) = 8; hi = min(15, 15 - 8) = 7. lo > hi, so the
+    /// whole sub-block falls outside PREC for this axis — forward-only.
+    #[test]
+    fn pb_b_bidir_extent_component_large_positive_mvb_empties_nh1() {
+        let r = pb_b_bidir_extent_component(16, 8, 15, 15);
+        assert_eq!(r, None);
+    }
+
+    /// §G.5 division is by truncation toward zero (Rust signed `/`),
+    /// matching the C expression `(-mh+1)/2` in the spec. mh=+3 (odd):
+    /// `(-3+1)/2 = -2/2 = -1`; `(3+1)/2 = 2`. lo=max(0,-1)=0, hi=
+    /// min(7, 15-2)=7. Range `[0, 7]` — full block. The point of the
+    /// test is that we don't accidentally use floor for the negative
+    /// numerator: `(-3+1)/2 = -1` truncation toward zero (not -1 or
+    /// 0 by floor, but matches "trunc" here anyway). Sanity-check by
+    /// using an mh with odd numerator that distinguishes the two
+    /// modes: mh=-3 → `(3+1)/2 = 2`, lo=max(0,2)=2; `(-3+1)/2 = -1`,
+    /// hi=min(7, 16)=7. Range `[2, 7]`.
+    #[test]
+    fn pb_b_bidir_extent_component_division_truncates_toward_zero() {
+        // mh=-3: lo = max(0, 2) = 2; hi = min(7, 15 - (-1)) = 7.
+        let r = pb_b_bidir_extent_component(-3, 0, 7, 15);
+        assert_eq!(r, Some((2, 7)));
+    }
+
+    /// §G.5 luma block extent: zero MVB on each of the four
+    /// `(nh, nv)` sub-blocks gives the full 8 × 8 rectangle for that
+    /// sub-block.
+    #[test]
+    fn pb_b_bidir_luma_block_extent_zero_mvb_full_block_all_four_subblocks() {
+        let mvb = MotionVector::default();
+        assert_eq!(
+            pb_b_bidir_luma_block_extent(mvb, 0, 0),
+            Some(((0, 7), (0, 7)))
+        );
+        assert_eq!(
+            pb_b_bidir_luma_block_extent(mvb, 1, 0),
+            Some(((8, 15), (0, 7)))
+        );
+        assert_eq!(
+            pb_b_bidir_luma_block_extent(mvb, 0, 1),
+            Some(((0, 7), (8, 15)))
+        );
+        assert_eq!(
+            pb_b_bidir_luma_block_extent(mvb, 1, 1),
+            Some(((8, 15), (8, 15)))
+        );
+    }
+
+    /// §G.5 luma block extent: MVB = (-4, -4) on the nh=0,nv=0
+    /// sub-block shrinks each axis to `[2, 7]`, so the bidirectional
+    /// rectangle is `[2..=7] × [2..=7]` (a 6 × 6 region inside the
+    /// upper-left 8 × 8 sub-block).
+    #[test]
+    fn pb_b_bidir_luma_block_extent_left_up_mvb_on_nh0_nv0() {
+        let mvb = MotionVector::new(-4, -4);
+        let extent = pb_b_bidir_luma_block_extent(mvb, 0, 0).expect("non-empty rectangle");
+        assert_eq!(extent, ((2, 7), (2, 7)));
+    }
+
+    /// §G.5 luma block extent: MVB with one axis empty short-circuits
+    /// the rectangle to `None`. nh=1,nv=0 sub-block with MVB = (+16, 0)
+    /// has empty horizontal range; the §G.5 axis-product makes the
+    /// whole sub-block forward-only regardless of the vertical range.
+    #[test]
+    fn pb_b_bidir_luma_block_extent_empty_axis_yields_none() {
+        let mvb = MotionVector::new(16, 0);
+        assert_eq!(pb_b_bidir_luma_block_extent(mvb, 1, 0), None);
+    }
+
+    /// §G.5 luma block extent: MVB = (0, +16) on nh=0,nv=1 — vertical
+    /// range empties (`max(8, -7) = 8`, `min(15, 15-8) = 7`); §G.5
+    /// makes the whole nh=0,nv=1 sub-block forward-only.
+    #[test]
+    fn pb_b_bidir_luma_block_extent_empty_vertical_axis_yields_none() {
+        let mvb = MotionVector::new(0, 16);
+        assert_eq!(pb_b_bidir_luma_block_extent(mvb, 0, 1), None);
+    }
+
+    /// §G.5 chroma extent: zero MVC gives the full 8 × 8 chroma
+    /// block: `[0..=7] × [0..=7]`.
+    #[test]
+    fn pb_b_bidir_chroma_extent_zero_mvc_is_full_chroma_block() {
+        let mvc = MotionVector::default();
+        assert_eq!(pb_b_bidir_chroma_extent(mvc), Some(((0, 7), (0, 7))));
+    }
+
+    /// §G.5 chroma extent with right + down MVC: mhc=+4 → lo =
+    /// max(0, -1) = 0; hi = min(7, 7-2) = 5. mvc=+4 same on vertical
+    /// axis. Bidirectional rectangle is `[0..=5] × [0..=5]`.
+    #[test]
+    fn pb_b_bidir_chroma_extent_right_down_mvc_shrinks_to_top_left() {
+        let mvc = MotionVector::new(4, 4);
+        assert_eq!(pb_b_bidir_chroma_extent(mvc), Some(((0, 5), (0, 5))));
+    }
+
+    /// §G.5 chroma extent with left + up MVC: mhc=-4 → lo =
+    /// max(0, 2) = 2; hi = min(7, 7-(-1)) = min(7, 8) = 7. mvc=-4
+    /// same on vertical axis. Bidirectional rectangle is
+    /// `[2..=7] × [2..=7]`.
+    #[test]
+    fn pb_b_bidir_chroma_extent_left_up_mvc_shrinks_to_bottom_right() {
+        let mvc = MotionVector::new(-4, -4);
+        assert_eq!(pb_b_bidir_chroma_extent(mvc), Some(((2, 7), (2, 7))));
+    }
+
+    /// §G.5 chroma extent with MVC so large the block falls outside
+    /// PREC: mhc=+16 → lo = max(0, -7) = 0; hi = min(7, 7-8) = -1.
+    /// Empty range → whole chroma block is forward-only.
+    #[test]
+    fn pb_b_bidir_chroma_extent_large_mvc_yields_none() {
+        let mvc = MotionVector::new(16, 0);
+        assert_eq!(pb_b_bidir_chroma_extent(mvc), None);
+    }
+
+    /// §G.5 chroma extent reuses the per-component primitive with
+    /// `ref_max = 7` and block bounds `[0, 7]`; verify by checking
+    /// the two-axis composition matches independent per-axis calls.
+    #[test]
+    fn pb_b_bidir_chroma_extent_factorises_per_axis() {
+        let mvc = MotionVector::new(-2, 6);
+        let extent = pb_b_bidir_chroma_extent(mvc).expect("non-empty");
+        let i = pb_b_bidir_extent_component(-2, 0, 7, 7).expect("i non-empty");
+        let j = pb_b_bidir_extent_component(6, 0, 7, 7).expect("j non-empty");
+        assert_eq!(extent, (i, j));
+    }
+
+    /// End-to-end §G.4 → §G.5: compute the §G.4 (MVF, MVB) pair for
+    /// a P-MV (8, 0) at TRB=1, TRD=2 with MVDB `(+2, -2)`, then
+    /// derive the §G.5 bidirectional rectangle for the nh=0,nv=0
+    /// luma sub-block from the resulting MVB. Demonstrates the
+    /// composed §G.4 + §G.5 pipeline the macroblock driver will run
+    /// per luma sub-block.
+    #[test]
+    fn pb_b_bidir_chained_after_g4() {
+        let p_mv = MotionVector::new(8, 0);
+        let mvd = Some(Mvd {
+            dx_half: 2,
+            dy_half: -2,
+        });
+        let (mvf, mvb) = pb_b_vector(p_mv, mvd, 1, 2);
+        // §G.4: MVF.x = (1×8)/2 + 2 = 6; MVF.y = (1×0)/2 + (-2) = -2.
+        // MVB on x: since MVD.x=2≠0, MVB.x = MVF.x - MV.x = 6-8 = -2.
+        // MVB on y: since MVD.y=-2≠0, MVB.y = MVF.y - MV.y = -2-0 = -2.
+        assert_eq!(mvf, MotionVector::new(6, -2));
+        assert_eq!(mvb, MotionVector::new(-2, -2));
+        // §G.5: nh=0,nv=0 sub-block with MVB = (-2, -2).
+        // x: lo=max(0, (2+1)/2)=max(0,1)=1; hi=min(7, 15-((-2+1)/2))=
+        // min(7, 15-0)=7. Range [1,7].
+        // y: same → [1,7].
+        let extent = pb_b_bidir_luma_block_extent(mvb, 0, 0).expect("non-empty");
+        assert_eq!(extent, ((1, 7), (1, 7)));
+    }
+
+    /// §G.5 luma `pb_b_bidir_luma_block_extent` panics on `nh > 1`
+    /// (§G.5 only enumerates the four sub-blocks).
+    #[test]
+    #[should_panic(expected = "§G.5 luma sub-block nh must be 0 or 1")]
+    fn pb_b_bidir_luma_block_extent_panics_on_invalid_nh() {
+        let _ = pb_b_bidir_luma_block_extent(MotionVector::default(), 2, 0);
+    }
+
+    /// §G.5 luma `pb_b_bidir_luma_block_extent` panics on `nv > 1`.
+    #[test]
+    #[should_panic(expected = "§G.5 luma sub-block nv must be 0 or 1")]
+    fn pb_b_bidir_luma_block_extent_panics_on_invalid_nv() {
+        let _ = pb_b_bidir_luma_block_extent(MotionVector::default(), 0, 2);
     }
 }
