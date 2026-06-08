@@ -8,6 +8,45 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §G.5 PB-frame B-block per-pixel bidirectional-prediction blend
+  (round 263):
+  - `pb_b_bidir_pixel(forward, backward) -> u8` new public function
+    in `pb_layer.rs`: the §G.5 per-pixel average primitive — "the
+    average is calculated by dividing the sum of the two predictions
+    by two (division by truncation)". Sum is computed `u16`-wide to
+    avoid `u8` overflow; the `(255 + 255) / 2 = 255` boundary stays
+    inside `u8` so the cast back never overflows. Commutative by
+    construction (`(a+b)/2 = (b+a)/2`).
+  - `pb_b_blend_block(forward, backward, bidir_extent,
+    block_i_origin, block_j_origin) -> [[u8; 8]; 8]` new public
+    function: composes `pb_b_bidir_pixel` over an 8 × 8 block given
+    the §G.5 bidirectional rectangle from
+    `pb_b_bidir_luma_block_extent` (luma) or
+    `pb_b_bidir_chroma_extent` (chroma). Pixels inside the
+    rectangle are averaged; pixels outside it are taken from
+    `forward` per §G.5's "all other pixels" clause. `None` extent
+    short-circuits to the forward array verbatim. The
+    `(block_i_origin, block_j_origin)` parameters translate between
+    the §G.5 macroblock-local 0..=15 (luma) / block-local 0..=7
+    (chroma) coordinate spaces the extent primitives return and the
+    block-local 0..=7 indexing of the input arrays. Panics if the
+    rectangle escapes the 8 × 8 block addressed by the origins.
+  - 11 new tests (`cargo test -p oxideav-h263` reports 492 passed,
+    previously 481): per-pixel identity (`(x+x)/2 == x` over the
+    full `u8` range), truncation-toward-zero pin
+    (`pb_b_bidir_pixel_truncates_toward_zero` covering `(0,1)`,
+    `(1,2)`, `(3,4)`), `u8` boundary
+    (`pb_b_bidir_pixel_max_inputs_does_not_overflow`),
+    commutativity across a wide sample
+    (`pb_b_bidir_pixel_commutes`), block-blend `None`-extent
+    forward fallback, full-chroma-extent uniform average,
+    sub-rectangle partial blend with forward fallback outside,
+    nh=1/nv=1 luma sub-block origin-offset coverage, block-bound
+    panic paths on `i` overflow / `j` underflow, and an end-to-end
+    §G.4 → §G.5 mask → §G.5 blend chain
+    (`pb_b_blend_chained_g4_extent_blend` composing `pb_b_vector`,
+    `pb_b_bidir_luma_block_extent`, then `pb_b_blend_block`).
+
 - §G.5 PB-frame B-block bidirectional-prediction mask (round 258):
   - `pb_b_bidir_extent_component(mvb_component, block_lo, block_hi,
     ref_max) -> Option<(i32, i32)>` new public function in

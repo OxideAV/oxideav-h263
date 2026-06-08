@@ -5,6 +5,65 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 32 (workspace round 263) — §G.5 PB-frame B-block per-pixel
+bidirectional-prediction blend. With the §G.5 mask-geometry
+primitives landed in r258, the remaining §G.5 gap is the per-pixel
+arithmetic the spec prescribes for pixels inside the bidirectional
+rectangle: "the average is calculated by dividing the sum of the
+two predictions by two (division by truncation)". This round adds
+the two primitives that close that gap so the macroblock-layer
+PB-mode driver has a complete §G.5 sample-write surface: a per-pixel
+average, and an 8×8-block blend that drives the per-pixel average
+over the rectangle from the mask primitives while taking forward-only
+samples outside it.**
+
+* `pb_b_bidir_pixel(forward: u8, backward: u8) -> u8` (new public
+  function in `pb_layer.rs`): the §G.5 per-pixel average — `(forward
+  + backward) / 2` computed `u16`-wide. Truncation toward zero per
+  §G.5 wording; commutative; `(255 + 255) / 2 = 255` stays inside
+  `u8`.
+* `pb_b_blend_block(forward, backward, bidir_extent, block_i_origin,
+  block_j_origin) -> [[u8; 8]; 8]` (new public function): blends
+  one 8×8 B-block by applying `pb_b_bidir_pixel` over the
+  bidirectional rectangle returned by
+  `pb_b_bidir_luma_block_extent` or `pb_b_bidir_chroma_extent`,
+  falling back to the `forward` sample for every pixel outside
+  the rectangle per §G.5's "all other pixels" clause. The
+  `(block_i_origin, block_j_origin)` parameters bridge the §G.5
+  macroblock-local 0..=15 (luma) / block-local 0..=7 (chroma)
+  coordinate spaces the rectangle uses to the block-local 0..=7
+  indexing of the input / output arrays. `None` extent
+  short-circuits to the forward array.
+
+11 new tests land: per-pixel identity over the full `u8` range
+(`pb_b_bidir_pixel_identical_inputs_unchanged`), truncation-toward-zero
+pin (`_truncates_toward_zero` covering `(0,1)`, `(1,2)`, `(3,4)`),
+`u8` overflow boundary (`_max_inputs_does_not_overflow`),
+commutativity across a wide step sample (`_commutes`); block-blend
+`None`-extent forward fallback
+(`pb_b_blend_block_none_extent_returns_forward`), full-chroma-extent
+uniform-fill average (`_full_chroma_extent_averages_every_pixel`),
+sub-rectangle partial blend with forward-only outside
+(`_partial_extent_averages_inside_only`), nh=1/nv=1 luma sub-block
+origin-offset coverage (`_nh1_nv1_luma_origin_offset`), block-bound
+panic paths (`_panics_on_i_overflow` /
+`_panics_on_j_underflow`), and an end-to-end §G.4 → §G.5 mask → §G.5
+blend chain (`pb_b_blend_chained_g4_extent_blend` composing
+`pb_b_vector`, `pb_b_bidir_luma_block_extent`, then
+`pb_b_blend_block` for a P-MV `(8, 0)` + MVDB `(+2, -2)` at
+TRB=1/TRD=2 with forward fill 80 / backward fill 240 → inside the
+`[1..=7]²` rectangle the blend is 160; outside it stays 80).
+`cargo test -p oxideav-h263` reports 492 passed (previously 481).
+
+The macroblock-layer PB-mode driver that fetches the forward /
+backward 8×8 prediction blocks via §6.1.2 half-pel bilinear
+interpolation, calls `pb_b_blend_block` per luma sub-block + per
+chroma block, and writes the result into the B-picture output
+remains the next-round step. This round closes the §G.5 sample
+arithmetic the driver needs once it has the two predictions in hand.
+
+---
+
 **Round 31 (workspace round 258) — §G.5 PB-frame B-block
 bidirectional-prediction mask. With the §G.4 forward / backward
 vector calculator landed in r249, the next step toward the

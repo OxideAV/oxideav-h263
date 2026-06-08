@@ -156,6 +156,14 @@
 //! [`pb_b_bidir_chroma_extent`] is the chroma counterpart over the
 //! single 0..=7 block. Pixels outside the returned rectangle are
 //! forward-only per §G.5's "all other pixels" clause.
+//!
+//! The blend itself — the per-pixel arithmetic §G.5 prescribes for
+//! pixels inside the rectangle — is [`pb_b_bidir_pixel`]: average
+//! of the two prediction samples by integer division. The driver
+//! convenience [`pb_b_blend_block`] applies the average across one
+//! 8 × 8 block given the rectangle from an extent primitive and the
+//! two prediction arrays, falling back to the forward sample for
+//! pixels outside the rectangle.
 
 use oxideav_core::bits::BitReader;
 
@@ -770,6 +778,100 @@ pub fn pb_b_bidir_chroma_extent(mvc: MotionVector) -> Option<((i32, i32), (i32, 
     let i_range = pb_b_bidir_extent_component(mvc.dx_half, 0, 7, 7)?;
     let j_range = pb_b_bidir_extent_component(mvc.dy_half, 0, 7, 7)?;
     Some((i_range, j_range))
+}
+
+/// §G.5 per-pixel bidirectional-prediction sample average.
+///
+/// Per §G.5: "Bidirectional prediction \[…\] is obtained as the
+/// average of the forward prediction using MVF relative to the
+/// previous decoded picture, and the backward prediction using MVB
+/// relative to PREC. The average is calculated by dividing the sum
+/// of the two predictions by two (division by truncation)."
+///
+/// `forward` is the forward-prediction sample (motion-compensated
+/// from the previous decoded picture by MVF) and `backward` is the
+/// backward-prediction sample (motion-compensated from PREC by MVB);
+/// both are clipped `u8` luma- or chroma-plane samples per §6.3.2.
+/// The return value is the §G.5 bidirectional prediction sample.
+///
+/// "Division by truncation" is signed integer division toward zero;
+/// since both operands are non-negative the sum (`u16`-wide so no
+/// `u8` overflow) divides cleanly by two — `(forward + backward) >>
+/// 1` is the same value but `/ 2` matches §G.5's literal wording.
+/// The cast back to `u8` cannot overflow: `(255 + 255) / 2 = 255`.
+///
+/// This is the per-pixel primitive; the caller iterates it over the
+/// rectangle returned by [`pb_b_bidir_luma_block_extent`] (luma) or
+/// [`pb_b_bidir_chroma_extent`] (chroma), using the forward sample
+/// for every pixel outside that rectangle per §G.5's "all other
+/// pixels" clause.
+#[inline]
+pub fn pb_b_bidir_pixel(forward: u8, backward: u8) -> u8 {
+    let sum = forward as u16 + backward as u16;
+    (sum / 2) as u8
+}
+
+/// §G.5 bidirectional-prediction blend over one 8 × 8 B-block.
+///
+/// Given the per-axis bidirectional rectangle returned by
+/// [`pb_b_bidir_luma_block_extent`] (luma) or
+/// [`pb_b_bidir_chroma_extent`] (chroma), composes the §G.5 split:
+/// pixels inside the rectangle get the [`pb_b_bidir_pixel`] average
+/// of the forward and backward sample at that position; pixels
+/// outside it get the forward sample only.
+///
+/// The `i`-axis is the horizontal axis ("rows of pixels at a given
+/// `j`") and the `j`-axis is the vertical axis, matching §G.5's
+/// `(i, j)` loop ordering. The eight `forward` rows / eight `backward`
+/// rows are addressed by `[j][i]` in block-local coordinates:
+/// `j ∈ [block_j_origin, block_j_origin+7]` indexes the row,
+/// `i ∈ [block_i_origin, block_i_origin+7]` indexes the column,
+/// where `(block_i_origin, block_j_origin)` is the block's origin in
+/// the coordinate system the §G.5 rectangle uses
+/// (macroblock-local `(0..=15)` for luma; block-local `(0..=7)` for
+/// chroma). Passing `None` for `bidir_extent` means §G.5's
+/// bidirectional region is empty (the whole block is forward-only),
+/// matching the `None` return from the extent primitives.
+///
+/// Returns an 8 × 8 array of §G.5 prediction samples in the same
+/// row-major `[j][i]` order as the inputs.
+///
+/// # Panics
+///
+/// Panics if `bidir_extent` ranges are not contained in the 8 × 8
+/// block addressed by `(block_i_origin, block_j_origin)`. §G.5
+/// invokes the primitive only with rectangles produced by the
+/// extent primitives, which respect the block bounds.
+pub fn pb_b_blend_block(
+    forward: &[[u8; 8]; 8],
+    backward: &[[u8; 8]; 8],
+    bidir_extent: Option<((i32, i32), (i32, i32))>,
+    block_i_origin: i32,
+    block_j_origin: i32,
+) -> [[u8; 8]; 8] {
+    let mut out = *forward;
+    let Some(((i_lo, i_hi), (j_lo, j_hi))) = bidir_extent else {
+        // §G.5 "all other pixels" — the whole block is forward-only.
+        return out;
+    };
+    // Spec invariant: the §G.5 rectangle stays inside the 8 × 8
+    // block (the extent primitives clamp to that block).
+    assert!(
+        i_lo >= block_i_origin && i_hi <= block_i_origin + 7,
+        "§G.5 i-range must lie inside the 8 × 8 block"
+    );
+    assert!(
+        j_lo >= block_j_origin && j_hi <= block_j_origin + 7,
+        "§G.5 j-range must lie inside the 8 × 8 block"
+    );
+    for j in j_lo..=j_hi {
+        let jb = (j - block_j_origin) as usize;
+        for i in i_lo..=i_hi {
+            let ib = (i - block_i_origin) as usize;
+            out[jb][ib] = pb_b_bidir_pixel(forward[jb][ib], backward[jb][ib]);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1898,5 +2000,180 @@ mod tests {
     #[should_panic(expected = "§G.5 luma sub-block nv must be 0 or 1")]
     fn pb_b_bidir_luma_block_extent_panics_on_invalid_nv() {
         let _ = pb_b_bidir_luma_block_extent(MotionVector::default(), 0, 2);
+    }
+
+    /// §G.5 per-pixel average of identical samples is the sample
+    /// itself: `(x + x) / 2 = x`.
+    #[test]
+    fn pb_b_bidir_pixel_identical_inputs_unchanged() {
+        for x in 0u8..=255 {
+            assert_eq!(pb_b_bidir_pixel(x, x), x);
+        }
+    }
+
+    /// §G.5 per-pixel "average by division truncation" — sum divided
+    /// by two. For `(0, 1)` the §G.5 spec gives `(0+1)/2 = 0`
+    /// (truncation toward zero); for `(1, 0)` symmetrically the
+    /// same. For `(1, 2)` it's `(1+2)/2 = 1` (not the
+    /// round-half-up `2`).
+    #[test]
+    fn pb_b_bidir_pixel_truncates_toward_zero() {
+        assert_eq!(pb_b_bidir_pixel(0, 1), 0);
+        assert_eq!(pb_b_bidir_pixel(1, 0), 0);
+        assert_eq!(pb_b_bidir_pixel(1, 2), 1);
+        assert_eq!(pb_b_bidir_pixel(2, 1), 1);
+        assert_eq!(pb_b_bidir_pixel(3, 4), 3);
+    }
+
+    /// §G.5 per-pixel average of maximum-range samples does not
+    /// overflow `u8`: `(255 + 255) / 2 = 255`.
+    #[test]
+    fn pb_b_bidir_pixel_max_inputs_does_not_overflow() {
+        assert_eq!(pb_b_bidir_pixel(255, 255), 255);
+        assert_eq!(pb_b_bidir_pixel(255, 254), 254);
+        assert_eq!(pb_b_bidir_pixel(254, 255), 254);
+    }
+
+    /// §G.5 per-pixel commutativity follows from the integer-sum
+    /// formula; verify across a broad sample of pairs that
+    /// `pb_b_bidir_pixel(a, b) == pb_b_bidir_pixel(b, a)`.
+    #[test]
+    fn pb_b_bidir_pixel_commutes() {
+        for a in (0u8..=255).step_by(17) {
+            for b in (0u8..=255).step_by(13) {
+                assert_eq!(pb_b_bidir_pixel(a, b), pb_b_bidir_pixel(b, a));
+            }
+        }
+    }
+
+    /// §G.5 block-blend with `None` extent (whole block forward-only
+    /// per §G.5's "all other pixels" clause when the rectangle is
+    /// empty): output equals the forward array verbatim and the
+    /// backward array is ignored.
+    #[test]
+    fn pb_b_blend_block_none_extent_returns_forward() {
+        let mut fwd = [[0u8; 8]; 8];
+        let mut bwd = [[0u8; 8]; 8];
+        for j in 0..8 {
+            for i in 0..8 {
+                fwd[j][i] = (j * 8 + i) as u8;
+                bwd[j][i] = 200u8.wrapping_sub((j * 8 + i) as u8);
+            }
+        }
+        let out = pb_b_blend_block(&fwd, &bwd, None, 0, 0);
+        assert_eq!(out, fwd);
+    }
+
+    /// §G.5 block-blend with the full 8 × 8 chroma rectangle
+    /// `[0..=7] × [0..=7]`: every output pixel is the average of
+    /// the corresponding forward and backward sample.
+    #[test]
+    fn pb_b_blend_block_full_chroma_extent_averages_every_pixel() {
+        let mut fwd = [[0u8; 8]; 8];
+        let mut bwd = [[0u8; 8]; 8];
+        for j in 0..8 {
+            for i in 0..8 {
+                fwd[j][i] = 100;
+                bwd[j][i] = 50;
+            }
+        }
+        let out = pb_b_blend_block(&fwd, &bwd, Some(((0, 7), (0, 7))), 0, 0);
+        for (j, row) in out.iter().enumerate() {
+            for (i, &px) in row.iter().enumerate() {
+                assert_eq!(px, 75, "j={}, i={}", j, i);
+            }
+        }
+    }
+
+    /// §G.5 block-blend with a sub-rectangle: pixels inside the
+    /// rectangle are averaged, pixels outside it are taken from
+    /// `forward` unchanged.
+    #[test]
+    fn pb_b_blend_block_partial_extent_averages_inside_only() {
+        let fwd = [[10u8; 8]; 8];
+        let bwd = [[200u8; 8]; 8];
+        // Rectangle [2..=5] × [3..=6] in chroma-local 0..=7
+        // coordinates.
+        let out = pb_b_blend_block(&fwd, &bwd, Some(((2, 5), (3, 6))), 0, 0);
+        for (j, row) in out.iter().enumerate() {
+            for (i, &px) in row.iter().enumerate() {
+                let inside_i = (2..=5).contains(&(i as i32));
+                let inside_j = (3..=6).contains(&(j as i32));
+                let expected = if inside_i && inside_j {
+                    (10 + 200) / 2
+                } else {
+                    10
+                };
+                assert_eq!(px, expected, "j={}, i={}", j, i);
+            }
+        }
+    }
+
+    /// §G.5 block-blend for a luma sub-block at `(nh=1, nv=1)` —
+    /// macroblock-local coordinates `[8..=15]` along each axis,
+    /// origin `(8, 8)`. The §G.5 rectangle and the input arrays use
+    /// macroblock-local coordinates for indexing the rectangle and
+    /// block-local 0..=7 indexing for the arrays.
+    #[test]
+    fn pb_b_blend_block_nh1_nv1_luma_origin_offset() {
+        let fwd = [[20u8; 8]; 8];
+        let bwd = [[60u8; 8]; 8];
+        // §G.5 rectangle for nh=1,nv=1 spanning the full 8 × 8 luma
+        // sub-block: i ∈ [8, 15], j ∈ [8, 15].
+        let out = pb_b_blend_block(&fwd, &bwd, Some(((8, 15), (8, 15))), 8, 8);
+        for (j, row) in out.iter().enumerate() {
+            for (i, &px) in row.iter().enumerate() {
+                assert_eq!(px, 40, "j={}, i={}", j, i);
+            }
+        }
+    }
+
+    /// §G.5 block-blend rejects a rectangle that escapes the 8 × 8
+    /// block on the high `i` side.
+    #[test]
+    #[should_panic(expected = "§G.5 i-range must lie inside the 8 × 8 block")]
+    fn pb_b_blend_block_panics_on_i_overflow() {
+        let fwd = [[0u8; 8]; 8];
+        let bwd = [[0u8; 8]; 8];
+        let _ = pb_b_blend_block(&fwd, &bwd, Some(((0, 8), (0, 7))), 0, 0);
+    }
+
+    /// §G.5 block-blend rejects a rectangle whose origin escapes
+    /// the 8 × 8 block on the low `j` side.
+    #[test]
+    #[should_panic(expected = "§G.5 j-range must lie inside the 8 × 8 block")]
+    fn pb_b_blend_block_panics_on_j_underflow() {
+        let fwd = [[0u8; 8]; 8];
+        let bwd = [[0u8; 8]; 8];
+        let _ = pb_b_blend_block(&fwd, &bwd, Some(((0, 7), (-1, 6))), 0, 0);
+    }
+
+    /// End-to-end §G.4 → §G.5 mask → §G.5 blend: compose all three
+    /// primitives for one luma sub-block. Uses a synthetic but
+    /// spec-consistent §G.4 MVB and a constant-fill forward /
+    /// backward prediction so the per-pixel result is predictable
+    /// from the rectangle.
+    #[test]
+    fn pb_b_blend_chained_g4_extent_blend() {
+        let p_mv = MotionVector::new(8, 0);
+        let mvd = Some(Mvd {
+            dx_half: 2,
+            dy_half: -2,
+        });
+        let (_mvf, mvb) = pb_b_vector(p_mv, mvd, 1, 2);
+        let extent = pb_b_bidir_luma_block_extent(mvb, 0, 0);
+        assert_eq!(extent, Some(((1, 7), (1, 7))));
+        let fwd = [[80u8; 8]; 8];
+        let bwd = [[240u8; 8]; 8];
+        let out = pb_b_blend_block(&fwd, &bwd, extent, 0, 0);
+        // Inside [1..=7] × [1..=7] (luma origin 0,0): (80+240)/2 =
+        // 160. Outside: 80.
+        for (j, row) in out.iter().enumerate() {
+            for (i, &px) in row.iter().enumerate() {
+                let inside = (1..=7).contains(&(i as i32)) && (1..=7).contains(&(j as i32));
+                let expected = if inside { 160 } else { 80 };
+                assert_eq!(px, expected, "j={}, i={}", j, i);
+            }
+        }
     }
 }
