@@ -5,6 +5,62 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 33 (workspace round 272) — §G.5 PB-frame B-block
+motion-compensated prediction composition. With the §G.5 per-pixel
+blend primitives (`pb_b_bidir_pixel` / `pb_b_blend_block`) landed in
+r263, the remaining §G.5 gap toward the macroblock-layer PB-mode
+driver was the prediction-fetch composition: building the forward and
+backward 8 × 8 motion-compensated predictions and feeding them to the
+blend. This round adds the per-block prediction primitive that closes
+that gap.**
+
+* `pb_b_predict_block(prev_plane, prec_plane, fwd_x, fwd_y, bwd_x,
+  bwd_y, mvf, mvb, bidir_extent, block_i_origin, block_j_origin,
+  rcontrol) -> [[u8; 8]; 8]` (new public function in `pb_layer.rs`):
+  the §G.5 per-block prediction composition. Builds the forward
+  prediction with `mvf` against `prev_plane` ("the forward prediction
+  using MVF relative to the previous decoded picture", §G.5) and the
+  backward prediction with `mvb` against `prec_plane` ("the backward
+  prediction using MVB relative to PREC", §G.5) — both through §6.1.2
+  half-pel bilinear interpolation via
+  [`crate::motion::motion_compensate_block`] — then blends the two
+  over the §G.5 `bidir_extent` rectangle via `pb_b_blend_block`. The
+  two reference planes are fetched independently at distinct origins,
+  matching §G.5's split reference layout (`prev_plane` is the previous
+  decoded picture; `prec_plane` is PREC, the just-reconstructed,
+  clipped P-macroblock). A `None` extent short-circuits the whole
+  block to forward-only per §G.5's "all other pixels" clause. This is
+  a pure prediction primitive (no residual add) mirroring
+  `motion_compensate_block` for the P-block path; the §6.3.1 residual
+  add stays the macroblock-driver's responsibility.
+* `flat_to_ji` (private helper): reshapes the flat row-major
+  `[u8; 64]` produced by `motion_compensate_block` (`flat[py*8+px]`)
+  into the `[[u8; 8]; 8]` `[j][i]` layout the §G.5 blend primitives
+  consume (`nested[j][i] = flat[j*8+i]`, §G.5 `i` horizontal / `j`
+  vertical).
+
+5 new tests land: `None`-extent forward-only short-circuit
+(`pb_b_predict_block_none_extent_is_forward_only`); full-extent
+truncated-average over uniform planes
+(`_full_extent_averages_uniform_planes`, `(90+200)/2 = 145`);
+distinct-plane / distinct-origin partial-extent blend over a
+horizontal-ramp forward plane (`_distinct_planes_and_origins`);
+non-zero integer MVF forward-fetch shift
+(`_nonzero_mvf_shifts_forward_fetch`, +2 px with §D.1 right-edge
+replication); and `flat_to_ji` row-major preservation
+(`flat_to_ji_preserves_row_major_order`). `cargo test -p
+oxideav-h263` reports 497 passed (previously 492).
+
+The macroblock-layer PB-mode driver that walks the picture,
+gates MODB / CBPB / MVDB parsing per §5.3.3 / §5.3.4, computes the
+§G.4 vectors and §G.5 extents per block, calls `pb_b_predict_block`
+per luma sub-block + per chroma block, and adds the §6.3.1 IDCT
+residual into the B-picture output remains the next-round step. This
+round closes the prediction-fetch composition that driver needs once
+it has the per-block vectors and extents in hand.
+
+---
+
 **Round 32 (workspace round 263) — §G.5 PB-frame B-block per-pixel
 bidirectional-prediction blend. With the §G.5 mask-geometry
 primitives landed in r258, the remaining §G.5 gap is the per-pixel

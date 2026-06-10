@@ -168,7 +168,7 @@
 use oxideav_core::bits::BitReader;
 
 use crate::macroblock::{decode_mvd_component, Mvd};
-use crate::motion::{chroma_mv_component_4mv, MotionVector};
+use crate::motion::{chroma_mv_component_4mv, motion_compensate_block, MotionVector, RefPlane};
 use crate::{Error, Result};
 
 /// Field width of the §5.3.4 CBPB Coded Block Pattern for B-blocks.
@@ -872,6 +872,109 @@ pub fn pb_b_blend_block(
         }
     }
     out
+}
+
+/// Reshape the flat row-major `[u8; 64]` block produced by
+/// [`motion_compensate_block`] (`flat[py * 8 + px]`, row `py`, column
+/// `px`) into the `[[u8; 8]; 8]` `[j][i]` layout the §G.5 blend
+/// primitives consume (row `j`, column `i`). The §G.5 `i`-axis is
+/// horizontal (the `px` column) and the `j`-axis is vertical (the
+/// `py` row), so `nested[j][i] = flat[j * 8 + i]`.
+#[inline]
+fn flat_to_ji(flat: &[u8; 64]) -> [[u8; 8]; 8] {
+    let mut out = [[0u8; 8]; 8];
+    for (j, row) in out.iter_mut().enumerate() {
+        for (i, cell) in row.iter_mut().enumerate() {
+            *cell = flat[j * 8 + i];
+        }
+    }
+    out
+}
+
+/// §G.5 — full bidirectional/forward-only prediction for one 8 × 8
+/// B-block of a PB-frame, fetching both motion-compensated
+/// predictions and applying the §G.5 split.
+///
+/// This composes the three §G.5 / §6.1.2 pieces the macroblock-layer
+/// PB-mode driver needs for a single block:
+///
+/// 1. The **forward** prediction is built with `mvf` against
+///    `prev_plane` — "the forward prediction using MVF relative to the
+///    previous decoded picture" (§G.5) — via §6.1.2 half-pel bilinear
+///    interpolation ([`motion_compensate_block`]).
+/// 2. The **backward** prediction is built with `mvb` against
+///    `prec_plane` — "the backward prediction using MVB relative to
+///    PREC" (§G.5), where PREC is the just-reconstructed, clipped
+///    P-macroblock plane (§6.3.2). The same §6.1.2 interpolation
+///    applies.
+/// 3. The two predictions are blended by [`pb_b_blend_block`] over the
+///    §G.5 `bidir_extent` rectangle (from
+///    [`pb_b_bidir_luma_block_extent`] / [`pb_b_bidir_chroma_extent`]):
+///    pixels inside the rectangle take the [`pb_b_bidir_pixel`]
+///    truncated average; pixels outside it take the forward sample
+///    only ("for all other pixels, forward prediction … is used",
+///    §G.5).
+///
+/// Inputs:
+///
+/// * `prev_plane` — the previous decoded picture plane (luma or one
+///   chroma channel) that MVF is relative to.
+/// * `prec_plane` — the PREC plane (the just-reconstructed P-picture,
+///   or for one PREC-local block view) that MVB is relative to. The
+///   two planes carry their own coordinate systems; `(fwd_x, fwd_y)`
+///   indexes `prev_plane` and `(bwd_x, bwd_y)` indexes `prec_plane`.
+/// * `fwd_x` / `fwd_y` — the integer top-left pixel position of the
+///   8 × 8 block in `prev_plane` for the forward prediction.
+/// * `bwd_x` / `bwd_y` — the integer top-left pixel position of the
+///   8 × 8 block in `prec_plane` for the backward prediction.
+/// * `mvf` / `mvb` — the §G.4 forward / backward vectors for this
+///   block, in half-pel units (from [`pb_b_vector`] /
+///   [`pb_b_chroma_vector`]).
+/// * `bidir_extent` — the §G.5 rectangle for this block, in the same
+///   coordinate space as `(block_i_origin, block_j_origin)` (from
+///   [`pb_b_bidir_luma_block_extent`] for luma sub-blocks, or
+///   [`pb_b_bidir_chroma_extent`] for chroma). `None` short-circuits
+///   the block to forward-only.
+/// * `block_i_origin` / `block_j_origin` — the §G.5-coordinate origin
+///   of this 8 × 8 block (macroblock-local `nh*8` / `nv*8` for luma;
+///   `0` / `0` for chroma), bridging the §G.5 rectangle coordinates
+///   to the `[[u8; 8]; 8]` block-local `[j][i]` indexing.
+/// * `rcontrol` — §6.1.2 `RCONTROL` rounding bit (baseline `0`; see
+///   [`crate::motion::RCONTROL_DEFAULT`]).
+///
+/// Returns the 8 × 8 §G.5 prediction block in row-major `[j][i]`
+/// layout (row `j` vertical, column `i` horizontal), matching
+/// [`pb_b_blend_block`]'s output convention. The reconstructed
+/// B-block is then this prediction plus the §6.3.1 dequantised IDCT
+/// residual (the residual add is the caller's; this routine produces
+/// the prediction only, mirroring [`motion_compensate_block`] for the
+/// P-block path).
+#[allow(clippy::too_many_arguments)]
+pub fn pb_b_predict_block(
+    prev_plane: &RefPlane<'_>,
+    prec_plane: &RefPlane<'_>,
+    fwd_x: usize,
+    fwd_y: usize,
+    bwd_x: usize,
+    bwd_y: usize,
+    mvf: MotionVector,
+    mvb: MotionVector,
+    bidir_extent: Option<((i32, i32), (i32, i32))>,
+    block_i_origin: i32,
+    block_j_origin: i32,
+    rcontrol: i32,
+) -> [[u8; 8]; 8] {
+    let forward_flat = motion_compensate_block(prev_plane, fwd_x, fwd_y, mvf, rcontrol);
+    let backward_flat = motion_compensate_block(prec_plane, bwd_x, bwd_y, mvb, rcontrol);
+    let forward = flat_to_ji(&forward_flat);
+    let backward = flat_to_ji(&backward_flat);
+    pb_b_blend_block(
+        &forward,
+        &backward,
+        bidir_extent,
+        block_i_origin,
+        block_j_origin,
+    )
 }
 
 #[cfg(test)]
@@ -2173,6 +2276,177 @@ mod tests {
                 let inside = (1..=7).contains(&(i as i32)) && (1..=7).contains(&(j as i32));
                 let expected = if inside { 160 } else { 80 };
                 assert_eq!(px, expected, "j={}, i={}", j, i);
+            }
+        }
+    }
+
+    use crate::motion::{RefPlane, RCONTROL_DEFAULT};
+
+    /// Build a 16 × 16 uniform-fill reference plane.
+    fn uniform_plane(fill: u8) -> Vec<u8> {
+        vec![fill; 16 * 16]
+    }
+
+    /// §G.5 block predictor: a `None` extent short-circuits the whole
+    /// 8 × 8 block to the forward prediction only. With a zero MVF
+    /// against a uniform `prev_plane` the forward prediction is that
+    /// uniform fill everywhere, and the backward prediction must not
+    /// leak into the output.
+    #[test]
+    fn pb_b_predict_block_none_extent_is_forward_only() {
+        let prev = uniform_plane(90);
+        let prec = uniform_plane(200);
+        let prev_plane = RefPlane::new(&prev, 16, 16);
+        let prec_plane = RefPlane::new(&prec, 16, 16);
+        let out = pb_b_predict_block(
+            &prev_plane,
+            &prec_plane,
+            0,
+            0,
+            0,
+            0,
+            MotionVector::default(),
+            MotionVector::default(),
+            None,
+            0,
+            0,
+            RCONTROL_DEFAULT,
+        );
+        for row in &out {
+            for &px in row {
+                assert_eq!(px, 90);
+            }
+        }
+    }
+
+    /// §G.5 block predictor: a full-block bidirectional extent with
+    /// integer (even half-pel) zero MVF / MVB over uniform planes
+    /// yields the §G.5 truncated average everywhere. `(90 + 200) / 2
+    /// = 145`.
+    #[test]
+    fn pb_b_predict_block_full_extent_averages_uniform_planes() {
+        let prev = uniform_plane(90);
+        let prec = uniform_plane(200);
+        let prev_plane = RefPlane::new(&prev, 16, 16);
+        let prec_plane = RefPlane::new(&prec, 16, 16);
+        let out = pb_b_predict_block(
+            &prev_plane,
+            &prec_plane,
+            0,
+            0,
+            0,
+            0,
+            MotionVector::default(),
+            MotionVector::default(),
+            Some(((0, 7), (0, 7))),
+            0,
+            0,
+            RCONTROL_DEFAULT,
+        );
+        for row in &out {
+            for &px in row {
+                // (90 + 200) / 2 = 145 (truncation toward zero).
+                assert_eq!(px, 145);
+            }
+        }
+    }
+
+    /// §G.5 block predictor: the forward / backward predictions are
+    /// fetched from *different* planes at *different* origins. A
+    /// horizontal-ramp `prev_plane` (sample = x) read at fwd origin
+    /// (0,0) gives forward column index; a uniform `prec_plane` of 0
+    /// gives backward 0. Over a partial extent the inside pixels are
+    /// `(x + 0) / 2` and outside pixels are the forward `x`.
+    #[test]
+    fn pb_b_predict_block_distinct_planes_and_origins() {
+        // prev: horizontal ramp, sample(x, y) = x (0..=15).
+        let mut prev = vec![0u8; 16 * 16];
+        for y in 0..16 {
+            for x in 0..16 {
+                prev[y * 16 + x] = x as u8;
+            }
+        }
+        let prec = uniform_plane(0);
+        let prev_plane = RefPlane::new(&prev, 16, 16);
+        let prec_plane = RefPlane::new(&prec, 16, 16);
+        // Forward block at prev origin (0,0), zero MVF → forward[j][i]
+        // = i (column). Backward all zero. Bidirectional over the
+        // sub-rectangle i∈[2,5], j∈[3,6] (block origin 0,0).
+        let extent = Some(((2, 5), (3, 6)));
+        let out = pb_b_predict_block(
+            &prev_plane,
+            &prec_plane,
+            0,
+            0,
+            0,
+            0,
+            MotionVector::default(),
+            MotionVector::default(),
+            extent,
+            0,
+            0,
+            RCONTROL_DEFAULT,
+        );
+        for (j, row) in out.iter().enumerate() {
+            for (i, &px) in row.iter().enumerate() {
+                let inside = (2..=5).contains(&(i as i32)) && (3..=6).contains(&(j as i32));
+                let fwd = i as u8; // forward[j][i] = column index
+                let expected = if inside { (fwd as u16 / 2) as u8 } else { fwd };
+                assert_eq!(px, expected, "j={}, i={}", j, i);
+            }
+        }
+    }
+
+    /// §G.5 block predictor: a non-zero integer MVF shifts the forward
+    /// fetch. With MVF = (+4, 0) half-pel (= +2 integer pixels) over a
+    /// horizontal-ramp `prev_plane`, the forward sample at block
+    /// column `i` is `x = i + 2`. A `None` extent keeps it forward
+    /// only, so the output column `i` is `i + 2` (clamped at the right
+    /// edge by §D.1 replication).
+    #[test]
+    fn pb_b_predict_block_nonzero_mvf_shifts_forward_fetch() {
+        let mut prev = vec![0u8; 16 * 16];
+        for y in 0..16 {
+            for x in 0..16 {
+                prev[y * 16 + x] = x as u8;
+            }
+        }
+        let prec = uniform_plane(0);
+        let prev_plane = RefPlane::new(&prev, 16, 16);
+        let prec_plane = RefPlane::new(&prec, 16, 16);
+        let out = pb_b_predict_block(
+            &prev_plane,
+            &prec_plane,
+            0,
+            0,
+            0,
+            0,
+            MotionVector::new(4, 0), // +2 integer pixels horizontally
+            MotionVector::default(),
+            None,
+            0,
+            0,
+            RCONTROL_DEFAULT,
+        );
+        for row in &out {
+            for (i, &px) in row.iter().enumerate() {
+                let expected = ((i + 2).min(15)) as u8;
+                assert_eq!(px, expected, "i={}", i);
+            }
+        }
+    }
+
+    /// `flat_to_ji` maps `flat[j * 8 + i]` to `nested[j][i]`.
+    #[test]
+    fn flat_to_ji_preserves_row_major_order() {
+        let mut flat = [0u8; 64];
+        for (k, v) in flat.iter_mut().enumerate() {
+            *v = k as u8;
+        }
+        let nested = flat_to_ji(&flat);
+        for (j, row) in nested.iter().enumerate() {
+            for (i, &cell) in row.iter().enumerate() {
+                assert_eq!(cell, (j * 8 + i) as u8);
             }
         }
     }

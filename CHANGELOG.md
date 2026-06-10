@@ -8,6 +8,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §G.5 PB-frame B-block motion-compensated prediction composition
+  (round 272):
+  - `pb_b_predict_block(prev_plane, prec_plane, fwd_x, fwd_y, bwd_x,
+    bwd_y, mvf, mvb, bidir_extent, block_i_origin, block_j_origin,
+    rcontrol) -> [[u8; 8]; 8]` new public function in `pb_layer.rs`:
+    the §G.5 per-block prediction driver-primitive. Builds the
+    forward prediction with `mvf` against `prev_plane` ("forward
+    prediction using MVF relative to the previous decoded picture")
+    and the backward prediction with `mvb` against `prec_plane`
+    ("backward prediction using MVB relative to PREC") — both via
+    §6.1.2 half-pel bilinear interpolation (`motion_compensate_block`)
+    — then blends the two over the §G.5 `bidir_extent` rectangle via
+    `pb_b_blend_block`. This closes the "fetch forward / backward 8 × 8
+    predictions, blend per §G.5" step the macroblock-layer PB-mode
+    driver needs per block, scoped as a pure function over two
+    reference planes. The forward / backward fetches are independent
+    (`prev_plane`/`prec_plane`, distinct origins), and a `None`
+    extent short-circuits the whole block to forward-only.
+  - `flat_to_ji` private helper: reshapes the flat row-major
+    `[u8; 64]` from `motion_compensate_block` (`flat[py*8+px]`) into
+    the `[[u8; 8]; 8]` `[j][i]` layout the §G.5 blend primitives
+    consume (`nested[j][i] = flat[j*8+i]`; §G.5 `i` horizontal, `j`
+    vertical).
+  - 5 new tests: `None`-extent forward-only short-circuit; full-extent
+    truncated-average over uniform planes (`(90+200)/2 = 145`);
+    distinct-plane/origin partial-extent blend over a horizontal-ramp
+    forward plane; non-zero integer MVF forward-fetch shift (+2 px
+    with §D.1 right-edge replication); and `flat_to_ji` row-major
+    order. `cargo test -p oxideav-h263` reports 497 passed (was 492).
 - §G.5 PB-frame B-block per-pixel bidirectional-prediction blend
   (round 263):
   - `pb_b_bidir_pixel(forward, backward) -> u8` new public function
