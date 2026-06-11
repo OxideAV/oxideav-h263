@@ -5,6 +5,61 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 34 (workspace round 279) — §G.4 + §G.5 PB-frame B-macroblock
+prediction composition. With the per-block §G.5 predictor
+(`pb_b_predict_block`) landed in r272, this round assembles the full
+six-block B-macroblock prediction step the PB-mode picture driver
+invokes once per macroblock: §G.4 vectors for all four luma blocks +
+the chroma pair, §G.5 extents per block, and the per-block predictor
+over all four luma sub-blocks plus Cb and Cr.**
+
+* `pb_b_predict_macroblock(planes, mb_x, mb_y, p_mvs, mvd, trb, trd,
+  rcontrol) -> PbBMacroblockPrediction` (new public function in
+  `pb_layer.rs`): the §G.4 + §G.5 whole-macroblock composition.
+  Derives the four per-luma-block `(MVF, MVB)` pairs via
+  `pb_b_vector` (same MVD for all four blocks per §G.4: "the same MVD
+  given by MVDB is used for each of the four luminance B-blocks"),
+  the chroma pair via `pb_b_chroma_vector` (§G.4 final paragraph),
+  the §G.5 rectangles via `pb_b_bidir_luma_block_extent` /
+  `pb_b_bidir_chroma_extent`, and predicts each of the six 8 × 8
+  blocks with `pb_b_predict_block` — forward fetch from the previous
+  decoded picture at the block's picture position, backward fetch
+  from the macroblock-local PREC plane at `(nh*8, nv*8)` (luma) /
+  `(0, 0)` (chroma). Asserts PREC geometry (16 × 16 luma, 8 × 8
+  chroma — §G.5 defines PREC as one reconstructed, clipped
+  P-macroblock, and the §D.1 replication boundary must be PREC's own
+  edge) and the §4.2.3 16-pixel macroblock grid.
+* `PbBReferencePlanes` (new public struct): the six reference planes
+  the composition reads — `prev_y`/`prev_cb`/`prev_cr` (previous
+  decoded picture, full-picture planes; MVF target) and
+  `prec_y`/`prec_cb`/`prec_cr` (PREC, macroblock-local planes; MVB
+  target).
+* `PbBMacroblockPrediction` (new public struct): the 16 × 16 luma +
+  two 8 × 8 chroma prediction arrays in §G.5 `[j][i]` layout. The
+  §6.3.1 residual add for CBPB-lit B-blocks and the §6.3.2 clip stay
+  with the caller.
+
+6 new tests land: zero-MV uniform-plane full-bidirectional averages
+across all three channels; Figure-5 quadrant mapping (per-quadrant
+PREC fills land in the right output quadrants); negative-MVB
+left-column forward-only split (MV = (+4, 0), TRB/TRD = 1/2 →
+MVB = −2 luma / −1 chroma, macroblock column 0 forward-only on all
+three channels); §G.4 MVD ≠ 0 path (MVB = MVF − MV = 0, full-bidir
+with a 2-px-shifted forward ramp fetch, chroma MVF = (4×4)/8 → +2
+half-pel pinned end-to-end); assembly consistency against direct
+per-block primitive composition over ramp planes with four distinct
+P-vectors; and PREC-geometry rejection (`should_panic`). `cargo test
+-p oxideav-h263` reports 503 passed (previously 497).
+
+The remaining PB-frame step is the bitstream-side driver: walk the
+picture's macroblocks under PTYPE bit-13 PB-frames mode, parse MODB /
+CBPB / MVDB (§5.3.3 / §5.3.4 / §5.3.9) between MCBPC and CBPY,
+reconstruct the P-macroblock into PREC, call
+`pb_b_predict_macroblock`, and add the §6.3.1 B-block residuals where
+CBPB lights them.
+
+---
+
 **Round 33 (workspace round 272) — §G.5 PB-frame B-block
 motion-compensated prediction composition. With the §G.5 per-pixel
 blend primitives (`pb_b_bidir_pixel` / `pb_b_blend_block`) landed in

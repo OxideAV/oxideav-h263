@@ -8,6 +8,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §G.4 + §G.5 PB-frame B-macroblock prediction composition
+  (round 279):
+  - `pb_b_predict_macroblock(planes, mb_x, mb_y, p_mvs, mvd, trb,
+    trd, rcontrol) -> PbBMacroblockPrediction` new public function in
+    `pb_layer.rs`: the whole-macroblock §G.4 + §G.5 step the PB-mode
+    picture driver invokes once the P-macroblock has been
+    reconstructed and clipped into PREC (§6.3.2). Derives the four
+    per-luma-block `(MVF, MVB)` pairs via `pb_b_vector` (the same MVD
+    applied to all four blocks per §G.4), the chroma pair via
+    `pb_b_chroma_vector`, the §G.5 bidirectional rectangles via
+    `pb_b_bidir_luma_block_extent` / `pb_b_bidir_chroma_extent`, and
+    predicts all six 8 × 8 B-blocks (four luma + Cb + Cr) via
+    `pb_b_predict_block` — forward fetch from the previous decoded
+    picture at the block's picture position, backward fetch from the
+    macroblock-local PREC plane at `(nh*8, nv*8)` luma / `(0, 0)`
+    chroma. Asserts PREC geometry (16 × 16 / 8 × 8 — §G.5 defines
+    PREC as one macroblock and the §D.1 replication boundary must be
+    PREC's own edge) and the §4.2.3 macroblock grid.
+  - `PbBReferencePlanes` new public struct: the six reference planes
+    the composition reads (`prev_y`/`prev_cb`/`prev_cr` full-picture
+    forward references; `prec_y`/`prec_cb`/`prec_cr` macroblock-local
+    PREC backward references).
+  - `PbBMacroblockPrediction` new public struct: 16 × 16 luma + two
+    8 × 8 chroma prediction arrays in §G.5 `[j][i]` layout; the
+    §6.3.1 residual add for CBPB-lit B-blocks and the §6.3.2 clip
+    stay with the caller.
+  - 6 new tests: zero-MV uniform-plane full-bidir averages on all
+    three channels; Figure-5 quadrant mapping; negative-MVB
+    left-column forward-only split (luma MVB = −2 / chroma −1);
+    §G.4 MVD ≠ 0 path (MVB = MVF − MV, shifted-ramp forward fetch +
+    chroma-vector arithmetic pinned end-to-end); assembly consistency
+    against direct per-block primitive composition; PREC-geometry
+    rejection (`should_panic`). `cargo test -p oxideav-h263` reports
+    503 passed (was 497).
 - §G.5 PB-frame B-block motion-compensated prediction composition
   (round 272):
   - `pb_b_predict_block(prev_plane, prec_plane, fwd_x, fwd_y, bwd_x,

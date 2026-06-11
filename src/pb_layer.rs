@@ -977,6 +977,226 @@ pub fn pb_b_predict_block(
     )
 }
 
+/// The six reference planes the §G.5 B-macroblock prediction reads.
+///
+/// Two picture-level planes per channel pair:
+///
+/// * `prev_*` — the **previous decoded picture** planes (full picture
+///   dimensions) that the §G.5 forward prediction (MVF) is relative
+///   to: "the forward prediction using MVF relative to the previous
+///   decoded picture".
+/// * `prec_*` — the **PREC** planes: the just-decoded, reconstructed
+///   and clipped P-macroblock of the same PB-frame (§G.5: "It is
+///   assumed that the P-macroblock (luminance and chrominance) is
+///   first decoded, reconstructed and clipped (see 6.3.2). This
+///   macroblock is called PREC."). These are *macroblock-local*
+///   planes — 16 × 16 for luma, 8 × 8 for each chroma channel —
+///   because §G.5's backward prediction (MVB) is bounded by PREC
+///   itself (the bidirectional region is exactly the pixels whose
+///   backward vector points inside PREC).
+#[derive(Debug, Clone, Copy)]
+pub struct PbBReferencePlanes<'a> {
+    /// Previous decoded picture, luminance plane.
+    pub prev_y: RefPlane<'a>,
+    /// Previous decoded picture, Cb plane.
+    pub prev_cb: RefPlane<'a>,
+    /// Previous decoded picture, Cr plane.
+    pub prev_cr: RefPlane<'a>,
+    /// PREC luminance — the 16 × 16 reconstructed, clipped
+    /// P-macroblock luma (§6.3.2 output for this macroblock).
+    pub prec_y: RefPlane<'a>,
+    /// PREC Cb — the 8 × 8 reconstructed, clipped P-macroblock Cb.
+    pub prec_cb: RefPlane<'a>,
+    /// PREC Cr — the 8 × 8 reconstructed, clipped P-macroblock Cr.
+    pub prec_cr: RefPlane<'a>,
+}
+
+/// §G.5 prediction for one whole B-macroblock: the 16 × 16 luminance
+/// prediction plus the two 8 × 8 chrominance predictions, in
+/// macroblock-local `[j][i]` layout (row `j` vertical, column `i`
+/// horizontal — §G.5's coordinate convention).
+///
+/// The reconstructed B-macroblock is this prediction plus the §6.3.1
+/// dequantised-IDCT residual of whichever B-blocks CBPB lights up
+/// (§5.3.4); the residual add and the §6.3.2 clip stay with the
+/// caller, mirroring [`pb_b_predict_block`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PbBMacroblockPrediction {
+    /// 16 × 16 luminance prediction, `luma[j][i]`.
+    pub luma: [[u8; 16]; 16],
+    /// 8 × 8 Cb prediction, `cb[j][i]`.
+    pub cb: [[u8; 8]; 8],
+    /// 8 × 8 Cr prediction, `cr[j][i]`.
+    pub cr: [[u8; 8]; 8],
+}
+
+/// §G.4 + §G.5 — full prediction composition for one B-macroblock of
+/// a PB-frame.
+///
+/// This is the per-macroblock step the PB-mode picture driver invokes
+/// once the P-macroblock has been reconstructed and clipped (PREC,
+/// §6.3.2) and the §5.3.3 / §5.3.9 MODB / MVDB fields have been
+/// parsed. It composes the previously landed primitives over all six
+/// 8 × 8 B-blocks of the macroblock (four luma + Cb + Cr, Figure 5
+/// order):
+///
+/// 1. **§G.4 vectors.** For each 8 × 8 luma block `(nh, nv)`, the
+///    forward / backward pair `(MVF, MVB)` is derived from that
+///    block's P-vector via [`pb_b_vector`] — the same `mvd` (zero if
+///    MVDB absent, `None` here) is applied to all four blocks per
+///    §G.4: "If MVDB is present, the same MVD given by MVDB is used
+///    for each of the four luminance B-blocks within the macroblock."
+///    The chroma pair is then derived from the four luma pairs via
+///    [`pb_b_chroma_vector`] (§G.4 final paragraph: sum of the four
+///    luma vectors divided by 8, snapped per Table F.1).
+/// 2. **§G.5 extents.** Each luma block's bidirectional rectangle
+///    comes from [`pb_b_bidir_luma_block_extent`]; the chroma
+///    rectangle (shared by Cb and Cr — the §G.5 chrominance procedure
+///    runs on the macroblock's single chroma vector pair) from
+///    [`pb_b_bidir_chroma_extent`].
+/// 3. **§G.5 prediction.** Each block is predicted by
+///    [`pb_b_predict_block`]: forward fetch from the previous decoded
+///    picture at the block's picture position, backward fetch from
+///    the macroblock-local PREC plane at the block's PREC-local
+///    origin (`(nh*8, nv*8)` luma; `(0, 0)` chroma), blended over the
+///    §G.5 rectangle.
+///
+/// Inputs:
+///
+/// * `planes` — the six reference planes (see
+///   [`PbBReferencePlanes`]).
+/// * `mb_x` / `mb_y` — the macroblock's top-left pixel position in
+///   **luminance** picture coordinates; both must be multiples of 16
+///   (§4.2.3 macroblock grid). The chroma block position is
+///   `(mb_x / 2, mb_y / 2)` per the §4.2 4:2:0 sampling layout.
+/// * `p_mvs` — the four P-picture luma motion vectors `MV` in
+///   Figure 5 block order (block 0 top-left, 1 top-right, 2
+///   bottom-left, 3 bottom-right), half-pel units. Per §G.4: "if only
+///   one vector per macroblock is transmitted, MV has the same value
+///   for each of the four 8 × 8 luminance blocks" — single-MV callers
+///   replicate the macroblock vector into all four entries. §G.4 also
+///   covers INTRA P-macroblocks ("The formulae for MVF and MVB are
+///   also used in the case of INTRA blocks where the vector data is
+///   used only for predicting B-blocks") — the caller passes the
+///   vector data decoded for that purpose.
+/// * `mvd` — the §5.3.9 MVDB delta, or `None` when MODB signalled no
+///   MVDB ("If MVDB is not present, MVD is set to zero", §G.4).
+/// * `trb` / `trd` — the §G.4 temporal-reference scalars (see
+///   [`pb_b_vectors`]; the §G.4 negative-TRD wrap is the caller's).
+/// * `rcontrol` — §6.1.2 rounding bit for the half-pel fetches
+///   (baseline `0`, [`crate::motion::RCONTROL_DEFAULT`]).
+///
+/// # Panics
+///
+/// Panics if `prec_y` is not 16 × 16 or `prec_cb` / `prec_cr` are not
+/// 8 × 8 (PREC is one macroblock by §G.5 definition, and the §D.1
+/// edge replication inside the backward fetch must clamp at PREC's
+/// boundary, so the plane dimensions are load-bearing); if `mb_x` /
+/// `mb_y` are not multiples of 16; or if `trd == 0` (propagated from
+/// [`pb_b_vectors`]).
+#[allow(clippy::too_many_arguments)]
+pub fn pb_b_predict_macroblock(
+    planes: &PbBReferencePlanes<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    p_mvs: &[MotionVector; 4],
+    mvd: Option<Mvd>,
+    trb: i32,
+    trd: i32,
+    rcontrol: i32,
+) -> PbBMacroblockPrediction {
+    assert!(
+        planes.prec_y.width == 16 && planes.prec_y.height == 16,
+        "§G.5 PREC luma must be one 16 × 16 macroblock"
+    );
+    assert!(
+        planes.prec_cb.width == 8 && planes.prec_cb.height == 8,
+        "§G.5 PREC Cb must be one 8 × 8 block"
+    );
+    assert!(
+        planes.prec_cr.width == 8 && planes.prec_cr.height == 8,
+        "§G.5 PREC Cr must be one 8 × 8 block"
+    );
+    assert!(
+        mb_x % 16 == 0 && mb_y % 16 == 0,
+        "macroblock position must sit on the §4.2.3 16-pixel grid"
+    );
+
+    // §G.4: per-luma-block (MVF, MVB), same MVD for all four blocks.
+    let mut luma_mvf = [MotionVector::default(); 4];
+    let mut luma_mvb = [MotionVector::default(); 4];
+    for n in 0..4 {
+        let (mvf, mvb) = pb_b_vector(p_mvs[n], mvd, trb, trd);
+        luma_mvf[n] = mvf;
+        luma_mvb[n] = mvb;
+    }
+    // §G.4 final paragraph: chroma pair from the four luma pairs.
+    let (chroma_mvf, chroma_mvb) = pb_b_chroma_vector(&luma_mvf, &luma_mvb);
+
+    // §G.5 luminance procedure: the four 8 × 8 blocks at (nh, nv).
+    let mut luma = [[0u8; 16]; 16];
+    for (n, (&mvf, &mvb)) in luma_mvf.iter().zip(luma_mvb.iter()).enumerate() {
+        let nh = (n & 1) as u8;
+        let nv = (n >> 1) as u8;
+        let i_origin = nh as i32 * 8;
+        let j_origin = nv as i32 * 8;
+        let extent = pb_b_bidir_luma_block_extent(mvb, nh, nv);
+        let block = pb_b_predict_block(
+            &planes.prev_y,
+            &planes.prec_y,
+            mb_x + i_origin as usize,
+            mb_y + j_origin as usize,
+            i_origin as usize,
+            j_origin as usize,
+            mvf,
+            mvb,
+            extent,
+            i_origin,
+            j_origin,
+            rcontrol,
+        );
+        for (j, row) in block.iter().enumerate() {
+            luma[j_origin as usize + j][i_origin as usize..i_origin as usize + 8]
+                .copy_from_slice(row);
+        }
+    }
+
+    // §G.5 chrominance procedure: one extent, applied to both Cb and
+    // Cr with the same chroma vector pair.
+    let chroma_extent = pb_b_bidir_chroma_extent(chroma_mvb);
+    let (cx, cy) = (mb_x / 2, mb_y / 2);
+    let cb = pb_b_predict_block(
+        &planes.prev_cb,
+        &planes.prec_cb,
+        cx,
+        cy,
+        0,
+        0,
+        chroma_mvf,
+        chroma_mvb,
+        chroma_extent,
+        0,
+        0,
+        rcontrol,
+    );
+    let cr = pb_b_predict_block(
+        &planes.prev_cr,
+        &planes.prec_cr,
+        cx,
+        cy,
+        0,
+        0,
+        chroma_mvf,
+        chroma_mvb,
+        chroma_extent,
+        0,
+        0,
+        rcontrol,
+    );
+
+    PbBMacroblockPrediction { luma, cb, cr }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2449,5 +2669,344 @@ mod tests {
                 assert_eq!(cell, (j * 8 + i) as u8);
             }
         }
+    }
+
+    /// Bundle six uniform reference planes for the macroblock-level
+    /// tests. Picture planes are 32 × 32 luma / 16 × 16 chroma so a
+    /// macroblock at (16, 16) exercises non-zero picture origins.
+    struct UniformRefs {
+        prev_y: Vec<u8>,
+        prev_cb: Vec<u8>,
+        prev_cr: Vec<u8>,
+        prec_y: Vec<u8>,
+        prec_cb: Vec<u8>,
+        prec_cr: Vec<u8>,
+    }
+
+    impl UniformRefs {
+        fn new(prev: [u8; 3], prec: [u8; 3]) -> Self {
+            Self {
+                prev_y: vec![prev[0]; 32 * 32],
+                prev_cb: vec![prev[1]; 16 * 16],
+                prev_cr: vec![prev[2]; 16 * 16],
+                prec_y: vec![prec[0]; 16 * 16],
+                prec_cb: vec![prec[1]; 8 * 8],
+                prec_cr: vec![prec[2]; 8 * 8],
+            }
+        }
+
+        fn planes(&self) -> PbBReferencePlanes<'_> {
+            PbBReferencePlanes {
+                prev_y: RefPlane::new(&self.prev_y, 32, 32),
+                prev_cb: RefPlane::new(&self.prev_cb, 16, 16),
+                prev_cr: RefPlane::new(&self.prev_cr, 16, 16),
+                prec_y: RefPlane::new(&self.prec_y, 16, 16),
+                prec_cb: RefPlane::new(&self.prec_cb, 8, 8),
+                prec_cr: RefPlane::new(&self.prec_cr, 8, 8),
+            }
+        }
+    }
+
+    /// §G.4 + §G.5 macroblock predictor: zero P-vectors and no MVDB
+    /// yield MVF = MVB = 0 for every block, so every §G.5 rectangle is
+    /// the full block and every output sample is the truncated average
+    /// of the forward and backward fills — across all four luma
+    /// quadrants and both chroma channels.
+    #[test]
+    fn pb_b_predict_macroblock_zero_mv_uniform_planes_full_bidir() {
+        let refs = UniformRefs::new([100, 60, 40], [200, 80, 240]);
+        let out = pb_b_predict_macroblock(
+            &refs.planes(),
+            16,
+            16,
+            &[MotionVector::default(); 4],
+            None,
+            1,
+            2,
+            RCONTROL_DEFAULT,
+        );
+        assert!(out.luma.iter().flatten().all(|&px| px == 150)); // (100+200)/2
+        assert!(out.cb.iter().flatten().all(|&px| px == 70)); // (60+80)/2
+        assert!(out.cr.iter().flatten().all(|&px| px == 140)); // (40+240)/2
+    }
+
+    /// §G.5 macroblock predictor: the four luma sub-blocks land in
+    /// their Figure 5 quadrants. PREC luma carries a distinct fill per
+    /// 8 × 8 quadrant (TL 10 / TR 20 / BL 30 / BR 40); with zero
+    /// vectors (full bidirectional rectangles) and a zero forward
+    /// plane, each output quadrant is exactly half its PREC fill.
+    #[test]
+    fn pb_b_predict_macroblock_luma_quadrants_map_to_figure5_order() {
+        let mut refs = UniformRefs::new([0, 0, 0], [0, 50, 90]);
+        for y in 0..16 {
+            for x in 0..16 {
+                let quad = match (x >= 8, y >= 8) {
+                    (false, false) => 10u8, // block 0, top-left
+                    (true, false) => 20,    // block 1, top-right
+                    (false, true) => 30,    // block 2, bottom-left
+                    (true, true) => 40,     // block 3, bottom-right
+                };
+                refs.prec_y[y * 16 + x] = quad;
+            }
+        }
+        let out = pb_b_predict_macroblock(
+            &refs.planes(),
+            0,
+            0,
+            &[MotionVector::default(); 4],
+            None,
+            1,
+            2,
+            RCONTROL_DEFAULT,
+        );
+        for (j, row) in out.luma.iter().enumerate() {
+            for (i, &px) in row.iter().enumerate() {
+                let expected = match (i >= 8, j >= 8) {
+                    (false, false) => 5u8, // (0 + 10) / 2
+                    (true, false) => 10,
+                    (false, true) => 15,
+                    (true, true) => 20,
+                };
+                assert_eq!(px, expected, "j={}, i={}", j, i);
+            }
+        }
+        assert!(out.cb.iter().flatten().all(|&px| px == 25)); // (0+50)/2
+        assert!(out.cr.iter().flatten().all(|&px| px == 45)); // (0+90)/2
+    }
+
+    /// §G.4 + §G.5 macroblock predictor with a non-zero P-vector and
+    /// no MVDB: `MV = (+4, 0)` half-pel, TRB = 1, TRD = 2 give
+    /// `MVF = (TRB×MV)/TRD = (+2, 0)` and
+    /// `MVB = ((TRB−TRD)×MV)/TRD = (−2, 0)` for every luma block. The
+    /// §G.5 luma extent for MVB = −2 starts at
+    /// `i = max(0, (2+1)/2) = 1`, so macroblock column 0 is
+    /// forward-only while columns 1..=15 are bidirectional (block
+    /// (1, 0)'s extent `[max(8,1), min(15,15)]` covers it fully). The
+    /// §G.4 chroma backward vector is `4×(−2) = −8` summed →
+    /// Table F.1 → −1 half-pel, whose chroma extent also starts at
+    /// `i = max(0, (1+1)/2) = 1`: chroma column 0 stays forward-only.
+    #[test]
+    fn pb_b_predict_macroblock_negative_mvb_leaves_left_column_forward_only() {
+        let refs = UniformRefs::new([100, 60, 40], [200, 80, 240]);
+        let out = pb_b_predict_macroblock(
+            &refs.planes(),
+            16,
+            16,
+            &[MotionVector::new(4, 0); 4],
+            None,
+            1,
+            2,
+            RCONTROL_DEFAULT,
+        );
+        for (j, row) in out.luma.iter().enumerate() {
+            for (i, &px) in row.iter().enumerate() {
+                let expected = if i == 0 { 100 } else { 150 };
+                assert_eq!(px, expected, "j={}, i={}", j, i);
+            }
+        }
+        for row in &out.cb {
+            for (i, &px) in row.iter().enumerate() {
+                assert_eq!(px, if i == 0 { 60 } else { 70 }, "i={}", i);
+            }
+        }
+        for row in &out.cr {
+            for (i, &px) in row.iter().enumerate() {
+                assert_eq!(px, if i == 0 { 40 } else { 140 }, "i={}", i);
+            }
+        }
+    }
+
+    /// §G.4 MVD ≠ 0 path through the macroblock predictor:
+    /// `MV = (+4, 0)`, MVDB = (+2, 0), TRB = 1, TRD = 2 give
+    /// `MVF = (1×4)/2 + 2 = (+4, 0)` (= 2 integer pixels) and
+    /// `MVB = MVF − MV = (0, 0)` — so the whole macroblock is
+    /// bidirectional and the forward fetch is shifted by 2 pixels.
+    /// Over a horizontal-ramp luma picture (`prev_y[y][x] = 3x`) with
+    /// the macroblock at (16, 0), luma output is
+    /// `(3·(16+i+2) + 200) / 2`. The §G.4 chroma forward vector is
+    /// `(4×4)/8 = 1` chroma pixel (Table F.1 fraction 0 → +2
+    /// half-pel) and chroma MVB sums to 0, so over a chroma ramp
+    /// (`prev_cb[y][x] = 2x`) the Cb output is
+    /// `(2·(8+i+1) + 100) / 2 = 59 + i`.
+    #[test]
+    fn pb_b_predict_macroblock_mvd_nonzero_backward_is_mvf_minus_mv() {
+        let mut refs = UniformRefs::new([0, 0, 0], [200, 100, 30]);
+        for y in 0..32 {
+            for x in 0..32 {
+                refs.prev_y[y * 32 + x] = (3 * x) as u8;
+            }
+        }
+        for y in 0..16 {
+            for x in 0..16 {
+                refs.prev_cb[y * 16 + x] = (2 * x) as u8;
+            }
+        }
+        let out = pb_b_predict_macroblock(
+            &refs.planes(),
+            16,
+            0,
+            &[MotionVector::new(4, 0); 4],
+            Some(Mvd {
+                dx_half: 2,
+                dy_half: 0,
+            }),
+            1,
+            2,
+            RCONTROL_DEFAULT,
+        );
+        for (j, row) in out.luma.iter().enumerate() {
+            for (i, &px) in row.iter().enumerate() {
+                // Forward x = 16 + i + 2, clamped at the 32-wide
+                // picture's right edge (§D.1) for i = 14, 15.
+                let fx = (16 + i + 2).min(31);
+                let expected = ((3 * fx + 200) / 2) as u8;
+                assert_eq!(px, expected, "j={}, i={}", j, i);
+            }
+        }
+        for (j, row) in out.cb.iter().enumerate() {
+            for (i, &px) in row.iter().enumerate() {
+                let fx = (8 + i + 1).min(15);
+                let expected = ((2 * fx + 100) / 2) as u8;
+                assert_eq!(px, expected, "j={}, i={}", j, i);
+            }
+        }
+    }
+
+    /// Assembly consistency: with four distinct P-vectors and a
+    /// non-zero MVDB over non-trivial ramp planes, every macroblock
+    /// quadrant and both chroma outputs must equal the direct
+    /// composition of the per-block primitives ([`pb_b_vector`] /
+    /// [`pb_b_chroma_vector`] / the extent primitives /
+    /// [`pb_b_predict_block`]) with the same inputs.
+    #[test]
+    fn pb_b_predict_macroblock_matches_per_block_primitives() {
+        let mut refs = UniformRefs::new([0, 0, 0], [0, 0, 0]);
+        for y in 0..32 {
+            for x in 0..32 {
+                refs.prev_y[y * 32 + x] = ((x * 5 + y * 3) % 251) as u8;
+            }
+        }
+        for y in 0..16 {
+            for x in 0..16 {
+                refs.prev_cb[y * 16 + x] = ((x * 7 + y) % 251) as u8;
+                refs.prev_cr[y * 16 + x] = ((x + y * 11) % 251) as u8;
+                refs.prec_y[y * 16 + x] = ((x * 13 + y * 2) % 251) as u8;
+            }
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                refs.prec_cb[y * 8 + x] = ((x * 9 + y * 4) % 251) as u8;
+                refs.prec_cr[y * 8 + x] = ((x * 2 + y * 17) % 251) as u8;
+            }
+        }
+        let planes = refs.planes();
+        let p_mvs = [
+            MotionVector::new(2, 0),
+            MotionVector::new(0, 2),
+            MotionVector::new(-2, 0),
+            MotionVector::new(0, -2),
+        ];
+        let mvd = Some(Mvd {
+            dx_half: 1,
+            dy_half: -1,
+        });
+        let (trb, trd) = (1, 3);
+        let (mb_x, mb_y) = (16usize, 16usize);
+        let out =
+            pb_b_predict_macroblock(&planes, mb_x, mb_y, &p_mvs, mvd, trb, trd, RCONTROL_DEFAULT);
+
+        let mut luma_mvf = [MotionVector::default(); 4];
+        let mut luma_mvb = [MotionVector::default(); 4];
+        for n in 0..4 {
+            let (mvf, mvb) = pb_b_vector(p_mvs[n], mvd, trb, trd);
+            luma_mvf[n] = mvf;
+            luma_mvb[n] = mvb;
+        }
+        for n in 0..4 {
+            let (nh, nv) = ((n & 1) as u8, (n >> 1) as u8);
+            let (io, jo) = (nh as usize * 8, nv as usize * 8);
+            let extent = pb_b_bidir_luma_block_extent(luma_mvb[n], nh, nv);
+            let expected = pb_b_predict_block(
+                &planes.prev_y,
+                &planes.prec_y,
+                mb_x + io,
+                mb_y + jo,
+                io,
+                jo,
+                luma_mvf[n],
+                luma_mvb[n],
+                extent,
+                io as i32,
+                jo as i32,
+                RCONTROL_DEFAULT,
+            );
+            for (j, row) in expected.iter().enumerate() {
+                for (i, &px) in row.iter().enumerate() {
+                    assert_eq!(
+                        out.luma[jo + j][io + i],
+                        px,
+                        "block {}, j={}, i={}",
+                        n,
+                        j,
+                        i
+                    );
+                }
+            }
+        }
+        let (chroma_mvf, chroma_mvb) = pb_b_chroma_vector(&luma_mvf, &luma_mvb);
+        let chroma_extent = pb_b_bidir_chroma_extent(chroma_mvb);
+        let expected_cb = pb_b_predict_block(
+            &planes.prev_cb,
+            &planes.prec_cb,
+            mb_x / 2,
+            mb_y / 2,
+            0,
+            0,
+            chroma_mvf,
+            chroma_mvb,
+            chroma_extent,
+            0,
+            0,
+            RCONTROL_DEFAULT,
+        );
+        let expected_cr = pb_b_predict_block(
+            &planes.prev_cr,
+            &planes.prec_cr,
+            mb_x / 2,
+            mb_y / 2,
+            0,
+            0,
+            chroma_mvf,
+            chroma_mvb,
+            chroma_extent,
+            0,
+            0,
+            RCONTROL_DEFAULT,
+        );
+        assert_eq!(out.cb, expected_cb);
+        assert_eq!(out.cr, expected_cr);
+    }
+
+    /// §G.5 defines PREC as one macroblock; a wrongly sized PREC luma
+    /// plane is a caller error the predictor refuses (the §D.1 edge
+    /// replication boundary must be PREC's own boundary).
+    #[test]
+    #[should_panic(expected = "PREC luma")]
+    fn pb_b_predict_macroblock_rejects_non_macroblock_prec() {
+        let refs = UniformRefs::new([0, 0, 0], [0, 0, 0]);
+        let mut planes = refs.planes();
+        // Present the 16 × 16 PREC luma buffer as an 8 × 32 plane —
+        // same length, wrong macroblock geometry.
+        planes.prec_y = RefPlane::new(&refs.prec_y, 8, 32);
+        pb_b_predict_macroblock(
+            &planes,
+            0,
+            0,
+            &[MotionVector::default(); 4],
+            None,
+            1,
+            2,
+            RCONTROL_DEFAULT,
+        );
     }
 }
