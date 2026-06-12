@@ -47,11 +47,15 @@
 //!   per macroblock; the candidate-predictor redefinition lives in
 //!   Annex F (§F.2 / Figure F.1) which is not yet wired. The driver
 //!   returns [`Error::NotImplemented`] when it meets such a macroblock.
-//! * **PB-frames** (Annex G), **extended PTYPE / PLUSPTYPE** (§5.1.4),
-//!   **Annex T variable-length DQUANT**, **CPM = 1 / GSBI**, **slice
+//! * **Annex T variable-length DQUANT**, **CPM = 1 / GSBI**, **slice
 //!   structured mode (Annex K)**, the Annex-I prediction
 //!   reconstruction, and **GSTUF** auto-detection — all rejected /
-//!   skipped exactly as the per-layer parsers do.
+//!   skipped exactly as the per-layer parsers do. **PB-frames**
+//!   (Annex G) decode through the dedicated [`decode_pb_picture`]
+//!   entry point (the single-frame entry points keep refusing them —
+//!   they cannot return the B-picture); PB combined with Advanced
+//!   Prediction is refused there pending the §G.2 OBMC remote-vector
+//!   exception.
 //! * **Custom picture formats** — the `"110"` source format (PLUSPTYPE
 //!   path with CPFMT) lands via [`PictureLayout::for_custom_dimensions`]
 //!   for spec-legal sizes that are macroblock-aligned (both luma
@@ -86,6 +90,7 @@ use crate::motion::{
     reconstruct_mv, reconstruct_mv_umv, select_4mv_candidates, LumaBlockIndex, Mb4Mv,
     Mb4MvNeighbourhood, MotionVector, RefPlane, RemoteMv, RCONTROL_DEFAULT,
 };
+use crate::pb_layer::{cbpb_block_present, pb_b_predict_macroblock, pb_bquant, PbBReferencePlanes};
 use crate::picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
     H263PictureHeader, H263PictureLayer, H263SourceFormat,
@@ -461,6 +466,14 @@ fn luma_block_grid_pos(mb_col: usize, mb_row: usize, blk: usize) -> (usize, usiz
 /// * MV1 = left neighbour `(col-1, row)`.
 /// * MV2 = above neighbour `(col, row-1)`.
 /// * MV3 = above-right neighbour `(col+1, row-1)`.
+///
+/// `pb_frames` selects the §6.1.1 rule-1 parenthetical: "When the
+/// corresponding macroblock was coded in INTRA mode **(if not in
+/// PB-frames mode with bidirectional prediction)** or was not coded
+/// (COD = 1), the candidate predictor is set to zero." In PB-frames
+/// mode every INTRA macroblock carries a vector (§G.2, used for
+/// predicting its B-blocks), and that vector stays a live candidate
+/// predictor; the COD = 1 zeroing applies in both modes.
 fn predict_mv(
     grid: &[MbGridEntry],
     mb_cols: usize,
@@ -468,6 +481,7 @@ fn predict_mv(
     row: usize,
     gob_top_row: usize,
     gob_header_present: bool,
+    pb_frames: bool,
 ) -> MotionVector {
     let fetch = |c: isize, r: isize| -> Option<MbGridEntry> {
         if c < 0 || r < 0 || c as usize >= mb_cols || r as usize > row {
@@ -480,10 +494,11 @@ fn predict_mv(
         }
     };
 
-    // §6.1.1 rule 1: an INTRA or not-coded candidate contributes a
-    // zero vector. We fold that into the per-candidate value below.
+    // §6.1.1 rule 1: an INTRA (outside PB-frames mode) or not-coded
+    // candidate contributes a zero vector. We fold that into the
+    // per-candidate value below.
     let candidate_value = |entry: MbGridEntry| -> MotionVector {
-        if entry.intra || entry.not_coded {
+        if entry.not_coded || (entry.intra && !pb_frames) {
             MotionVector::new(0, 0)
         } else {
             entry.mv
@@ -573,7 +588,7 @@ pub fn decode_picture(
     let header = parse_picture_header(&mut reader)?;
     let layout =
         PictureLayout::for_source_format(header.source_format).ok_or(Error::NotImplemented)?;
-    decode_after_picture_header(&mut reader, &header, &layout, reference, options)
+    decode_after_picture_header(&mut reader, &header, &layout, reference, options, None)
 }
 
 /// Decode a single H.263 picture from `data`, dispatching on the
@@ -721,8 +736,14 @@ pub fn decode_picture_layer_with_inherited(
         H263PictureLayer::Baseline(header) => {
             let layout = PictureLayout::for_source_format(header.source_format)
                 .ok_or(Error::NotImplemented)?;
-            let frame =
-                decode_after_picture_header(&mut reader, &header, &layout, reference, options)?;
+            let frame = decode_after_picture_header(
+                &mut reader,
+                &header,
+                &layout,
+                reference,
+                options,
+                None,
+            )?;
             // §5.1.4.5 rule 3 — a picture without PLUSPTYPE clears all
             // inferred mode state.
             Ok(DecodePictureOutcome {
@@ -749,6 +770,7 @@ pub fn decode_picture_layer_with_inherited(
                 &layout,
                 reference,
                 shim_options,
+                None,
             )?;
             Ok(DecodePictureOutcome {
                 frame,
@@ -756,6 +778,329 @@ pub fn decode_picture_layer_with_inherited(
             })
         }
     }
+}
+
+/// The two decoded pictures of an Annex G PB-frame, returned by
+/// [`decode_pb_picture`].
+///
+/// Display order is B then P: per §G.1 the B-picture is "predicted
+/// both from the previous decoded P-picture and the P-picture
+/// currently being decoded" — it sits temporally *between* the
+/// reference picture and the P-picture (TRB increments after the
+/// reference, §5.1.22). The P-picture is the one the caller should
+/// feed back as the `reference` of the next decode; the B-picture is
+/// display-only (nothing is ever predicted from it, §G.1 /
+/// Figure G.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PbFramePair {
+    /// The P-picture part — the next prediction reference.
+    pub p_frame: YuvFrame,
+    /// The B-picture part — displayed before `p_frame`, never used
+    /// as a prediction reference.
+    pub b_frame: YuvFrame,
+}
+
+/// Per-picture Annex G PB-frames context threaded into
+/// [`decode_after_picture_header`] by [`decode_pb_picture`]: the §G.4
+/// temporal-reference scalars, the §5.1.23 DBQUANT code, and the
+/// B-picture sink the per-macroblock B-parts are written into.
+struct PbPictureCtx<'b> {
+    /// §5.1.22 TRB, already validated non-zero.
+    trb: i32,
+    /// §G.4 TRD (TR increment from the last picture header, wrapped
+    /// modulo 256), already validated non-zero.
+    trd: i32,
+    /// §5.1.23 DBQUANT — the 2-bit Table 6 selector relating each
+    /// macroblock's QUANT to its B-block BQUANT.
+    dbquant: u8,
+    /// The B-picture under construction (same geometry as the
+    /// P-picture).
+    b_frame: &'b mut YuvFrame,
+}
+
+/// Decode one Annex G PB-frame from `data`, producing both the
+/// P-picture and the B-picture.
+///
+/// The picture must be a baseline-PTYPE INTER picture with PTYPE
+/// bit 13 (PB-frames mode) set. Per §G.1 the Annex G PB-frames mode
+/// "cannot be used with the additional features of the syntax which
+/// require the use of PLUSPTYPE", so there is no extended-PTYPE arm
+/// here (the Annex M Improved PB-frames mode is a separate,
+/// PLUSPTYPE-only mode this driver does not stage).
+///
+/// Wire layout consumed: PSC + TR + PTYPE (§5.1.1–§5.1.3), then —
+/// because PTYPE indicates PB-frames — TRB (§5.1.22, 3 bits at the
+/// standard CIF picture clock frequency) and DBQUANT (§5.1.23,
+/// 2 bits), then the GOB layers. As elsewhere in this driver subset,
+/// the PQUANT / CPM / PEI picture-header fields are not consumed
+/// (every GOB is required to carry its own header, whose GQUANT
+/// supplies the quantiser — the same convention [`decode_picture`]
+/// applies).
+///
+/// `prev_tr` is the §5.1.2 Temporal Reference of the `reference`
+/// picture (the last decoded P- or I-picture / P-part). §G.4 derives
+/// TRD — the denominator of the B-vector temporal scaling — as the TR
+/// increment from that picture, adding 256 when the raw difference is
+/// negative ("If TRD is negative, then TRD = TRD + d where d = 256
+/// for CIF picture frequency").
+///
+/// Per macroblock the driver walks the §5.3 Table 10 / Figure 10
+/// PB-frame layer (COD, MCBPC, MODB, CBPB, CBPY, DQUANT, MVD —
+/// including for INTRA macroblocks per §G.2 — MVDB), reconstructs the
+/// six P-blocks into the P-picture exactly as the non-PB driver does,
+/// then (§G.3: "First, the data for the six P-blocks is transmitted
+/// as in the default H.263 mode, then the data for the six
+/// B-blocks") predicts the six B-blocks via §G.4 / §G.5
+/// ([`pb_b_predict_macroblock`] over the previous decoded picture and
+/// the just-reconstructed PREC) and adds the §6.3.1 B-residuals,
+/// dequantised with the Table 6 BQUANT, where CBPB lights them.
+///
+/// `options.deblock` applies to the P-picture only (the B-picture is
+/// never a prediction source, and the baseline PTYPE header cannot
+/// signal Annex J on the wire).
+///
+/// # Errors
+///
+/// All the per-layer parser errors, plus:
+///
+/// * [`Error::NotImplemented`] — PTYPE bit 13 clear (use
+///   [`decode_picture`] / [`decode_picture_layer`]), an INTRA coding
+///   type, SAC, Advanced Prediction (the §G.2 OBMC remote-vector
+///   exception — "the remote 'INTRA' motion vector is used" — is not
+///   yet applied by the Annex F path), `options.aic` (Annex I is
+///   PLUSPTYPE-only, which §G.1 bars from Annex G), a reserved source
+///   format, or a `reference` of mismatched geometry.
+/// * [`Error::BadPbTemporalReference`] — TRB was `0`, or the TR
+///   increment from `prev_tr` was `0`.
+pub fn decode_pb_picture(
+    data: &[u8],
+    reference: &YuvFrame,
+    prev_tr: u8,
+    options: DecodeOptions,
+) -> Result<PbFramePair> {
+    let mut reader = BitReader::new(data);
+    let header = parse_picture_header(&mut reader)?;
+    if !header.pb_frames {
+        return Err(Error::NotImplemented);
+    }
+    // Table 10 defines the PB-frame macroblock layers for INTER
+    // pictures only (the P-part is a P-picture, §G.1).
+    if !matches!(header.coding_type, H263PictureCodingType::Inter) {
+        return Err(Error::NotImplemented);
+    }
+    if header.advanced_prediction || header.sac_mode || options.aic {
+        return Err(Error::NotImplemented);
+    }
+
+    // §5.1.22 — TRB. The 5-bit form only arises under a custom
+    // picture clock frequency, a PLUSPTYPE-only feature §G.1 bars
+    // from Annex G; at the standard CIF PCF the field is 3 bits.
+    // "The codeword is the natural binary representation of the
+    // number of non-transmitted pictures plus one" — `0` is illegal.
+    let trb = reader.read_u32(3).map_err(|_| Error::UnexpectedEof)? as i32;
+    if trb == 0 {
+        return Err(Error::BadPbTemporalReference);
+    }
+    // §5.1.23 — DBQUANT.
+    let dbquant = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)? as u8;
+    // §G.4 — TRD.
+    let mut trd = i32::from(header.temporal_reference) - i32::from(prev_tr);
+    if trd < 0 {
+        trd += 256;
+    }
+    if trd == 0 {
+        return Err(Error::BadPbTemporalReference);
+    }
+
+    let layout =
+        PictureLayout::for_source_format(header.source_format).ok_or(Error::NotImplemented)?;
+    let luma_w = layout.luma_width as usize;
+    let luma_h = layout.luma_height as usize;
+    let mut b_frame = YuvFrame {
+        y: vec![0u8; luma_w * luma_h],
+        cb: vec![0u8; (luma_w / 2) * (luma_h / 2)],
+        cr: vec![0u8; (luma_w / 2) * (luma_h / 2)],
+        luma_width: luma_w,
+        luma_height: luma_h,
+    };
+    let p_frame = decode_after_picture_header(
+        &mut reader,
+        &header,
+        &layout,
+        Some(reference),
+        options,
+        Some(PbPictureCtx {
+            trb,
+            trd,
+            dbquant,
+            b_frame: &mut b_frame,
+        }),
+    )?;
+    Ok(PbFramePair { p_frame, b_frame })
+}
+
+/// Decode and reconstruct the B-part of one PB-macroblock (§G.3 –
+/// §G.5 + §6.3.1): predict the six B-blocks from the previous decoded
+/// picture (forward) and the just-reconstructed PREC (backward), add
+/// the dequantised B-residuals where CBPB lights them, and write the
+/// result into the B-picture planes.
+///
+/// Invoked from the macroblock loop of [`decode_after_picture_header`]
+/// immediately after the P-part of the macroblock has been decoded,
+/// reconstructed and clipped into `p_frame` — at which point the
+/// reader sits at the first bit of the macroblock's B-block data
+/// (§5.4: "First the data for the six P-blocks is transmitted as in
+/// the default H.263 mode, then the data for the six B-blocks").
+///
+/// * `mvs4` — the four reconstructed P-vectors of the macroblock in
+///   Figure-5 order (all zero for a skipped macroblock per §5.3.1;
+///   four copies of the single vector for one-MV macroblocks per
+///   §G.4; the §G.2 B-purpose vector for INTRA macroblocks).
+/// * `quant` — the macroblock's QUANT after any DQUANT; the B-block
+///   quantiser is the Table 6 BQUANT derived from it
+///   ([`pb_bquant`]).
+///
+/// A skipped macroblock carries no MODB / CBPB / MVDB (Table 10), so
+/// `mb.cbpb` is `None` → no residual is parsed and the B-part is the
+/// bare §G.5 prediction with zero vectors.
+#[allow(clippy::too_many_arguments)]
+fn decode_pb_b_part(
+    reader: &mut BitReader<'_>,
+    mb: &H263Macroblock,
+    reference: &YuvFrame,
+    p_frame: &YuvFrame,
+    pb: &mut PbPictureCtx<'_>,
+    col: usize,
+    row: usize,
+    mvs4: &Mb4Mv,
+    quant: u8,
+) -> Result<()> {
+    let mb_x = col * 16;
+    let mb_y = row * 16;
+    let c_x = col * 8;
+    let c_y = row * 8;
+    let luma_stride = p_frame.luma_width;
+    let chroma_stride = p_frame.chroma_width();
+
+    // §G.5: "It is assumed that the P-macroblock (luminance and
+    // chrominance) is first decoded, reconstructed and clipped (see
+    // 6.3.2). This macroblock is called PREC." The P-part was just
+    // written into `p_frame`, so PREC is the macroblock-sized copy of
+    // those planes (macroblock-local, because the §G.5 backward
+    // prediction is bounded by PREC itself).
+    let mut prec_y = [0u8; 256];
+    for j in 0..16 {
+        let src = (mb_y + j) * luma_stride + mb_x;
+        prec_y[j * 16..j * 16 + 16].copy_from_slice(&p_frame.y[src..src + 16]);
+    }
+    let mut prec_cb = [0u8; COEFFS_PER_BLOCK];
+    let mut prec_cr = [0u8; COEFFS_PER_BLOCK];
+    for j in 0..8 {
+        let src = (c_y + j) * chroma_stride + c_x;
+        prec_cb[j * 8..j * 8 + 8].copy_from_slice(&p_frame.cb[src..src + 8]);
+        prec_cr[j * 8..j * 8 + 8].copy_from_slice(&p_frame.cr[src..src + 8]);
+    }
+
+    let planes = PbBReferencePlanes {
+        prev_y: RefPlane::new(&reference.y, reference.luma_width, reference.luma_height),
+        prev_cb: RefPlane::new(
+            &reference.cb,
+            reference.chroma_width(),
+            reference.chroma_height(),
+        ),
+        prev_cr: RefPlane::new(
+            &reference.cr,
+            reference.chroma_width(),
+            reference.chroma_height(),
+        ),
+        prec_y: RefPlane::new(&prec_y, 16, 16),
+        prec_cb: RefPlane::new(&prec_cb, 8, 8),
+        prec_cr: RefPlane::new(&prec_cr, 8, 8),
+    };
+
+    // §G.4 + §G.5 whole-macroblock prediction. `mb.mvdb` is `None`
+    // whenever MODB signalled no MVDB ("If MVDB is not present, MVD
+    // is set to zero", §G.4) — including the skipped-macroblock case.
+    let prediction = pb_b_predict_macroblock(
+        &planes,
+        mb_x,
+        mb_y,
+        mvs4,
+        mb.mvdb,
+        pb.trb,
+        pb.trd,
+        RCONTROL_DEFAULT,
+    );
+
+    // §5.1.23 / Table 6 B-block quantiser; §5.3.4 CBPB pattern (all
+    // zeros when MODB carried no CBPB — no B-residuals).
+    let bquant = pb_bquant(pb.dbquant, quant);
+    let cbpb = mb.cbpb.unwrap_or(0);
+
+    // Four luma B-blocks (Figure 5 blocks 1..=4), then Cb (block 5)
+    // and Cr (block 6). "B-blocks are always coded in INTER mode,
+    // even if the macroblock type of the PB-macroblock indicates
+    // INTRA" (Table 10 note 3) and "INTRADC is not present for
+    // B-blocks" (§G.3) — every lit block is an INTER-style TCOEF
+    // sequence summed onto the §G.5 prediction per §6.3.1 and clipped
+    // per §6.3.2.
+    for blk in 0..4 {
+        let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+        let ox = (blk & 1) * 8;
+        let oy = (blk >> 1) * 8;
+        let mut pred = [0u8; COEFFS_PER_BLOCK];
+        for j in 0..8 {
+            pred[j * 8..j * 8 + 8].copy_from_slice(&prediction.luma[oy + j][ox..ox + 8]);
+        }
+        let samples = if cbpb_block_present(cbpb, blk as u32 + 1) {
+            let block = parse_block(
+                reader,
+                BlockContext {
+                    has_intradc: false,
+                    has_coefficients: true,
+                },
+            )?;
+            reconstruct_inter_block_with_prediction(&block, bquant, &pred)
+        } else {
+            pred
+        };
+        blit_block(&mut pb.b_frame.y, luma_stride, bx, by, &samples);
+    }
+
+    let mut pred_cb = [0u8; COEFFS_PER_BLOCK];
+    let mut pred_cr = [0u8; COEFFS_PER_BLOCK];
+    for j in 0..8 {
+        pred_cb[j * 8..j * 8 + 8].copy_from_slice(&prediction.cb[j]);
+        pred_cr[j * 8..j * 8 + 8].copy_from_slice(&prediction.cr[j]);
+    }
+    let cb_samples = if cbpb_block_present(cbpb, 5) {
+        let block = parse_block(
+            reader,
+            BlockContext {
+                has_intradc: false,
+                has_coefficients: true,
+            },
+        )?;
+        reconstruct_inter_block_with_prediction(&block, bquant, &pred_cb)
+    } else {
+        pred_cb
+    };
+    blit_block(&mut pb.b_frame.cb, chroma_stride, c_x, c_y, &cb_samples);
+    let cr_samples = if cbpb_block_present(cbpb, 6) {
+        let block = parse_block(
+            reader,
+            BlockContext {
+                has_intradc: false,
+                has_coefficients: true,
+            },
+        )?;
+        reconstruct_inter_block_with_prediction(&block, bquant, &pred_cr)
+    } else {
+        pred_cr
+    };
+    blit_block(&mut pb.b_frame.cr, chroma_stride, c_x, c_y, &cr_samples);
+
+    Ok(())
 }
 
 /// Validate that the extended-PTYPE header `extended` falls inside the
@@ -990,11 +1335,17 @@ fn decode_after_picture_header(
     layout: &PictureLayout,
     reference: Option<&YuvFrame>,
     options: DecodeOptions,
+    mut pb: Option<PbPictureCtx<'_>>,
 ) -> Result<YuvFrame> {
     // Unsupported header-signalled modes — refuse rather than guess.
-    if header.pb_frames || header.sac_mode {
+    // SAC is refused outright. A PB-frames picture must arrive through
+    // [`decode_pb_picture`], which supplies the Annex G context plus
+    // the B-frame sink (`pb`); conversely the PB context must not be
+    // supplied for a non-PB picture.
+    if header.sac_mode || header.pb_frames != pb.is_some() {
         return Err(Error::NotImplemented);
     }
+    let pb_mode = pb.is_some();
 
     let luma_w = layout.luma_width;
     let luma_h = layout.luma_height;
@@ -1077,6 +1428,7 @@ fn decode_after_picture_header(
                             picture_coding_type: header.coding_type,
                             advanced_prediction: header.advanced_prediction,
                             aic_intra_mode: options.aic,
+                            pb_frames: header.pb_frames,
                             quantiser_before: current_quant,
                         },
                     )?;
@@ -1100,11 +1452,36 @@ fn decode_after_picture_header(
                     gob_header_present,
                     header.umv_mode,
                     header.advanced_prediction,
+                    pb_mode,
                     &mut current_quant,
                     options,
                     &mut aic_state,
                     aic_segment,
                 )?;
+                // PB-frames mode (Annex G): the six B-blocks of the
+                // macroblock follow the six P-blocks on the wire
+                // (§5.4 / §G.3 — "First the data for the six P-blocks
+                // is transmitted as in the default H.263 mode, then
+                // the data for the six B-blocks"). The P-macroblock
+                // just reconstructed and clipped into `frame` is PREC
+                // (§G.5); the B-part is predicted from the previous
+                // decoded picture (forward, MVF) and PREC (backward,
+                // MVB), then B-residuals are added where CBPB lights
+                // them.
+                if let Some(pb) = pb.as_mut() {
+                    let prev = reference.ok_or(Error::NotImplemented)?;
+                    decode_pb_b_part(
+                        reader,
+                        &mb,
+                        prev,
+                        &frame,
+                        pb,
+                        col,
+                        row,
+                        &mvs4,
+                        current_quant,
+                    )?;
+                }
                 record_grid(
                     &mut grid,
                     &mut mb_quant,
@@ -1183,6 +1560,7 @@ fn decode_one_macroblock(
     gob_header_present: bool,
     umv_mode: bool,
     advanced_prediction: bool,
+    pb_mode: bool,
     current_quant: &mut u8,
     options: DecodeOptions,
     aic_state: &mut AicState,
@@ -1305,10 +1683,35 @@ fn decode_one_macroblock(
         let cr_samples = reconstruct_intra_block(&cr_block, quant);
         blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
 
-        // INTRA macroblocks have no motion vector (§6.1.1 rule 1 treats
-        // them as zero candidates for neighbours).
-        let zero = MotionVector::new(0, 0);
-        return Ok((zero, [zero; 4]));
+        // Outside PB-frames mode, INTRA macroblocks have no motion
+        // vector (§6.1.1 rule 1 treats them as zero candidates for
+        // neighbours). In PB-frames mode every INTRA macroblock
+        // carries MVD (§G.2 — "the vector is used for the B-blocks
+        // only"); it is reconstructed exactly like an INTER vector
+        // (§6.1.1 predictor + Table 14) and returned so the B-part
+        // prediction and the §6.1.1 rule-1 PB exception (INTRA
+        // candidates are NOT zeroed in PB-frames mode) can see it.
+        // The INTRA P-block reconstruction above is unaffected.
+        let mv = if pb_mode {
+            let predictor = predict_mv(
+                grid,
+                mb_cols,
+                col,
+                row,
+                gob_top_row,
+                gob_header_present,
+                pb_mode,
+            );
+            let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
+            if umv_mode {
+                reconstruct_mv_umv(predictor, mvd)
+            } else {
+                reconstruct_mv(predictor, mvd)
+            }
+        } else {
+            MotionVector::new(0, 0)
+        };
+        return Ok((mv, [mv; 4]));
     }
 
     // INTER / INTER+Q (single MV).
@@ -1317,7 +1720,15 @@ fn decode_one_macroblock(
     // §6.1.1 / Figure-12 predictor + Table-14 MVD. In the Annex D
     // Unrestricted Motion Vector mode (non-PLUSPTYPE) the §D.2
     // extended-range reconstruction replaces the default wrap.
-    let predictor = predict_mv(grid, mb_cols, col, row, gob_top_row, gob_header_present);
+    let predictor = predict_mv(
+        grid,
+        mb_cols,
+        col,
+        row,
+        gob_top_row,
+        gob_header_present,
+        pb_mode,
+    );
     let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
     let luma_mv = if umv_mode {
         reconstruct_mv_umv(predictor, mvd)
@@ -2301,7 +2712,7 @@ mod tests {
     #[test]
     fn predict_top_left_is_zero() {
         let grid = grid_with(11, 9);
-        let p = predict_mv(&grid, 11, 0, 0, 0, true);
+        let p = predict_mv(&grid, 11, 0, 0, 0, true, false);
         assert_eq!(p, MotionVector::new(0, 0));
     }
 
@@ -2318,7 +2729,7 @@ mod tests {
         };
         // MB (1, 0): MV1 = grid[0] = (6,-4); top border so MV2=MV3=MV1.
         // median = (6,-4).
-        let p = predict_mv(&grid, 11, 1, 0, 0, true);
+        let p = predict_mv(&grid, 11, 1, 0, 0, true, false);
         assert_eq!(p, MotionVector::new(6, -4));
     }
 
@@ -2332,7 +2743,7 @@ mod tests {
             mv: MotionVector::new(10, 10), // ignored because intra
             mvs4: [MotionVector::new(10, 10); 4],
         };
-        let p = predict_mv(&grid, 11, 1, 0, 0, true);
+        let p = predict_mv(&grid, 11, 1, 0, 0, true, false);
         assert_eq!(p, MotionVector::new(0, 0));
     }
 
@@ -2352,7 +2763,7 @@ mod tests {
         set(&mut grid, 1, 1, 2, 2); // left  (col-1,row)
         set(&mut grid, 2, 0, 8, -2); // above (col,row-1)
         set(&mut grid, 3, 0, -4, 6); // above-right (col+1,row-1)
-        let p = predict_mv(&grid, 11, 2, 1, 0, false);
+        let p = predict_mv(&grid, 11, 2, 1, 0, false, false);
         // medians: dx median(2,8,-4)=2; dy median(2,-2,6)=2.
         assert_eq!(p, MotionVector::new(2, 2));
     }
@@ -2374,7 +2785,7 @@ mod tests {
         set(&mut grid, 9, 1, 10, 10); // left
         set(&mut grid, 10, 0, 20, 20); // above
                                        // above-right (11,0) is outside -> rule 4 zero.
-        let p = predict_mv(&grid, 11, 10, 1, 0, false);
+        let p = predict_mv(&grid, 11, 10, 1, 0, false, false);
         // candidates: MV1=(10,10), MV2=(20,20), MV3=(0,0).
         // median dx of (10,20,0)=10; dy=10.
         assert_eq!(p, MotionVector::new(10, 10));
@@ -4779,5 +5190,378 @@ mod tests {
                 deblocking: true,
             }
         );
+    }
+
+    // ---- Annex G PB-frame end-to-end decode ------------------------
+
+    /// Write a QCIF INTER + PB-frames picture header: PSC + TR +
+    /// PTYPE with bit 13 (PB-frames) set, followed by the §5.1.22 TRB
+    /// (3 bits) and §5.1.23 DBQUANT (2 bits) fields the PB driver
+    /// consumes (PQUANT / CPM / PEI are not part of this driver
+    /// subset's wire layout, as in every other fixture here).
+    fn write_qcif_pb_picture_header(w: &mut BitWriter, tr: u8, trb: u32, dbquant: u32) {
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(tr as u32, 8); // TR
+        w.write_bit(true); // PTYPE bit1
+        w.write_bit(false); // PTYPE bit2
+        w.write_bit(false); // split-screen
+        w.write_bit(false); // doc-camera
+        w.write_bit(false); // freeze
+        w.write_u32(0b010, 3); // QCIF
+        w.write_bit(true); // INTER
+        w.write_bit(false); // umv
+        w.write_bit(false); // sac
+        w.write_bit(false); // ap
+        w.write_bit(true); // pb = ON
+        w.write_u32(trb, 3); // §5.1.22 TRB
+        w.write_u32(dbquant, 2); // §5.1.23 DBQUANT
+    }
+
+    /// Build a QCIF PB-frame picture (9 GOBs × 11 MBs, GQUANT = 8)
+    /// whose per-macroblock payload is produced by `write_mb(w, gob,
+    /// mb)`.
+    fn build_qcif_pb_picture<F: FnMut(&mut BitWriter, usize, usize)>(
+        tr: u8,
+        trb: u32,
+        dbquant: u32,
+        mut write_mb: F,
+    ) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        write_qcif_pb_picture_header(&mut w, tr, trb, dbquant);
+        for gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS); // QUANT = 8
+            for mb in 0..11 {
+                write_mb(&mut w, gob, mb);
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// Copy the macroblock at `(col, row)` out of a frame as the §G.5
+    /// PREC plane triple (16 × 16 luma + two 8 × 8 chroma).
+    fn extract_prec(frame: &YuvFrame, col: usize, row: usize) -> ([u8; 256], [u8; 64], [u8; 64]) {
+        let mut prec_y = [0u8; 256];
+        for j in 0..16 {
+            let src = (row * 16 + j) * frame.luma_width + col * 16;
+            prec_y[j * 16..j * 16 + 16].copy_from_slice(&frame.y[src..src + 16]);
+        }
+        let mut prec_cb = [0u8; 64];
+        let mut prec_cr = [0u8; 64];
+        for j in 0..8 {
+            let src = (row * 8 + j) * frame.chroma_width() + col * 8;
+            prec_cb[j * 8..j * 8 + 8].copy_from_slice(&frame.cb[src..src + 8]);
+            prec_cr[j * 8..j * 8 + 8].copy_from_slice(&frame.cr[src..src + 8]);
+        }
+        (prec_y, prec_cb, prec_cr)
+    }
+
+    /// An all-skipped PB-frame reproduces the reference in BOTH
+    /// parts: every P-macroblock is a zero-MV reference copy
+    /// (§5.3.1), and every B-macroblock has MV = 0 / MVD = 0 → §G.4
+    /// MVF = MVB = 0 → the §G.5 backward vector points inside PREC
+    /// for every pixel → fully bidirectional average of two identical
+    /// planes (the reference and PREC, itself a reference copy).
+    /// Verified sample-exact over a non-flat ramp on all three
+    /// channels of both frames.
+    #[test]
+    fn decode_pb_picture_all_skipped_reproduces_reference_in_both_parts() {
+        let reference = ramp_reference(176, 144);
+        let data = build_qcif_pb_picture(2, 1, 0b00, |w, _, _| write_skipped_mb(w));
+        let pair =
+            decode_pb_picture(&data, &reference, 0, DecodeOptions::default()).expect("decode");
+        assert_eq!(pair.p_frame, reference);
+        assert_eq!(pair.b_frame, reference);
+    }
+
+    /// §5.1.22: TRB is "the number of non-transmitted pictures plus
+    /// one" — a zero TRB field is malformed.
+    #[test]
+    fn decode_pb_picture_rejects_zero_trb() {
+        let reference = YuvFrame::grey(176, 144);
+        let data = build_qcif_pb_picture(2, 0, 0b00, |w, _, _| write_skipped_mb(w));
+        assert_eq!(
+            decode_pb_picture(&data, &reference, 0, DecodeOptions::default()).unwrap_err(),
+            Error::BadPbTemporalReference
+        );
+    }
+
+    /// §G.4 TRD is the TR increment from the last picture header; a
+    /// PB picture co-timed with its reference (TR == prev_tr → TRD =
+    /// 0) cannot be temporally scaled.
+    #[test]
+    fn decode_pb_picture_rejects_zero_trd() {
+        let reference = YuvFrame::grey(176, 144);
+        let data = build_qcif_pb_picture(5, 1, 0b00, |w, _, _| write_skipped_mb(w));
+        assert_eq!(
+            decode_pb_picture(&data, &reference, 5, DecodeOptions::default()).unwrap_err(),
+            Error::BadPbTemporalReference
+        );
+    }
+
+    /// §G.4 negative-TRD wrap: "If TRD is negative, then TRD = TRD +
+    /// d where d = 256 for CIF picture frequency". TR = 1 with
+    /// prev_tr = 255 is a forward step of 2 (the §5.1.2 TR counter is
+    /// modulo 256), so the all-skipped picture decodes exactly as in
+    /// the unwrapped TRD = 2 case.
+    #[test]
+    fn decode_pb_picture_wraps_negative_trd() {
+        let reference = ramp_reference(176, 144);
+        let data = build_qcif_pb_picture(1, 1, 0b00, |w, _, _| write_skipped_mb(w));
+        let pair =
+            decode_pb_picture(&data, &reference, 255, DecodeOptions::default()).expect("decode");
+        assert_eq!(pair.p_frame, reference);
+        assert_eq!(pair.b_frame, reference);
+    }
+
+    /// [`decode_pb_picture`] refuses a picture whose PTYPE bit 13 is
+    /// clear, and the single-frame entry points keep refusing PB
+    /// pictures (they cannot return the B-picture).
+    #[test]
+    fn pb_entry_points_gate_on_ptype_bit_13() {
+        let reference = ramp_reference(176, 144);
+        // Non-PB INTER picture through the PB entry point.
+        let mut w = BitWriter::new();
+        write_qcif_inter_ap_picture_header(&mut w, false);
+        let non_pb = w.finish();
+        assert_eq!(
+            decode_pb_picture(&non_pb, &reference, 0, DecodeOptions::default()).unwrap_err(),
+            Error::NotImplemented
+        );
+        // PB picture through the single-frame entry point.
+        let pb = build_qcif_pb_picture(2, 1, 0b00, |w, _, _| write_skipped_mb(w));
+        assert_eq!(
+            decode_picture(&pb, Some(&reference), DecodeOptions::default()).unwrap_err(),
+            Error::NotImplemented
+        );
+    }
+
+    /// A coded zero-MV INTER macroblock with MODB row 1 (MVDB only)
+    /// and MVDB = (+2, 0): the driver's B-part must match the direct
+    /// §G.4 + §G.5 composition over the same inputs — forward
+    /// prediction shifted one full pel into the ramp reference,
+    /// blended with PREC over the §G.5 rectangle for MVB = MVF − MV =
+    /// +2.
+    #[test]
+    fn decode_pb_picture_mvdb_matches_direct_composition() {
+        let reference = ramp_reference(176, 144);
+        let data = build_qcif_pb_picture(2, 1, 0b00, |w, gob, mb| {
+            if gob == 0 && mb == 0 {
+                w.write_bit(false); // COD = 0
+                w.write_bit(true); // MCBPC type 0 (INTER), cbpc 00
+                w.write_u32(0b10, 2); // MODB row 1: MVDB only
+                w.write_u32(0b11, 2); // CBPY: INTER pattern 0000
+                w.write_bit(true); // MVD dx = 0
+                w.write_bit(true); // MVD dy = 0
+                w.write_u32(0b0010, 4); // MVDB dx = +2 half-pel
+                w.write_bit(true); // MVDB dy = 0
+            } else {
+                write_skipped_mb(w);
+            }
+        });
+        let pair =
+            decode_pb_picture(&data, &reference, 0, DecodeOptions::default()).expect("decode");
+
+        // P-part: zero-MV, no residual — a reference copy.
+        assert_eq!(pair.p_frame, reference);
+
+        // Direct §G.4 + §G.5 composition over the same inputs.
+        let (prec_y, prec_cb, prec_cr) = extract_prec(&pair.p_frame, 0, 0);
+        let planes = PbBReferencePlanes {
+            prev_y: RefPlane::new(&reference.y, 176, 144),
+            prev_cb: RefPlane::new(&reference.cb, 88, 72),
+            prev_cr: RefPlane::new(&reference.cr, 88, 72),
+            prec_y: RefPlane::new(&prec_y, 16, 16),
+            prec_cb: RefPlane::new(&prec_cb, 8, 8),
+            prec_cr: RefPlane::new(&prec_cr, 8, 8),
+        };
+        let expected = pb_b_predict_macroblock(
+            &planes,
+            0,
+            0,
+            &[MotionVector::new(0, 0); 4],
+            Some(crate::macroblock::Mvd {
+                dx_half: 2,
+                dy_half: 0,
+            }),
+            1,
+            2,
+            RCONTROL_DEFAULT,
+        );
+        for j in 0..16 {
+            for i in 0..16 {
+                assert_eq!(
+                    pair.b_frame.y[j * 176 + i],
+                    expected.luma[j][i],
+                    "B luma mismatch at ({i}, {j})"
+                );
+            }
+        }
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(pair.b_frame.cb[j * 88 + i], expected.cb[j][i]);
+                assert_eq!(pair.b_frame.cr[j * 88 + i], expected.cr[j][i]);
+            }
+        }
+        // The +1-pel shift is observable on the ramp: MVF = MVB = +2
+        // half-pel, so both the forward fetch (reference) and the
+        // backward fetch (PREC, itself a reference copy) read sample
+        // (x + 1, y) — pixel (0, 8) = ramp value 1 + 8 = 9 instead of
+        // the unshifted 8.
+        assert_eq!(pair.b_frame.y[8 * 176], 9);
+        // Skipped macroblocks elsewhere reproduce the reference in
+        // the B-picture too.
+        assert_eq!(&pair.b_frame.y[16..32], &reference.y[16..32]);
+    }
+
+    /// B-block residual: MODB row 2 (CBPB + MVDB), CBPB lighting only
+    /// B-block 1, MVDB = (0, 0), over a uniform-100 reference. The
+    /// fully-bidirectional prediction is 100 everywhere; the lit
+    /// block adds a DC-only TCOEF residual (LAST=1 RUN=0 LEVEL=+1,
+    /// Table 16 code `0111` + sign `0`) dequantised with BQUANT —
+    /// Table 6 at DBQUANT `11` / QUANT 8 → BQUANT = 16, §6.2.1 even-
+    /// QUANT formula |REC| = 16·(2·1+1) − 1 = 47, IDCT DC spread
+    /// 47 / 8 = 5.875 → rounds to +6 per pixel (§6.2.4 nearest
+    /// integer) → B-block 1 = 106, every other B sample = 100.
+    #[test]
+    fn decode_pb_picture_adds_cbpb_residual_with_bquant() {
+        let mut reference = YuvFrame::grey(176, 144);
+        reference.y.fill(100);
+        reference.cb.fill(100);
+        reference.cr.fill(100);
+        let data = build_qcif_pb_picture(2, 1, 0b11, |w, gob, mb| {
+            if gob == 0 && mb == 0 {
+                w.write_bit(false); // COD = 0
+                w.write_bit(true); // MCBPC type 0 (INTER), cbpc 00
+                w.write_u32(0b11, 2); // MODB row 2: CBPB + MVDB
+                w.write_u32(0b100000, 6); // CBPB: B-block 1 only
+                w.write_u32(0b11, 2); // CBPY: INTER pattern 0000
+                w.write_bit(true); // MVD dx = 0
+                w.write_bit(true); // MVD dy = 0
+                w.write_bit(true); // MVDB dx = 0
+                w.write_bit(true); // MVDB dy = 0
+                w.write_u32(0b0111_0, 5); // TCOEF LAST=1 RUN=0 LEVEL=+1
+            } else {
+                write_skipped_mb(w);
+            }
+        });
+        let pair =
+            decode_pb_picture(&data, &reference, 0, DecodeOptions::default()).expect("decode");
+        assert_eq!(pair.p_frame, reference);
+        for y in 0..144 {
+            for x in 0..176 {
+                let expected = if x < 8 && y < 8 { 106 } else { 100 };
+                assert_eq!(
+                    pair.b_frame.y[y * 176 + x],
+                    expected,
+                    "B luma mismatch at ({x}, {y})"
+                );
+            }
+        }
+        assert!(pair.b_frame.cb.iter().all(|&p| p == 100));
+        assert!(pair.b_frame.cr.iter().all(|&p| p == 100));
+    }
+
+    /// §G.2 + §6.1.1 rule 1 PB exception: an INTRA macroblock in a
+    /// PB-frame carries MVD "used for the B-blocks only", and its
+    /// reconstructed vector stays a live §6.1.1 candidate predictor
+    /// ("if not in PB-frames mode" qualifies the INTRA zeroing).
+    /// MB(0,0) is INTRA with MVD = (+2, 0) (predictor zero → MV =
+    /// +1 pel); MB(1,0) is a zero-MVD INTER macroblock whose
+    /// predictor median is therefore (+2, 0) (left candidate = the
+    /// INTRA vector; top border copies MV1 into MV2 / MV3) — its
+    /// P-part must be the reference shifted one full pel left-to-
+    /// right, NOT an unshifted copy. The INTRA P-part itself is the
+    /// usual uniform INTRADC field, unaffected by the vector. The
+    /// B-part of the INTRA macroblock must match the direct §G.4 +
+    /// §G.5 composition with p_mvs = (+2, 0) and PREC = the INTRA
+    /// reconstruction.
+    #[test]
+    fn decode_pb_picture_intra_mb_vector_feeds_b_part_and_neighbour_predictor() {
+        let reference = ramp_reference(176, 144);
+        let data = build_qcif_pb_picture(2, 1, 0b00, |w, gob, mb| {
+            if gob == 0 && mb == 0 {
+                w.write_bit(false); // COD = 0
+                w.write_u32(0b00011, 5); // MCBPC type 3 (INTRA), cbpc 00
+                w.write_bit(false); // MODB row 0: no CBPB, no MVDB
+                w.write_u32(0b0011, 4); // CBPY: CBPY(INTRA) = 0000
+                w.write_u32(0b0010, 4); // MVD dx = +2 half-pel (+1 pel)
+                w.write_bit(true); // MVD dy = 0
+                for _ in 0..6 {
+                    w.write_u32(0x40, 8); // INTRADC -> level 512 -> 64
+                }
+            } else if gob == 0 && mb == 1 {
+                w.write_bit(false); // COD = 0
+                w.write_bit(true); // MCBPC type 0 (INTER), cbpc 00
+                w.write_bit(false); // MODB row 0
+                w.write_u32(0b11, 2); // CBPY: INTER pattern 0000
+                w.write_bit(true); // MVD dx = 0
+                w.write_bit(true); // MVD dy = 0
+            } else {
+                write_skipped_mb(w);
+            }
+        });
+        let pair =
+            decode_pb_picture(&data, &reference, 0, DecodeOptions::default()).expect("decode");
+
+        // INTRA P-part: uniform 64 (INTRADC 0x40), vector-independent.
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(pair.p_frame.y[y * 176 + x], 64);
+            }
+        }
+        // MB(1,0) P-part: MV = predictor (+2, 0) + MVD 0 = one full
+        // pel — sample (x, y) fetches reference (x + 1, y), i.e. the
+        // ramp value x + 1 + y.
+        for y in 0..16 {
+            for x in 16..32 {
+                assert_eq!(
+                    pair.p_frame.y[y * 176 + x],
+                    reference.y[y * 176 + x + 1],
+                    "P MB(1,0) not shifted at ({x}, {y})"
+                );
+            }
+        }
+
+        // INTRA B-part: direct composition with p_mvs = (+2, 0).
+        let (prec_y, prec_cb, prec_cr) = extract_prec(&pair.p_frame, 0, 0);
+        let planes = PbBReferencePlanes {
+            prev_y: RefPlane::new(&reference.y, 176, 144),
+            prev_cb: RefPlane::new(&reference.cb, 88, 72),
+            prev_cr: RefPlane::new(&reference.cr, 88, 72),
+            prec_y: RefPlane::new(&prec_y, 16, 16),
+            prec_cb: RefPlane::new(&prec_cb, 8, 8),
+            prec_cr: RefPlane::new(&prec_cr, 8, 8),
+        };
+        let expected = pb_b_predict_macroblock(
+            &planes,
+            0,
+            0,
+            &[MotionVector::new(2, 0); 4],
+            None,
+            1,
+            2,
+            RCONTROL_DEFAULT,
+        );
+        for j in 0..16 {
+            for i in 0..16 {
+                assert_eq!(
+                    pair.b_frame.y[j * 176 + i],
+                    expected.luma[j][i],
+                    "INTRA B luma mismatch at ({i}, {j})"
+                );
+            }
+        }
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(pair.b_frame.cb[j * 88 + i], expected.cb[j][i]);
+                assert_eq!(pair.b_frame.cr[j * 88 + i], expected.cr[j][i]);
+            }
+        }
     }
 }

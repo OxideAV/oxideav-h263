@@ -5,6 +5,75 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 35 (workspace round 283) — Annex G PB-frame end-to-end
+decode: the bitstream-side driver named as "the remaining PB-frame
+step" since r279 lands, closing the PB-frame integration. A PB
+picture now decodes from PSC to a (P, B) frame pair through a
+dedicated entry point, with the §5.3 Table 10 / Figure 10 PB
+macroblock layer parsed in place and the §G.4 / §G.5 prediction
+primitives invoked per macroblock against the just-reconstructed
+PREC.**
+
+* `decode_pb_picture(data, reference, prev_tr, options) ->
+  PbFramePair` (new public entry point in `picture.rs`): parses the
+  baseline INTER + PTYPE-bit-13 picture header, the §5.1.22 TRB
+  (3 bits, rejected when 0 — the codeword is "the number of
+  non-transmitted pictures plus one") and §5.1.23 DBQUANT (2 bits),
+  derives §G.4 TRD from `prev_tr` (the reference picture's §5.1.2
+  TR) with the modulo-256 negative wrap, then walks the GOB grid
+  with the PB-aware macroblock layer. Per coded macroblock the six
+  P-blocks reconstruct exactly as before; the §G.5 PREC is lifted
+  from the P-frame planes; `pb_b_predict_macroblock` composes the
+  §G.4 vectors + §G.5 blend; and the six B-blocks add INTER-style
+  TCOEF residuals (no INTRADC, §G.3) dequantised with the Table 6
+  BQUANT where CBPB lights them (§5.4 order: "First the data for
+  the six P-blocks is transmitted …, then the data for the six
+  B-blocks"). Skipped macroblocks produce a zero-vector B
+  prediction with no residual. PB + Advanced Prediction is refused
+  pending the §G.2 OBMC remote-vector exception; PB + AIC cannot
+  arise (§G.1 bars PLUSPTYPE-dependent modes from Annex G).
+* `PbFramePair { p_frame, b_frame }` (new public struct): display
+  order B then P; `p_frame` is the next prediction reference,
+  `b_frame` is display-only (§G.1 / Figure G.1).
+* `parse_macroblock` PB extension: new `MbContext::pb_frames` flag
+  gates MODB (§5.3.3, after MCBPC), CBPB (§5.3.4, before CBPY), MVD
+  for INTRA types 3 / 4 (§5.3.7 / §G.2 "the vector is used for the
+  B-blocks only"), and MVDB (§5.3.9, after MVD2-4), surfaced on the
+  new `H263Macroblock::{modb, cbpb, mvdb}` fields.
+* §6.1.1 rule-1 PB exception: in PB-frames mode an INTRA
+  macroblock's reconstructed vector stays a live candidate
+  predictor ("if not in PB-frames mode with bidirectional
+  prediction" qualifies the INTRA zeroing) — `predict_mv` takes the
+  mode flag and the INTRA branch of the macroblock decoder
+  reconstructs the §G.2 B-purpose vector via the same predictor +
+  Table 14 path.
+* `pb_bquant(dbquant, quant)` (new public function in
+  `pb_layer.rs`): the §5.1.23 / Table 6 BQUANT derivation
+  `((5 + DBQUANT) × QUANT) / 4`, truncating division, clipped to 31.
+* `Error::BadPbTemporalReference` (new variant): TRB = 0 or TRD = 0.
+
+18 new tests land: Table 6 BQUANT rows / truncation / clip / two
+panic paths; PB macroblock-layer wire tests (MODB row 0 with MVD,
+full MODB row 2 with CBPB + MVDB at pinned bit budgets, INTRA + MVD
++ MVDB at 19 bits with no MVD2-4, skipped-MB and non-PB field
+absence); and end-to-end picture tests — all-skipped PB picture
+reproduces a ramp reference sample-exactly in BOTH frames,
+TRB = 0 / TRD = 0 rejections, negative-TRD modulo-256 wrap,
+entry-point gating both ways, MVDB-only B-prediction matching the
+direct §G.4 + §G.5 composition over a ramp, CBPB-lit B-block
+residual hand-pinned end-to-end (BQUANT 16 → |REC| = 47 → +6 per
+pixel → 106 against the 100 background), and the INTRA-vector test
+(INTRA MVD feeds the B-part AND the right-hand neighbour's §6.1.1
+median — its P-part decodes one full pel shifted). `cargo test -p
+oxideav-h263` reports 521 passed (previously 503).
+
+Remaining PB scope: Annex M Improved PB-frames (separate Table M.1
+MODB + §M.2 coding modes, PLUSPTYPE picture-type `"010"`) and the
+§G.2 OBMC remote-vector exception that would unlock PB + Advanced
+Prediction.
+
+---
+
 **Round 34 (workspace round 279) — §G.4 + §G.5 PB-frame B-macroblock
 prediction composition. With the per-block §G.5 predictor
 (`pb_b_predict_block`) landed in r272, this round assembles the full

@@ -40,15 +40,21 @@
 //!   Deblocking-Filter MVD2-4 follow-on vectors (§5.3.8) are
 //!   decoded when the MB type is `2` or `5`.
 //!
+//! ## PB-frames mode (Annex G)
+//!
+//! When [`MbContext::pb_frames`] is set (PTYPE bit 13), the parser
+//! additionally consumes the §5.3 Table 10 / Figure 10 PB-frame
+//! fields: MODB (§5.3.3, Table 11) for every coded non-stuffing
+//! macroblock, CBPB (§5.3.4) when MODB indicates it, MVD also for
+//! INTRA macroblock types 3 / 4 (§5.3.7: "in PB-frames mode also
+//! for INTRA macroblocks" — the vector is used for B-block
+//! prediction only, §G.2), and MVDB (§5.3.9) after MVD2-4 when MODB
+//! indicates it. The Annex M Improved-PB MODB form (Table M.1) is a
+//! separate parser ([`crate::pb_layer::parse_modb_annex_m`]) not
+//! gated by this flag.
+//!
 //! ## Deliberately deferred
 //!
-//! * §5.3.3 / §5.3.4 — MODB / CBPB (PB-frame B-block fields).
-//!   These appear in PB-frames mode (Annex G); the round-1 picture
-//!   header parser surfaces `pb_frames`, but the round-3
-//!   macroblock parser refuses PB-mode pictures up front because
-//!   the B-block path needs Annex-G context that hasn't been
-//!   spec'd in this crate yet.
-//! * §5.3.8 MVDB — B-macroblock MVD (PB-frames mode).
 //! * Annex-T variable-length DQUANT.
 //! * Annex-D Unrestricted Motion Vector mode's PLUSPTYPE-only
 //!   alternate Table D.3 for MVD; round 3 always uses Table 14.
@@ -78,6 +84,7 @@
 use oxideav_core::bits::BitReader;
 
 use crate::aic::{decode_intra_mode, IntraMode};
+use crate::pb_layer::{parse_cbpb, parse_modb, parse_mvdb, ModbPresence};
 use crate::{Error, H263PictureCodingType, Result};
 
 /// Picture-level context the macroblock parser needs.
@@ -108,6 +115,18 @@ pub struct MbContext {
     /// for every INTRA macroblock (MB type 3 or 4). The decoded
     /// mode is surfaced on [`H263Macroblock::intra_mode`].
     pub aic_intra_mode: bool,
+    /// PTYPE bit 13 — PB-frames mode (Annex G). When `true`, the
+    /// §5.3 / Figure 10 / Table 10 PB-frame fields are parsed: MODB
+    /// (§5.3.3) after MCBPC for every coded non-stuffing macroblock,
+    /// CBPB (§5.3.4) between MODB and CBPY when MODB indicates it,
+    /// MVD (§5.3.7) also for INTRA macroblock types 3 / 4 ("in
+    /// PB-frames mode also for INTRA macroblocks"), and MVDB
+    /// (§5.3.9) after MVD2-4 when MODB indicates it. This is the
+    /// Annex G form (Table 11 MODB); the Annex M Improved-PB form
+    /// (Table M.1) is a separate parser
+    /// ([`crate::pb_layer::parse_modb_annex_m`]) that a future
+    /// Improved-PB driver gates itself.
+    pub pb_frames: bool,
     /// Current QUANT from the most recent GOB-layer header (or
     /// the picture-layer's PQUANT in the no-GOB case). Used to
     /// compute [`H263Macroblock::quantiser_after`] after any
@@ -234,6 +253,19 @@ pub struct H263Macroblock {
     /// every block of the macroblock. `None` for all non-AIC paths
     /// and for INTER macroblocks in AIC pictures.
     pub intra_mode: Option<IntraMode>,
+    /// §5.3.3 MODB (Table 11). `Some` iff
+    /// [`MbContext::pb_frames`] is set and the macroblock is coded
+    /// and not stuffing (per Table 10, the stuffing row carries COD
+    /// + MCBPC only). `None` for all non-PB paths.
+    pub modb: Option<ModbPresence>,
+    /// §5.3.4 CBPB — the 6-bit B-block coded-block pattern, bit 5
+    /// = B-block 1 … bit 0 = B-block 6 (Figure 5 numbering).
+    /// `Some` iff MODB indicated CBPB presence.
+    pub cbpb: Option<u8>,
+    /// §5.3.9 MVDB — the B-macroblock motion-vector delta pair, in
+    /// half-pel units like [`H263Macroblock::mvd`]. `Some` iff MODB
+    /// indicated MVDB presence.
+    pub mvdb: Option<Mvd>,
 }
 
 /// Parse an H.263 macroblock header starting at the current
@@ -260,6 +292,9 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
 
     if !coded {
         // Skipped macroblock: nothing else on the wire for this MB.
+        // In PB-frames mode too — Table 10's "Not coded" row carries
+        // COD only (the B-part of a skipped PB-macroblock is
+        // predicted with zero vectors and no residual, Annex G).
         return Ok(H263Macroblock {
             coded: false,
             mb_type: None,
@@ -270,6 +305,9 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
             mvd: None,
             mvd234: [None; 3],
             intra_mode: None,
+            modb: None,
+            cbpb: None,
+            mvdb: None,
         });
     }
 
@@ -280,7 +318,8 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
         // Per §5.3.2: "When MCBPC = Stuffing, the remaining part
         // of the macroblock layer is skipped." Surface the type
         // so callers know not to advance the MB counter, but
-        // populate nothing else.
+        // populate nothing else. The Table 10 stuffing row carries
+        // COD + MCBPC only — no MODB even in PB-frames mode.
         return Ok(H263Macroblock {
             coded: true,
             mb_type: Some(MbType::Stuffing),
@@ -291,6 +330,9 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
             mvd: None,
             mvd234: [None; 3],
             intra_mode: None,
+            modb: None,
+            cbpb: None,
+            mvdb: None,
         });
     }
 
@@ -302,6 +344,25 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
         Some(decode_intra_mode(reader)?)
     } else {
         None
+    };
+
+    // §5.3.3 — MODB (Table 11), between MCBPC and CBPY per
+    // Figure 10. Present for every coded non-stuffing macroblock in
+    // PB-frames mode ("MODB is present for MB-type 0-4 if PTYPE
+    // indicates 'PB-frame'"; type 5 cannot occur under Annex G
+    // because it requires PLUSPTYPE, which §G.1 bars — Table 10
+    // nonetheless lists MODB for it, so no type gate is needed).
+    let modb = if ctx.pb_frames {
+        Some(parse_modb(reader)?)
+    } else {
+        None
+    };
+
+    // §5.3.4 — CBPB (6-bit FLC), between MODB and CBPY per
+    // Figure 10, only when MODB indicates it.
+    let cbpb = match modb {
+        Some(m) if m.has_cbpb() => Some(parse_cbpb(reader)?),
+        _ => None,
     };
 
     // §5.3.5 — CBPY (variable length, Table 12).
@@ -325,8 +386,10 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
     };
 
     // §5.3.7 — MVD (variable length, Table 14). Horizontal first,
-    // then vertical.
-    let mvd = if mb_type.has_mvd() {
+    // then vertical. "MVD is included for all INTER macroblocks (in
+    // PB-frames mode also for INTRA macroblocks)" — the PB-mode
+    // INTRA vector is used only for predicting B-blocks (§G.2).
+    let mvd = if mb_type.has_mvd() || (ctx.pb_frames && mb_type.is_intra()) {
         Some(Mvd {
             dx_half: decode_mvd_component(reader)?,
             dy_half: decode_mvd_component(reader)?,
@@ -335,7 +398,9 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
         None
     };
 
-    // §5.3.8 — MVD2-4 (Advanced Prediction).
+    // §5.3.8 — MVD2-4 (Advanced Prediction). "The codewords MVD2-4
+    // are never used for INTRA" (§G.2) — has_mvd2_4 is false for
+    // INTRA types, so no PB-mode adjustment is needed here.
     let mut mvd234 = [None; 3];
     if mb_type.has_mvd2_4(ctx.advanced_prediction) {
         for slot in mvd234.iter_mut() {
@@ -345,6 +410,13 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
             });
         }
     }
+
+    // §5.3.9 — MVDB, last header field per Figure 10, only when
+    // MODB indicates it.
+    let mvdb = match modb {
+        Some(m) if m.has_mvdb() => Some(parse_mvdb(reader)?),
+        _ => None,
+    };
 
     Ok(H263Macroblock {
         coded: true,
@@ -356,6 +428,9 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
         mvd,
         mvd234,
         intra_mode,
+        modb,
+        cbpb,
+        mvdb,
     })
 }
 
@@ -762,6 +837,7 @@ mod tests {
             picture_coding_type: H263PictureCodingType::Intra,
             advanced_prediction: false,
             aic_intra_mode: false,
+            pb_frames: false,
             quantiser_before: q,
         }
     }
@@ -771,6 +847,7 @@ mod tests {
             picture_coding_type: H263PictureCodingType::Inter,
             advanced_prediction: advanced,
             aic_intra_mode: false,
+            pb_frames: false,
             quantiser_before: q,
         }
     }
@@ -1398,6 +1475,7 @@ mod tests {
                 picture_coding_type: pic.coding_type,
                 advanced_prediction: pic.advanced_prediction,
                 aic_intra_mode: false,
+                pb_frames: false,
                 quantiser_before: gob.quantiser,
             },
         )
@@ -1405,5 +1483,166 @@ mod tests {
         assert_eq!(mb.mb_type, Some(MbType::Intra));
         assert_eq!(mb.cbpy, Some(0b0000));
         assert_eq!(mb.quantiser_after, 5);
+    }
+
+    // ---- PB-frames mode (§5.3 Table 10 / Figure 10) ----------------
+
+    fn pb_picture_ctx(q: u8) -> MbContext {
+        MbContext {
+            picture_coding_type: H263PictureCodingType::Inter,
+            advanced_prediction: false,
+            aic_intra_mode: false,
+            pb_frames: true,
+            quantiser_before: q,
+        }
+    }
+
+    /// PB-mode INTER macroblock with MODB row 0 (`0`): no CBPB, no
+    /// MVDB. Wire: COD `0`, MCBPC `1` (type 0, cbpc 00), MODB `0`,
+    /// CBPY `11` (CBPY(INTRA) = 1111 → INTER pattern 0000), then MVD
+    /// `1` `1` — 7 bits total.
+    #[test]
+    fn pb_inter_mb_modb_none_parses_mvd_only() {
+        let mut w = BitWriter::new();
+        w.write_bit(false); // COD = 0
+        w.write_bit(true); // MCBPC type 0, cbpc 00
+        w.write_bit(false); // MODB row 0
+        w.write_u32(0b11, 2); // CBPY
+        w.write_bit(true); // MVD dx = 0
+        w.write_bit(true); // MVD dy = 0
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let mb = parse_macroblock(&mut r, pb_picture_ctx(8)).expect("mb");
+        assert!(mb.coded);
+        assert_eq!(mb.mb_type, Some(MbType::Inter));
+        assert_eq!(mb.modb, Some(ModbPresence::None));
+        assert_eq!(mb.cbpb, None);
+        assert_eq!(mb.mvdb, None);
+        assert_eq!(
+            mb.mvd,
+            Some(Mvd {
+                dx_half: 0,
+                dy_half: 0
+            })
+        );
+        assert_eq!(r.bit_position(), 7);
+    }
+
+    /// PB-mode INTER macroblock with MODB row 2 (`11`): CBPB and
+    /// MVDB both on the wire, in Figure 10 order — MODB and CBPB
+    /// between MCBPC and CBPY, MVDB after MVD. CBPB `101010` lights
+    /// B-blocks 1 / 3 / 5; MVDB pair (+1, −1) half-pel (Table 14
+    /// codes `010` / `011`). Total 1 + 1 + 2 + 6 + 2 + 2 + 6 = 20
+    /// bits.
+    #[test]
+    fn pb_inter_mb_modb_cbpb_and_mvdb_full_layer() {
+        let mut w = BitWriter::new();
+        w.write_bit(false); // COD = 0
+        w.write_bit(true); // MCBPC type 0, cbpc 00
+        w.write_u32(0b11, 2); // MODB row 2
+        w.write_u32(0b101010, 6); // CBPB: blocks 1, 3, 5
+        w.write_u32(0b11, 2); // CBPY
+        w.write_bit(true); // MVD dx = 0
+        w.write_bit(true); // MVD dy = 0
+        w.write_u32(0b010, 3); // MVDB dx = +1 half-pel
+        w.write_u32(0b011, 3); // MVDB dy = -1 half-pel
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let mb = parse_macroblock(&mut r, pb_picture_ctx(8)).expect("mb");
+        assert_eq!(mb.modb, Some(ModbPresence::CbpbAndMvdb));
+        assert_eq!(mb.cbpb, Some(0b101010));
+        assert_eq!(
+            mb.mvdb,
+            Some(Mvd {
+                dx_half: 1,
+                dy_half: -1
+            })
+        );
+        assert_eq!(
+            mb.mvd,
+            Some(Mvd {
+                dx_half: 0,
+                dy_half: 0
+            })
+        );
+        assert_eq!(r.bit_position(), 20);
+    }
+
+    /// §5.3.7 / §G.2: "MVD is included for all INTER macroblocks (in
+    /// PB-frames mode also for INTRA macroblocks)" — an INTRA
+    /// macroblock (Table 8 type 3, code `0001 1`) in a PB-mode
+    /// P-picture carries MODB, MVD (here +2 half-pel horizontal,
+    /// Table 14 code `0010`) and — via MODB row 1 (`10`) — MVDB, but
+    /// never MVD2-4 ("The codewords MVD2-4 are never used for
+    /// INTRA", §G.2). Total 1 + 5 + 2 + 4 + 5 + 2 = 19 bits.
+    #[test]
+    fn pb_intra_mb_carries_mvd_and_mvdb() {
+        let mut w = BitWriter::new();
+        w.write_bit(false); // COD = 0
+        w.write_u32(0b00011, 5); // MCBPC type 3 (INTRA), cbpc 00
+        w.write_u32(0b10, 2); // MODB row 1: MVDB only
+        w.write_u32(0b0011, 4); // CBPY: CBPY(INTRA) = 0000
+        w.write_u32(0b0010, 4); // MVD dx = +2 half-pel
+        w.write_bit(true); // MVD dy = 0
+        w.write_bit(true); // MVDB dx = 0
+        w.write_bit(true); // MVDB dy = 0
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let mb = parse_macroblock(&mut r, pb_picture_ctx(8)).expect("mb");
+        assert_eq!(mb.mb_type, Some(MbType::Intra));
+        assert_eq!(mb.modb, Some(ModbPresence::MvdbOnly));
+        assert_eq!(mb.cbpb, None);
+        assert_eq!(
+            mb.mvd,
+            Some(Mvd {
+                dx_half: 2,
+                dy_half: 0
+            })
+        );
+        assert_eq!(
+            mb.mvdb,
+            Some(Mvd {
+                dx_half: 0,
+                dy_half: 0
+            })
+        );
+        assert_eq!(mb.mvd234, [None; 3]);
+        assert_eq!(r.bit_position(), 19);
+    }
+
+    /// A skipped macroblock (COD = 1) in PB-frames mode carries no
+    /// further fields (Table 10 "Not coded" row: COD only).
+    #[test]
+    fn pb_skipped_mb_carries_no_pb_fields() {
+        let mut w = BitWriter::new();
+        w.write_bit(true); // COD = 1
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let mb = parse_macroblock(&mut r, pb_picture_ctx(8)).expect("mb");
+        assert!(!mb.coded);
+        assert_eq!(mb.modb, None);
+        assert_eq!(mb.cbpb, None);
+        assert_eq!(mb.mvdb, None);
+        assert_eq!(r.bit_position(), 1);
+    }
+
+    /// Outside PB-frames mode the INTER macroblock wire layout has no
+    /// MODB / CBPB / MVDB — the new fields stay `None` and no extra
+    /// bits are consumed (COD + MCBPC + CBPY + MVD = 6 bits).
+    #[test]
+    fn non_pb_inter_mb_has_no_pb_fields() {
+        let mut w = BitWriter::new();
+        w.write_bit(false); // COD = 0
+        w.write_bit(true); // MCBPC type 0, cbpc 00
+        w.write_u32(0b11, 2); // CBPY
+        w.write_bit(true); // MVD dx = 0
+        w.write_bit(true); // MVD dy = 0
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let mb = parse_macroblock(&mut r, inter_picture_ctx(8, false)).expect("mb");
+        assert_eq!(mb.modb, None);
+        assert_eq!(mb.cbpb, None);
+        assert_eq!(mb.mvdb, None);
+        assert_eq!(r.bit_position(), 6);
     }
 }

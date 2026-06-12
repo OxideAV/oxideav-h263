@@ -8,6 +8,60 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex G PB-frame end-to-end decode driver (round 283):
+  - `decode_pb_picture(data, reference, prev_tr, options) ->
+    Result<PbFramePair>` new public entry point in `picture.rs`:
+    decodes one baseline-PTYPE PB-frame (PTYPE bit 13) into the (P, B)
+    picture pair. Parses §5.1.22 TRB (3 bits; `0` rejected) and
+    §5.1.23 DBQUANT (2 bits) after PTYPE, derives §G.4 TRD from the
+    caller-supplied `prev_tr` with the modulo-256 negative wrap, and
+    drives the shared GOB/macroblock walker with a PB context. Per
+    coded macroblock: P-blocks reconstruct as before; PREC (§G.5) is
+    lifted from the P-frame planes; `pb_b_predict_macroblock` builds
+    the §G.4 + §G.5 B-prediction from the reconstructed P-vectors
+    (replicated single MV, the §G.2 INTRA B-purpose vector, or zeros
+    for skipped MBs) and the parsed MVDB; the six B-blocks then add
+    INTER-style TCOEF residuals (no INTRADC, §G.3) dequantised with
+    the Table 6 BQUANT where CBPB lights them, in the §5.4 P-then-B
+    wire order. PB + Advanced Prediction is refused
+    (`Error::NotImplemented`) pending the §G.2 OBMC remote-vector
+    exception; the single-frame entry points keep refusing PB
+    pictures (they cannot return the B-picture).
+  - `PbFramePair { p_frame, b_frame }` new public struct (display
+    order B then P; only `p_frame` is a prediction reference).
+  - `MbContext::pb_frames` new field +
+    `H263Macroblock::{modb, cbpb, mvdb}` new fields: under the flag,
+    `parse_macroblock` consumes the §5.3 Table 10 / Figure 10
+    PB-frame layer — MODB (§5.3.3) after MCBPC for every coded
+    non-stuffing macroblock, CBPB (§5.3.4) before CBPY when MODB
+    indicates it, MVD also for INTRA types 3 / 4 (§5.3.7 "in
+    PB-frames mode also for INTRA macroblocks"), MVDB (§5.3.9) after
+    MVD2-4 when MODB indicates it.
+  - §6.1.1 rule-1 PB exception: INTRA macroblocks' reconstructed
+    vectors stay live candidate predictors in PB-frames mode ("if
+    not in PB-frames mode with bidirectional prediction" qualifies
+    the INTRA zeroing); the INTRA branch of the macroblock decoder
+    reconstructs the §G.2 vector through the same §6.1.1 predictor +
+    Table 14 path used for INTER vectors.
+  - `pb_bquant(dbquant, quant)` new public function in `pb_layer.rs`:
+    §5.1.23 / Table 6 `((5 + DBQUANT) × QUANT) / 4` by truncation,
+    clipped to 31.
+  - `Error::BadPbTemporalReference` new variant (TRB = 0 or TRD = 0).
+  - 18 new tests: Table 6 rows / truncation / clip / two panic paths;
+    PB macroblock wire layer at pinned bit budgets (MODB row 0 + MVD
+    = 7 bits; MODB row 2 + CBPB + MVDB = 20 bits; INTRA + MODB row 1
+    + MVD + MVDB = 19 bits with `mvd234` empty; skipped-MB and non-PB
+    field absence); end-to-end: all-skipped PB picture reproduces a
+    ramp reference sample-exactly in both frames; TRB = 0 / TRD = 0
+    rejections; negative-TRD wrap (TR 1 after prev_tr 255 = forward
+    step 2); entry-point gating both directions; MVDB-only
+    B-prediction equal to the direct §G.4 + §G.5 composition;
+    CBPB-lit B-residual hand-pinned (DBQUANT `11` × QUANT 8 → BQUANT
+    16 → |REC| = 47 → +6/pixel → 106 on a 100 background); INTRA
+    vector feeding both the B-part and the right neighbour's §6.1.1
+    median (P-part decodes one full pel shifted). `cargo test -p
+    oxideav-h263` reports 521 passed (was 503).
+
 - §G.4 + §G.5 PB-frame B-macroblock prediction composition
   (round 279):
   - `pb_b_predict_macroblock(planes, mb_x, mb_y, p_mvs, mvd, trb,

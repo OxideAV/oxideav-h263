@@ -264,12 +264,12 @@ pub use motion::{
 pub use pb_layer::{
     cbpb_block_present, parse_cbpb, parse_modb, parse_modb_annex_m, parse_mvdb,
     pb_b_bidir_chroma_extent, pb_b_bidir_extent_component, pb_b_bidir_luma_block_extent,
-    pb_b_bidir_pixel, pb_b_blend_block, pb_b_chroma_vector, pb_b_vector, pb_b_vectors,
+    pb_b_bidir_pixel, pb_b_blend_block, pb_b_chroma_vector, pb_b_vector, pb_b_vectors, pb_bquant,
     BpbCodingMode, ModbAnnexM, ModbPresence, CBPB_BITS,
 };
 pub use picture::{
-    decode_picture, decode_picture_layer, decode_picture_layer_with_inherited, DecodeOptions,
-    DecodePictureOutcome, PictureLayout, YuvFrame,
+    decode_pb_picture, decode_picture, decode_picture_layer, decode_picture_layer_with_inherited,
+    DecodeOptions, DecodePictureOutcome, PbFramePair, PictureLayout, YuvFrame,
 };
 pub use picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
@@ -391,6 +391,14 @@ pub enum Error {
     /// One of the §K.2.1 SSTUF stuffing bits before an SSC was `1`
     /// where the spec mandates `0`. See [`slice_header::skip_sstuf`].
     BadSliceStuffing,
+    /// A PB-frame's temporal references were unusable: the §5.1.22
+    /// TRB field was `0` (the codeword is "the number of
+    /// non-transmitted pictures plus one", so its minimum legal
+    /// value is 1), or the §G.4 TRD increment between the current
+    /// picture's TR and the caller-supplied previous TR was zero
+    /// (the §G.4 vector scaling divides by TRD, which is undefined
+    /// when the two pictures are co-timed).
+    BadPbTemporalReference,
 }
 
 impl core::fmt::Display for Error {
@@ -493,6 +501,10 @@ impl core::fmt::Display for Error {
             Error::BadSliceStuffing => write!(
                 f,
                 "oxideav-h263: SSTUF stuffing bit was 1 (must be 0 per §K.2.1)"
+            ),
+            Error::BadPbTemporalReference => write!(
+                f,
+                "oxideav-h263: PB-frame temporal reference unusable (TRB = 0 or TRD = 0)"
             ),
         }
     }

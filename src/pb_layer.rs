@@ -10,8 +10,11 @@
 //!                  §5.3.3 §5.3.4                                §5.3.9
 //! ```
 //!
-//! This module provides the two pure-parser primitives the future
-//! macroblock-layer driver needs to consume them:
+//! This module provides the pure-parser primitives the macroblock
+//! layer ([`crate::macroblock::parse_macroblock`] under
+//! [`crate::macroblock::MbContext::pb_frames`]) consumes for them,
+//! plus the §G.4 / §G.5 prediction primitives the PB-frame picture
+//! driver ([`crate::picture::decode_pb_picture`]) composes:
 //!
 //! * [`parse_modb`] — §5.3.3 / Table 11 variable-length codeword that
 //!   tells the decoder whether the B-block coefficient pattern (CBPB)
@@ -476,6 +479,35 @@ pub fn parse_mvdb(reader: &mut BitReader<'_>) -> Result<Mvd> {
     let dx_half = decode_mvd_component(reader)?;
     let dy_half = decode_mvd_component(reader)?;
     Ok(Mvd { dx_half, dy_half })
+}
+
+/// §5.1.23 / Table 6 — B-block quantiser BQUANT from the picture
+/// header's 2-bit DBQUANT code and the macroblock's QUANT.
+///
+/// "With PB-frames QUANT is used for the P-block, while for the
+/// B-block a different quantization parameter BQUANT is used. …
+/// DBQUANT indicates the relation between QUANT and BQUANT as
+/// defined in Table 6. In this table, '/' means division by
+/// truncation. BQUANT ranges from 1 to 31; if the value for BQUANT
+/// resulting from Table 6 is greater than 31, it is clipped to 31."
+///
+/// Table 6 maps DBQUANT `00` / `01` / `10` / `11` to
+/// `(5 × QUANT) / 4` … `(8 × QUANT) / 4` — i.e. a multiplier of
+/// `5 + dbquant` over 4. With `quant >= 1` the smallest possible
+/// result is `(5 × 1) / 4 = 1`, so only the upper clip is needed.
+///
+/// # Panics
+///
+/// Panics if `dbquant > 3` (DBQUANT is a 2-bit field) or if `quant`
+/// is outside `1..=31` (§5.1.23: "QUANT ranges from 1 to 31").
+pub fn pb_bquant(dbquant: u8, quant: u8) -> u8 {
+    assert!(dbquant <= 3, "DBQUANT is a 2-bit field (§5.1.23)");
+    assert!(
+        (1..=31).contains(&quant),
+        "QUANT ranges from 1 to 31 (§5.1.23)"
+    );
+    let bquant = ((5 + dbquant as u32) * quant as u32) / 4;
+    bquant.min(31) as u8
 }
 
 /// §G.4 forward / backward motion-vector pair for one B-picture
@@ -3008,5 +3040,53 @@ mod tests {
             2,
             RCONTROL_DEFAULT,
         );
+    }
+
+    // ---- §5.1.23 / Table 6 BQUANT ----------------------------------
+
+    /// The four Table 6 rows at QUANT = 8: BQUANT =
+    /// (5 × 8) / 4 = 10, (6 × 8) / 4 = 12, (7 × 8) / 4 = 14,
+    /// (8 × 8) / 4 = 16.
+    #[test]
+    fn pb_bquant_table6_rows_at_quant_8() {
+        assert_eq!(pb_bquant(0b00, 8), 10);
+        assert_eq!(pb_bquant(0b01, 8), 12);
+        assert_eq!(pb_bquant(0b10, 8), 14);
+        assert_eq!(pb_bquant(0b11, 8), 16);
+    }
+
+    /// §5.1.23: "'/' means division by truncation". (5 × 7) / 4 =
+    /// 35 / 4 = 8; (6 × 3) / 4 = 18 / 4 = 4; the minimum input
+    /// (5 × 1) / 4 = 1 stays in range without a lower clip.
+    #[test]
+    fn pb_bquant_divides_by_truncation() {
+        assert_eq!(pb_bquant(0b00, 7), 8);
+        assert_eq!(pb_bquant(0b01, 3), 4);
+        assert_eq!(pb_bquant(0b00, 1), 1);
+    }
+
+    /// §5.1.23: "if the value for BQUANT resulting from Table 6 is
+    /// greater than 31, it is clipped to 31". (8 × 31) / 4 = 62 →
+    /// 31; (8 × 16) / 4 = 32 → 31; the truncated boundary case
+    /// (6 × 21) / 4 = 31 needs no clip.
+    #[test]
+    fn pb_bquant_clips_to_31() {
+        assert_eq!(pb_bquant(0b11, 31), 31);
+        assert_eq!(pb_bquant(0b11, 16), 31);
+        assert_eq!(pb_bquant(0b01, 21), 31);
+    }
+
+    /// DBQUANT is a 2-bit field; values above 3 are caller errors.
+    #[test]
+    #[should_panic(expected = "DBQUANT")]
+    fn pb_bquant_panics_on_oversized_dbquant() {
+        pb_bquant(4, 8);
+    }
+
+    /// §5.1.23: "QUANT ranges from 1 to 31" — zero is a caller error.
+    #[test]
+    #[should_panic(expected = "QUANT ranges")]
+    fn pb_bquant_panics_on_zero_quant() {
+        pb_bquant(0, 0);
     }
 }
