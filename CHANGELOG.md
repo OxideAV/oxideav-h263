@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex K Slice-Structured mode end-to-end decode, free-running
+  (non-Rectangular-Slice) submode (round 291):
+  - `decode_picture_layer` / `decode_picture_layer_with_inherited`
+    now route a UFEP=001 PLUSPTYPE picture whose §5.1.4.4 OPPTYPE
+    Slice-Structured bit (bit 10) is set to a new internal
+    `decode_slice_structured_after_header` driver. It reads §5.1.19
+    PQUANT, parses the §K.2 reduced first-slice header, and walks
+    macroblocks in picture scanning order from the slice's MBA until
+    the next §K.2.2 SSC or end of stream; subsequent slices re-anchor
+    via `skip_sstuf` + `parse_slice_layer`.
+  - §6.1.1 "outside the slice" motion-vector prediction: a per-
+    macroblock `segment` id on the prediction grid makes a candidate
+    neighbour in a different slice unavailable (MV1 zeroed, MV2/MV3
+    copied from MV1). The baseline GOB driver is bit-identical.
+  - §K.1 exact-tiling enforcement with the new `Error::BadSliceCoverage`
+    (overlap, non-strictly-increasing MBA, or undecoded macroblock).
+  - The §K.2.8 Rectangular Slice submode, Annex K + Advanced
+    Prediction, CPM sub-bitstreams, RRU, and PB-frames are refused
+    with `Error::NotImplemented` (reported, not guessed).
+  - 7 new tests (QCIF single-/two-slice INTRA, all-skipped and
+    two-slice INTER, MBA-order and coverage rejections, RS refusal);
+    suite now 527 passing (was 521).
 - Annex G PB-frame end-to-end decode driver (round 283):
   - `decode_pb_picture(data, reference, prev_tr, options) ->
     Result<PbFramePair>` new public entry point in `picture.rs`:

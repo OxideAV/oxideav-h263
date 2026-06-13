@@ -5,6 +5,68 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 36 (workspace round 291) — Annex K Slice-Structured mode
+end-to-end decode (free-running submode). A PLUSPTYPE picture
+carrying the OPPTYPE Slice-Structured bit (bit 10) now decodes from
+PSC to a reconstructed frame: the §K.2 slice layer (whose header
+parse landed in r15) is finally driven, walking macroblocks in
+picture scanning order across slice boundaries with each slice a
+fresh §6.1.1 / §I.3 video picture segment.**
+
+* `decode_picture_layer` / `decode_picture_layer_with_inherited`
+  routing: a UFEP=001 PLUSPTYPE picture with the §5.1.4.4 OPPTYPE
+  Slice-Structured bit set is dispatched to a new internal
+  `decode_slice_structured_after_header` driver instead of the GOB
+  walker. The driver reads §5.1.19 PQUANT (the QUANT in force for the
+  slice that follows the Picture Start Code, which carries no §K.2.7
+  SQUANT), parses the §K.2 reduced first-slice header
+  (`parse_first_slice_header`), then walks macroblocks in picture
+  scanning order from the slice's MBA (§K.1 "a slice contains a number
+  of macroblocks in scanning order within the picture as a whole")
+  until the next §K.2.2 SSC or the end of the bitstream. Each
+  subsequent slice is re-anchored by `skip_sstuf` + `parse_slice_layer`
+  at its own MBA / SQUANT.
+* §K.2.2 slice-boundary detection (`at_slice_boundary`): a
+  position-preserving probe (the `Copy` `BitReader` checkpoint idiom)
+  that discards §K.2.1 SSTUF to the next byte boundary and tests the
+  17-bit aligned window against the SSC value. The §K.2
+  emulation-prevention bits (SEPB1 / SEPB2 / SEPB3) guarantee
+  macroblock data cannot emulate an SSC, so the peek is unambiguous.
+* §6.1.1 "outside the slice" motion-vector prediction: `MbGridEntry`
+  gains a `segment` id and `predict_mv` a `current_segment`
+  parameter. A candidate neighbour in a different slice is treated as
+  unavailable — MV1 (left) is zeroed (rule 2) and MV2 / MV3
+  (above / above-right) are copied from MV1 (rule 3) — exactly as if a
+  GOB header were present. The baseline GOB driver is bit-identical
+  (its only segment transitions land on GOB-row top borders, already
+  covered by the pre-existing `gob_top_row` test). The Annex I §I.3
+  Advanced-INTRA-Coding predictor already treated each slice as a
+  fresh segment via the same `aic_segment` id, which now doubles as
+  the §6.1.1 segment.
+* §K.1 exact-tiling enforcement: the driver tracks which macroblocks
+  each slice covers and rejects overlap, non-strictly-increasing MBA
+  order (ASO off), or any macroblock left undecoded with the new
+  `Error::BadSliceCoverage`.
+* Refused (reported, not guessed): the §K.2.8 Rectangular Slice
+  submode (RS — the SWI-driven rectangle scan order is out of scope);
+  Annex K with Advanced Prediction (the §F.3 OBMC remote-vector
+  slice-boundary exclusion is unstaged); CPM sub-bitstreams (SSBI);
+  Reduced-Resolution Update; PB-frames — all `Error::NotImplemented`.
+
+7 new tests land: QCIF single-slice INTRA decode (uniform frame,
+bit-identical to the GOB-layer equivalent); two-slice INTRA decode
+(SSC boundary ends slice 0 at the right macroblock, slice 1
+re-anchors at its MBA — same pixels as the single-slice form);
+all-skipped INTER decode (exact reference copy, proving the INTER
+macroblock path runs within slices); two-slice INTER decode with a
+coded zero-MVD macroblock at the head of slice 1 (the cross-slice
+predictor zeroing yields a zero reconstructed vector → exact
+reference copy); non-increasing-MBA rejection; incomplete-coverage
+rejection; and Rectangular-Slice refusal. `cargo test -p oxideav-h263`
+reports 527 passed (previously 521).
+
+---
+
 **Round 35 (workspace round 283) — Annex G PB-frame end-to-end
 decode: the bitstream-side driver named as "the remaining PB-frame
 step" since r279 lands, closing the PB-frame integration. A PB
@@ -1645,11 +1707,19 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * GSBI (§5.2.4, CPM = "1" case) — picture-layer CPM is not yet
   exposed, so the GOB parser only handles the CPM = "0" branch.
 * Slice-structured mode (Annex K) — the §K.2 slice-layer header parse
-  landed in round 15 (`slice_header` module: `parse_slice_layer` /
-  `parse_first_slice_header`), but the `decode_picture` driver does
-  not yet dispatch on it (it still walks GOB headers only). End-of-
-  sequence markers (§5.1.27, EOS/EOSBS as PSC-prefixed codes) are
-  still not parsed.
+  landed in round 15 and the **free-running** (non-Rectangular-Slice)
+  end-to-end driver landed in round 36 (workspace round 291): a
+  PLUSPTYPE picture with the OPPTYPE Slice-Structured bit set now
+  decodes through `decode_slice_structured_after_header`, walking
+  macroblocks in picture scanning order from each slice header's MBA
+  with each slice a fresh §6.1.1 / §I.3 video picture segment. Still
+  NOT done: the **Rectangular Slice** submode (RS) scan order and its
+  SWI-driven rectangle tiling (refused with `NotImplemented`); Annex K
+  with Advanced Prediction (the §F.3 OBMC remote-vector slice-boundary
+  exclusion is not staged); Annex K with CPM sub-bitstreams (SSBI);
+  and the Arbitrary Slice Ordering submode (ASO — slices must arrive
+  in strictly-increasing MBA order). End-of-sequence markers (§5.1.27,
+  EOS/EOSBS as PSC-prefixed codes) are still not parsed.
 * The Annex-O optional fields after PTYPE: PQUANT, CPM/PSBI, TRB,
   DBQUANT, PEI/PSUPP.
 * Extended PTYPE / PLUSPTYPE — the §5.1.4 onward picture-header *parse*

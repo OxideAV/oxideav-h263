@@ -95,7 +95,13 @@ use crate::picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
     H263PictureHeader, H263PictureLayer, H263SourceFormat,
 };
-use crate::plus_ptype::{InheritedExtendedState, PlusPictureType, PlusSourceFormat, Uui};
+use crate::plus_ptype::{
+    InheritedExtendedState, PlusPictureType, PlusSourceFormat, SliceStructuredSubmode, Uui,
+};
+use crate::slice_header::{
+    parse_first_slice_header, parse_slice_layer, skip_sstuf, SliceHeaderContext, SQUANT_BITS,
+    SSC_BITS, SSC_VALUE,
+};
 use crate::{reconstruct_inter_block_with_prediction, reconstruct_intra_block, Error, Result};
 
 /// A decoded planar YUV 4:2:0 frame produced by [`decode_picture`].
@@ -306,6 +312,20 @@ struct MbGridEntry {
     /// per-block predictor selection (Figure F.1) and the §F.3 OBMC
     /// remote-vector lookup.
     mvs4: Mb4Mv,
+    /// §6.1.1 "video picture segment" identifier of the macroblock.
+    /// Incremented at every GOB header (baseline driver) or slice
+    /// header (Annex K driver). The §6.1.1 border rules treat a
+    /// candidate neighbour whose segment differs from the current
+    /// macroblock's as "outside the slice": MV1 (left) is zeroed and
+    /// MV2 / MV3 (above / above-right) are copied from MV1. For the
+    /// baseline GOB driver every macroblock of a GOB shares the GOB
+    /// index, so the only segment transitions land on GOB-row top
+    /// borders — exactly where the pre-existing `gob_top_row` test
+    /// already applied — leaving the baseline path bit-identical.
+    /// [`OUTSIDE`](Self::OUTSIDE) carries `u32::MAX`, which never
+    /// matches a real segment id, so an off-picture fetch is also a
+    /// segment mismatch.
+    segment: u32,
 }
 
 impl MbGridEntry {
@@ -315,6 +335,7 @@ impl MbGridEntry {
         not_coded: false,
         mv: MotionVector::new(0, 0),
         mvs4: [MotionVector::new(0, 0); 4],
+        segment: u32::MAX,
     };
 }
 
@@ -474,6 +495,16 @@ fn luma_block_grid_pos(mb_col: usize, mb_row: usize, blk: usize) -> (usize, usiz
 /// mode every INTRA macroblock carries a vector (§G.2, used for
 /// predicting its B-blocks), and that vector stays a live candidate
 /// predictor; the COD = 1 zeroing applies in both modes.
+///
+/// `current_segment` is the §6.1.1 "video picture segment" id of the
+/// macroblock being decoded (the GOB index for the baseline driver,
+/// the slice index for the Annex K driver). A candidate neighbour
+/// whose recorded [`MbGridEntry::segment`] differs is "outside the
+/// slice": MV1 is zeroed (rule 2) and MV2 / MV3 are copied from MV1
+/// (rule 3). For the baseline GOB driver the only segment transitions
+/// fall on GOB-row top borders, which the `gob_top_row` test already
+/// covered, so the GOB path is unaffected by the segment check.
+#[allow(clippy::too_many_arguments)]
 fn predict_mv(
     grid: &[MbGridEntry],
     mb_cols: usize,
@@ -482,6 +513,7 @@ fn predict_mv(
     gob_top_row: usize,
     gob_header_present: bool,
     pb_frames: bool,
+    current_segment: u32,
 ) -> MotionVector {
     let fetch = |c: isize, r: isize| -> Option<MbGridEntry> {
         if c < 0 || r < 0 || c as usize >= mb_cols || r as usize > row {
@@ -493,6 +525,12 @@ fn predict_mv(
             Some(grid[r as usize * mb_cols + c as usize])
         }
     };
+
+    // A fetched neighbour is a §6.1.1 candidate only if it belongs to
+    // the current video picture segment (GOB / slice). A different
+    // segment — or an off-picture [`MbGridEntry::OUTSIDE`] sentinel
+    // (segment `u32::MAX`) — counts as "outside the slice".
+    let in_segment = |entry: MbGridEntry| entry.segment == current_segment;
 
     // §6.1.1 rule 1: an INTRA (outside PB-frames mode) or not-coded
     // candidate contributes a zero vector. We fold that into the
@@ -507,40 +545,46 @@ fn predict_mv(
 
     // MV1 — left neighbour. §6.1.1 rule 2: zero if outside picture/
     // slice at the left side.
-    let outside_left = col == 0;
+    let left = fetch(col as isize - 1, row as isize).unwrap_or(MbGridEntry::OUTSIDE);
+    let outside_left = col == 0 || !in_segment(left);
     let mv1 = if outside_left {
         MotionVector::new(0, 0)
     } else {
-        candidate_value(fetch(col as isize - 1, row as isize).unwrap_or(MbGridEntry::OUTSIDE))
+        candidate_value(left)
     };
 
     // §6.1.1 rule 3: MV2 / MV3 are set to MV1 if the corresponding
     // macroblock is outside the picture at the top, or outside the GOB
-    // at the top when the current GOB's header is non-empty.
+    // at the top when the current GOB's header is non-empty, or outside
+    // the slice (segment mismatch on the above neighbour).
+    let above = fetch(col as isize, row as isize - 1).unwrap_or(MbGridEntry::OUTSIDE);
     let above_outside_picture = row == 0;
     let above_outside_gob = gob_header_present && row == gob_top_row;
-    let top_border = above_outside_picture || above_outside_gob;
+    let above_outside_slice = !in_segment(above);
+    let top_border = above_outside_picture || above_outside_gob || above_outside_slice;
 
     // MV2 — above neighbour.
     let mv2 = if top_border {
         mv1
     } else {
-        candidate_value(fetch(col as isize, row as isize - 1).unwrap_or(MbGridEntry::OUTSIDE))
+        candidate_value(above)
     };
 
     // MV3 — above-right neighbour. §6.1.1 rule 4: zero if outside the
     // picture at the right side (otherwise rule 3's top-border copy of
-    // MV1 applies).
+    // MV1 applies). A different-slice above-right neighbour also falls
+    // under rule 3 (copy MV1).
+    let above_right = fetch(col as isize + 1, row as isize - 1).unwrap_or(MbGridEntry::OUTSIDE);
     let outside_right = col + 1 >= mb_cols;
     let mv3 = if outside_right {
         // Rule 4: outside picture at the right -> zero. This applies
         // after rule 3, so a right-edge MB at a top border still gets
         // zero (not MV1).
         MotionVector::new(0, 0)
-    } else if top_border {
+    } else if top_border || !in_segment(above_right) {
         mv1
     } else {
-        candidate_value(fetch(col as isize + 1, row as isize - 1).unwrap_or(MbGridEntry::OUTSIDE))
+        candidate_value(above_right)
     };
 
     predict_mv_median(mv1, mv2, mv3)
@@ -762,16 +806,30 @@ pub fn decode_picture_layer_with_inherited(
                 // UFEP=001 or non-PLUSPTYPE picture).
                 None => inherited,
             };
-            let (header, layout, shim_options) =
+            let (header, layout, shim_options, slice_structured) =
                 plus_ptype_to_baseline_shim(&extended, options, inherited)?;
-            let frame = decode_after_picture_header(
-                &mut reader,
-                &header,
-                &layout,
-                reference,
-                shim_options,
-                None,
-            )?;
+            // Annex K Slice-Structured mode (OPPTYPE SS bit set) replaces
+            // the GOB layer with the §K.2 slice layer; route to the
+            // dedicated driver. Otherwise decode through the baseline GOB
+            // driver.
+            let frame = match slice_structured {
+                Some(sss) => decode_slice_structured_after_header(
+                    &mut reader,
+                    &header,
+                    &layout,
+                    sss,
+                    reference,
+                    shim_options,
+                )?,
+                None => decode_after_picture_header(
+                    &mut reader,
+                    &header,
+                    &layout,
+                    reference,
+                    shim_options,
+                    None,
+                )?,
+            };
             Ok(DecodePictureOutcome {
                 frame,
                 inherited: next_inherited,
@@ -1122,11 +1180,22 @@ fn decode_pb_b_part(
 /// [`PlusSourceFormat::Custom`] it resolves via
 /// [`PictureLayout::for_custom_dimensions`] against the parsed CPFMT
 /// (UFEP=001) or the inherited `(width, height)` snapshot (UFEP=000).
+/// Resolution of the Annex K Slice-Structured submode for a PLUSPTYPE
+/// picture, returned by [`plus_ptype_to_baseline_shim`] so the caller
+/// can route to the slice driver. `Some(sss)` ⇔ the §5.1.4.4 OPPTYPE
+/// SS bit is set; `None` ⇔ the picture uses the GOB layer.
+type SliceStructuredRouting = Option<SliceStructuredSubmode>;
+
 fn plus_ptype_to_baseline_shim(
     extended: &H263ExtendedPicture,
     options: DecodeOptions,
     inherited: InheritedExtendedState,
-) -> Result<(H263PictureHeader, PictureLayout, DecodeOptions)> {
+) -> Result<(
+    H263PictureHeader,
+    PictureLayout,
+    DecodeOptions,
+    SliceStructuredRouting,
+)> {
     // §5.1.4.3 — only INTRA / INTER picture types are decodable here.
     // Resolve this first because §5.1.4.5 rule 1 inference (UMV / AP
     // off in I-pictures) needs the picture-type code below.
@@ -1195,9 +1264,11 @@ fn plus_ptype_to_baseline_shim(
         }
     };
 
-    // §5.1.4.2 — refuse the modes the driver does not stage.
+    // §5.1.4.2 — refuse the modes the driver does not stage. Slice
+    // Structured (Annex K) is *not* refused here: when its OPPTYPE bit
+    // is set the caller routes to the dedicated slice driver via the
+    // [`SliceStructuredRouting`] returned below.
     if opptype_sac
-        || opptype_slice_structured
         || opptype_independent_segment_decoding
         || opptype_alternative_inter_vlc
         || opptype_modified_quantization
@@ -1207,6 +1278,18 @@ fn plus_ptype_to_baseline_shim(
     {
         return Err(Error::NotImplemented);
     }
+
+    // §5.1.4.4 / §5.1.10 — the Slice-Structured submode bits (SSS) are
+    // present only on a UFEP=001 picture; resolve the routing the
+    // caller uses to pick the slice driver vs the GOB driver.
+    let slice_structured = if opptype_slice_structured {
+        Some(extended.plus.sss.unwrap_or(SliceStructuredSubmode {
+            rectangular: false,
+            arbitrary_order: false,
+        }))
+    } else {
+        None
+    };
 
     // §5.1.4.4 / §5.1.4.5: capture the AIC / DF bits separately. On
     // UFEP=001 they come from the just-parsed OPPTYPE; on UFEP=000 they
@@ -1318,7 +1401,7 @@ fn plus_ptype_to_baseline_shim(
         aic: options.aic || advanced_intra_effective,
     };
 
-    Ok((header, layout, options))
+    Ok((header, layout, options, slice_structured))
 }
 
 /// Decode the macroblock layers of a picture given an already-parsed
@@ -1492,9 +1575,298 @@ fn decode_after_picture_header(
                     current_quant,
                     mv,
                     mvs4,
+                    aic_segment,
                 );
             }
         }
+    }
+
+    if options.deblock {
+        apply_deblocking(&mut frame, &grid, &mb_quant, mb_cols, mb_rows_total);
+    }
+
+    Ok(frame)
+}
+
+/// `true` iff the reader is positioned (after discarding up to seven
+/// §K.2.1 SSTUF zero-bits) at the §K.2.2 Slice Start Code.
+///
+/// Annex K macroblock data is followed either by the end of the
+/// picture or by SSTUF + a byte-aligned 17-bit SSC. Because the §K.2
+/// emulation-prevention bits (SEPB1 / SEPB2 / SEPB3) guarantee no
+/// run of macroblock data can emulate an SSC, peeking for the start
+/// code is an unambiguous slice-boundary test. This is a *peek* — the
+/// reader position is restored on return regardless of the result, so
+/// the caller can decode one more macroblock when no boundary is
+/// present.
+///
+/// Returns `Ok(false)` when fewer than `SSTUF + SSC` bits remain (the
+/// final slice runs to the end of the buffer with no trailing SSC) or
+/// when the aligned 17-bit window is not [`SSC_VALUE`]. Returns
+/// [`Error::BadSliceStuffing`] if a non-zero SSTUF bit is encountered
+/// before the alignment boundary (a malformed stream).
+fn at_slice_boundary(reader: &BitReader<'_>) -> Result<bool> {
+    // [`BitReader`] is `Copy` and owns no heap state, so a by-value copy
+    // is a self-contained checkpoint: probing the clone leaves the
+    // caller's reader untouched (the documented checkpoint/restore
+    // pattern).
+    let mut probe = *reader;
+    // Discard SSTUF to the next byte boundary; if it carries a 1-bit
+    // this is not a (well-formed) slice boundary.
+    match skip_sstuf(&mut probe) {
+        Ok(_) => {}
+        Err(Error::BadSliceStuffing) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    if probe.bits_remaining() < u64::from(SSC_BITS) {
+        return Ok(false);
+    }
+    let word = probe.peek_u32(SSC_BITS).map_err(|_| Error::UnexpectedEof)?;
+    Ok(word == SSC_VALUE)
+}
+
+/// Decode an Annex K Slice-Structured picture given an already-parsed
+/// header and a `reader` positioned immediately after the picture
+/// header (at the first bit of the first slice's reduced header — the
+/// slice following the Picture Start Code carries no SSC, §K.2.2).
+///
+/// The driver supports the **free-running** (non-Rectangular-Slice)
+/// submode: each slice contains a run of macroblocks in picture
+/// scanning order beginning at the slice header's MBA field (§K.1
+/// "a slice contains a number of macroblocks in scanning order within
+/// the picture as a whole"), running until the next §K.2.2 SSC or the
+/// end of the bitstream. With Arbitrary Slice Ordering off (§K.1) the
+/// MBA fields are strictly increasing from slice to slice; the driver
+/// enforces that, and verifies the slices tile the picture exactly
+/// once.
+///
+/// Each slice is a fresh §6.1.1 / §I.3 "video picture segment": the
+/// motion-vector predictor and the Advanced-INTRA-Coding predictor
+/// treat a candidate macroblock in a different slice as unavailable
+/// (the §6.1.1 "outside the slice" rule, threaded through the
+/// per-macroblock `segment` id recorded on the grid).
+///
+/// # Errors
+///
+/// * [`Error::NotImplemented`] — the Rectangular Slice submode (the
+///   SWI field is present), an Advanced Prediction picture (the §F.3
+///   OBMC remote-vector slice-boundary exclusion is not staged by
+///   this driver), CPM (Annex C sub-bitstreams), Reduced-Resolution
+///   Update mode, a PB-frames picture, or an INTER picture with a
+///   `reference` of mismatched geometry.
+/// * [`Error::BadSliceCoverage`] — the slices overlapped, were not in
+///   strictly-increasing MBA order, or left a macroblock undecoded.
+/// * the union of the §K.2 slice-header and §5.3 macroblock-layer
+///   parser errors.
+#[allow(clippy::too_many_arguments)]
+fn decode_slice_structured_after_header(
+    reader: &mut BitReader<'_>,
+    header: &H263PictureHeader,
+    layout: &PictureLayout,
+    sss: SliceStructuredSubmode,
+    reference: Option<&YuvFrame>,
+    options: DecodeOptions,
+) -> Result<YuvFrame> {
+    // Header-signalled modes the slice driver does not stage. PB-frames
+    // and SAC never reach here (the slice routing in
+    // `decode_picture_layer_with_inherited` only fires for a non-PB
+    // PLUSPTYPE picture), but keep the guard explicit.
+    if header.sac_mode || header.pb_frames || header.advanced_prediction {
+        return Err(Error::NotImplemented);
+    }
+    // The Rectangular Slice submode changes the macroblock scan order
+    // (a slice tiles an SWI-wide rectangle rather than running in
+    // picture raster order); this driver stages the free-running form
+    // only. SWI presence is gated by `sss.rectangular` in the slice
+    // header, so refuse here rather than mis-walk the rectangle.
+    if sss.rectangular {
+        return Err(Error::NotImplemented);
+    }
+
+    let luma_w = layout.luma_width as usize;
+    let luma_h = layout.luma_height as usize;
+    let mb_cols = luma_w / 16;
+    let mb_rows_total = luma_h / 16;
+    let mb_count = mb_cols * mb_rows_total;
+    if mb_count == 0 {
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+    let chroma_w = luma_w / 2;
+    let chroma_h = luma_h / 2;
+
+    let is_inter_picture = matches!(header.coding_type, H263PictureCodingType::Inter);
+    if is_inter_picture {
+        match reference {
+            Some(r) if r.luma_width == luma_w && r.luma_height == luma_h => {}
+            _ => return Err(Error::NotImplemented),
+        }
+    }
+
+    let mut frame = YuvFrame {
+        y: vec![0u8; luma_w * luma_h],
+        cb: vec![0u8; chroma_w * chroma_h],
+        cr: vec![0u8; chroma_w * chroma_h],
+        luma_width: luma_w,
+        luma_height: luma_h,
+    };
+
+    let mut grid = vec![MbGridEntry::OUTSIDE; mb_count];
+    let mut mb_quant = vec![0u8; mb_count];
+    let mut aic_state = AicState::new(mb_cols, mb_rows_total);
+    // §K.1 coverage tracking: every macroblock must belong to exactly
+    // one slice.
+    let mut decoded = vec![false; mb_count];
+
+    // §5.1.19 — PQUANT. With PLUSPTYPE present the picture-header field
+    // order (Figure 6, part 1) places the 5-bit PQUANT immediately
+    // before the first video-segment layer (the optional scalability /
+    // RPS / RPR fields between PLUSPTYPE and PQUANT are absent for the
+    // INTRA / INTER baseline subset this driver decodes — CPM, RRU,
+    // PB-frames, AP and the Rectangular Slice submode are all refused
+    // above or by the routing layer). The slice that follows the
+    // Picture Start Code carries no SQUANT (§K.2.7), so PQUANT is the
+    // QUANT in force for its macroblocks until the first DQUANT.
+    let pquant = reader
+        .read_u32(SQUANT_BITS)
+        .map_err(|_| Error::UnexpectedEof)? as u8;
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::SliceMbaOutOfRange);
+    }
+
+    // Build the §K.2 slice-header context (free-running, CPM / RRU off
+    // — both refused by the routing layer).
+    let ctx = SliceHeaderContext::from_picture_layout(layout, Some(sss), false, false);
+
+    let mut slice_index: u32 = 0;
+    // §K.1 (ASO off): MBA strictly increases from slice to slice. Track
+    // the previous slice's MBA to enforce it.
+    let mut prev_mba: Option<u32> = None;
+
+    // The first slice after the Picture Start Code uses the reduced
+    // header form (no SSC / SSBI / SQUANT / GFID, §K.2.2 / §K.2.7); its
+    // QUANT is the picture-layer PQUANT just read.
+    let first = parse_first_slice_header(reader, &ctx)?;
+    let mut slice_mba = first.mba;
+    let mut slice_quant: u8 = pquant;
+
+    loop {
+        // §K.1: enforce strictly-increasing MBA (ASO off).
+        if let Some(p) = prev_mba {
+            if slice_mba <= p {
+                return Err(Error::BadSliceCoverage);
+            }
+        }
+        prev_mba = Some(slice_mba);
+        if slice_mba as usize >= mb_count {
+            return Err(Error::SliceMbaOutOfRange);
+        }
+
+        // Each slice opens a fresh §6.1.1 / §I.3 video picture segment.
+        let segment = slice_index;
+        let mut current_quant = slice_quant;
+        let mut mb_addr = slice_mba as usize;
+
+        // Walk macroblocks in picture scanning order until the next SSC
+        // or the end of the picture.
+        loop {
+            let col = mb_addr % mb_cols;
+            let row = mb_addr / mb_cols;
+
+            if decoded[mb_addr] {
+                // Overlap with an earlier slice — §K.1 forbids it.
+                return Err(Error::BadSliceCoverage);
+            }
+
+            // §5.3.2 MCBPC stuffing: skip until a real macroblock.
+            let mb = loop {
+                let mb = parse_macroblock(
+                    reader,
+                    MbContext {
+                        picture_coding_type: header.coding_type,
+                        advanced_prediction: header.advanced_prediction,
+                        aic_intra_mode: options.aic,
+                        pb_frames: header.pb_frames,
+                        quantiser_before: current_quant,
+                    },
+                )?;
+                if matches!(mb.mb_type, Some(MbType::Stuffing)) {
+                    continue;
+                }
+                break mb;
+            };
+
+            // The slice acts as a GOB whose header is present at its top
+            // row (the §6.1.1 rule-3 border), but the per-segment grid
+            // check is what actually enforces the cross-slice
+            // unavailability; pass `gob_top_row = row` so a same-segment
+            // above neighbour inside the slice is still consulted and
+            // `gob_header_present = false` to leave the border decision
+            // entirely to the segment id.
+            let (mv, mvs4) = decode_one_macroblock(
+                reader,
+                &mb,
+                reference,
+                &mut frame,
+                &grid,
+                mb_cols,
+                mb_rows_total,
+                col,
+                row,
+                row,
+                false,
+                header.umv_mode,
+                header.advanced_prediction,
+                false,
+                &mut current_quant,
+                options,
+                &mut aic_state,
+                segment,
+            )?;
+            record_grid(
+                &mut grid,
+                &mut mb_quant,
+                mb_cols,
+                col,
+                row,
+                &mb,
+                current_quant,
+                mv,
+                mvs4,
+                segment,
+            );
+            decoded[mb_addr] = true;
+
+            mb_addr += 1;
+            if mb_addr >= mb_count {
+                // Reached the bottom-right macroblock; no more slices.
+                // Any trailing SSTUF / EOS is the picture-layer's
+                // concern.
+                break;
+            }
+            // A slice boundary (next SSC) ends this slice.
+            if at_slice_boundary(&*reader)? {
+                break;
+            }
+        }
+
+        if mb_addr >= mb_count {
+            break;
+        }
+
+        // Consume the next slice header. Discard SSTUF, read the full
+        // §K.2 slice header (SSC + SEPB1 + MBA + (SEPB2?) + SQUANT +
+        // SEPB3 + GFID — SSBI absent because CPM is off, SWI absent
+        // because RS is off).
+        skip_sstuf(reader)?;
+        let next = parse_slice_layer(reader, &ctx)?;
+        slice_index += 1;
+        slice_mba = next.mba;
+        slice_quant = next.squant;
+    }
+
+    // §K.1 — every macroblock must belong to exactly one slice.
+    if decoded.iter().any(|d| !d) {
+        return Err(Error::BadSliceCoverage);
     }
 
     if options.deblock {
@@ -1523,6 +1895,7 @@ fn record_grid(
     quant: u8,
     mv: MotionVector,
     mvs4: Mb4Mv,
+    segment: u32,
 ) {
     let idx = row * mb_cols + col;
     grid[idx] = MbGridEntry {
@@ -1530,6 +1903,7 @@ fn record_grid(
         not_coded: !mb.coded,
         mv,
         mvs4,
+        segment,
     };
     mb_quant[idx] = quant;
 }
@@ -1701,6 +2075,7 @@ fn decode_one_macroblock(
                 gob_top_row,
                 gob_header_present,
                 pb_mode,
+                aic_segment,
             );
             let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
             if umv_mode {
@@ -1728,6 +2103,7 @@ fn decode_one_macroblock(
         gob_top_row,
         gob_header_present,
         pb_mode,
+        aic_segment,
     );
     let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
     let luma_mv = if umv_mode {
@@ -2712,7 +3088,7 @@ mod tests {
     #[test]
     fn predict_top_left_is_zero() {
         let grid = grid_with(11, 9);
-        let p = predict_mv(&grid, 11, 0, 0, 0, true, false);
+        let p = predict_mv(&grid, 11, 0, 0, 0, true, false, 0);
         assert_eq!(p, MotionVector::new(0, 0));
     }
 
@@ -2726,10 +3102,11 @@ mod tests {
             not_coded: false,
             mv: MotionVector::new(6, -4),
             mvs4: [MotionVector::new(6, -4); 4],
+            segment: 0,
         };
         // MB (1, 0): MV1 = grid[0] = (6,-4); top border so MV2=MV3=MV1.
         // median = (6,-4).
-        let p = predict_mv(&grid, 11, 1, 0, 0, true, false);
+        let p = predict_mv(&grid, 11, 1, 0, 0, true, false, 0);
         assert_eq!(p, MotionVector::new(6, -4));
     }
 
@@ -2742,8 +3119,9 @@ mod tests {
             not_coded: false,
             mv: MotionVector::new(10, 10), // ignored because intra
             mvs4: [MotionVector::new(10, 10); 4],
+            segment: 0,
         };
-        let p = predict_mv(&grid, 11, 1, 0, 0, true, false);
+        let p = predict_mv(&grid, 11, 1, 0, 0, true, false, 0);
         assert_eq!(p, MotionVector::new(0, 0));
     }
 
@@ -2757,13 +3135,14 @@ mod tests {
                 not_coded: false,
                 mv: MotionVector::new(dx, dy),
                 mvs4: [MotionVector::new(dx, dy); 4],
+                segment: 0,
             };
         };
         // current MB at (2, 1): MV1=(1,2) left=(1,1)? careful with idx.
         set(&mut grid, 1, 1, 2, 2); // left  (col-1,row)
         set(&mut grid, 2, 0, 8, -2); // above (col,row-1)
         set(&mut grid, 3, 0, -4, 6); // above-right (col+1,row-1)
-        let p = predict_mv(&grid, 11, 2, 1, 0, false, false);
+        let p = predict_mv(&grid, 11, 2, 1, 0, false, false, 0);
         // medians: dx median(2,8,-4)=2; dy median(2,-2,6)=2.
         assert_eq!(p, MotionVector::new(2, 2));
     }
@@ -2779,13 +3158,14 @@ mod tests {
                 not_coded: false,
                 mv: MotionVector::new(dx, dy),
                 mvs4: [MotionVector::new(dx, dy); 4],
+                segment: 0,
             };
         };
         // current MB at the rightmost column (10, 1).
         set(&mut grid, 9, 1, 10, 10); // left
         set(&mut grid, 10, 0, 20, 20); // above
                                        // above-right (11,0) is outside -> rule 4 zero.
-        let p = predict_mv(&grid, 11, 10, 1, 0, false, false);
+        let p = predict_mv(&grid, 11, 10, 1, 0, false, false, 0);
         // candidates: MV1=(10,10), MV2=(20,20), MV3=(0,0).
         // median dx of (10,20,0)=10; dy=10.
         assert_eq!(p, MotionVector::new(10, 10));
@@ -3690,6 +4070,7 @@ mod tests {
             not_coded: false,
             mv: MotionVector::new(8, 8),
             mvs4: [MotionVector::new(8, 8); 4],
+            segment: 0,
         });
         let (r_top, r_bot, _s_left, _s_right) = classify_remote_mvs(
             LumaBlockIndex::B3,
@@ -3719,6 +4100,7 @@ mod tests {
             not_coded: true,
             mv: MotionVector::new(0, 0),
             mvs4: [MotionVector::new(0, 0); 4],
+            segment: 0,
         });
         let (_r_top, _r_bot, s_left, _s_right) = classify_remote_mvs(
             LumaBlockIndex::B1,
@@ -3745,6 +4127,7 @@ mod tests {
             not_coded: false,
             mv: MotionVector::new(0, 0),
             mvs4: [MotionVector::new(0, 0); 4],
+            segment: 0,
         });
         let (r_top, _r_bot, _s_left, _s_right) = classify_remote_mvs(
             LumaBlockIndex::B1,
@@ -3772,6 +4155,7 @@ mod tests {
             not_coded: false,
             mv: MotionVector::new(5, 5),
             mvs4: [MotionVector::new(5, 5); 4],
+            segment: 0,
         };
         // Current MB at (1, 1); left = (0, 1) which is INTRA.
         let n = build_4mv_neighbourhood(&grid, mb_cols, 1, 1);
@@ -3795,6 +4179,7 @@ mod tests {
             not_coded: false,
             mv: mvs[0],
             mvs4: mvs,
+            segment: 0,
         };
         let n = build_4mv_neighbourhood(&grid, mb_cols, 1, 1);
         assert_eq!(n.left, Some(mvs));
@@ -4492,12 +4877,14 @@ mod tests {
         assert!(matches!(r, Err(Error::NotImplemented)));
     }
 
-    /// Slice-Structured mode (OPPTYPE bit 10) is refused with
-    /// `NotImplemented` — the §K.2 slice-layer parser lands per
-    /// macroblock-row rather than per GOB, and the GOB-walker the
-    /// driver runs would mis-frame.
+    /// Slice-Structured mode with the Rectangular Slice submode (SSS
+    /// bit `rectangular = 1`) is refused with `NotImplemented` — the
+    /// free-running slice driver stages picture-raster scan order only;
+    /// the rectangular-region scan order is out of scope for this
+    /// round. The refusal fires before any slice data is read, so the
+    /// stream may stop right after the SSS field.
     #[test]
-    fn decode_picture_layer_plus_refuses_slice_structured() {
+    fn decode_picture_layer_plus_refuses_rectangular_slice() {
         let mut w = BitWriter::new();
         w.write_u32(PSC_VALUE, PSC_BITS);
         w.write_u32(0, 8);
@@ -4530,13 +4917,359 @@ mod tests {
         w.write_bit(false);
         w.write_bit(true);
         w.write_bit(false); // CPM
-                            // §5.1.10 SSS (2 bits) follows because SS is on. Add it so
-                            // parse_plus_ptype succeeds — the shim's NotImplemented
-                            // refusal is the test's actual subject.
-        w.write_u32(0b00, 2);
+                            // §5.1.10 SSS (2 bits): bit `rectangular = 1`,
+                            // `arbitrary_order = 0` ⇒ raw `0b10`.
+        w.write_u32(0b10, 2);
         let data = w.finish();
         let r = decode_picture_layer(&data, None, DecodeOptions::default());
         assert!(matches!(r, Err(Error::NotImplemented)));
+    }
+
+    // ---- Annex K Slice-Structured end-to-end decode ----------------
+
+    use crate::slice_header::{GFID_BITS as K_GFID_BITS, SEPB_BITS};
+
+    /// Write a QCIF PLUSPTYPE INTRA picture-layer header with the
+    /// OPPTYPE Slice-Structured bit (bit 10) set and a free-running SSS
+    /// field (`rectangular = 0`, `arbitrary_order = 0`). UFEP=001, every
+    /// other mode off, CPM off, RRU off. The reader is left positioned
+    /// at the first bit of PQUANT (which the slice driver reads, then
+    /// the first slice's reduced header).
+    fn write_qcif_ss_intra_header(w: &mut BitWriter) {
+        // §5.1.1 / §5.1.2 — PSC + TR.
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+                           // §5.1.3 PTYPE bits 1-2 = "10".
+        w.write_bit(true);
+        w.write_bit(false);
+        // PTYPE bits 3-5: split-screen / doc-camera / freeze off.
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        // PTYPE bits 6-8 = "111" → extended PTYPE.
+        w.write_u32(0b111, 3);
+        // §5.1.4.1 — UFEP = "001".
+        w.write_u32(0b001, 3);
+        // §5.1.4.2 — OPPTYPE (18 bits). Source = "010" (QCIF).
+        w.write_u32(0b010, 3);
+        // Bits 4-9 off (custom_pcf / umv / sac / ap / aic / deblock).
+        for _ in 0..6 {
+            w.write_bit(false);
+        }
+        // Bit 10 — Slice Structured = 1.
+        w.write_bit(true);
+        // Bits 11-14 off (rps / isd / alt-inter / mod-quant).
+        for _ in 0..4 {
+            w.write_bit(false);
+        }
+        // Bit 15 SCE-guard = 1; bits 16-18 reserved = "000".
+        w.write_bit(true);
+        w.write_u32(0b000, 3);
+        // §5.1.4.3 — MPPTYPE (9 bits): INTRA (000), RPR/RRU/RTYPE off,
+        // reserved 0,0, SCE-guard bit 9 = 1.
+        w.write_u32(0b000, 3);
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+                           // §5.1.20 — CPM = 0.
+        w.write_bit(false);
+        // §5.1.10 — SSS (2 bits): rectangular = 0, arbitrary_order = 0.
+        w.write_u32(0b00, 2);
+    }
+
+    /// Emit one DC-only INTRA macroblock (MCBPC = `1` → type INTRA,
+    /// CBPC 00; CBPY = `0011` → no luma AC; six 8-bit INTRADC FLCs).
+    fn write_intra_dc_mb(w: &mut BitWriter, dc_byte: u32) {
+        w.write_bit(true); // MCBPC `1`
+        w.write_bit(false); // CBPY `0011`
+        w.write_bit(false);
+        w.write_bit(true);
+        w.write_bit(true);
+        for _ in 0..6 {
+            w.write_u32(dc_byte, 8);
+        }
+    }
+
+    /// Build a QCIF Slice-Structured INTRA picture whose **single**
+    /// free-running slice (MBA 0) covers all 99 macroblocks, each a
+    /// DC-only INTRA MB with INTRADC = `dc_byte`. PQUANT = 8.
+    fn build_qcif_ss_single_slice_intra(dc_byte: u32) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        write_qcif_ss_intra_header(&mut w);
+        // §5.1.19 — PQUANT (5 bits) = 8.
+        w.write_u32(8, SQUANT_BITS);
+        // First slice reduced header: SEPB1=1, MBA=0 (7 bits), SEPB3=1.
+        w.write_u32(1, SEPB_BITS);
+        w.write_u32(0, 7); // MBA
+        w.write_u32(1, SEPB_BITS); // SEPB3
+                                   // 99 INTRA DC macroblocks in raster order.
+        for _ in 0..99 {
+            write_intra_dc_mb(&mut w, dc_byte);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// A single-slice QCIF Slice-Structured INTRA picture decodes to a
+    /// uniform frame, bit-identical to the GOB-layer equivalent.
+    #[test]
+    fn decode_qcif_ss_single_slice_intra_uniform() {
+        let data = build_qcif_ss_single_slice_intra(0x10);
+        let frame = decode_picture_layer(&data, None, DecodeOptions::default())
+            .expect("slice-structured decode");
+        assert_eq!(frame.luma_width, 176);
+        assert_eq!(frame.luma_height, 144);
+        // INTRADC 0x10 → level 128 → 16 per pixel everywhere.
+        assert!(frame.y.iter().all(|&p| p == 16), "luma not uniform 16");
+        assert!(frame.cb.iter().all(|&p| p == 16), "cb not uniform 16");
+        assert!(frame.cr.iter().all(|&p| p == 16), "cr not uniform 16");
+        // Same pixels as the baseline GOB path produces for the same
+        // INTRADC.
+        let gob = decode_picture(
+            &build_qcif_intra_dc_picture(0x10),
+            None,
+            DecodeOptions::default(),
+        )
+        .expect("gob decode");
+        assert_eq!(frame.y, gob.y);
+        assert_eq!(frame.cb, gob.cb);
+        assert_eq!(frame.cr, gob.cr);
+    }
+
+    /// Build a QCIF Slice-Structured INTRA picture split into **two**
+    /// free-running slices: slice 0 (MBA 0) covers the first `split`
+    /// macroblocks, slice 1 (MBA = `split`) covers the rest. Slice 0
+    /// uses PQUANT; slice 1 carries its own SQUANT. Both encode the
+    /// same DC-only INTRA MBs.
+    fn build_qcif_ss_two_slice_intra(dc_byte: u32, split: u32) -> Vec<u8> {
+        assert!((1..99).contains(&split));
+        let mut w = BitWriter::new();
+        write_qcif_ss_intra_header(&mut w);
+        w.write_u32(8, SQUANT_BITS); // PQUANT = 8
+                                     // Slice 0 reduced header (MBA 0).
+        w.write_u32(1, SEPB_BITS);
+        w.write_u32(0, 7);
+        w.write_u32(1, SEPB_BITS);
+        for _ in 0..split {
+            write_intra_dc_mb(&mut w, dc_byte);
+        }
+        // Slice 1: SSTUF to byte-align, then SSC (byte aligned), full
+        // §K.2 header (no SSBI: CPM off; no SWI: RS off).
+        while !w.is_byte_aligned() {
+            w.write_bit(false); // SSTUF zero-bit
+        }
+        w.write_u32(SSC_VALUE, SSC_BITS); // SSC = 0x0001 (17 bits)
+        w.write_u32(1, SEPB_BITS); // SEPB1
+        w.write_u32(split, 7); // MBA
+        w.write_u32(8, SQUANT_BITS); // SQUANT = 8
+        w.write_u32(1, SEPB_BITS); // SEPB3
+        w.write_u32(0, K_GFID_BITS); // GFID
+        for _ in split..99 {
+            write_intra_dc_mb(&mut w, dc_byte);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// A two-slice QCIF Slice-Structured INTRA picture decodes to the
+    /// same uniform frame as the single-slice form: the §K.2.2 SSC
+    /// boundary detection ends slice 0 at the right macroblock and the
+    /// second slice's §K.2 header re-anchors at MBA = `split`.
+    #[test]
+    fn decode_qcif_ss_two_slice_intra_matches_single() {
+        let two = build_qcif_ss_two_slice_intra(0x10, 40);
+        let frame =
+            decode_picture_layer(&two, None, DecodeOptions::default()).expect("two-slice decode");
+        assert!(frame.y.iter().all(|&p| p == 16));
+        assert!(frame.cb.iter().all(|&p| p == 16));
+        let single = decode_picture_layer(
+            &build_qcif_ss_single_slice_intra(0x10),
+            None,
+            DecodeOptions::default(),
+        )
+        .expect("single-slice decode");
+        assert_eq!(frame.y, single.y);
+        assert_eq!(frame.cb, single.cb);
+        assert_eq!(frame.cr, single.cr);
+    }
+
+    /// A slice whose MBA is not strictly greater than the previous
+    /// slice's MBA (ASO off, §K.1) is rejected with `BadSliceCoverage`.
+    #[test]
+    fn decode_qcif_ss_non_increasing_mba_rejected() {
+        // Slice 1 re-uses MBA 0 (== slice 0's MBA): the strictly-
+        // increasing invariant fails.
+        let mut w = BitWriter::new();
+        write_qcif_ss_intra_header(&mut w);
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        w.write_u32(1, SEPB_BITS); // slice 0 SEPB1
+        w.write_u32(0, 7); // slice 0 MBA = 0
+        w.write_u32(1, SEPB_BITS); // SEPB3
+        write_intra_dc_mb(&mut w, 0x10); // one MB
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.write_u32(SSC_VALUE, SSC_BITS);
+        w.write_u32(1, SEPB_BITS);
+        w.write_u32(0, 7); // MBA = 0 again (not > 0)
+        w.write_u32(8, SQUANT_BITS);
+        w.write_u32(1, SEPB_BITS);
+        w.write_u32(0, K_GFID_BITS);
+        write_intra_dc_mb(&mut w, 0x10);
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let r = decode_picture_layer(&data, None, DecodeOptions::default());
+        assert!(matches!(r, Err(Error::BadSliceCoverage)));
+    }
+
+    /// A picture whose slices leave some macroblock undecoded (the
+    /// final slice stops short of the bottom-right MB) is rejected with
+    /// `BadSliceCoverage` per the §K.1 exact-tiling invariant.
+    #[test]
+    fn decode_qcif_ss_incomplete_coverage_rejected() {
+        // Single slice covering only 50 of 99 macroblocks, then EOF.
+        let mut w = BitWriter::new();
+        write_qcif_ss_intra_header(&mut w);
+        w.write_u32(8, SQUANT_BITS);
+        w.write_u32(1, SEPB_BITS);
+        w.write_u32(0, 7);
+        w.write_u32(1, SEPB_BITS);
+        for _ in 0..50 {
+            write_intra_dc_mb(&mut w, 0x10);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let r = decode_picture_layer(&data, None, DecodeOptions::default());
+        // The driver reaches EOF after slice 0 (no SSC) with MB 50..99
+        // undecoded → coverage failure (or a parse EOF if the trailing
+        // stuffing is read as a macroblock — both are decode errors).
+        assert!(r.is_err());
+        if let Err(e) = r {
+            assert!(
+                matches!(e, Error::BadSliceCoverage | Error::UnexpectedEof),
+                "unexpected error {e:?}"
+            );
+        }
+    }
+
+    /// Write a QCIF Slice-Structured PLUSPTYPE **INTER** picture-layer
+    /// header (MPPTYPE picture-type = INTER `001`, every mode off). The
+    /// reader is left at the first bit of PQUANT.
+    fn write_qcif_ss_inter_header(w: &mut BitWriter) {
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true); // PTYPE bit1
+        w.write_bit(false); // bit2
+        w.write_bit(false); // split
+        w.write_bit(false); // doc-cam
+        w.write_bit(false); // freeze
+        w.write_u32(0b111, 3); // extended PTYPE
+        w.write_u32(0b001, 3); // UFEP = 001
+                               // OPPTYPE: source QCIF + SS bit 10 set, rest off.
+        w.write_u32(0b010, 3);
+        for _ in 0..6 {
+            w.write_bit(false);
+        }
+        w.write_bit(true); // bit 10 — SS
+        for _ in 0..4 {
+            w.write_bit(false);
+        }
+        w.write_bit(true); // bit 15 SCE-guard
+        w.write_u32(0b000, 3); // bits 16-18
+                               // MPPTYPE: INTER (001).
+        w.write_u32(0b001, 3);
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+        w.write_bit(false); // CPM
+        w.write_u32(0b00, 2); // SSS: free-running
+    }
+
+    /// An all-skipped QCIF Slice-Structured INTER picture copies the
+    /// reference frame exactly (every macroblock COD = 1, zero MV),
+    /// proving the slice driver drives INTER macroblock decoding within
+    /// slices.
+    #[test]
+    fn decode_qcif_ss_inter_all_skipped_copies_reference() {
+        let reference = ramp_reference(176, 144);
+        let mut w = BitWriter::new();
+        write_qcif_ss_inter_header(&mut w);
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        w.write_u32(1, SEPB_BITS); // slice 0 SEPB1
+        w.write_u32(0, 7); // MBA 0
+        w.write_u32(1, SEPB_BITS); // SEPB3
+        for _ in 0..99 {
+            write_skipped_mb(&mut w); // COD = 1
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let frame = decode_picture_layer(&data, Some(&reference), DecodeOptions::default())
+            .expect("ss inter decode");
+        assert_eq!(frame.y, reference.y);
+        assert_eq!(frame.cb, reference.cb);
+        assert_eq!(frame.cr, reference.cr);
+    }
+
+    /// Two-slice INTER picture with a coded zero-MVD macroblock at the
+    /// head of slice 1. Because slice 1 is a fresh §6.1.1 video picture
+    /// segment, the MB's left/above neighbours (in slice 0) are
+    /// "outside the slice": the predictor is zero, so MVD = (0, 0)
+    /// reconstructs to a zero motion vector and the MB copies the
+    /// co-located reference — identical to the all-skipped result.
+    #[test]
+    fn decode_qcif_ss_inter_two_slice_coded_head_zero_mv() {
+        let reference = ramp_reference(176, 144);
+        let split = 40u32;
+        let mut w = BitWriter::new();
+        write_qcif_ss_inter_header(&mut w);
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        w.write_u32(1, SEPB_BITS); // slice 0 SEPB1
+        w.write_u32(0, 7); // MBA 0
+        w.write_u32(1, SEPB_BITS); // SEPB3
+        for _ in 0..split {
+            write_skipped_mb(&mut w);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.write_u32(SSC_VALUE, SSC_BITS); // SSC
+        w.write_u32(1, SEPB_BITS); // SEPB1
+        w.write_u32(split, 7); // MBA
+        w.write_u32(8, SQUANT_BITS); // SQUANT
+        w.write_u32(1, SEPB_BITS); // SEPB3
+        w.write_u32(0, K_GFID_BITS); // GFID
+                                     // Slice 1 head: one coded INTER MB with MVD = (0,0), then
+                                     // the rest skipped.
+        write_inter_single_mv_zero(&mut w);
+        for _ in (split + 1)..99 {
+            write_skipped_mb(&mut w);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let frame = decode_picture_layer(&data, Some(&reference), DecodeOptions::default())
+            .expect("ss inter two-slice decode");
+        // Zero reconstructed MV everywhere → exact reference copy.
+        assert_eq!(frame.y, reference.y);
+        assert_eq!(frame.cb, reference.cb);
+        assert_eq!(frame.cr, reference.cr);
     }
 
     /// Write a PLUSPTYPE INTRA picture-layer header with the OPPTYPE

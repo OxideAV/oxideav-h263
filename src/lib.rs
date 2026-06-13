@@ -399,6 +399,13 @@ pub enum Error {
     /// (the §G.4 vector scaling divides by TRD, which is undefined
     /// when the two pictures are co-timed).
     BadPbTemporalReference,
+    /// An Annex K Slice-Structured picture violated the §K.1 coverage
+    /// invariant: the decoded slices did not tile the picture exactly
+    /// once. Either a slice's macroblocks overlapped a macroblock
+    /// already decoded by an earlier slice, the slice headers were not
+    /// in strictly-increasing MBA order (ASO off, §K.1), or after the
+    /// final slice some macroblock of the picture remained undecoded.
+    BadSliceCoverage,
 }
 
 impl core::fmt::Display for Error {
@@ -505,6 +512,10 @@ impl core::fmt::Display for Error {
             Error::BadPbTemporalReference => write!(
                 f,
                 "oxideav-h263: PB-frame temporal reference unusable (TRB = 0 or TRD = 0)"
+            ),
+            Error::BadSliceCoverage => write!(
+                f,
+                "oxideav-h263: Annex K slices did not tile the picture exactly once (overlap, MBA order, or gap)"
             ),
         }
     }
