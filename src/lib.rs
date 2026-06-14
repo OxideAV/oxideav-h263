@@ -212,6 +212,7 @@ use oxideav_core::RuntimeContext;
 pub mod aic;
 pub mod aic_dequant;
 pub mod aic_predict;
+pub mod annex_t;
 pub mod block;
 pub mod block_aic;
 pub mod deblock;
@@ -239,6 +240,7 @@ pub use aic_predict::{
     aic_intra_reconstruct_coefficients, aic_intra_reconstruct_samples, reconstruct_intra_block_aic,
     Neighbour, AIC_FALLBACK_DC_PREDICTOR,
 };
+pub use annex_t::{parse_modified_dquant, quant_c_from_quant, ModifiedDquant};
 pub use block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
 pub use block_aic::parse_intra_block_aic;
 pub use deblock::{

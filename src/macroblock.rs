@@ -144,6 +144,18 @@ pub struct MbContext {
     /// compute [`H263Macroblock::quantiser_after`] after any
     /// DQUANT differential.
     pub quantiser_before: u8,
+    /// PLUSPTYPE OPPTYPE bit 14 — Modified Quantization mode
+    /// (Annex T). When `true`, the §5.3.6 DQUANT field is the §T.2
+    /// variable-length form (two- or six-bit, parsed by
+    /// [`crate::annex_t::parse_modified_dquant`]) instead of the
+    /// baseline 2-bit Table 13 differential. The resulting
+    /// [`H263Macroblock::quantiser_after`] is the §T.2 / Table T.1 /
+    /// §T.2.2 new QUANT directly; [`H263Macroblock::dquant`] carries
+    /// the signed change (`new − prior`) for callers that track the
+    /// differential. The §T.3 chrominance `QUANT_C` derivation
+    /// ([`crate::annex_t::quant_c_from_quant`]) is applied by the
+    /// dequant stage, not the parser.
+    pub modified_quant: bool,
 }
 
 /// Macroblock type from MCBPC (§5.3.2, Tables 7-9).
@@ -400,19 +412,30 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
     // §5.3.5 — CBPY (variable length, Table 12).
     let cbpy = decode_cbpy(reader)?;
 
-    // §5.3.6 — DQUANT (2 bits, baseline Table 13). Annex-T not
-    // handled in round 3.
+    // §5.3.6 — DQUANT. Two forms: the baseline 2-bit Table 13
+    // differential, or — when Modified Quantization mode (Annex T)
+    // is in use — the §T.2 variable-length form (two- or six-bit)
+    // parsed by [`crate::annex_t::parse_modified_dquant`].
     let (dquant, quantiser_after) = if mb_type.has_dquant() {
-        let raw = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)?;
-        let diff = match raw {
-            0b00 => -1,
-            0b01 => -2,
-            0b10 => 1,
-            0b11 => 2,
-            _ => unreachable!("read_u32(2) <= 3"),
-        };
-        let next = (ctx.quantiser_before as i16 + diff as i16).clamp(1, 31) as u8;
-        (Some(diff), next)
+        if ctx.modified_quant {
+            // §T.2 — the field directly yields the new QUANT; carry
+            // the signed change (new − prior) on `dquant` for
+            // differential-tracking callers.
+            let md = crate::annex_t::parse_modified_dquant(reader, ctx.quantiser_before)?;
+            let diff = md.new_quant as i16 - ctx.quantiser_before as i16;
+            (Some(diff as i8), md.new_quant)
+        } else {
+            let raw = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)?;
+            let diff = match raw {
+                0b00 => -1,
+                0b01 => -2,
+                0b10 => 1,
+                0b11 => 2,
+                _ => unreachable!("read_u32(2) <= 3"),
+            };
+            let next = (ctx.quantiser_before as i16 + diff as i16).clamp(1, 31) as u8;
+            (Some(diff), next)
+        }
     } else {
         (None, ctx.quantiser_before)
     };
@@ -878,6 +901,7 @@ mod tests {
             pb_frames: false,
             pb_annex_m: false,
             quantiser_before: q,
+            modified_quant: false,
         }
     }
 
@@ -889,6 +913,7 @@ mod tests {
             pb_frames: false,
             pb_annex_m: false,
             quantiser_before: q,
+            modified_quant: false,
         }
     }
 
@@ -958,6 +983,67 @@ mod tests {
         let mb = parse_macroblock(&mut r, intra_picture_ctx(2)).expect("parse");
         assert_eq!(mb.dquant, Some(-2));
         assert_eq!(mb.quantiser_after, 1);
+    }
+
+    /// Annex T (§T.2.1) Modified Quantization mode: an INTRA+Q
+    /// macroblock whose DQUANT is the small-step codeword `"11"`
+    /// resolves the new QUANT through Table T.1 (prior 11 → +2 → 13),
+    /// not the baseline 2-bit differential, and consumes only 2 bits.
+    #[test]
+    fn intra_picture_modified_quant_small_step() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b0001, 4); // MCBPC idx 4 (type 4 / cbpc 00)
+        w.write_u32(0b11, 2); // CBPY 1111
+        w.write_u32(0b11, 2); // §T.2.1 DQUANT "11"
+        let bytes = finish_aligned(w);
+
+        let mut ctx = intra_picture_ctx(11);
+        ctx.modified_quant = true;
+        let mut r = BitReader::new(&bytes);
+        let mb = parse_macroblock(&mut r, ctx).expect("parse");
+        assert_eq!(mb.mb_type, Some(MbType::IntraQ));
+        // Table T.1: prior 11, "11" → +2 → new QUANT 13.
+        assert_eq!(mb.quantiser_after, 13);
+        assert_eq!(mb.dquant, Some(2));
+    }
+
+    /// Annex T (§T.2.2) Modified Quantization mode: the arbitrary-
+    /// selection DQUANT form (`0` + 5 bits) sets a brand-new QUANT
+    /// directly, independent of the prior QUANT, consuming 6 bits.
+    #[test]
+    fn intra_picture_modified_quant_arbitrary() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b0001, 4); // MCBPC idx 4
+        w.write_u32(0b11, 2); // CBPY 1111
+        w.write_u32(0b0_01111, 6); // §T.2.2 "001111" → new QUANT 15
+        let bytes = finish_aligned(w);
+
+        let mut ctx = intra_picture_ctx(2);
+        ctx.modified_quant = true;
+        let mut r = BitReader::new(&bytes);
+        let mb = parse_macroblock(&mut r, ctx).expect("parse");
+        assert_eq!(mb.quantiser_after, 15);
+        // Signed change carried on dquant: 15 − 2 = +13.
+        assert_eq!(mb.dquant, Some(13));
+    }
+
+    /// The Modified Quantization flag only changes DQUANT decoding for
+    /// MB types that actually carry DQUANT; a plain INTRA macroblock
+    /// (no DQUANT) is unaffected and keeps the GOB QUANT.
+    #[test]
+    fn modified_quant_flag_inert_without_dquant() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b1, 1); // MCBPC "1" (idx 0, type 3 / cbpc 00)
+        w.write_u32(0b0011, 4); // CBPY 0000
+        let bytes = finish_aligned(w);
+
+        let mut ctx = intra_picture_ctx(8);
+        ctx.modified_quant = true;
+        let mut r = BitReader::new(&bytes);
+        let mb = parse_macroblock(&mut r, ctx).expect("parse");
+        assert_eq!(mb.mb_type, Some(MbType::Intra));
+        assert_eq!(mb.dquant, None);
+        assert_eq!(mb.quantiser_after, 8);
     }
 
     /// I-picture, INTRA+Q MB, DQUANT differential +2 clamps QUANT
@@ -1518,6 +1604,7 @@ mod tests {
                 pb_frames: false,
                 pb_annex_m: false,
                 quantiser_before: gob.quantiser,
+                modified_quant: false,
             },
         )
         .expect("mb");
@@ -1536,6 +1623,7 @@ mod tests {
             pb_frames: true,
             pb_annex_m: false,
             quantiser_before: q,
+            modified_quant: false,
         }
     }
 
@@ -1549,6 +1637,7 @@ mod tests {
             pb_frames: true,
             pb_annex_m: true,
             quantiser_before: q,
+            modified_quant: false,
         }
     }
 

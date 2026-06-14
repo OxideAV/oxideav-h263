@@ -989,6 +989,7 @@ mod tests {
                 pb_frames: false,
                 pb_annex_m: false,
                 quantiser_before: gob.quantiser,
+                modified_quant: false,
             },
         )
         .expect("mb");

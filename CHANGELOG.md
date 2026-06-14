@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex T Modified Quantization mode — §T.2 Modified DQUANT + §T.3
+  chrominance QUANT_C (round 302):
+  - New `annex_t` module. `parse_modified_dquant(reader, prior_quant)
+    -> Result<ModifiedDquant>` decodes the §T.2 variable-length DQUANT
+    field: the §T.2.1 small-step form (first bit `1` + one more bit →
+    Table T.1 lookup of the new QUANT from the prior QUANT, two bits
+    total) and the §T.2.2 arbitrary-selection form (first bit `0` +
+    five bits → a brand-new QUANT directly per §5.1.19, six bits
+    total; a five-bit value of `0` is rejected). `ModifiedDquant`
+    carries the new QUANT and the bit count consumed.
+  - `quant_c_from_quant(quant) -> Result<u8>` implements the §T.3 /
+    Table T.2 chrominance quantiser derivation (the smaller chroma
+    step size used for inverse-quantising chrominance coefficients,
+    and the Annex J chrominance deblocking filter, when MQ is in use).
+  - `MbContext::modified_quant` flag: when set, the §5.3.6 DQUANT field
+    in `parse_macroblock` is parsed via `parse_modified_dquant` instead
+    of the baseline 2-bit Table 13 differential.
+    `H263Macroblock::quantiser_after` becomes the §T.2 new QUANT and
+    `dquant` carries the signed change (`new − prior`).
+  - Out of scope (reported, not guessed): the §T.4 EXTENDED-ESCAPE /
+    EXTENDED-LEVEL coefficient-range extension (it belongs in the
+    §5.4.2 TCOEF VLC layer) and the §T.5 encoder usage restrictions.
+  - 21 new tests (`cargo test -p oxideav-h263`: 557, was 536).
+
 - Annex M Improved PB-frames mode end-to-end decode (round 295):
   - `decode_improved_pb_picture(data, reference, prev_tr, options) ->
     Result<PbFramePair>` new public entry point in `picture.rs`. It

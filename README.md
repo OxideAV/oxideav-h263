@@ -5,6 +5,52 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 38 (workspace round 302) — Annex T Modified Quantization mode:
+§T.2 Modified DQUANT + §T.3 chrominance QUANT_C. The §5.3.6 DQUANT
+field, previously decodable only as the baseline 2-bit Table 13
+differential, now also decodes its Annex T variable-length form when
+Modified Quantization mode is in use, and the §T.3 chrominance
+quantiser is derived from the luminance QUANT.**
+
+* New `annex_t` module. `parse_modified_dquant(reader, prior_quant) ->
+  Result<ModifiedDquant>` decodes the §T.2 variable-length DQUANT
+  field, selected by its first bit: the §T.2.1 small-step form (first
+  bit `1` + one more bit, looked up in Table T.1 against the prior
+  QUANT to give the new QUANT — two bits total) and the §T.2.2
+  arbitrary-selection form (first bit `0` + five bits giving a
+  brand-new QUANT directly per §5.1.19 — six bits total; a five-bit
+  value of `0` is rejected per the §5.1.19 `1..=31` range).
+  `ModifiedDquant` reports the new QUANT and the bit count consumed.
+* `quant_c_from_quant(quant) -> Result<u8>` implements the §T.3 /
+  Table T.2 chrominance quantiser `QUANT_C` derivation — the smaller
+  chroma step size used to inverse-quantise chrominance coefficients
+  (and, per §T.3, the Annex J chrominance deblocking filter) whenever
+  Modified Quantization mode is in use.
+* `MbContext::modified_quant` flag wires the primitive into the
+  macroblock parser: when set, `parse_macroblock` decodes the §5.3.6
+  DQUANT field via `parse_modified_dquant`. `H263Macroblock::
+  quantiser_after` becomes the §T.2 new QUANT and `dquant` carries the
+  signed change (`new − prior`).
+* Refused (reported, not guessed): the §T.4 EXTENDED-ESCAPE /
+  EXTENDED-LEVEL extended-coefficient-range mechanism (it belongs in
+  the §5.4.2 TCOEF VLC layer, not the DQUANT / dequant boundary) and
+  the §T.5 encoder-side usage restrictions.
+
+21 new tests land: §T.3 QUANT_C bands (identity 1-6, `−1` band 7-9,
+the seven saturating bands, monotonicity, out-of-range rejection);
+§T.2.1 small-step coverage (the §T.2.1 worked example QUANT 29 / "11"
+→ 31, the QUANT 1 / 11 / 31 boundary rows for both codewords, and the
+all-priors / both-codewords in-range invariant); §T.2.2 arbitrary
+selection (the §T.2.2 worked example "001111" → 15, endpoints 1 / 31,
+the zero-value rejection); the error paths (out-of-range prior QUANT
+consuming no bits, empty buffer, small-step and arbitrary truncation);
+back-to-back field independence; and three `parse_macroblock`
+integration tests (MQ small-step, MQ arbitrary, and the flag being
+inert for a non-DQUANT MB type). `cargo test -p oxideav-h263` reports
+557 passed (previously 536).
+
+---
+
 **Round 37 (workspace round 295) — Annex M Improved PB-frames mode
 end-to-end decode. A PLUSPTYPE picture whose §5.1.4.3 MPPTYPE
 picture-type is `"010"` (Improved PB-frame, §M.1) now decodes from
@@ -1727,10 +1773,18 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * PB-frame MODB / CBPB / MVDB (§5.3.3 / §5.3.4 / §5.3.9, Annex G);
   the parser refuses no fields directly but the caller's picture
   context must keep `pb_frames = false`.
-* Annex T variable-length DQUANT (Modified Quantization mode);
-  the baseline 2-bit form is the only one decoded, and the
-  Annex-T EXTENDED-ESCAPE LEVEL prefix (`1000 0000`) is not
-  accepted in TCOEF.
+* Annex T (Modified Quantization mode) — the §T.2 variable-length
+  DQUANT parser (`annex_t::parse_modified_dquant`) and the §T.3
+  chrominance `QUANT_C` derivation (`annex_t::quant_c_from_quant`)
+  landed in round 302, gated into the macroblock parser by
+  `MbContext::modified_quant`. Still NOT done: the §T.4
+  EXTENDED-ESCAPE LEVEL prefix (`1000 0000`) coefficient-range
+  extension in TCOEF (a §5.4.2 VLC-layer change), the §T.5 usage
+  restrictions, and wiring the §T.3 `QUANT_C` into the chrominance
+  inverse-quant / Annex J deblock paths of the picture driver (the
+  primitive exists; the driver does not yet apply it). The MQ mode
+  bit is also not yet routed from the PLUSPTYPE header into
+  `MbContext::modified_quant` by `decode_picture_layer`.
 * Annex I (Advanced INTRA Coding) — the remaining parts beyond the
   round-8 scan-and-mode layer, the round-14 Table I.2 separate
   INTRA-coefficient VLC, and the round-17 §I.3 modified inverse-

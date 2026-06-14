@@ -1865,6 +1865,7 @@ fn decode_after_picture_header(
                             pb_frames: header.pb_frames,
                             pb_annex_m: pb.as_ref().is_some_and(|p| p.annex_m),
                             quantiser_before: current_quant,
+                            modified_quant: false,
                         },
                     )?;
                     if matches!(mb.mb_type, Some(MbType::Stuffing)) {
@@ -2143,6 +2144,7 @@ fn decode_slice_structured_after_header(
                         // Annex M MODB form never engages here.
                         pb_annex_m: false,
                         quantiser_before: current_quant,
+                        modified_quant: false,
                     },
                 )?;
                 if matches!(mb.mb_type, Some(MbType::Stuffing)) {
