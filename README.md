@@ -5,6 +5,58 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 37 (workspace round 295) — Annex M Improved PB-frames mode
+end-to-end decode. A PLUSPTYPE picture whose §5.1.4.3 MPPTYPE
+picture-type is `"010"` (Improved PB-frame, §M.1) now decodes from
+PSC to a (P, BPB) frame pair through a dedicated entry point, with the
+§M.4 / Table M.1 MODB form parsed in place and all three §M.2 BPB
+prediction modes — bidirectional, forward, and backward —
+reconstructed.**
+
+* `decode_improved_pb_picture(data, reference, prev_tr, options) ->
+  Result<PbFramePair>` new public entry: parses the PLUSPTYPE header,
+  requires the §5.1.4.3 Improved-PB picture-type, then consumes
+  §5.1.19 PQUANT, §5.1.22 TRB (3 bits; `0` rejected) and §5.1.23
+  DBQUANT, derives §G.4 TRD (modulo-256 negative wrap) from `prev_tr`,
+  and drives the shared GOB / macroblock walker with an Annex M PB
+  context.
+* §M.4 / Table M.1 MODB wired into the macroblock parser via the new
+  `MbContext::pb_annex_m` flag (selects `parse_modb_annex_m`, the
+  6-entry Table M.1, over the Annex G Table 11 form). The §M.2 coding
+  mode plus CBPB / MVDB presence surface on the new
+  `H263Macroblock::annex_m_modb`; CBPB / MVDB are gated by the
+  Table M.1 accessors.
+* §M.2.1 bidirectional (Table M.1 rows 0 / 1) reuses the Annex G
+  §G.4 / §G.5 composition with MVD = 0 (§M.3 — "calculated as
+  described in Annex G when MVD = 0"). A skipped or not-coded
+  macroblock (no MODB) is treated as this zero-motion case.
+* §M.2.2 forward (rows 2 / 3) reconstructs a single 16 × 16 forward
+  vector from MVDB plus the §M.2.2 left-neighbour predictor (the
+  left macroblock's forward vector, or zero at the picture / slice far-
+  left edge; reset at each macroblock row). The six 8 × 8 blocks are
+  forward-fetched from the previous reference only (no PREC backward
+  part), the chroma block using the §6.1.1 single-vector chroma MV.
+* §M.2.3 backward (rows 4 / 5) sets the BPB prediction identical to
+  PREC (§G.5 — the just-reconstructed, clipped P-macroblock); no MVDB
+  is on the wire and the forward-vector predictor resets.
+* Refused (reported, not guessed): Improved-PB combined with Annex K
+  Slice-Structured (§K.2 slice-boundary BPB exclusions), Advanced
+  Prediction (the §F.2 four-vector BPB derivation), UMV (the §M.2.2
+  over-boundary forward vector under the extended range), AIC, custom
+  PCF, CPM and RRU — all `Error::NotImplemented`. The single-frame
+  entry points refuse an Improved PB-frame (they cannot return the
+  BPB-picture).
+
+9 new tests land: all-skipped P/BPB reference reproduction; §M.2.3
+backward = PREC (BPB copies the reconstructed P-macroblock); §M.2.2
+forward MVDB one-pixel shift; §M.2.2 left-neighbour predictor chaining
+across two forward macroblocks; entry-point picture-type gating;
+zero-TRB rejection; and three Table M.1 MODB parser tests (rows 0
+bidirectional, 3 forward+CBPB+MVDB, 4 backward). `cargo test -p
+oxideav-h263` reports 536 passed (previously 527).
+
+---
+
 **Round 36 (workspace round 291) — Annex K Slice-Structured mode
 end-to-end decode (free-running submode). A PLUSPTYPE picture
 carrying the OPPTYPE Slice-Structured bit (bit 10) now decodes from

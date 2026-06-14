@@ -987,6 +987,7 @@ mod tests {
                 advanced_prediction: pic.advanced_prediction,
                 aic_intra_mode: false,
                 pb_frames: false,
+                pb_annex_m: false,
                 quantiser_before: gob.quantiser,
             },
         )

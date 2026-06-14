@@ -84,13 +84,16 @@ use crate::block_aic::parse_intra_block_aic;
 use crate::deblock::{deblock_plane, strength_for_quant, EdgeCondition};
 use crate::gob_header::parse_gob_layer;
 use crate::idct::BLOCK_DIM;
-use crate::macroblock::{parse_macroblock, H263Macroblock, MbContext, MbType};
+use crate::macroblock::{parse_macroblock, H263Macroblock, MbContext, MbType, Mvd};
 use crate::motion::{
     chroma_mv, chroma_mv_4mv, motion_compensate_block, obmc_predict_block, predict_mv_median,
     reconstruct_mv, reconstruct_mv_umv, select_4mv_candidates, LumaBlockIndex, Mb4Mv,
     Mb4MvNeighbourhood, MotionVector, RefPlane, RemoteMv, RCONTROL_DEFAULT,
 };
-use crate::pb_layer::{cbpb_block_present, pb_b_predict_macroblock, pb_bquant, PbBReferencePlanes};
+use crate::pb_layer::{
+    cbpb_block_present, pb_b_predict_macroblock, pb_bquant, BpbCodingMode, PbBMacroblockPrediction,
+    PbBReferencePlanes,
+};
 use crate::picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
     H263PictureHeader, H263PictureLayer, H263SourceFormat,
@@ -806,8 +809,21 @@ pub fn decode_picture_layer_with_inherited(
                 // UFEP=001 or non-PLUSPTYPE picture).
                 None => inherited,
             };
-            let (header, layout, shim_options, slice_structured) =
-                plus_ptype_to_baseline_shim(&extended, options, inherited)?;
+            let PlusShimOutcome {
+                header,
+                layout,
+                options: shim_options,
+                slice_structured,
+                improved_pb,
+            } = plus_ptype_to_baseline_shim(&extended, options, inherited)?;
+            // An Improved PB-frame (Annex M) decodes into a (P, B) pair,
+            // not a single frame: it must go through
+            // [`decode_improved_pb_picture`], which supplies the B-frame
+            // sink and the §G.4 temporal-reference context. This
+            // single-frame entry refuses it.
+            if improved_pb {
+                return Err(Error::NotImplemented);
+            }
             // Annex K Slice-Structured mode (OPPTYPE SS bit set) replaces
             // the GOB layer with the §K.2 slice layer; route to the
             // dedicated driver. Otherwise decode through the baseline GOB
@@ -871,6 +887,18 @@ struct PbPictureCtx<'b> {
     /// §5.1.23 DBQUANT — the 2-bit Table 6 selector relating each
     /// macroblock's QUANT to its B-block BQUANT.
     dbquant: u8,
+    /// `true` for an Annex M Improved PB-frame, `false` for an
+    /// Annex G PB-frame. Selects the Table M.1 MODB form in the
+    /// macroblock parser and the §M.2 three-mode BPB reconstruction
+    /// (bidirectional / forward / backward) in [`decode_pb_b_part`].
+    annex_m: bool,
+    /// §M.2.2 forward-vector predictor state — the forward motion
+    /// vector of the BPB-macroblock immediately to the left, in
+    /// half-pel units, or `None` if that macroblock had no forward
+    /// vector (or is off the left edge of the picture / slice). Reset
+    /// to `None` at the start of each macroblock row. Unused under
+    /// Annex G (`annex_m == false`).
+    left_bpb_forward_mv: Option<MotionVector>,
     /// The B-picture under construction (same geometry as the
     /// P-picture).
     b_frame: &'b mut YuvFrame,
@@ -991,10 +1019,248 @@ pub fn decode_pb_picture(
             trb,
             trd,
             dbquant,
+            annex_m: false,
+            left_bpb_forward_mv: None,
             b_frame: &mut b_frame,
         }),
     )?;
     Ok(PbFramePair { p_frame, b_frame })
+}
+
+/// Decode one Annex M Improved PB-frame from `data`, producing both the
+/// P-picture and the BPB-picture.
+///
+/// The picture must be a PLUSPTYPE picture whose §5.1.4.3 MPPTYPE
+/// picture-type is `"010"` (Improved PB-frame). Per §M.1 the Improved
+/// PB-frames mode is PLUSPTYPE-only (it replaces the Annex G PB-frames
+/// mode for extended-PTYPE bitstreams), so unlike [`decode_pb_picture`]
+/// there is no baseline-PTYPE arm here.
+///
+/// Wire layout consumed: the §5.1.1–§5.1.4 PLUSPTYPE header (via
+/// [`parse_picture_layer`] / [`plus_ptype_to_baseline_shim`]), then —
+/// because the picture is an Improved PB-frame — §5.1.19 PQUANT (5 bits;
+/// always present with PLUSPTYPE, Figure 6 part 1), §5.1.22 TRB (3 bits
+/// at the standard CIF picture clock frequency) and §5.1.23 DBQUANT
+/// (2 bits), then the GOB layers. PQUANT primes the QUANT for the first
+/// GOB; each GOB header's GQUANT then takes over (the GOB-header-per-GOB
+/// convention of [`decode_after_picture_header`]).
+///
+/// `prev_tr` is the §5.1.2 Temporal Reference of the `reference` picture
+/// (the last decoded P- or I-picture / P-part). §G.4 (referenced by §M
+/// for the bidirectional vectors) derives TRD — the denominator of the
+/// vector temporal scaling — as the TR increment from that picture,
+/// adding 256 when the raw difference is negative.
+///
+/// Per macroblock the driver reads the §5.3 / Figure 10 PB-frame layer
+/// with the §M.4 / Table M.1 MODB form, reconstructs the six P-blocks
+/// into the P-picture exactly as the non-PB driver does, then predicts
+/// the six BPB-blocks per the §M.2 coding mode the macroblock's MODB
+/// selected — §M.2.1 bidirectional (the §G.4 / §G.5 composition with
+/// MVD = 0, §M.3), §M.2.2 forward (a single 16 × 16 MVDB vector plus the
+/// §M.2.2 left-neighbour predictor, forward-only from the previous
+/// reference), or §M.2.3 backward (the BPB prediction is PREC) — and
+/// adds the §6.3.1 BPB-residuals where CBPB lights them.
+///
+/// # Errors
+///
+/// * [`Error::NotImplemented`] — not a PLUSPTYPE picture; an MPPTYPE
+///   picture-type other than Improved PB-frame; any mode
+///   [`plus_ptype_to_baseline_shim`] refuses (SAC, ISD, Alternative
+///   INTER VLC, Modified Quantisation, custom PCF, CPM, RRU); the
+///   Slice-Structured submode (Annex K + Improved-PB is unstaged);
+///   Advanced Prediction (the §F.2 four-vector BPB derivation under
+///   Annex M is unstaged); UMV (the §M.2.2 over-boundary forward vector
+///   under the extended range is unstaged); AIC; or a `reference` of
+///   mismatched geometry.
+/// * [`Error::BadPbTemporalReference`] — TRB was `0`, or the TR
+///   increment from `prev_tr` was `0`.
+pub fn decode_improved_pb_picture(
+    data: &[u8],
+    reference: &YuvFrame,
+    prev_tr: u8,
+    options: DecodeOptions,
+) -> Result<PbFramePair> {
+    let mut reader = BitReader::new(data);
+    let layer = parse_picture_layer(&mut reader, InheritedExtendedState::default())?;
+    let extended = match layer {
+        H263PictureLayer::Extended(e) => e,
+        // §M.1 — Improved PB-frames is PLUSPTYPE-only.
+        H263PictureLayer::Baseline(_) => return Err(Error::NotImplemented),
+    };
+    let PlusShimOutcome {
+        header,
+        layout,
+        options: shim_options,
+        slice_structured,
+        improved_pb,
+    } = plus_ptype_to_baseline_shim(&extended, options, InheritedExtendedState::default())?;
+    if !improved_pb {
+        // Not an Improved PB-frame — the caller should use
+        // [`decode_picture_layer`] for a plain INTRA / INTER picture.
+        return Err(Error::NotImplemented);
+    }
+    // Annex K + Improved-PB (the §K.2 slice-boundary BPB exclusions) and
+    // Advanced Prediction + Improved-PB (the §F.2 four-vector BPB
+    // derivation) and UMV + Improved-PB (the §M.2.2 over-boundary
+    // forward vector under the extended range) are unstaged.
+    if slice_structured.is_some() || header.advanced_prediction || header.umv_mode {
+        return Err(Error::NotImplemented);
+    }
+
+    // §5.1.19 — PQUANT (5 bits). With PLUSPTYPE present the field order
+    // (Figure 6 part 1) places PQUANT immediately after the PLUSPTYPE /
+    // CPFMT block (the layered RPS / RPR fields between are refused by
+    // the shim). It primes the QUANT for the first GOB until the GOB's
+    // GQUANT takes over.
+    let pquant = reader.read_u32(5).map_err(|_| Error::UnexpectedEof)? as u8;
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    // §5.1.22 — TRB (3 bits at the standard CIF PCF; the 5-bit form
+    // requires a custom PCF, which the shim refuses). "The codeword is
+    // the natural binary representation of the number of non-transmitted
+    // pictures plus one" — `0` is illegal.
+    let trb = reader.read_u32(3).map_err(|_| Error::UnexpectedEof)? as i32;
+    if trb == 0 {
+        return Err(Error::BadPbTemporalReference);
+    }
+    // §5.1.23 — DBQUANT.
+    let dbquant = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)? as u8;
+    // §G.4 — TRD (referenced by §M for the bidirectional vectors).
+    let mut trd = i32::from(header.temporal_reference) - i32::from(prev_tr);
+    if trd < 0 {
+        trd += 256;
+    }
+    if trd == 0 {
+        return Err(Error::BadPbTemporalReference);
+    }
+
+    let luma_w = layout.luma_width as usize;
+    let luma_h = layout.luma_height as usize;
+    if reference.luma_width != luma_w || reference.luma_height != luma_h {
+        return Err(Error::NotImplemented);
+    }
+    let mut b_frame = YuvFrame {
+        y: vec![0u8; luma_w * luma_h],
+        cb: vec![0u8; (luma_w / 2) * (luma_h / 2)],
+        cr: vec![0u8; (luma_w / 2) * (luma_h / 2)],
+        luma_width: luma_w,
+        luma_height: luma_h,
+    };
+    let p_frame = decode_after_picture_header(
+        &mut reader,
+        &header,
+        &layout,
+        Some(reference),
+        shim_options,
+        Some(PbPictureCtx {
+            trb,
+            trd,
+            dbquant,
+            annex_m: true,
+            left_bpb_forward_mv: None,
+            b_frame: &mut b_frame,
+        }),
+    )?;
+    Ok(PbFramePair { p_frame, b_frame })
+}
+
+/// §M.2.2 — forward prediction for one Improved-PB BPB-macroblock.
+///
+/// "In the forward prediction mode, the vector data contained in MVDB
+/// are used for forward prediction from the previous reference picture
+/// … there is always only one 16 × 16 vector for the BPB-macroblock in
+/// this prediction mode." The §M.2.2 predictor rule: "if the current
+/// macroblock is not at the far left edge of the picture or slice and
+/// the macroblock to the left has a forward motion vector, then the
+/// predictor of the forward motion vector for the current macroblock is
+/// set to the value of the forward motion vector of the block to the
+/// left; otherwise, the predictor is set to zero. The difference …
+/// is then VLC coded in the same way as vector data … (MVD)."
+///
+/// `mvdb` is the §5.3.9 MVDB delta (always present for a forward row,
+/// Table M.1 rows 2 / 3 — but defensively treated as a zero delta if
+/// `None`). The reconstructed forward vector is stored back into
+/// `pb.left_bpb_forward_mv` so the next macroblock to the right can use
+/// it as its predictor. The six 8 × 8 blocks are forward-fetched from
+/// the previous decoded picture (`planes.prev_*`): the four luma blocks
+/// with the single 16 × 16 vector, the two chroma blocks with the
+/// §6.1.1 / Table 8 single-vector chroma vector derived via
+/// [`chroma_mv`].
+fn improved_pb_forward_prediction(
+    planes: &PbBReferencePlanes<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    mvdb: Option<Mvd>,
+    pb: &mut PbPictureCtx<'_>,
+) -> PbBMacroblockPrediction {
+    // §M.2.2 left-neighbour predictor (zero at the row's left edge or
+    // when the left macroblock carried no forward vector).
+    let predictor = pb.left_bpb_forward_mv.unwrap_or_default();
+    // The difference is "VLC coded in the same way as … (MVD)", so the
+    // forward vector is reconstructed exactly like a §5.3.7 P-vector:
+    // predictor + delta, with the §6.1.1 modulo wrap into the standard
+    // range. (UMV + Improved-PB is refused by the driver entry, so the
+    // baseline reconstruction applies.)
+    let forward_mv = reconstruct_mv(
+        predictor,
+        mvdb.unwrap_or(Mvd {
+            dx_half: 0,
+            dy_half: 0,
+        }),
+    );
+    pb.left_bpb_forward_mv = Some(forward_mv);
+
+    // Forward-only fetch of the four 8 × 8 luma blocks (one 16 × 16
+    // vector) and the two chroma blocks (single-vector chroma MV).
+    let mut luma = [[0u8; 16]; 16];
+    for n in 0..4 {
+        let nh = n & 1;
+        let nv = n >> 1;
+        let bx = mb_x + nh * 8;
+        let by = mb_y + nv * 8;
+        let block = motion_compensate_block(&planes.prev_y, bx, by, forward_mv, RCONTROL_DEFAULT);
+        for j in 0..8 {
+            luma[nv * 8 + j][nh * 8..nh * 8 + 8].copy_from_slice(&block[j * 8..j * 8 + 8]);
+        }
+    }
+    let chroma_vec = chroma_mv(forward_mv);
+    let (cx, cy) = (mb_x / 2, mb_y / 2);
+    let cb_flat = motion_compensate_block(&planes.prev_cb, cx, cy, chroma_vec, RCONTROL_DEFAULT);
+    let cr_flat = motion_compensate_block(&planes.prev_cr, cx, cy, chroma_vec, RCONTROL_DEFAULT);
+    let mut cb = [[0u8; 8]; 8];
+    let mut cr = [[0u8; 8]; 8];
+    for j in 0..8 {
+        cb[j].copy_from_slice(&cb_flat[j * 8..j * 8 + 8]);
+        cr[j].copy_from_slice(&cr_flat[j * 8..j * 8 + 8]);
+    }
+    PbBMacroblockPrediction { luma, cb, cr }
+}
+
+/// §M.2.3 — backward prediction for one Improved-PB BPB-macroblock.
+///
+/// "In the backward prediction mode, the prediction of the BPB
+/// macroblock is identical to PREC (defined in G.5). No motion vector
+/// data is used for the backward prediction." PREC is the
+/// just-reconstructed-and-clipped P-macroblock — the row-major
+/// `prec_y` (16 × 16), `prec_cb` / `prec_cr` (8 × 8) the caller already
+/// lifted out of `p_frame`. The prediction is simply that copy.
+fn improved_pb_backward_prediction(
+    prec_y: &[u8; 256],
+    prec_cb: &[u8; COEFFS_PER_BLOCK],
+    prec_cr: &[u8; COEFFS_PER_BLOCK],
+) -> PbBMacroblockPrediction {
+    let mut luma = [[0u8; 16]; 16];
+    for (j, row) in luma.iter_mut().enumerate() {
+        row.copy_from_slice(&prec_y[j * 16..j * 16 + 16]);
+    }
+    let mut cb = [[0u8; 8]; 8];
+    let mut cr = [[0u8; 8]; 8];
+    for j in 0..8 {
+        cb[j].copy_from_slice(&prec_cb[j * 8..j * 8 + 8]);
+        cr[j].copy_from_slice(&prec_cr[j * 8..j * 8 + 8]);
+    }
+    PbBMacroblockPrediction { luma, cb, cr }
 }
 
 /// Decode and reconstruct the B-part of one PB-macroblock (§G.3 –
@@ -1076,19 +1342,67 @@ fn decode_pb_b_part(
         prec_cr: RefPlane::new(&prec_cr, 8, 8),
     };
 
-    // §G.4 + §G.5 whole-macroblock prediction. `mb.mvdb` is `None`
-    // whenever MODB signalled no MVDB ("If MVDB is not present, MVD
-    // is set to zero", §G.4) — including the skipped-macroblock case.
-    let prediction = pb_b_predict_macroblock(
-        &planes,
-        mb_x,
-        mb_y,
-        mvs4,
-        mb.mvdb,
-        pb.trb,
-        pb.trd,
-        RCONTROL_DEFAULT,
-    );
+    // Whole-macroblock BPB prediction. Under Annex G this is always
+    // the §G.4 + §G.5 bidirectional composition; under Annex M
+    // (Improved PB-frames) the §M.2 coding mode selects one of three
+    // predictions (bidirectional / forward / backward).
+    let prediction = if pb.annex_m {
+        // §M.2 coding mode for this BPB-macroblock. A skipped or
+        // not-coded macroblock carries no MODB (Table 10): Annex M
+        // treats such a macroblock the same way Annex G does — a
+        // bidirectional prediction with zero motion (the §M.2.1
+        // "equivalent to Annex G when MVD = 0" case).
+        let mode = mb
+            .annex_m_modb
+            .map(|m| m.coding_mode())
+            .unwrap_or(BpbCodingMode::Bidirectional);
+        match mode {
+            // §M.2.1 / §M.3 — "the scaled forward and backward vectors
+            // are calculated as described in Annex G when MVD = 0". No
+            // MVDB is on the wire for a bidirectional row (Table M.1
+            // rows 0 / 1), so the §G.4 delta is `None`. The left
+            // forward-vector predictor is left untouched (only the
+            // forward mode updates it, §M.2.2).
+            BpbCodingMode::Bidirectional => pb_b_predict_macroblock(
+                &planes,
+                mb_x,
+                mb_y,
+                mvs4,
+                None,
+                pb.trb,
+                pb.trd,
+                RCONTROL_DEFAULT,
+            ),
+            // §M.2.2 — a single 16 × 16 forward vector from MVDB plus
+            // the §M.2.2 left-neighbour predictor, forward prediction
+            // only from the previous reference picture.
+            BpbCodingMode::Forward => {
+                improved_pb_forward_prediction(&planes, mb_x, mb_y, mb.mvdb, pb)
+            }
+            // §M.2.3 — "the prediction of the BPB macroblock is
+            // identical to PREC". No MVDB, and the forward-vector
+            // predictor for the next macroblock is reset (this
+            // macroblock has no forward vector, §M.2.2).
+            BpbCodingMode::Backward => {
+                pb.left_bpb_forward_mv = None;
+                improved_pb_backward_prediction(&prec_y, &prec_cb, &prec_cr)
+            }
+        }
+    } else {
+        // §G.4 + §G.5 whole-macroblock prediction. `mb.mvdb` is `None`
+        // whenever MODB signalled no MVDB ("If MVDB is not present,
+        // MVD is set to zero", §G.4) — including the skipped case.
+        pb_b_predict_macroblock(
+            &planes,
+            mb_x,
+            mb_y,
+            mvs4,
+            mb.mvdb,
+            pb.trb,
+            pb.trd,
+            RCONTROL_DEFAULT,
+        )
+    };
 
     // §5.1.23 / Table 6 B-block quantiser; §5.3.4 CBPB pattern (all
     // zeros when MODB carried no CBPB — no B-residuals).
@@ -1186,23 +1500,39 @@ fn decode_pb_b_part(
 /// SS bit is set; `None` ⇔ the picture uses the GOB layer.
 type SliceStructuredRouting = Option<SliceStructuredSubmode>;
 
+/// Outcome of [`plus_ptype_to_baseline_shim`]: the baseline-equivalent
+/// header / layout / options, the §5.1.10 Slice-Structured routing, and
+/// whether the picture is an Annex M Improved PB-frame (MPPTYPE `"010"`)
+/// whose B-part the caller must drive via the [`decode_improved_pb_picture`]
+/// path. For a plain INTRA / INTER picture `improved_pb` is `false`.
+struct PlusShimOutcome {
+    header: H263PictureHeader,
+    layout: PictureLayout,
+    options: DecodeOptions,
+    slice_structured: SliceStructuredRouting,
+    improved_pb: bool,
+}
+
 fn plus_ptype_to_baseline_shim(
     extended: &H263ExtendedPicture,
     options: DecodeOptions,
     inherited: InheritedExtendedState,
-) -> Result<(
-    H263PictureHeader,
-    PictureLayout,
-    DecodeOptions,
-    SliceStructuredRouting,
-)> {
-    // §5.1.4.3 — only INTRA / INTER picture types are decodable here.
-    // Resolve this first because §5.1.4.5 rule 1 inference (UMV / AP
-    // off in I-pictures) needs the picture-type code below.
+) -> Result<PlusShimOutcome> {
+    // §5.1.4.3 — INTRA / INTER picture types are decodable through the
+    // GOB / slice drivers; the Improved PB-frame type (`"010"`, Annex M)
+    // resolves to an INTER P-part here and is flagged via the returned
+    // `improved_pb` so the caller routes its B-part through the
+    // Improved-PB driver. Resolve this first because §5.1.4.5 rule 1
+    // inference (UMV / AP off in I-pictures) needs the picture-type
+    // code below.
+    let improved_pb = matches!(
+        extended.plus.mpptype.picture_type,
+        PlusPictureType::ImprovedPb
+    );
     let coding_type = match extended.plus.mpptype.picture_type {
         PlusPictureType::Intra => H263PictureCodingType::Intra,
-        PlusPictureType::Inter => H263PictureCodingType::Inter,
-        // Improved-PB needs Annex M sub-MB handling (out of scope).
+        // The Improved PB-frame's P-part is a P-picture (§M.1).
+        PlusPictureType::Inter | PlusPictureType::ImprovedPb => H263PictureCodingType::Inter,
         // B / EI / EP are refused by `parse_plus_ptype` already and
         // therefore never reach this arm; keep the catch-all explicit.
         _ => return Err(Error::NotImplemented),
@@ -1387,7 +1717,13 @@ fn plus_ptype_to_baseline_shim(
         umv_mode: umv_effective,
         sac_mode: false,
         advanced_prediction: ap_effective,
-        pb_frames: false,
+        // Annex M Improved-PB drives the shared §5.3 PB-frame
+        // macroblock layer (MODB / CBPB / MVDB), so the baseline
+        // `pb_frames` gate must be set; the Table M.1 vs Table 11 MODB
+        // form is then selected by the `annex_m` flag on the
+        // [`PbPictureCtx`]. A plain INTRA / INTER picture leaves it
+        // clear.
+        pb_frames: improved_pb,
     };
 
     // PLUSPTYPE wire signals OR into the caller-supplied options: the
@@ -1401,7 +1737,13 @@ fn plus_ptype_to_baseline_shim(
         aic: options.aic || advanced_intra_effective,
     };
 
-    Ok((header, layout, options, slice_structured))
+    Ok(PlusShimOutcome {
+        header,
+        layout,
+        options,
+        slice_structured,
+        improved_pb,
+    })
 }
 
 /// Decode the macroblock layers of a picture given an already-parsed
@@ -1498,6 +1840,15 @@ fn decode_after_picture_header(
                 break;
             }
             let mut current_quant = gob_quant;
+            // §M.2.2 — the forward-vector predictor for Improved-PB is
+            // "the value of the forward motion vector of the block to
+            // the left" and is reset at the far-left edge of the
+            // picture or slice. A GOB header starts a new segment, so
+            // the predictor restarts at the left of every macroblock
+            // row of the GOB.
+            if let Some(pb) = pb.as_mut() {
+                pb.left_bpb_forward_mv = None;
+            }
 
             for col in 0..mb_cols {
                 // §5.3.2: an MCBPC stuffing code carries no macroblock
@@ -1512,6 +1863,7 @@ fn decode_after_picture_header(
                             advanced_prediction: header.advanced_prediction,
                             aic_intra_mode: options.aic,
                             pb_frames: header.pb_frames,
+                            pb_annex_m: pb.as_ref().is_some_and(|p| p.annex_m),
                             quantiser_before: current_quant,
                         },
                     )?;
@@ -1786,6 +2138,10 @@ fn decode_slice_structured_after_header(
                         advanced_prediction: header.advanced_prediction,
                         aic_intra_mode: options.aic,
                         pb_frames: header.pb_frames,
+                        // The slice-structured driver does not support
+                        // PB / Improved-PB (refused upstream), so the
+                        // Annex M MODB form never engages here.
+                        pb_annex_m: false,
                         quantiser_before: current_quant,
                     },
                 )?;
@@ -6296,5 +6652,269 @@ mod tests {
                 assert_eq!(pair.b_frame.cr[j * 88 + i], expected.cr[j][i]);
             }
         }
+    }
+
+    // ---- Annex M Improved PB-frames (§M) --------------------------
+
+    /// Build a UFEP=001 QCIF PLUSPTYPE Improved PB-frame header
+    /// (MPPTYPE picture-type `"010"`), followed by §5.1.19 PQUANT,
+    /// §5.1.22 TRB and §5.1.23 DBQUANT, then nine GOB layers (GQUANT =
+    /// 8) whose macroblocks are emitted by `write_mb`. All optional
+    /// modes (UMV / AP / AIC / DF / SS / …) are off.
+    fn build_qcif_improved_pb_picture<F: FnMut(&mut BitWriter, usize, usize)>(
+        tr: u8,
+        trb: u32,
+        dbquant: u32,
+        mut write_mb: F,
+    ) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        // §5.1.1 / §5.1.2 — PSC + TR.
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(tr as u32, 8);
+        // §5.1.3 — PTYPE bits 1-2 = "10"; bits 3-5 = "000"; bits 6-8 =
+        // "111" → extended PTYPE.
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_u32(0b111, 3);
+        // §5.1.4.1 — UFEP = "001".
+        w.write_u32(0b001, 3);
+        // §5.1.4.2 — OPPTYPE (18 bits): source format "010" QCIF, all
+        // mode bits off, SCE-guard bit 15 = 1, reserved "000".
+        w.write_u32(0b010, 3);
+        for _ in 0..11 {
+            w.write_bit(false); // bits 4-14: PCF/UMV/SAC/AP/AIC/DF/SS/RPS/IS/AIV/MQ
+        }
+        w.write_bit(true); // bit 15 SCE-guard
+        w.write_u32(0b000, 3); // bits 16-18 reserved
+                               // §5.1.4.3 — MPPTYPE (9 bits): picture type "010"
+                               // (Improved PB), RPR/RRU/RTYPE = 0, reserved "00",
+                               // SCE-guard = 1.
+        w.write_u32(0b010, 3);
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+                           // §5.1.20 — CPM = 0.
+        w.write_bit(false);
+        // §5.1.19 — PQUANT (5 bits) = 8.
+        w.write_u32(8, 5);
+        // §5.1.22 — TRB (3 bits).
+        w.write_u32(trb, 3);
+        // §5.1.23 — DBQUANT (2 bits).
+        w.write_u32(dbquant, 2);
+        for gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS); // QUANT = 8
+            for mb in 0..11 {
+                write_mb(&mut w, gob, mb);
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// An all-skipped Improved PB-frame over a reference reproduces the
+    /// reference in both the P-part and the BPB-part. A skipped
+    /// macroblock carries no MODB (Table 10): §M treats it as the
+    /// §M.2.1 bidirectional case with zero motion, which — like Annex G
+    /// — composes to an exact reference copy when the P-part is itself
+    /// a reference copy.
+    #[test]
+    fn decode_improved_pb_all_skipped_reproduces_reference() {
+        let reference = ramp_reference(176, 144);
+        let data = build_qcif_improved_pb_picture(2, 1, 0b00, |w, _, _| write_skipped_mb(w));
+        let pair = decode_improved_pb_picture(&data, &reference, 0, DecodeOptions::default())
+            .expect("decode");
+        assert_eq!(pair.p_frame, reference);
+        assert_eq!(pair.b_frame, reference);
+    }
+
+    /// §M.2.3 backward prediction (Table M.1 row 4, code `11110`): the
+    /// BPB-macroblock prediction "is identical to PREC". With a
+    /// zero-MV, no-residual P-part (PREC = the reference copy) and no
+    /// CBPB residual, the backward-mode BPB-macroblock must equal the
+    /// reference. The remaining macroblocks are skipped (also
+    /// reference copies), so the whole BPB-picture reproduces the
+    /// reference.
+    #[test]
+    fn decode_improved_pb_backward_mode_copies_prec() {
+        let reference = ramp_reference(176, 144);
+        let data = build_qcif_improved_pb_picture(2, 1, 0b00, |w, gob, mb| {
+            if gob == 0 && mb == 0 {
+                w.write_bit(false); // COD = 0
+                w.write_bit(true); // MCBPC type 0 (INTER), cbpc 00
+                w.write_u32(0b11110, 5); // MODB row 4: backward, no CBPB/MVDB
+                w.write_u32(0b11, 2); // CBPY: INTER pattern 0000
+                w.write_bit(true); // MVD dx = 0
+                w.write_bit(true); // MVD dy = 0
+            } else {
+                write_skipped_mb(w);
+            }
+        });
+        let pair = decode_improved_pb_picture(&data, &reference, 0, DecodeOptions::default())
+            .expect("decode");
+        // P-part: zero-MV, no residual — a reference copy.
+        assert_eq!(pair.p_frame, reference);
+        // §M.2.3 backward = PREC = the reference-copy P-macroblock.
+        for j in 0..16 {
+            for i in 0..16 {
+                assert_eq!(
+                    pair.b_frame.y[j * 176 + i],
+                    reference.y[j * 176 + i],
+                    "backward BPB luma must equal PREC at ({i}, {j})"
+                );
+            }
+        }
+        assert_eq!(pair.b_frame, reference);
+    }
+
+    /// §M.2.2 forward prediction (Table M.1 row 2, code `110`, MVDB
+    /// present): the BPB-macroblock is a single 16 × 16 forward fetch
+    /// from the previous reference at the §M.2.2-reconstructed forward
+    /// vector. With the left-neighbour predictor 0 (the macroblock is
+    /// at the picture's far-left edge) and MVDB = (+2, 0) (one full
+    /// pel), every BPB sample fetches reference (x + 1, y). On the ramp
+    /// that is the value `(x + 1) + y` — a one-pixel horizontal shift,
+    /// distinct from PREC / bidirectional.
+    #[test]
+    fn decode_improved_pb_forward_mode_shifts_by_mvdb() {
+        let reference = ramp_reference(176, 144);
+        let data = build_qcif_improved_pb_picture(2, 1, 0b00, |w, gob, mb| {
+            if gob == 0 && mb == 0 {
+                w.write_bit(false); // COD = 0
+                w.write_bit(true); // MCBPC type 0 (INTER), cbpc 00
+                w.write_u32(0b110, 3); // MODB row 2: forward, MVDB present
+                w.write_u32(0b11, 2); // CBPY: INTER pattern 0000
+                w.write_bit(true); // MVD dx = 0 (P-part zero MV)
+                w.write_bit(true); // MVD dy = 0
+                w.write_u32(0b0010, 4); // MVDB dx = +2 half-pel (+1 pel)
+                w.write_bit(true); // MVDB dy = 0
+            } else {
+                write_skipped_mb(w);
+            }
+        });
+        let pair = decode_improved_pb_picture(&data, &reference, 0, DecodeOptions::default())
+            .expect("decode");
+        // P-part: zero-MV, no residual — a reference copy.
+        assert_eq!(pair.p_frame, reference);
+        // §M.2.2 forward: BPB sample (x, y) = reference (x + 1, y).
+        let fwd_mv = MotionVector::new(2, 0);
+        let y_ref = RefPlane::new(&reference.y, 176, 144);
+        for j in 0..16 {
+            for i in 0..16 {
+                let block =
+                    motion_compensate_block(&y_ref, i & !7, j & !7, fwd_mv, RCONTROL_DEFAULT);
+                let expected = block[(j % 8) * 8 + (i % 8)];
+                assert_eq!(
+                    pair.b_frame.y[j * 176 + i],
+                    expected,
+                    "forward BPB luma at ({i}, {j})"
+                );
+            }
+        }
+        // Concretely on the ramp: BPB(0, 8) reads ref(1, 8) = 9, not
+        // the unshifted 8.
+        assert_eq!(pair.b_frame.y[8 * 176], 9);
+        // The chroma block is forward-fetched with the single-vector
+        // chroma MV — distinct from the backward (PREC) case where it
+        // would equal the reference chroma exactly. Sanity: skipped
+        // macroblocks elsewhere still reproduce the reference.
+        assert_eq!(&pair.b_frame.y[16..32], &reference.y[16..32]);
+    }
+
+    /// §M.2.2 forward-vector left-neighbour predictor: a second forward
+    /// macroblock immediately to the right of a forward macroblock
+    /// predicts its forward vector from the left macroblock's forward
+    /// vector. MB(0,0) forward with MVDB = (+2, 0) establishes a +2
+    /// forward vector; MB(1,0) forward with MVDB = (0, 0) therefore
+    /// reconstructs to the same +2 vector via the predictor (not 0),
+    /// shifting its BPB-part by the same one pixel.
+    #[test]
+    fn decode_improved_pb_forward_predictor_chains_left_neighbour() {
+        let reference = ramp_reference(176, 144);
+        let data = build_qcif_improved_pb_picture(2, 1, 0b00, |w, gob, mb| {
+            if gob == 0 && (mb == 0 || mb == 1) {
+                w.write_bit(false); // COD = 0
+                w.write_bit(true); // MCBPC type 0 (INTER), cbpc 00
+                w.write_u32(0b110, 3); // MODB row 2: forward, MVDB present
+                w.write_u32(0b11, 2); // CBPY: INTER pattern 0000
+                w.write_bit(true); // MVD dx = 0
+                w.write_bit(true); // MVD dy = 0
+                if mb == 0 {
+                    w.write_u32(0b0010, 4); // MVDB dx = +2 half-pel
+                    w.write_bit(true); // MVDB dy = 0
+                } else {
+                    w.write_bit(true); // MVDB dx = 0 (delta from predictor)
+                    w.write_bit(true); // MVDB dy = 0
+                }
+            } else {
+                write_skipped_mb(w);
+            }
+        });
+        let pair = decode_improved_pb_picture(&data, &reference, 0, DecodeOptions::default())
+            .expect("decode");
+        assert_eq!(pair.p_frame, reference);
+        // MB(1,0)'s forward vector = predictor(+2) + delta(0) = +2, so
+        // its BPB-part is shifted by one pixel exactly like MB(0,0).
+        let fwd_mv = MotionVector::new(2, 0);
+        let y_ref = RefPlane::new(&reference.y, 176, 144);
+        for j in 0..16 {
+            for i in 16..32 {
+                let block =
+                    motion_compensate_block(&y_ref, i & !7, j & !7, fwd_mv, RCONTROL_DEFAULT);
+                let expected = block[(j % 8) * 8 + (i % 8)];
+                assert_eq!(
+                    pair.b_frame.y[j * 176 + i],
+                    expected,
+                    "MB(1,0) forward BPB luma at ({i}, {j}) must use the +2 predictor"
+                );
+            }
+        }
+    }
+
+    /// The single-frame entry points refuse an Improved PB-frame (they
+    /// cannot return the BPB-picture), and [`decode_improved_pb_picture`]
+    /// refuses a plain INTER PLUSPTYPE picture (no BPB-part to decode).
+    #[test]
+    fn improved_pb_entry_points_gate_on_picture_type() {
+        let reference = ramp_reference(176, 144);
+        // Improved PB-frame through the single-frame entry point.
+        let improved = build_qcif_improved_pb_picture(2, 1, 0b00, |w, _, _| write_skipped_mb(w));
+        assert_eq!(
+            decode_picture_layer(&improved, Some(&reference), DecodeOptions::default())
+                .unwrap_err(),
+            Error::NotImplemented
+        );
+        // Plain INTER PLUSPTYPE picture through the Improved-PB entry.
+        let mut w = BitWriter::new();
+        write_qcif_inter_ap_picture_header(&mut w, false);
+        let inter = w.finish();
+        assert_eq!(
+            decode_improved_pb_picture(&inter, &reference, 0, DecodeOptions::default())
+                .unwrap_err(),
+            Error::NotImplemented
+        );
+    }
+
+    /// [`decode_improved_pb_picture`] rejects TRB = 0 (§5.1.22 — the
+    /// codeword is "the number of non-transmitted pictures plus one",
+    /// so the minimum legal value is 1).
+    #[test]
+    fn decode_improved_pb_rejects_zero_trb() {
+        let reference = ramp_reference(176, 144);
+        let data = build_qcif_improved_pb_picture(2, 0, 0b00, |w, _, _| write_skipped_mb(w));
+        assert_eq!(
+            decode_improved_pb_picture(&data, &reference, 0, DecodeOptions::default()).unwrap_err(),
+            Error::BadPbTemporalReference
+        );
     }
 }

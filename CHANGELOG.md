@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex M Improved PB-frames mode end-to-end decode (round 295):
+  - `decode_improved_pb_picture(data, reference, prev_tr, options) ->
+    Result<PbFramePair>` new public entry point in `picture.rs`. It
+    decodes a PLUSPTYPE picture whose §5.1.4.3 MPPTYPE picture-type is
+    `"010"` (Improved PB-frame, §M.1) into the (P, BPB) pair. After the
+    PLUSPTYPE header it consumes §5.1.19 PQUANT, §5.1.22 TRB (`0`
+    rejected) and §5.1.23 DBQUANT, derives §G.4 TRD (the modulo-256
+    negative wrap) from `prev_tr`, and drives the shared GOB /
+    macroblock walker with an Annex M PB context.
+  - §M.4 / Table M.1 MODB form wired into the macroblock parser: a new
+    `MbContext::pb_annex_m` flag selects `parse_modb_annex_m` (the
+    6-entry Table M.1) over the Annex G Table 11 form, surfacing the
+    §M.2 coding mode plus CBPB / MVDB presence on the new
+    `H263Macroblock::annex_m_modb`. CBPB / MVDB are gated by the
+    Table M.1 accessors.
+  - §M.2 three BPB-macroblock prediction modes: §M.2.1 bidirectional
+    (the §G.4 / §G.5 composition with MVD = 0, §M.3); §M.2.2 forward (a
+    single 16 × 16 MVDB vector plus the §M.2.2 left-neighbour forward-
+    vector predictor — reset at each row's far-left edge — forward-only
+    from the previous reference, no PREC); and §M.2.3 backward (the BPB
+    prediction is PREC). The §6.3.1 BPB-residuals are added where CBPB
+    lights them, dequantised with the Table 6 BQUANT, exactly as
+    Annex G.
+  - Refused (reported, not guessed): Improved-PB combined with Annex K
+    Slice-Structured (§K.2 slice-boundary BPB exclusions), Advanced
+    Prediction (the §F.2 four-vector BPB derivation), UMV (the §M.2.2
+    over-boundary forward vector under the extended range), AIC, custom
+    PCF, CPM and RRU — all `Error::NotImplemented`. The single-frame
+    entry points (`decode_picture` / `decode_picture_layer`) refuse an
+    Improved PB-frame (they cannot return the BPB-picture).
+  - 9 new tests (all-skipped P/BPB reference reproduction; §M.2.3
+    backward = PREC; §M.2.2 forward MVDB shift; §M.2.2 left-neighbour
+    predictor chaining; entry-point gating; zero-TRB rejection; and
+    three Table M.1 MODB parser tests for rows 0 / 3 / 4); suite now
+    536 passing (was 527).
 - Annex K Slice-Structured mode end-to-end decode, free-running
   (non-Rectangular-Slice) submode (round 291):
   - `decode_picture_layer` / `decode_picture_layer_with_inherited`

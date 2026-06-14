@@ -84,7 +84,9 @@
 use oxideav_core::bits::BitReader;
 
 use crate::aic::{decode_intra_mode, IntraMode};
-use crate::pb_layer::{parse_cbpb, parse_modb, parse_mvdb, ModbPresence};
+use crate::pb_layer::{
+    parse_cbpb, parse_modb, parse_modb_annex_m, parse_mvdb, ModbAnnexM, ModbPresence,
+};
 use crate::{Error, H263PictureCodingType, Result};
 
 /// Picture-level context the macroblock parser needs.
@@ -124,9 +126,19 @@ pub struct MbContext {
     /// (§5.3.9) after MVD2-4 when MODB indicates it. This is the
     /// Annex G form (Table 11 MODB); the Annex M Improved-PB form
     /// (Table M.1) is a separate parser
-    /// ([`crate::pb_layer::parse_modb_annex_m`]) that a future
-    /// Improved-PB driver gates itself.
+    /// ([`crate::pb_layer::parse_modb_annex_m`]) selected by
+    /// [`MbContext::pb_annex_m`].
     pub pb_frames: bool,
+    /// PLUSPTYPE picture-type `"010"` — Improved PB-frames mode
+    /// (Annex M). When `true` (which requires [`MbContext::pb_frames`]
+    /// also set, since the §5.3 layer fields are shared), MODB is the
+    /// §M.4 / Table M.1 6-entry form parsed by
+    /// [`crate::pb_layer::parse_modb_annex_m`] and surfaced on
+    /// [`H263Macroblock::annex_m_modb`]; CBPB / MVDB presence is gated
+    /// by [`ModbAnnexM::has_cbpb`] / [`ModbAnnexM::has_mvdb`] instead
+    /// of the Table 11 [`ModbPresence`] accessors. When `false` the
+    /// Annex G Table 11 form is used.
+    pub pb_annex_m: bool,
     /// Current QUANT from the most recent GOB-layer header (or
     /// the picture-layer's PQUANT in the no-GOB case). Used to
     /// compute [`H263Macroblock::quantiser_after`] after any
@@ -254,10 +266,18 @@ pub struct H263Macroblock {
     /// and for INTER macroblocks in AIC pictures.
     pub intra_mode: Option<IntraMode>,
     /// §5.3.3 MODB (Table 11). `Some` iff
-    /// [`MbContext::pb_frames`] is set and the macroblock is coded
-    /// and not stuffing (per Table 10, the stuffing row carries COD
-    /// + MCBPC only). `None` for all non-PB paths.
+    /// [`MbContext::pb_frames`] is set, [`MbContext::pb_annex_m`] is
+    /// clear (Annex G form), and the macroblock is coded and not
+    /// stuffing (per Table 10, the stuffing row carries COD + MCBPC
+    /// only). `None` for all non-PB paths and for Annex M pictures
+    /// (whose MODB is surfaced on [`H263Macroblock::annex_m_modb`]).
     pub modb: Option<ModbPresence>,
+    /// §M.4 / Table M.1 MODB for an Improved PB-frame. `Some` iff
+    /// both [`MbContext::pb_frames`] and [`MbContext::pb_annex_m`] are
+    /// set and the macroblock is coded and not stuffing. Carries the
+    /// §M.2 coding mode (bidirectional / forward / backward) plus the
+    /// CBPB / MVDB presence flags. `None` for all non-Annex-M paths.
+    pub annex_m_modb: Option<ModbAnnexM>,
     /// §5.3.4 CBPB — the 6-bit B-block coded-block pattern, bit 5
     /// = B-block 1 … bit 0 = B-block 6 (Figure 5 numbering).
     /// `Some` iff MODB indicated CBPB presence.
@@ -306,6 +326,7 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
             mvd234: [None; 3],
             intra_mode: None,
             modb: None,
+            annex_m_modb: None,
             cbpb: None,
             mvdb: None,
         });
@@ -331,6 +352,7 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
             mvd234: [None; 3],
             intra_mode: None,
             modb: None,
+            annex_m_modb: None,
             cbpb: None,
             mvdb: None,
         });
@@ -352,17 +374,27 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
     // indicates 'PB-frame'"; type 5 cannot occur under Annex G
     // because it requires PLUSPTYPE, which §G.1 bars — Table 10
     // nonetheless lists MODB for it, so no type gate is needed).
-    let modb = if ctx.pb_frames {
-        Some(parse_modb(reader)?)
+    // Annex M (Improved PB-frames) replaces Table 11 with the §M.4
+    // Table M.1 6-entry form; otherwise the Annex G Table 11 form is
+    // read. Only one of the two MODB fields is ever populated.
+    let (modb, annex_m_modb) = if ctx.pb_frames {
+        if ctx.pb_annex_m {
+            (None, Some(parse_modb_annex_m(reader)?))
+        } else {
+            (Some(parse_modb(reader)?), None)
+        }
     } else {
-        None
+        (None, None)
     };
 
     // §5.3.4 — CBPB (6-bit FLC), between MODB and CBPY per
-    // Figure 10, only when MODB indicates it.
-    let cbpb = match modb {
-        Some(m) if m.has_cbpb() => Some(parse_cbpb(reader)?),
-        _ => None,
+    // Figure 10, only when MODB indicates it. Annex G consults
+    // Table 11 ([`ModbPresence::has_cbpb`]); Annex M consults Table M.1
+    // ([`ModbAnnexM::has_cbpb`]).
+    let cbpb = if modb.is_some_and(|m| m.has_cbpb()) || annex_m_modb.is_some_and(|m| m.has_cbpb()) {
+        Some(parse_cbpb(reader)?)
+    } else {
+        None
     };
 
     // §5.3.5 — CBPY (variable length, Table 12).
@@ -412,10 +444,15 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
     }
 
     // §5.3.9 — MVDB, last header field per Figure 10, only when
-    // MODB indicates it.
-    let mvdb = match modb {
-        Some(m) if m.has_mvdb() => Some(parse_mvdb(reader)?),
-        _ => None,
+    // MODB indicates it. Under Annex M MVDB is a forward motion
+    // vector (§M.2.2) rather than the Annex G bidirectional-vector
+    // enhancement, but its on-wire form is identical (two Table 14
+    // VLCs); the §M.2.2 interpretation is applied by the decoder, not
+    // the parser.
+    let mvdb = if modb.is_some_and(|m| m.has_mvdb()) || annex_m_modb.is_some_and(|m| m.has_mvdb()) {
+        Some(parse_mvdb(reader)?)
+    } else {
+        None
     };
 
     Ok(H263Macroblock {
@@ -429,6 +466,7 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
         mvd234,
         intra_mode,
         modb,
+        annex_m_modb,
         cbpb,
         mvdb,
     })
@@ -838,6 +876,7 @@ mod tests {
             advanced_prediction: false,
             aic_intra_mode: false,
             pb_frames: false,
+            pb_annex_m: false,
             quantiser_before: q,
         }
     }
@@ -848,6 +887,7 @@ mod tests {
             advanced_prediction: advanced,
             aic_intra_mode: false,
             pb_frames: false,
+            pb_annex_m: false,
             quantiser_before: q,
         }
     }
@@ -1476,6 +1516,7 @@ mod tests {
                 advanced_prediction: pic.advanced_prediction,
                 aic_intra_mode: false,
                 pb_frames: false,
+                pb_annex_m: false,
                 quantiser_before: gob.quantiser,
             },
         )
@@ -1493,6 +1534,20 @@ mod tests {
             advanced_prediction: false,
             aic_intra_mode: false,
             pb_frames: true,
+            pb_annex_m: false,
+            quantiser_before: q,
+        }
+    }
+
+    /// Annex M (Improved PB-frames) macroblock context: Table M.1 MODB
+    /// instead of Table 11.
+    fn improved_pb_picture_ctx(q: u8) -> MbContext {
+        MbContext {
+            picture_coding_type: H263PictureCodingType::Inter,
+            advanced_prediction: false,
+            aic_intra_mode: false,
+            pb_frames: true,
+            pb_annex_m: true,
             quantiser_before: q,
         }
     }
@@ -1624,6 +1679,83 @@ mod tests {
         assert_eq!(mb.cbpb, None);
         assert_eq!(mb.mvdb, None);
         assert_eq!(r.bit_position(), 1);
+    }
+
+    /// Annex M (Improved PB-frames): MODB is the §M.4 Table M.1 form,
+    /// surfaced on `annex_m_modb` (not `modb`). Table M.1 row 0
+    /// (code `0`, bidirectional, no CBPB / no MVDB) parses with no
+    /// CBPB / MVDB on the wire. Total: COD `0` + MCBPC `1` + MODB `0`
+    /// + CBPY `11` + MVD `1` `1` = 7 bits.
+    #[test]
+    fn improved_pb_inter_mb_modb_row0_bidirectional() {
+        let mut w = BitWriter::new();
+        w.write_bit(false); // COD = 0
+        w.write_bit(true); // MCBPC type 0, cbpc 00
+        w.write_bit(false); // Table M.1 row 0 (code `0`)
+        w.write_u32(0b11, 2); // CBPY
+        w.write_bit(true); // MVD dx = 0
+        w.write_bit(true); // MVD dy = 0
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let mb = parse_macroblock(&mut r, improved_pb_picture_ctx(8)).expect("mb");
+        assert_eq!(mb.modb, None, "Annex G MODB not populated under Annex M");
+        assert_eq!(mb.annex_m_modb, Some(ModbAnnexM::BidirNoCbpbNoMvdb));
+        assert_eq!(mb.cbpb, None);
+        assert_eq!(mb.mvdb, None);
+        assert_eq!(r.bit_position(), 7);
+    }
+
+    /// Annex M Table M.1 row 3 (code `1110`, forward, CBPB + MVDB both
+    /// present): the parser reads CBPB between MODB and CBPY and MVDB
+    /// after MVD, gating both on the Table M.1 accessors. CBPB
+    /// `110000` lights B-blocks 1 / 2; MVDB (+2, 0) (Table 14 `0010` /
+    /// `1`). Total: 1 + 1 + 4 + 6 + 2 + 1 + 1 + 4 + 1 = 21 bits.
+    #[test]
+    fn improved_pb_inter_mb_modb_row3_forward_cbpb_mvdb() {
+        let mut w = BitWriter::new();
+        w.write_bit(false); // COD = 0
+        w.write_bit(true); // MCBPC type 0, cbpc 00
+        w.write_u32(0b1110, 4); // Table M.1 row 3 (code `1110`)
+        w.write_u32(0b110000, 6); // CBPB: blocks 1, 2
+        w.write_u32(0b11, 2); // CBPY
+        w.write_bit(true); // MVD dx = 0
+        w.write_bit(true); // MVD dy = 0
+        w.write_u32(0b0010, 4); // MVDB dx = +2 half-pel
+        w.write_bit(true); // MVDB dy = 0
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let mb = parse_macroblock(&mut r, improved_pb_picture_ctx(8)).expect("mb");
+        assert_eq!(mb.annex_m_modb, Some(ModbAnnexM::ForwardCbpbMvdb));
+        assert_eq!(mb.cbpb, Some(0b110000));
+        assert_eq!(
+            mb.mvdb,
+            Some(Mvd {
+                dx_half: 2,
+                dy_half: 0
+            })
+        );
+        assert_eq!(r.bit_position(), 21);
+    }
+
+    /// Annex M Table M.1 row 4 (code `11110`, backward, no CBPB / no
+    /// MVDB): the 5-bit codeword is consumed and no CBPB / MVDB follow.
+    /// Total: 1 + 1 + 5 + 2 + 1 + 1 = 11 bits.
+    #[test]
+    fn improved_pb_inter_mb_modb_row4_backward() {
+        let mut w = BitWriter::new();
+        w.write_bit(false); // COD = 0
+        w.write_bit(true); // MCBPC type 0, cbpc 00
+        w.write_u32(0b11110, 5); // Table M.1 row 4 (code `11110`)
+        w.write_u32(0b11, 2); // CBPY
+        w.write_bit(true); // MVD dx = 0
+        w.write_bit(true); // MVD dy = 0
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let mb = parse_macroblock(&mut r, improved_pb_picture_ctx(8)).expect("mb");
+        assert_eq!(mb.annex_m_modb, Some(ModbAnnexM::BackwardNoCbpbNoMvdb));
+        assert_eq!(mb.cbpb, None);
+        assert_eq!(mb.mvdb, None);
+        assert_eq!(r.bit_position(), 11);
     }
 
     /// Outside PB-frames mode the INTER macroblock wire layout has no

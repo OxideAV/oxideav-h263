@@ -268,8 +268,9 @@ pub use pb_layer::{
     BpbCodingMode, ModbAnnexM, ModbPresence, CBPB_BITS,
 };
 pub use picture::{
-    decode_pb_picture, decode_picture, decode_picture_layer, decode_picture_layer_with_inherited,
-    DecodeOptions, DecodePictureOutcome, PbFramePair, PictureLayout, YuvFrame,
+    decode_improved_pb_picture, decode_pb_picture, decode_picture, decode_picture_layer,
+    decode_picture_layer_with_inherited, DecodeOptions, DecodePictureOutcome, PbFramePair,
+    PictureLayout, YuvFrame,
 };
 pub use picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
