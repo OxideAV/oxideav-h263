@@ -194,6 +194,23 @@ pub struct DecodeOptions {
     /// cannot signal MQ on the wire, but [`decode_picture_layer`] sets
     /// it from the PLUSPTYPE OPPTYPE Modified-Quantization bit.
     pub modified_quant: bool,
+    /// Decode the picture under Annex S Alternative INTER VLC mode. Two
+    /// §S syntax alterations apply to INTER macroblocks:
+    ///
+    /// * **§S.2** — each INTER coefficient block is parsed by
+    ///   [`crate::block::parse_inter_block_alt_inter_vlc`]: the
+    ///   codewords are interpreted with the baseline INTER VLC (Table
+    ///   16) first, and only re-interpreted with the Annex I INTRA VLC
+    ///   (Table I.2) when the INTER interpretation would address
+    ///   coefficients past slot 63 of the block (§S.2.2 step 3).
+    /// * **§S.3** — when both chrominance blocks of an INTER macroblock
+    ///   carry coefficients (`CBPC5 = CBPC6 = 1`), the CBPY codeword is
+    ///   the Table 12 **INTRA** pattern (no INTER complement).
+    ///
+    /// Off by default; the baseline picture header cannot signal AIV on
+    /// the wire, but [`decode_picture_layer`] sets it from the PLUSPTYPE
+    /// OPPTYPE Alternative-INTER-VLC bit (§5.1.4.4 bit 13).
+    pub alt_inter_vlc: bool,
 }
 
 /// Picture-level layout the §4.2.1 GOB walker needs: total luma
@@ -1615,10 +1632,26 @@ fn plus_ptype_to_baseline_shim(
     // [`SliceStructuredRouting`] returned below.
     if opptype_sac
         || opptype_independent_segment_decoding
-        || opptype_alternative_inter_vlc
         || opptype_custom_pcf
         || extended.plus.cpm
         || extended.plus.mpptype.reduced_resolution_update
+    {
+        return Err(Error::NotImplemented);
+    }
+
+    // Annex S Alternative INTER VLC (§S.2 / §S.3) is wired into the
+    // baseline GOB-walker INTER macroblock path. Its §S.2 re-decode and
+    // §S.3 CBPY-orientation handling thread only through the baseline
+    // single-MV INTER reconstruction, so AIV combined with Advanced
+    // Prediction / INTER4V (Annex F), PB-frames (Annex G / M),
+    // Slice-Structured (Annex K) or Modified Quantization (Annex T) is
+    // refused rather than silently dropping the §S handling on those
+    // blocks.
+    if opptype_alternative_inter_vlc
+        && (opptype_advanced_prediction
+            || opptype_slice_structured
+            || improved_pb
+            || opptype_modified_quantization)
     {
         return Err(Error::NotImplemented);
     }
@@ -1669,6 +1702,14 @@ fn plus_ptype_to_baseline_shim(
     // been refused at its UFEP=001 source picture.
     let modified_quant_effective = match extended.plus.opptype {
         Some(_) => opptype_modified_quantization,
+        None => false,
+    };
+    // §5.1.4.4 bit 13 — the Annex S Alternative INTER VLC bit. As with
+    // the other refused-on-UFEP=000 modes, the inherited snapshot does
+    // not retain AIV, so a UFEP=000 picture inheriting it would already
+    // have been refused at its UFEP=001 source picture.
+    let alt_inter_vlc_effective = match extended.plus.opptype {
+        Some(_) => opptype_alternative_inter_vlc,
         None => false,
     };
 
@@ -1775,6 +1816,7 @@ fn plus_ptype_to_baseline_shim(
         deblock: options.deblock || deblocking_effective,
         aic: options.aic || advanced_intra_effective,
         modified_quant: options.modified_quant || modified_quant_effective,
+        alt_inter_vlc: options.alt_inter_vlc || alt_inter_vlc_effective,
     };
 
     Ok(PlusShimOutcome {
@@ -2529,10 +2571,17 @@ fn decode_one_macroblock(
     };
     let chroma_vec = chroma_mv(luma_mv);
 
-    // INTER macroblocks: CBPY is the *complement* on the wire — the
-    // macroblock parser already returns the CBPY(INTRA) orientation, so
-    // for INTER the actual coded pattern is `cbpy ^ 0b1111` (§5.3.5).
-    let inter_cbpy = cbpy ^ 0b1111;
+    // INTER macroblocks: CBPY is normally the *complement* on the
+    // wire — the macroblock parser returns the CBPY(INTRA) orientation,
+    // so for INTER the actual coded pattern is `cbpy ^ 0b1111` (§5.3.5).
+    //
+    // Annex S §S.3 — under Alternative INTER VLC mode, when both
+    // chrominance blocks carry coefficients (`CBPC5 = CBPC6 = 1`,
+    // i.e. `cbpc == 0b11`) the assumption behind the INTER CBPY
+    // codewords no longer holds, so the Table 12 **INTRA** pattern is
+    // used for the INTER macroblock — i.e. no complement.
+    let alt_cbpy = options.alt_inter_vlc && (cbpc & 0b11) == 0b11;
+    let inter_cbpy = if alt_cbpy { cbpy } else { cbpy ^ 0b1111 };
 
     let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
     for blk in 0..4 {
@@ -2540,14 +2589,19 @@ fn decode_one_macroblock(
         let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
         let prediction = motion_compensate_block(&y_ref, bx, by, luma_mv, RCONTROL_DEFAULT);
         let samples = if has_coef {
-            let block = parse_block(
-                reader,
-                BlockContext {
-                    has_intradc: false,
-                    has_coefficients: true,
-                    modified_quant: mq,
-                },
-            )?;
+            // §S.2 — Alternative INTER VLC for coefficients.
+            let block = if options.alt_inter_vlc {
+                crate::block::parse_inter_block_alt_inter_vlc(reader, mq)?
+            } else {
+                parse_block(
+                    reader,
+                    BlockContext {
+                        has_intradc: false,
+                        has_coefficients: true,
+                        modified_quant: mq,
+                    },
+                )?
+            };
             reconstruct_inter_block_with_prediction(&block, quant, &prediction)
         } else {
             prediction
@@ -2563,14 +2617,20 @@ fn decode_one_macroblock(
     );
     let cb_pred = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
     let cb_samples = if cbpc & 0b10 != 0 {
-        let block = parse_block(
-            reader,
-            BlockContext {
-                has_intradc: false,
-                has_coefficients: true,
-                modified_quant: mq,
-            },
-        )?;
+        // §S.2 — Alternative INTER VLC applies to every INTER block,
+        // including chrominance.
+        let block = if options.alt_inter_vlc {
+            crate::block::parse_inter_block_alt_inter_vlc(reader, mq)?
+        } else {
+            parse_block(
+                reader,
+                BlockContext {
+                    has_intradc: false,
+                    has_coefficients: true,
+                    modified_quant: mq,
+                },
+            )?
+        };
         reconstruct_inter_block_with_prediction(&block, chroma_quant, &cb_pred)
     } else {
         cb_pred
@@ -2584,14 +2644,20 @@ fn decode_one_macroblock(
     );
     let cr_pred = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
     let cr_samples = if cbpc & 0b01 != 0 {
-        let block = parse_block(
-            reader,
-            BlockContext {
-                has_intradc: false,
-                has_coefficients: true,
-                modified_quant: mq,
-            },
-        )?;
+        // §S.2 — Alternative INTER VLC applies to every INTER block,
+        // including chrominance.
+        let block = if options.alt_inter_vlc {
+            crate::block::parse_inter_block_alt_inter_vlc(reader, mq)?
+        } else {
+            parse_block(
+                reader,
+                BlockContext {
+                    has_intradc: false,
+                    has_coefficients: true,
+                    modified_quant: mq,
+                },
+            )?
+        };
         reconstruct_inter_block_with_prediction(&block, chroma_quant, &cr_pred)
     } else {
         cr_pred
@@ -3694,6 +3760,7 @@ mod tests {
                 deblock: true,
                 aic: false,
                 modified_quant: false,
+                alt_inter_vlc: false,
             },
         )
         .expect("decode");
@@ -4830,6 +4897,7 @@ mod tests {
                 deblock: false,
                 aic: true,
                 modified_quant: false,
+                alt_inter_vlc: false,
             },
         )
         .expect("AIC driver should decode the zero-residual picture");
@@ -4927,6 +4995,7 @@ mod tests {
                 deblock: false,
                 aic: true,
                 modified_quant: false,
+                alt_inter_vlc: false,
             },
         )
         .expect("AIC driver should decode the +1-DC picture");
@@ -4998,6 +5067,7 @@ mod tests {
                 deblock: false,
                 aic: true,
                 modified_quant: false,
+                alt_inter_vlc: false,
             },
         )
         .expect("decode");
@@ -5086,6 +5156,144 @@ mod tests {
         w.write_bit(true); // SCE-guard
                            // §5.1.20 — CPM = 0.
         w.write_bit(false);
+    }
+
+    /// Write a QCIF PLUSPTYPE **P-picture** (INTER) header with the
+    /// Annex S Alternative INTER VLC bit (OPPTYPE bit 13) set, and AP /
+    /// SS / MQ all off so the baseline single-MV INTER path (which now
+    /// threads §S.2 / §S.3) is selected.
+    fn write_plus_qcif_inter_aiv_header(w: &mut BitWriter) {
+        // §5.1.1 / §5.1.2 — PSC + TR.
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+                           // §5.1.3 — PTYPE bits 1-2 = "10".
+        w.write_bit(true);
+        w.write_bit(false);
+        // PTYPE bits 3-5 = "000".
+        w.write_u32(0b000, 3);
+        // PTYPE bits 6-8 = "111" → extended PTYPE.
+        w.write_u32(0b111, 3);
+        // §5.1.4.1 — UFEP = "001" (OPPTYPE present).
+        w.write_u32(0b001, 3);
+        // §5.1.4.2 — OPPTYPE (18 bits, MSB first).
+        w.write_u32(0b010, 3); // bits 1-3 source format = QCIF
+        w.write_bit(false); // bit 4 custom_pcf
+        w.write_bit(false); // bit 5 UMV
+        w.write_bit(false); // bit 6 SAC
+        w.write_bit(false); // bit 7 AP
+        w.write_bit(false); // bit 8 AIC
+        w.write_bit(false); // bit 9 DF
+        w.write_bit(false); // bit 10 SS
+        w.write_bit(false); // bit 11 RPS
+        w.write_bit(false); // bit 12 IS
+        w.write_bit(true); // bit 13 AIV = ON
+        w.write_bit(false); // bit 14 MQ
+        w.write_bit(true); // bit 15 SCE-guard
+        w.write_u32(0b000, 3); // bits 16-18 reserved
+                               // §5.1.4.3 — MPPTYPE (9 bits): picture type "001"
+                               // (INTER), RPR=0, RRU=0, RTYPE=0, reserved "00",
+                               // SCE-guard "1".
+        w.write_u32(0b001, 3); // picture type INTER
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+                           // §5.1.20 — CPM = 0.
+        w.write_bit(false);
+    }
+
+    /// Append an Annex S INTER macroblock to `w`: MVD = (0, 0), MCBPC
+    /// idx 3 (`000101` → INTER type 0, CBPC = "11", i.e.
+    /// CBPC5 = CBPC6 = 1 so §S.3 engages), CBPY codeword for the §S.3
+    /// INTRA orientation pattern `1000` (luma block 0 coded only), and a
+    /// luma-block-0 coefficient stream that overruns the block under the
+    /// INTER VLC so §S.2.2 step 3 re-decodes it with Table I.2: three
+    /// idx-57 events `(INTRA RUN 0, LEVEL 21)` + an idx-58 terminator.
+    /// The two chroma blocks carry a single in-range event each.
+    fn write_inter_annex_s_mb(w: &mut BitWriter) {
+        w.write_bit(false); // COD = 0 (coded)
+                            // MCBPC idx 3 = "000101" (INTER type 0, CBPC 11).
+        w.write_u32(0b000101, 6);
+        // §S.3 — with AIV + CBPC = 11 the CBPY codeword is the INTRA
+        // pattern. We want luma pattern `1000` (block 0 only): Table-12
+        // INTRA idx 8 codeword = "00010".
+        w.write_u32(0b00010, 5);
+        // §5.3.7 — MVD = (0, 0) → both Table-14 "1" codes.
+        w.write_bit(true);
+        w.write_bit(true);
+        // Luma block 0 — §S.2 overflow-then-INTRA stream.
+        for _ in 0..3 {
+            w.write_u32(0b0000_0101_0111, 12); // idx 57 prefix
+            w.write_bit(false); // sign +
+        }
+        w.write_u32(0b0111, 4); // idx 58 (LAST=1)
+        w.write_bit(false); // sign +
+                            // Cb + Cr — one in-range event each (idx 58, LAST=1, +1). These
+                            // stay inside the block under the INTER table, so §S.2.2 step 2
+                            // keeps the INTER interpretation.
+        for _ in 0..2 {
+            w.write_u32(0b0111, 4);
+            w.write_bit(false);
+        }
+    }
+
+    /// `decode_picture_layer` must accept an Annex S Alternative INTER
+    /// VLC P-picture (OPPTYPE bit 13) — previously refused — and decode
+    /// the §S.2 / §S.3 INTER macroblock end-to-end. We assert the AIV
+    /// macroblock reconstructs (the §S.2 INTRA re-decode would be
+    /// impossible to parse under the plain INTER VLC, so a successful
+    /// non-grey reconstruction proves the §S path ran) while the
+    /// remaining skipped macroblocks copy the flat-grey reference.
+    #[test]
+    fn decode_picture_layer_plus_annex_s_inter_decodes() {
+        let reference = YuvFrame::grey(176, 144);
+        let mut w = BitWriter::new();
+        write_plus_qcif_inter_aiv_header(&mut w);
+        for gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for mb in 0..11 {
+                if gob == 0 && mb == 0 {
+                    write_inter_annex_s_mb(&mut w);
+                } else {
+                    write_skipped_mb(&mut w);
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let frame = decode_picture_layer(&data, Some(&reference), DecodeOptions::default())
+            .expect("Annex S AIV P-picture should decode (was previously refused)");
+        assert_eq!(frame.luma_width, 176);
+        assert_eq!(frame.luma_height, 144);
+
+        // MB(0,0) luma block 0 carried the §S.2 INTRA-reinterpreted
+        // coefficients on top of a flat-128 prediction, so at least one
+        // sample in the top-left 8×8 must differ from grey 128.
+        let lw = frame.luma_width;
+        let mut changed = false;
+        for y in 0..8 {
+            for x in 0..8 {
+                if frame.y[y * lw + x] != 128 {
+                    changed = true;
+                }
+            }
+        }
+        assert!(
+            changed,
+            "§S.2 INTRA-reinterpreted residual was not applied to MB(0,0) block 0"
+        );
+
+        // A skipped macroblock far from MB(0,0) must be the verbatim
+        // grey reference (zero-MV copy).
+        assert_eq!(frame.y[100 * lw + 100], 128);
     }
 
     /// Build a QCIF AIC INTRA picture using the PLUSPTYPE header path,
@@ -5247,6 +5455,7 @@ mod tests {
                 aic: true,
                 deblock: false,
                 modified_quant: false,
+                alt_inter_vlc: false,
             },
         )
         .expect("decode");

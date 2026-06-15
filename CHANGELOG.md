@@ -8,6 +8,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex S Alternative INTER VLC mode (round 318):
+  - **§S.2** — `block::parse_inter_block_alt_inter_vlc` decodes each
+    INTER coefficient block per §S.2.2: the codewords are interpreted
+    with the baseline INTER VLC (Table 16) first, and only when the
+    INTER interpretation would address coefficients past slot 63 of the
+    block (the `BadTcoefRunOverflow` signal — step 3) the reader is
+    rewound to the block's first bit and the same codewords are
+    re-decoded with the Annex I Table I.2 (INTRA) interpretation. Both
+    tables share one codeword inventory (§I.3 / §S.2), so the re-decode
+    consumes exactly the same bits. Applied to every INTER block of the
+    macroblock, luma and chroma.
+  - **§S.3** — when both chrominance blocks of an INTER macroblock carry
+    coefficients (`CBPC5 = CBPC6 = 1`), the CBPY codeword is the Table 12
+    INTRA pattern (no INTER complement).
+  - `DecodeOptions::alt_inter_vlc` gates the mode; the §5.1.4 PLUSPTYPE
+    shim now auto-activates it from the OPPTYPE Alternative-INTER-VLC bit
+    (bit 13) instead of refusing the picture, and ORs it into the
+    caller's options like the AIC / DF / MQ wire bits.
+  - Out of scope (reported, not guessed): AIV combined with Advanced
+    Prediction / INTER4V (Annex F), PB / Improved PB-frames (Annex G / M),
+    Slice-Structured (Annex K) or Modified Quantization (Annex T) — the
+    shim refuses those combinations because the §S re-decode and §S.3
+    CBPY orientation thread only through the baseline single-MV INTER
+    reconstruction path.
+  - Tests: three `block` unit tests (INTER-in-range, INTRA-reinterpret-on-
+    overflow, baseline-INTER-overflows-on-same-stream) and one
+    `decode_picture_layer` end-to-end test on a PLUSPTYPE AIV P-picture
+    (previously refused). `cargo test -p oxideav-h263`: 576 (was 572).
+
 - Annex T Modified Quantization mode combined with Annex I Advanced
   INTRA Coding (round 315):
   - The §5.1.4 PLUSPTYPE shim no longer refuses an OPPTYPE picture that

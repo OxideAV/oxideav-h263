@@ -246,6 +246,97 @@ pub fn parse_block(reader: &mut BitReader<'_>, ctx: BlockContext) -> Result<H263
     Ok(block)
 }
 
+/// Parse a single **INTER** block under the Annex S §S.2 Alternative
+/// INTER VLC rule.
+///
+/// §S.2.2 specifies the decoder process precisely:
+///
+/// 1. The decoder first receives all coefficient codes of the block.
+/// 2. The codewords are interpreted assuming the INTER VLC (Table 16).
+///    If the coefficient addressing stays inside the 64 coefficients of
+///    the block, the VLC decoding is finished.
+/// 3. If coefficients outside the block are addressed, the codewords
+///    are re-interpreted according to the INTRA VLC (Table I.2 of
+///    Annex I).
+///
+/// Both tables share the *same* codeword inventory (§I.3 / §S.2): the
+/// INTRA table is the INTER table with the `(RUN, LEVEL)` meaning
+/// "reshuffled" among codewords that carry the same `LAST` value.
+/// Re-interpreting therefore consumes exactly the same bits — so the
+/// implementation parses the block once with the INTER table and, only
+/// if that interpretation overruns the 64-coefficient block (the
+/// [`Error::BadTcoefRunOverflow`] the baseline parser raises when a RUN
+/// addresses past slot 63), rewinds the reader to the block's first bit
+/// and re-parses with the Table I.2 interpretation. The decoder detects
+/// the INTRA table's use exactly as the spec describes: INTER decoding
+/// addresses more than 64 coefficients.
+///
+/// `reader` must be positioned at the first TCOEF bit of the block.
+/// On success it is left after the block's `LAST = 1` terminator (in
+/// either interpretation the codewords — hence the consumed bit count —
+/// are identical, so the final position matches whichever table won).
+///
+/// `modified_quant` threads the Annex T §T.4 / §T.5 EXTENDED-ESCAPE
+/// interpretation into both table parses for completeness; the picture
+/// shim refuses the MQ + AIV combination, so in practice it is always
+/// `false` on this path.
+pub fn parse_inter_block_alt_inter_vlc(
+    reader: &mut BitReader<'_>,
+    modified_quant: bool,
+) -> Result<H263Block> {
+    // §S.2.2 step 2 — try the baseline INTER VLC (Table 16) first.
+    // `BitReader` is `Copy`, so snapshot the start position for the
+    // possible §S.2.2 step-3 rewind.
+    let start = *reader;
+    let inter_ctx = BlockContext {
+        has_intradc: false,
+        has_coefficients: true,
+        modified_quant,
+    };
+    match parse_block(reader, inter_ctx) {
+        Ok(block) => Ok(block),
+        // §S.2.2 step 3 — INTER addressing overran the 64-coefficient
+        // block, so the codewords are the Annex I INTRA VLC. Rewind to
+        // the block's first bit and re-decode with Table I.2.
+        Err(Error::BadTcoefRunOverflow) => {
+            *reader = start;
+            parse_inter_block_as_intra_vlc(reader, modified_quant)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Re-parse an INTER block's coefficient codes using the Annex I
+/// Table I.2 (INTRA) `(LAST, RUN, LEVEL)` interpretation, per §S.2.2
+/// step 3. An INTER block has no INTRADC, so the first AC the events
+/// may write to is scan slot 0 (`RUN == 0` ⇒ DC slot).
+fn parse_inter_block_as_intra_vlc(
+    reader: &mut BitReader<'_>,
+    modified_quant: bool,
+) -> Result<H263Block> {
+    let mut block = H263Block::empty();
+    let mut scan_pos: usize = 0;
+    loop {
+        let event = crate::intra_tcoef::decode_intra_tcoef_event(reader, modified_quant)?;
+        scan_pos = scan_pos
+            .checked_add(event.run as usize)
+            .ok_or(Error::BadTcoefRunOverflow)?;
+        if scan_pos >= COEFFS_PER_BLOCK {
+            return Err(Error::BadTcoefRunOverflow);
+        }
+        block.coefficients[scan_pos] = event.level;
+        block.tcoef_event_count += 1;
+        if event.last {
+            break;
+        }
+        scan_pos += 1;
+        if scan_pos >= COEFFS_PER_BLOCK {
+            return Err(Error::BadTcoefRunOverflow);
+        }
+    }
+    Ok(block)
+}
+
 /// A single (LAST, RUN, LEVEL) TCOEF event decoded from the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcoefEvent {
@@ -1271,6 +1362,82 @@ mod tests {
         assert_eq!(
             parse_block(&mut r, inter_ctx_with_coefs()).unwrap_err(),
             Error::BadTcoefCode
+        );
+    }
+
+    /// Annex S §S.2 — when the INTER (Table 16) interpretation stays
+    /// inside the 64-coefficient block (§S.2.2 step 2), the alternative
+    /// parser returns exactly the baseline INTER decode: no re-decode.
+    #[test]
+    fn annex_s_s2_inter_interpretation_used_when_in_range() {
+        // Single event: Table-16 idx 58 "0111" + sign 0 →
+        // (LAST=1, RUN=0, LEVEL=+1). Stays in range, so §S.2.2 step 2
+        // finishes with the INTER table.
+        let mut w = BitWriter::new();
+        w.write_u32(0b0111, 4); // idx 58 prefix
+        w.write_bit(false); // sign +
+        let bytes = finish_aligned(w);
+
+        let mut r = BitReader::new(&bytes);
+        let blk = parse_inter_block_alt_inter_vlc(&mut r, false).expect("alt-vlc parse");
+        // INTER interpretation: slot 0 = +1, nothing else.
+        assert_eq!(blk.coefficients[0], 1);
+        assert!(blk.coefficients[1..].iter().all(|c| *c == 0));
+        assert_eq!(blk.tcoef_event_count, 1);
+        // The reader consumed exactly the one event (4 + 1 bits).
+        assert_eq!(r.bit_position(), 5);
+    }
+
+    /// Annex S §S.2 — when the INTER interpretation would address
+    /// coefficients past slot 63 (§S.2.2 step 3), the parser rewinds and
+    /// re-decodes the *same* codewords with the Annex I Table I.2 (INTRA)
+    /// interpretation.
+    ///
+    /// Codeword idx 57 ("0000 0101 0111") has LAST = 0 in both tables but
+    /// INTER `(RUN, LEVEL) = (26, 1)` vs INTRA `(0, 21)`. Three of them
+    /// overrun the block under the INTER table (0→27→54→80 ≥ 64) but pack
+    /// into slots 0..2 under the INTRA table; a final idx-58 "0111"
+    /// terminates with LAST = 1, `(RUN, LEVEL) = (0, 1)` in both tables.
+    #[test]
+    fn annex_s_s2_reinterprets_with_intra_vlc_on_overflow() {
+        let mut w = BitWriter::new();
+        for _ in 0..3 {
+            w.write_u32(0b0000_0101_0111, 12); // idx 57 prefix
+            w.write_bit(false); // sign +
+        }
+        w.write_u32(0b0111, 4); // idx 58 prefix (LAST=1)
+        w.write_bit(false); // sign +
+        let bytes = finish_aligned(w);
+
+        let mut r = BitReader::new(&bytes);
+        let blk = parse_inter_block_alt_inter_vlc(&mut r, false).expect("alt-vlc parse");
+        // INTRA interpretation: slots 0,1,2 = 21 (RUN 0 each), slot 3 = 1.
+        assert_eq!(&blk.coefficients[0..4], &[21, 21, 21, 1]);
+        assert!(blk.coefficients[4..].iter().all(|c| *c == 0));
+        assert_eq!(blk.tcoef_event_count, 4);
+        // Re-decode consumed the same bit count as the (failed) INTER
+        // attempt: 3 × 13 + 5 = 44 bits.
+        assert_eq!(r.bit_position(), 44);
+    }
+
+    /// Annex S §S.2 — the baseline INTER parser by itself rejects the
+    /// same overflowing stream with `BadTcoefRunOverflow` (this is the
+    /// exact signal the alternative parser keys §S.2.2 step 3 on).
+    #[test]
+    fn annex_s_s2_baseline_inter_overflows_on_same_stream() {
+        let mut w = BitWriter::new();
+        for _ in 0..3 {
+            w.write_u32(0b0000_0101_0111, 12);
+            w.write_bit(false);
+        }
+        w.write_u32(0b0111, 4);
+        w.write_bit(false);
+        let bytes = finish_aligned(w);
+
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_block(&mut r, inter_ctx_with_coefs()).unwrap_err(),
+            Error::BadTcoefRunOverflow
         );
     }
 }

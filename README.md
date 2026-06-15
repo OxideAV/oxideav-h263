@@ -67,6 +67,18 @@ planar 4:2:0 `YuvFrame`:
   parse (SSC + SEPB1/2/3 + optional SSBI + MBA + SQUANT + optional
   SWI + GFID, plus the first-slice reduced form) and the free-running
   (non-Rectangular-Slice) end-to-end decode driver.
+* **Annex S §S.2 / §S.3** — Alternative INTER VLC mode: each INTER
+  coefficient block is interpreted with the baseline INTER VLC (Table
+  16) first and re-interpreted with the Annex I INTRA VLC (Table I.2)
+  only when the INTER reading would address coefficients past slot 63 of
+  the block (§S.2.2 step 3, keyed on the run-overflow signal — both
+  tables share one codeword inventory so the re-decode consumes the same
+  bits); and, when both chrominance blocks of an INTER macroblock carry
+  coefficients (`CBPC5 = CBPC6 = 1`), the CBPY codeword is the Table 12
+  INTRA pattern (no INTER complement, §S.3). Wired into the baseline
+  single-MV INTER path and auto-activated from the PLUSPTYPE OPPTYPE
+  bit 13; refused when combined with Advanced Prediction / INTER4V,
+  PB-frames, Slice-Structured or Modified Quantization.
 * **Annex T** — Modified Quantization mode: the §T.2 variable-length
   DQUANT parser, the §T.3 chrominance `QUANT_C` step, and the §T.4
   EXTENDED-ESCAPE / EXTENDED-LEVEL extended coefficient range, driving
