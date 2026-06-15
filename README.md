@@ -5,6 +5,49 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 40 (workspace round 310) — Annex T Modified Quantization mode:
+MQ-active picture reconstruction end-to-end. The OPPTYPE
+Modified-Quantization bit (§5.1.4.2 bit 14), previously refused at the
+extended-PTYPE picture boundary, now drives a full picture decode: the
+§T.2 variable-length DQUANT field is parsed per macroblock, chrominance
+coefficients are inverse-quantised with the §T.3 / Table T.2 `QUANT_C`
+step size, and the §T.4 EXTENDED-ESCAPE / EXTENDED-LEVEL extended
+coefficient range is honoured per block. The §T.2 / §T.3 / §T.4
+primitives that landed in rounds 302 and 308 are now reachable through
+the single `decode_picture_layer` entry point.**
+
+* `DecodeOptions::modified_quant` new flag carries the MQ decision into
+  the §4.2.1 GOB-walker driver. `plus_ptype_to_baseline_shim` no longer
+  refuses the OPPTYPE MQ bit; it OR-merges it into the effective options
+  (UFEP=001 from the parsed OPPTYPE, the same way AIC / DF are wired),
+  so a PLUSPTYPE MQ picture auto-activates the mode with the caller's
+  default options.
+* `decode_one_macroblock` threads MQ into the macroblock + block layers:
+  `MbContext::modified_quant` selects the §T.2 DQUANT VLC; every
+  `BlockContext::modified_quant` enables the §T.4 EXTENDED-ESCAPE
+  interpretation of the §5.4.2 ESCAPE LEVEL; and the two chrominance
+  blocks are dequantised with the §T.3 `QUANT_C` (via
+  `quant_c_from_quant`) while luma keeps QUANT.
+* Refused (reported, not guessed): MQ combined with Advanced INTRA
+  Coding (Annex I), Advanced Prediction / INTER4V (Annex F), PB / Improved
+  PB-frames (Annex G / M) or Slice-Structured (Annex K) — those
+  reconstruction paths do not yet thread the §T.3 / §T.4 dequant
+  boundary, so the shim returns `Error::NotImplemented` rather than
+  silently dropping MQ on those blocks. The §T.5 encoder-side usage
+  restrictions remain out of scope (decoder does not enforce them).
+
+5 new tests land: the §T.3 chroma comparison (identical INTRA body
+decoded MQ-on vs MQ-off — luma bit-identical, both chroma planes differ
+because QUANT_C=12 ≠ QUANT=16); the §T.3 QUANT_C reconstruction-level
+pin (a single chroma AC reconstructs differently at QUANT 16 vs
+QUANT_C 12); the §T.4 end-to-end EXTENDED-ESCAPE through the picture
+driver (a +200 chroma coefficient at QUANT 4 < 8 decodes and reaches the
+output plane); the §T.2 arbitrary-selection DQUANT mid-picture decode;
+and the MQ + AIC shim refusal. `cargo test -p oxideav-h263` reports 571
+passed (previously 566).
+
+---
+
 **Round 39 (workspace round 308) — Annex T Modified Quantization mode:
 §T.4 Modified coefficient range (EXTENDED-ESCAPE / EXTENDED-LEVEL).
 The §5.4.2 TCOEF ESCAPE LEVEL field `1000 0000`, forbidden in

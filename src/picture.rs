@@ -182,6 +182,18 @@ pub struct DecodeOptions {
     /// Off by default; callers must opt in because the baseline picture
     /// header cannot signal AIC on the wire.
     pub aic: bool,
+    /// Decode the picture under Annex T Modified Quantization mode: the
+    /// §5.3.6 DQUANT field is the §T.2 variable-length form (parsed by
+    /// [`crate::annex_t::parse_modified_dquant`]), chrominance
+    /// coefficients are inverse-quantised with the §T.3 / Table T.2
+    /// `QUANT_C` step size ([`crate::annex_t::quant_c_from_quant`])
+    /// rather than the luminance QUANT, and the §5.4.2 TCOEF ESCAPE
+    /// LEVEL `1000 0000` decodes as the §T.4 EXTENDED-ESCAPE marker
+    /// (an 11-bit EXTENDED-LEVEL field representing AC magnitudes
+    /// greater than 127). Off by default; the baseline picture header
+    /// cannot signal MQ on the wire, but [`decode_picture_layer`] sets
+    /// it from the PLUSPTYPE OPPTYPE Modified-Quantization bit.
+    pub modified_quant: bool,
 }
 
 /// Picture-level layout the §4.2.1 GOB walker needs: total luma
@@ -1604,10 +1616,26 @@ fn plus_ptype_to_baseline_shim(
     if opptype_sac
         || opptype_independent_segment_decoding
         || opptype_alternative_inter_vlc
-        || opptype_modified_quantization
         || opptype_custom_pcf
         || extended.plus.cpm
         || extended.plus.mpptype.reduced_resolution_update
+    {
+        return Err(Error::NotImplemented);
+    }
+
+    // Annex T Modified Quantization (§T.2 / §T.3 / §T.4) is wired into
+    // the baseline GOB-walker macroblock path only this round. The MQ
+    // dequant boundary is not yet threaded through the Advanced INTRA
+    // Coding (Annex I), Advanced Prediction / INTER4V (Annex F),
+    // PB-frame (Annex G / M) or Slice-Structured (Annex K) reconstruction
+    // paths, so MQ combined with any of those is refused rather than
+    // silently dropping the §T.3 QUANT_C / §T.4 extended-coefficient
+    // handling on those blocks.
+    if opptype_modified_quantization
+        && (opptype_advanced_intra
+            || opptype_advanced_prediction
+            || opptype_slice_structured
+            || improved_pb)
     {
         return Err(Error::NotImplemented);
     }
@@ -1634,6 +1662,15 @@ fn plus_ptype_to_baseline_shim(
     let deblocking_effective = match extended.plus.opptype {
         Some(_) => opptype_deblocking,
         None => inherited.deblocking,
+    };
+    // §5.1.4.4 — the Annex T Modified Quantization bit. On UFEP=001 it
+    // comes from the just-parsed OPPTYPE; on UFEP=000 the refused-mode
+    // bits (MQ among them) are not retained in the inherited snapshot,
+    // so any UFEP=000 picture that would inherit MQ would already have
+    // been refused at its UFEP=001 source picture.
+    let modified_quant_effective = match extended.plus.opptype {
+        Some(_) => opptype_modified_quantization,
+        None => false,
     };
 
     // §5.1.4.5 rule 1 — UMV (Annex D) and Advanced Prediction (Annex F)
@@ -1738,6 +1775,7 @@ fn plus_ptype_to_baseline_shim(
     let options = DecodeOptions {
         deblock: options.deblock || deblocking_effective,
         aic: options.aic || advanced_intra_effective,
+        modified_quant: options.modified_quant || modified_quant_effective,
     };
 
     Ok(PlusShimOutcome {
@@ -1868,7 +1906,7 @@ fn decode_after_picture_header(
                             pb_frames: header.pb_frames,
                             pb_annex_m: pb.as_ref().is_some_and(|p| p.annex_m),
                             quantiser_before: current_quant,
-                            modified_quant: false,
+                            modified_quant: options.modified_quant,
                         },
                     )?;
                     if matches!(mb.mb_type, Some(MbType::Stuffing)) {
@@ -2361,6 +2399,18 @@ fn decode_one_macroblock(
     *current_quant = mb.quantiser_after;
     let quant = mb.quantiser_after;
 
+    // Annex T §T.3 — when Modified Quantization mode is in use, the
+    // chrominance coefficients are inverse-quantised with QUANT_C
+    // (Table T.2) rather than the luminance QUANT. Outside MQ the two
+    // are identical. §T.4 (EXTENDED-ESCAPE) is gated per block by the
+    // same `options.modified_quant` flag via `BlockContext`.
+    let mq = options.modified_quant;
+    let chroma_quant = if mq {
+        crate::annex_t::quant_c_from_quant(quant)?
+    } else {
+        quant
+    };
+
     let cbpy = mb.cbpy.unwrap_or(0);
     let cbpc = mb.cbpc.unwrap_or(0);
 
@@ -2391,7 +2441,7 @@ fn decode_one_macroblock(
                 BlockContext {
                     has_intradc: true,
                     has_coefficients: has_ac,
-                    ..Default::default()
+                    modified_quant: mq,
                 },
             )?;
             let samples = reconstruct_intra_block(&block, quant);
@@ -2399,15 +2449,16 @@ fn decode_one_macroblock(
             blit_block(&mut frame.y, luma_stride, bx, by, &samples);
         }
         // Chroma: CBPC bit 0b10 = Cb (block 5), 0b01 = Cr (block 6).
+        // §T.3 — chrominance dequant uses QUANT_C when MQ is in use.
         let cb_block = parse_block(
             reader,
             BlockContext {
                 has_intradc: true,
                 has_coefficients: cbpc & 0b10 != 0,
-                ..Default::default()
+                modified_quant: mq,
             },
         )?;
-        let cb_samples = reconstruct_intra_block(&cb_block, quant);
+        let cb_samples = reconstruct_intra_block(&cb_block, chroma_quant);
         blit_block(&mut frame.cb, chroma_stride, c_x, c_y, &cb_samples);
 
         let cr_block = parse_block(
@@ -2415,10 +2466,10 @@ fn decode_one_macroblock(
             BlockContext {
                 has_intradc: true,
                 has_coefficients: cbpc & 0b01 != 0,
-                ..Default::default()
+                modified_quant: mq,
             },
         )?;
-        let cr_samples = reconstruct_intra_block(&cr_block, quant);
+        let cr_samples = reconstruct_intra_block(&cr_block, chroma_quant);
         blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
 
         // Outside PB-frames mode, INTRA macroblocks have no motion
@@ -2493,7 +2544,7 @@ fn decode_one_macroblock(
                 BlockContext {
                     has_intradc: false,
                     has_coefficients: true,
-                    ..Default::default()
+                    modified_quant: mq,
                 },
             )?;
             reconstruct_inter_block_with_prediction(&block, quant, &prediction)
@@ -2503,6 +2554,7 @@ fn decode_one_macroblock(
         blit_block(&mut frame.y, luma_stride, bx, by, &samples);
     }
 
+    // §T.3 — chrominance dequant uses QUANT_C when MQ is in use.
     let cb_ref = RefPlane::new(
         &reference.cb,
         reference.chroma_width(),
@@ -2515,10 +2567,10 @@ fn decode_one_macroblock(
             BlockContext {
                 has_intradc: false,
                 has_coefficients: true,
-                ..Default::default()
+                modified_quant: mq,
             },
         )?;
-        reconstruct_inter_block_with_prediction(&block, quant, &cb_pred)
+        reconstruct_inter_block_with_prediction(&block, chroma_quant, &cb_pred)
     } else {
         cb_pred
     };
@@ -2536,10 +2588,10 @@ fn decode_one_macroblock(
             BlockContext {
                 has_intradc: false,
                 has_coefficients: true,
-                ..Default::default()
+                modified_quant: mq,
             },
         )?;
-        reconstruct_inter_block_with_prediction(&block, quant, &cr_pred)
+        reconstruct_inter_block_with_prediction(&block, chroma_quant, &cr_pred)
     } else {
         cr_pred
     };
@@ -3633,6 +3685,7 @@ mod tests {
             DecodeOptions {
                 deblock: true,
                 aic: false,
+                modified_quant: false,
             },
         )
         .expect("decode");
@@ -4768,6 +4821,7 @@ mod tests {
             DecodeOptions {
                 deblock: false,
                 aic: true,
+                modified_quant: false,
             },
         )
         .expect("AIC driver should decode the zero-residual picture");
@@ -4864,6 +4918,7 @@ mod tests {
             DecodeOptions {
                 deblock: false,
                 aic: true,
+                modified_quant: false,
             },
         )
         .expect("AIC driver should decode the +1-DC picture");
@@ -4934,6 +4989,7 @@ mod tests {
             DecodeOptions {
                 deblock: false,
                 aic: true,
+                modified_quant: false,
             },
         )
         .expect("decode");
@@ -5182,6 +5238,7 @@ mod tests {
             DecodeOptions {
                 aic: true,
                 deblock: false,
+                modified_quant: false,
             },
         )
         .expect("decode");
@@ -6929,6 +6986,280 @@ mod tests {
         assert_eq!(
             decode_improved_pb_picture(&data, &reference, 0, DecodeOptions::default()).unwrap_err(),
             Error::BadPbTemporalReference
+        );
+    }
+
+    // ---- Annex T Modified Quantization mode — picture driver ----
+
+    /// Write a QCIF PLUSPTYPE INTRA picture header, parameterised on the
+    /// OPPTYPE Modified-Quantization (MQ) and Advanced-INTRA-Coding (AIC)
+    /// bits. All other mode bits are clear. Mirrors
+    /// `write_plus_qcif_intra_header` but exposes the §5.1.4.2 MQ bit
+    /// (bit 14) so an MQ-active picture can be assembled.
+    fn write_plus_qcif_intra_header_mq(w: &mut BitWriter, mq: bool, aic: bool) {
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true); // PTYPE bit 1
+        w.write_bit(false); // PTYPE bit 2
+        w.write_bit(false); // bit 3 split-screen
+        w.write_bit(false); // bit 4 doc-camera
+        w.write_bit(false); // bit 5 freeze
+        w.write_u32(0b111, 3); // bits 6-8 → extended PTYPE
+        w.write_u32(0b001, 3); // UFEP = 001
+        w.write_u32(0b010, 3); // OPPTYPE bits 1-3 source format = QCIF
+        w.write_bit(false); // bit 4 custom_pcf
+        w.write_bit(false); // bit 5 UMV
+        w.write_bit(false); // bit 6 SAC
+        w.write_bit(false); // bit 7 AP
+        w.write_bit(aic); // bit 8 AIC
+        w.write_bit(false); // bit 9 DF
+        w.write_bit(false); // bit 10 SS
+        w.write_bit(false); // bit 11 RPS
+        w.write_bit(false); // bit 12 IS
+        w.write_bit(false); // bit 13 AIV
+        w.write_bit(mq); // bit 14 MQ
+        w.write_bit(true); // bit 15 SCE-guard
+        w.write_u32(0b000, 3); // bits 16-18 reserved
+        w.write_u32(0b000, 3); // MPPTYPE picture type INTRA
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+        w.write_bit(false); // CPM
+    }
+
+    /// Body shared by the §T.3 MQ-on/MQ-off comparison: a QCIF INTRA
+    /// picture whose luma blocks are DC-only and whose chroma blocks
+    /// carry one AC coefficient. The DQUANT-free INTRA macroblock type
+    /// is used so the wire bytes are identical regardless of MQ, leaving
+    /// the §T.3 chrominance QUANT_C the only decode-time difference.
+    fn write_mq_chroma_ac_body(w: &mut BitWriter) {
+        for _gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(16, GQUANT_BITS); // QUANT = 16 → QUANT_C = 12
+            for _mb in 0..11 {
+                // MCBPC = `011` (Table 7 idx 3 — INTRA, CBPC = "11").
+                w.write_u32(0b011, 3);
+                // CBPY(INTRA) = "0000" → no luma AC. Table-12 code for
+                // CBPY pattern 0 is "0011".
+                w.write_u32(0b0011, 4);
+                // Four luma blocks: INTRADC only (recon level 8*0x10=128
+                // → uniform pixel 16).
+                for _blk in 0..4 {
+                    w.write_u32(0x10, 8); // INTRADC
+                }
+                // Two chroma blocks: INTRADC + one AC at scan-pos 1.
+                for _blk in 0..2 {
+                    w.write_u32(0x10, 8); // INTRADC
+                    w.write_u32(0b0111, 4); // LAST=1 RUN=0 |LEVEL|=1
+                    w.write_bit(false); // sign +
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+    }
+
+    /// §T.3 end-to-end: an MQ-active INTRA picture inverse-quantises its
+    /// chrominance coefficients with QUANT_C (Table T.2), so with the
+    /// identical macroblock body the chroma planes differ from a
+    /// non-MQ decode while the luma planes stay bit-identical (luma
+    /// always uses QUANT).
+    #[test]
+    fn decode_picture_layer_plus_mq_chroma_uses_quant_c() {
+        let mut w_on = BitWriter::new();
+        write_plus_qcif_intra_header_mq(&mut w_on, /* mq */ true, /* aic */ false);
+        write_mq_chroma_ac_body(&mut w_on);
+        let data_on = w_on.finish();
+
+        let mut w_off = BitWriter::new();
+        write_plus_qcif_intra_header_mq(&mut w_off, /* mq */ false, /* aic */ false);
+        write_mq_chroma_ac_body(&mut w_off);
+        let data_off = w_off.finish();
+
+        let frame_on =
+            decode_picture_layer(&data_on, None, DecodeOptions::default()).expect("MQ-on decode");
+        let frame_off =
+            decode_picture_layer(&data_off, None, DecodeOptions::default()).expect("MQ-off decode");
+
+        // Luma uses QUANT in both modes → identical.
+        assert_eq!(frame_on.y, frame_off.y, "luma must be unaffected by MQ");
+        // Chroma uses QUANT_C (12) under MQ vs QUANT (16) without →
+        // the AC coefficient dequantises to a different reconstruction
+        // level, so the chroma planes must differ.
+        assert_ne!(
+            frame_on.cb, frame_off.cb,
+            "Cb must reflect the §T.3 QUANT_C dequant"
+        );
+        assert_ne!(
+            frame_on.cr, frame_off.cr,
+            "Cr must reflect the §T.3 QUANT_C dequant"
+        );
+    }
+
+    /// §T.3 pin: with QUANT=16 the chroma AC coefficient (|LEVEL|=1)
+    /// reconstructs at the QUANT_C=12 level under MQ. The single AC slot
+    /// at scan-pos 1 (block position (0,1)) dequantises to
+    /// `12 * (2*1+1) = 36` under QUANT_C vs `16*(2*1+1)-1 = 47` under
+    /// QUANT; the two distinct reconstruction levels yield distinct DC
+    /// offsets across the 8×8 chroma block, so the corner sample
+    /// differs in a fixed direction.
+    #[test]
+    fn decode_picture_layer_plus_mq_chroma_quant_c_level() {
+        // Reconstruct the expected single-AC chroma block directly via
+        // the public reconstruction helper at both quantiser values and
+        // confirm they differ — pinning the §T.3 derivation independent
+        // of the picture walker.
+        let mut block = crate::block::H263Block::empty();
+        block.coefficients[0] = 128; // INTRADC recon level (0x10 * 8)
+        block.coefficients[1] = 1; // one AC at scan-pos 1
+        block.had_intradc = true;
+
+        let with_quant = reconstruct_intra_block(&block, 16);
+        let with_quant_c = reconstruct_intra_block(&block, 12);
+        assert_ne!(
+            with_quant, with_quant_c,
+            "QUANT=16 and QUANT_C=12 must reconstruct the AC differently"
+        );
+        // §T.3 / Table T.2: QUANT 16 → QUANT_C 12.
+        assert_eq!(crate::annex_t::quant_c_from_quant(16).unwrap(), 12);
+    }
+
+    /// §T.4 end-to-end through the picture driver: an MQ-active INTRA
+    /// picture whose chroma block carries an AC coefficient of magnitude
+    /// greater than 127 (encoded via the EXTENDED-ESCAPE marker +
+    /// 11-bit EXTENDED-LEVEL field) decodes without error and produces a
+    /// frame that differs from the same picture decoded with the AC
+    /// removed — proving the §T.4 extended coefficient range is reachable
+    /// from the picture entry point.
+    #[test]
+    fn decode_picture_layer_plus_mq_extended_escape_in_chroma() {
+        // Test-side EXTENDED-LEVEL wire encoder (Figure T.1 rotate-right
+        // by 5 of the low 11 bits of LEVEL's two's complement).
+        fn ext_wire(level: i16) -> u32 {
+            let v = (level as u16) & 0x07FF;
+            (((v >> 5) | (v << (11 - 5))) & 0x07FF) as u32
+        }
+
+        let build = |with_extended: bool| -> Vec<u8> {
+            let mut w = BitWriter::new();
+            write_plus_qcif_intra_header_mq(&mut w, /* mq */ true, /* aic */ false);
+            for _gob in 0..9 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(1, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                // QUANT = 4 → QUANT_C = 4 (< 8, the §T.5 condition under
+                // which EXTENDED-ESCAPE is valid).
+                w.write_u32(4, GQUANT_BITS);
+                for _mb in 0..11 {
+                    w.write_u32(0b011, 3); // MCBPC INTRA CBPC "11"
+                    w.write_u32(0b0011, 4); // CBPY(INTRA) "0000"
+                    for _blk in 0..4 {
+                        w.write_u32(0x10, 8); // luma INTRADC only
+                    }
+                    for _blk in 0..2 {
+                        w.write_u32(0x10, 8); // chroma INTRADC
+                        if with_extended {
+                            // §5.4.2 ESCAPE + §T.4 EXTENDED-ESCAPE marker
+                            // + EXTENDED-LEVEL = +200 at scan-pos 0.
+                            w.write_u32(0b0000_011, 7); // ESCAPE
+                            w.write_bit(true); // LAST = 1
+                            w.write_u32(0, 6); // RUN = 0
+                            w.write_u32(0x80, 8); // EXTENDED-ESCAPE marker
+                            w.write_u32(ext_wire(200), 11); // EXTENDED-LEVEL
+                        } else {
+                            // No AC: a single LAST=1 RUN=0 |LEVEL|=1 is
+                            // the smallest legal coded block. Use plain
+                            // "0111s" instead so the chroma differs only
+                            // in coefficient magnitude.
+                            w.write_u32(0b0111, 4);
+                            w.write_bit(false);
+                        }
+                    }
+                }
+            }
+            while !w.is_byte_aligned() {
+                w.write_bit(false);
+            }
+            w.finish()
+        };
+
+        let extended = build(true);
+        let small = build(false);
+
+        let frame_ext = decode_picture_layer(&extended, None, DecodeOptions::default())
+            .expect("EXTENDED-ESCAPE chroma must decode under MQ");
+        let frame_small = decode_picture_layer(&small, None, DecodeOptions::default())
+            .expect("small-AC chroma must decode under MQ");
+
+        // The much larger extended coefficient changes the chroma output.
+        assert_ne!(
+            frame_ext.cb, frame_small.cb,
+            "the §T.4 extended chroma coefficient must reach the output"
+        );
+        // Luma identical (no luma AC in either body).
+        assert_eq!(frame_ext.y, frame_small.y);
+    }
+
+    /// §T.2 end-to-end: an MQ-active picture with an INTRA+Q macroblock
+    /// carries the §T.2 variable-length DQUANT field (here the
+    /// arbitrary-selection form `0 + 5 bits`), changing QUANT mid-row.
+    /// The picture decodes without error through the MQ-aware driver.
+    #[test]
+    fn decode_picture_layer_plus_mq_t2_dquant_decodes() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_intra_header_mq(&mut w, /* mq */ true, /* aic */ false);
+        for _gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS); // QUANT = 8
+            for mb in 0..11 {
+                if mb == 0 {
+                    // MCBPC = INTRA+Q (Table 7 idx 4) → code "0001".
+                    // Per Table 7 the INTRA+Q codeword is "0001".
+                    w.write_u32(0b0001, 4);
+                    w.write_u32(0b0011, 4); // CBPY(INTRA) "0000"
+                                            // §T.2.2 arbitrary DQUANT: first bit 0 + "00110" = 6.
+                    w.write_bit(false);
+                    w.write_u32(0b00110, 5);
+                } else {
+                    w.write_u32(0b1, 1); // MCBPC INTRA, CBPC = 00
+                    w.write_u32(0b0011, 4); // CBPY(INTRA) "0000"
+                }
+                for _blk in 0..6 {
+                    w.write_u32(0x10, 8); // INTRADC only on every block
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let frame = decode_picture_layer(&data, None, DecodeOptions::default())
+            .expect("§T.2 DQUANT picture must decode under MQ");
+        // DC-only blocks: every luma sample is 16 (INTRADC 128 → /8).
+        assert!(frame.y.iter().all(|&p| p == 16));
+    }
+
+    /// Annex T MQ combined with Advanced INTRA Coding is refused at the
+    /// shim (the §T.3 / §T.4 dequant boundary is not threaded through
+    /// the AIC reconstruction path this round).
+    #[test]
+    fn decode_picture_layer_plus_mq_with_aic_refused() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_intra_header_mq(&mut w, /* mq */ true, /* aic */ true);
+        // Body is irrelevant — the refusal happens in the header shim.
+        let data = w.finish();
+        assert_eq!(
+            decode_picture_layer(&data, None, DecodeOptions::default()).unwrap_err(),
+            Error::NotImplemented
         );
     }
 }

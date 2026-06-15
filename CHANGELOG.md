@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex T Modified Quantization mode — MQ-active picture reconstruction
+  end-to-end (round 310):
+  - `DecodeOptions::modified_quant` new flag carries the MQ decision
+    into the §4.2.1 GOB-walker driver.
+    `plus_ptype_to_baseline_shim` no longer refuses the §5.1.4.2
+    OPPTYPE Modified-Quantization bit (bit 14); it OR-merges the
+    effective MQ bit into the returned options exactly as it already
+    does for the AIC / DF bits, so a UFEP=001 PLUSPTYPE MQ picture
+    auto-activates the mode through `decode_picture_layer` with the
+    caller's default options.
+  - `decode_one_macroblock` threads MQ into the macroblock + block
+    layers: `MbContext::modified_quant` selects the §T.2
+    variable-length DQUANT VLC
+    ([`crate::annex_t::parse_modified_dquant`]); every
+    `BlockContext::modified_quant` enables the §T.4 EXTENDED-ESCAPE
+    interpretation of the §5.4.2 ESCAPE LEVEL `1000 0000`; and the two
+    chrominance blocks are inverse-quantised with the §T.3 / Table T.2
+    `QUANT_C` ([`crate::annex_t::quant_c_from_quant`]) while the four
+    luma blocks keep the luminance QUANT.
+  - Out of scope (reported, not guessed): MQ combined with Advanced
+    INTRA Coding (Annex I), Advanced Prediction / INTER4V (Annex F), PB
+    / Improved PB-frames (Annex G / M) or Slice-Structured (Annex K) —
+    the shim returns `Error::NotImplemented` because those
+    reconstruction paths do not yet thread the §T.3 / §T.4 dequant
+    boundary. The §T.5 encoder-side usage restrictions are not enforced
+    by the decoder.
+  - 5 new tests: §T.3 MQ-on/MQ-off chroma comparison (identical INTRA
+    body — luma bit-identical, both chroma planes differ); §T.3 QUANT_C
+    reconstruction-level pin; §T.4 end-to-end EXTENDED-ESCAPE through
+    the picture driver (+200 chroma coefficient at QUANT 4); §T.2
+    arbitrary-selection DQUANT mid-picture decode; MQ + AIC shim
+    refusal. `cargo test -p oxideav-h263`: 571 (was 566).
+
 - Annex T Modified Quantization mode — §T.4 Modified coefficient range
   (EXTENDED-ESCAPE / EXTENDED-LEVEL) (round 308):
   - `BlockContext::modified_quant` flag threads the §T.4 interpretation
