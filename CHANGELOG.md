@@ -8,6 +8,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex T Modified Quantization mode combined with Annex I Advanced
+  INTRA Coding (round 315):
+  - The §5.1.4 PLUSPTYPE shim no longer refuses an OPPTYPE picture that
+    signals both Modified Quantization (bit 14) and Advanced INTRA
+    Coding (bit 8); the AIC+MQ combination decodes end-to-end through
+    the §I.3 INTRA reconstruction path.
+  - `decode_intra_macroblock_aic` threads the §T.3 chrominance
+    `QUANT_C` step into the two AIC chroma blocks (the four luma blocks
+    keep the luminance QUANT) and the §T.4 EXTENDED-ESCAPE flag into
+    every AIC block parse.
+  - `parse_intra_block_aic` and `decode_intra_tcoef_event` gained a
+    `modified_quant` parameter. When set, the Table I.2 ESCAPE LEVEL
+    `1000 0000` is the §T.4 EXTENDED-ESCAPE marker introducing an
+    11-bit EXTENDED-LEVEL field, rather than a forbidden code — §T.5
+    rule 2 extends the EXTENDED-ESCAPE mechanism to the Table I.2 VLC.
+    The wire transform reuses `block::extended_level_from_wire`
+    (now `pub(crate)`); with the flag clear `0x80` stays forbidden.
+  - Out of scope (reported, not guessed): MQ combined with Advanced
+    Prediction / INTER4V (Annex F), PB / Improved PB-frames
+    (Annex G / M) or Slice-Structured (Annex K) — the shim still
+    refuses those because their reconstruction paths do not yet thread
+    the §T.3 / §T.4 dequant boundary.
+  - Tests: the prior MQ+AIC shim-refusal test is replaced by a §T.3
+    QUANT_C chroma comparison (MQ-on vs AIC-only over identical AIC
+    macroblock bytes — luma bit-identical, both chroma planes differ)
+    and a §T.4 EXTENDED-ESCAPE-in-chroma decode through the AIC path
+    (+200 extended AC at QUANT_C 4). `cargo test -p oxideav-h263`: 572
+    (was 571).
+
 - Annex T Modified Quantization mode — MQ-active picture reconstruction
   end-to-end (round 310):
   - `DecodeOptions::modified_quant` new flag carries the MQ decision

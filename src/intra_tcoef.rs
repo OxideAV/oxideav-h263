@@ -20,9 +20,11 @@
 //! is changed (and `LAST` is preserved between the two tables at each
 //! index — only `RUN` / `|LEVEL|` are reassigned). The ESCAPE escape
 //! event is decoded with the same 1-bit `LAST` + 6-bit `RUN` + 8-bit
-//! signed `LEVEL` layout as in §5.4.2, and the baseline forbidden
-//! LEVEL codes (`0x00` / `0x80`) apply identically — Annex T's
-//! EXTENDED-ESCAPE relaxation is out of scope for this module.
+//! signed `LEVEL` layout as in §5.4.2. The baseline forbidden LEVEL
+//! code `0x00` applies identically; `0x80` is forbidden in the
+//! baseline but becomes the §T.4 EXTENDED-ESCAPE marker when the
+//! `modified_quant` flag is set (§T.5 rule 2 extends the
+//! EXTENDED-ESCAPE mechanism to the Table I.2 VLC).
 //!
 //! ## Scope of this round
 //!
@@ -280,7 +282,20 @@ fn lookup_prefix(bits: u8, code: u32) -> Option<IntraEntry> {
 
 /// Apply the trailing sign bit (or the ESCAPE fixed-length tail) to
 /// produce a fully-decoded [`IntraTcoefEvent`].
-fn finalise_event(reader: &mut BitReader<'_>, entry: IntraEntry) -> Result<IntraTcoefEvent> {
+///
+/// `modified_quant` selects the Annex T §T.4 interpretation of the
+/// ESCAPE LEVEL field. §T.5 rule 2 states the EXTENDED-ESCAPE
+/// mechanism applies to *either* the §5.4.2 Table 16 VLC *or* the
+/// §I.3 Table I.2 VLC, so when Modified Quantization mode is in use
+/// alongside Advanced INTRA Coding the 8-bit LEVEL value `1000 0000`
+/// is the EXTENDED-ESCAPE marker (rather than a forbidden code) and
+/// is followed by an 11-bit EXTENDED-LEVEL field, exactly as in the
+/// baseline coefficient parser ([`crate::block`]).
+fn finalise_event(
+    reader: &mut BitReader<'_>,
+    entry: IntraEntry,
+    modified_quant: bool,
+) -> Result<IntraTcoefEvent> {
     match entry {
         IntraEntry::Vlc {
             last,
@@ -297,13 +312,31 @@ fn finalise_event(reader: &mut BitReader<'_>, entry: IntraEntry) -> Result<Intra
         }
         IntraEntry::Escape => {
             // §I.3 reuses the §5.4.2 ESCAPE layout: 1 bit LAST, 6 bits
-            // RUN, 8 bits LEVEL (two's complement), with the baseline
-            // §5.4.2 forbidden LEVEL codes (`0x00` / `0x80`) applied.
+            // RUN, 8 bits LEVEL (two's complement). `0000 0000` is
+            // forbidden in both modes. `1000 0000` is forbidden in the
+            // baseline; §T.4 (Modified Quantization mode) re-purposes
+            // it as the EXTENDED-ESCAPE marker introducing an 11-bit
+            // EXTENDED-LEVEL field carrying an AC magnitude > 127.
             let last_bit = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
             let run = reader.read_u32(6).map_err(|_| Error::UnexpectedEof)? as u8;
             let level_bits = reader.read_u32(8).map_err(|_| Error::UnexpectedEof)? as u8;
-            if level_bits == 0x00 || level_bits == 0x80 {
+            if level_bits == 0x00 {
                 return Err(Error::BadTcoefEscapeLevel);
+            }
+            if level_bits == 0x80 {
+                if !modified_quant {
+                    return Err(Error::BadTcoefEscapeLevel);
+                }
+                // §T.4 EXTENDED-ESCAPE: an 11-bit EXTENDED-LEVEL field
+                // follows. The §T.4 / Figure T.1 wire transform is the
+                // same one the baseline path applies; reuse it.
+                let wire = reader.read_u32(11).map_err(|_| Error::UnexpectedEof)? as u16;
+                let level = crate::block::extended_level_from_wire(wire);
+                return Ok(IntraTcoefEvent {
+                    last: last_bit,
+                    run,
+                    level,
+                });
             }
             let level: i16 = (level_bits as i8) as i16;
             Ok(IntraTcoefEvent {
@@ -327,9 +360,15 @@ fn finalise_event(reader: &mut BitReader<'_>, entry: IntraEntry) -> Result<Intra
 /// * [`Error::BadTcoefCode`] — 13 bits consumed without matching any
 ///   Table I.2 row.
 /// * [`Error::BadTcoefEscapeLevel`] — ESCAPE LEVEL was a forbidden
-///   baseline code (`0x00` or `0x80`). Annex T's EXTENDED-ESCAPE
-///   relaxation is not supported.
-pub fn decode_intra_tcoef_event(reader: &mut BitReader<'_>) -> Result<IntraTcoefEvent> {
+///   code: `0x00` (forbidden in both modes), or `0x80` when
+///   `modified_quant` is clear. When `modified_quant` is set, `0x80`
+///   is the §T.4 EXTENDED-ESCAPE marker (§T.5 rule 2 extends the
+///   mechanism to the Table I.2 VLC) and decodes an 11-bit
+///   EXTENDED-LEVEL field instead of failing.
+pub fn decode_intra_tcoef_event(
+    reader: &mut BitReader<'_>,
+    modified_quant: bool,
+) -> Result<IntraTcoefEvent> {
     let mut acc: u32 = 0;
     let mut len: u8 = 0;
     while len < 7 {
@@ -337,7 +376,7 @@ pub fn decode_intra_tcoef_event(reader: &mut BitReader<'_>) -> Result<IntraTcoef
         acc = (acc << 1) | (b as u32);
         len += 1;
         if let Some(entry) = lookup_prefix(len, acc) {
-            return finalise_event(reader, entry);
+            return finalise_event(reader, entry, modified_quant);
         }
     }
     while len < 13 {
@@ -345,7 +384,7 @@ pub fn decode_intra_tcoef_event(reader: &mut BitReader<'_>) -> Result<IntraTcoef
         acc = (acc << 1) | (b as u32);
         len += 1;
         if let Some(entry) = lookup_prefix(len, acc) {
-            return finalise_event(reader, entry);
+            return finalise_event(reader, entry, modified_quant);
         }
     }
     Err(Error::BadTcoefCode)
@@ -379,7 +418,7 @@ mod tests {
         w.write_bit(sign);
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
-        decode_intra_tcoef_event(&mut r).expect("decode")
+        decode_intra_tcoef_event(&mut r, false).expect("decode")
     }
 
     /// Table I.2 has exactly 102 regular entries + 1 ESCAPE prefix.
@@ -433,7 +472,7 @@ mod tests {
         w.write_bit(false); // sign = +
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
-        let e = decode_intra_tcoef_event(&mut r).unwrap();
+        let e = decode_intra_tcoef_event(&mut r, false).unwrap();
         assert_eq!(
             e,
             IntraTcoefEvent {
@@ -456,7 +495,7 @@ mod tests {
         w.write_bit(false);
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
-        let e = decode_intra_tcoef_event(&mut r).unwrap();
+        let e = decode_intra_tcoef_event(&mut r, false).unwrap();
         assert_eq!(
             e,
             IntraTcoefEvent {
@@ -476,7 +515,7 @@ mod tests {
         w.write_bit(true); // sign = -
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
-        let e = decode_intra_tcoef_event(&mut r).unwrap();
+        let e = decode_intra_tcoef_event(&mut r, false).unwrap();
         assert_eq!(
             e,
             IntraTcoefEvent {
@@ -497,7 +536,7 @@ mod tests {
         w.write_bit(false);
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
-        let e = decode_intra_tcoef_event(&mut r).unwrap();
+        let e = decode_intra_tcoef_event(&mut r, false).unwrap();
         assert_eq!(
             e,
             IntraTcoefEvent {
@@ -517,7 +556,7 @@ mod tests {
         w.write_bit(false);
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
-        let e = decode_intra_tcoef_event(&mut r).unwrap();
+        let e = decode_intra_tcoef_event(&mut r, false).unwrap();
         assert_eq!(
             e,
             IntraTcoefEvent {
@@ -537,7 +576,7 @@ mod tests {
         w.write_bit(false);
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
-        let e = decode_intra_tcoef_event(&mut r).unwrap();
+        let e = decode_intra_tcoef_event(&mut r, false).unwrap();
         assert_eq!(
             e,
             IntraTcoefEvent {
@@ -559,7 +598,7 @@ mod tests {
         w.write_bit(true); // sign = -
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
-        let e = decode_intra_tcoef_event(&mut r).unwrap();
+        let e = decode_intra_tcoef_event(&mut r, false).unwrap();
         assert_eq!(
             e,
             IntraTcoefEvent {
@@ -582,7 +621,7 @@ mod tests {
         w.write_u32(50, 8); // LEVEL = +50
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
-        let e = decode_intra_tcoef_event(&mut r).unwrap();
+        let e = decode_intra_tcoef_event(&mut r, false).unwrap();
         assert_eq!(
             e,
             IntraTcoefEvent {
@@ -603,7 +642,7 @@ mod tests {
         w.write_u32(0xFE, 8); // LEVEL = -2
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
-        let e = decode_intra_tcoef_event(&mut r).unwrap();
+        let e = decode_intra_tcoef_event(&mut r, false).unwrap();
         assert_eq!(
             e,
             IntraTcoefEvent {
@@ -627,7 +666,7 @@ mod tests {
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
         assert_eq!(
-            decode_intra_tcoef_event(&mut r),
+            decode_intra_tcoef_event(&mut r, false),
             Err(Error::BadTcoefEscapeLevel)
         );
     }
@@ -644,7 +683,7 @@ mod tests {
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
         assert_eq!(
-            decode_intra_tcoef_event(&mut r),
+            decode_intra_tcoef_event(&mut r, false),
             Err(Error::BadTcoefEscapeLevel)
         );
     }
@@ -658,7 +697,10 @@ mod tests {
         w.write_u32(0xFFFF, 16);
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
-        assert_eq!(decode_intra_tcoef_event(&mut r), Err(Error::BadTcoefCode));
+        assert_eq!(
+            decode_intra_tcoef_event(&mut r, false),
+            Err(Error::BadTcoefCode)
+        );
     }
 
     /// Truncated input (less than the shortest legal prefix) →
@@ -668,7 +710,10 @@ mod tests {
     fn truncated_input_unexpected_eof() {
         let empty: [u8; 0] = [];
         let mut r = BitReader::new(&empty);
-        assert_eq!(decode_intra_tcoef_event(&mut r), Err(Error::UnexpectedEof));
+        assert_eq!(
+            decode_intra_tcoef_event(&mut r, false),
+            Err(Error::UnexpectedEof)
+        );
     }
 
     /// Bit-consumption: index-0 `10s` consumes exactly 3 bits and
@@ -682,7 +727,7 @@ mod tests {
         w.write_bit(true);
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
-        let _ = decode_intra_tcoef_event(&mut r).unwrap();
+        let _ = decode_intra_tcoef_event(&mut r, false).unwrap();
         assert_eq!(r.bit_position(), 3);
         assert!(r.read_bit().unwrap());
     }
@@ -700,7 +745,7 @@ mod tests {
         w.write_bit(false);
         let bytes = finish_aligned(w);
         let mut r = BitReader::new(&bytes);
-        let _ = decode_intra_tcoef_event(&mut r).unwrap();
+        let _ = decode_intra_tcoef_event(&mut r, false).unwrap();
         assert_eq!(r.bit_position(), 22);
         assert!(!r.read_bit().unwrap());
     }

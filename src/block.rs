@@ -421,7 +421,7 @@ fn finalise_tcoef(
 ///
 /// Wire layout (MSB→LSB):  b5 b4 b3 b2 b1 b11 b10 b9 b8 b7 b6
 /// Recovered LEVEL (MSB→LSB): b11 b10 b9 b8 b7 b6 b5 b4 b3 b2 b1
-fn extended_level_from_wire(wire: u16) -> i16 {
+pub(crate) fn extended_level_from_wire(wire: u16) -> i16 {
     const MASK: u16 = 0x07FF; // low 11 bits
     let w = wire & MASK;
     // Cyclic left-rotate by 5 within an 11-bit field.

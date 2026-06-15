@@ -63,13 +63,18 @@
 //!   §I-mode picture go through this parser vs. the round-4
 //!   [`crate::block::parse_block`] path (i.e. when to set the AIC
 //!   flag) lives in `picture` once the PLUSPTYPE-gated driver lands.
-//! * Annex T modified-quantization EXTENDED-ESCAPE — out of scope here
-//!   for the same reason as in round 14 (`intra_tcoef` already rejects
-//!   `0x80` as a forbidden ESCAPE LEVEL in baseline mode; Annex T
-//!   would re-allow it, but only when the picture header signals
-//!   modified quantization).
 //! * The DC/AC prediction reconstruction itself (needs neighbour
 //!   blocks).
+//!
+//! ## Annex T interaction
+//!
+//! When the picture header signals both Advanced INTRA Coding and
+//! Modified Quantization mode, [`parse_intra_block_aic`] threads the
+//! caller's `modified_quant` flag into [`decode_intra_tcoef_event`]:
+//! the §5.4.2 / §I.3 ESCAPE LEVEL `1000 0000` then becomes the §T.4
+//! EXTENDED-ESCAPE marker rather than a forbidden code (§T.5 rule 2
+//! extends the mechanism to the Table I.2 VLC). With the flag clear
+//! the baseline rule applies and `0x80` stays forbidden.
 
 // Tests in this module write bitstream events using the same
 // MSB-first nibble grouping the spec prints (e.g. `0000 011` for the
@@ -125,6 +130,7 @@ use crate::{Error, Result};
 pub fn parse_intra_block_aic(
     reader: &mut BitReader<'_>,
     has_coefficients: bool,
+    modified_quant: bool,
 ) -> Result<H263Block> {
     let mut block = H263Block::empty();
 
@@ -140,7 +146,11 @@ pub fn parse_intra_block_aic(
     let mut scan_pos: usize = 0;
 
     loop {
-        let event = decode_intra_tcoef_event(reader)?;
+        // §T.4 / §T.5 rule 2 — when Modified Quantization mode is in
+        // use the Table I.2 ESCAPE LEVEL `1000 0000` is the
+        // EXTENDED-ESCAPE marker (AC magnitude > 127); otherwise it is
+        // forbidden, exactly as in the baseline coefficient parser.
+        let event = decode_intra_tcoef_event(reader, modified_quant)?;
         // Advance past `RUN` zero coefficients, then write LEVEL into
         // the resulting slot. Before the first event runs, scan_pos
         // is 0 — so the very first event's RUN is the count of zero
@@ -222,7 +232,7 @@ mod tests {
         let bytes = vec![0xFFu8; 4];
         let mut reader = BitReader::new(&bytes);
         let block =
-            parse_intra_block_aic(&mut reader, false).expect("no-events path is infallible");
+            parse_intra_block_aic(&mut reader, false, false).expect("no-events path is infallible");
         assert!(!block.had_intradc, "AIC never sets had_intradc");
         assert_eq!(block.tcoef_event_count, 0);
         assert_eq!(block.coefficients, [0; COEFFS_PER_BLOCK]);
@@ -245,8 +255,8 @@ mod tests {
         // the DC slot to +1 and terminates the block.
         let bytes = encode_row_l1_r0_lvl1(false);
         let mut reader = BitReader::new(&bytes);
-        let block =
-            parse_intra_block_aic(&mut reader, true).expect("well-formed single-event block");
+        let block = parse_intra_block_aic(&mut reader, true, false)
+            .expect("well-formed single-event block");
         assert!(!block.had_intradc);
         assert_eq!(block.tcoef_event_count, 1);
         assert_eq!(block.coefficients[0], 1);
@@ -266,7 +276,7 @@ mod tests {
         // Use ESCAPE to get exact (RUN=3, LEVEL=+1, LAST=1).
         let bytes = encode_escape_event(true, 3, 1);
         let mut reader = BitReader::new(&bytes);
-        let block = parse_intra_block_aic(&mut reader, true)
+        let block = parse_intra_block_aic(&mut reader, true, false)
             .expect("escape-event block with RUN=3 is well-formed");
         assert!(!block.had_intradc);
         assert_eq!(block.tcoef_event_count, 1);
@@ -301,7 +311,7 @@ mod tests {
         w.write_u32(((-1i8) as u8) as u32, 8);
         bytes.extend(finish_aligned(w));
         let mut reader = BitReader::new(&bytes);
-        let block = parse_intra_block_aic(&mut reader, true).expect("two-event block");
+        let block = parse_intra_block_aic(&mut reader, true, false).expect("two-event block");
         assert_eq!(block.tcoef_event_count, 2);
         assert_eq!(block.coefficients[0], 1, "DC from first event");
         assert_eq!(block.coefficients[1], 0);
@@ -319,7 +329,7 @@ mod tests {
         let bytes = encode_escape_event(true, 63, 1);
         let mut reader = BitReader::new(&bytes);
         let block =
-            parse_intra_block_aic(&mut reader, true).expect("RUN=63 lands LEVEL at slot 63");
+            parse_intra_block_aic(&mut reader, true, false).expect("RUN=63 lands LEVEL at slot 63");
         assert_eq!(block.coefficients[63], 1);
         assert_eq!(block.coefficients[0], 0);
         assert_eq!(block.tcoef_event_count, 1);
@@ -336,7 +346,7 @@ mod tests {
         // to read another event into a non-existent slot 64.
         let bytes = encode_escape_event(false, 63, 1);
         let mut reader = BitReader::new(&bytes);
-        let err = parse_intra_block_aic(&mut reader, true).expect_err("overflow expected");
+        let err = parse_intra_block_aic(&mut reader, true, false).expect_err("overflow expected");
         assert_eq!(err, Error::BadTcoefRunOverflow);
     }
 
@@ -360,7 +370,7 @@ mod tests {
         w.write_u32(1, 8);
         let bytes = finish_aligned(w);
         let mut reader = BitReader::new(&bytes);
-        let err = parse_intra_block_aic(&mut reader, true).expect_err("cumulative overflow");
+        let err = parse_intra_block_aic(&mut reader, true, false).expect_err("cumulative overflow");
         assert_eq!(err, Error::BadTcoefRunOverflow);
     }
 
@@ -375,7 +385,7 @@ mod tests {
         // to read it.
         let bytes = w.finish();
         let mut reader = BitReader::new(&bytes);
-        let err = parse_intra_block_aic(&mut reader, true).expect_err("EOF mid-event");
+        let err = parse_intra_block_aic(&mut reader, true, false).expect_err("EOF mid-event");
         assert_eq!(err, Error::UnexpectedEof);
     }
 
@@ -392,7 +402,7 @@ mod tests {
         w.write_u32(0, 8);
         let bytes = finish_aligned(w);
         let mut reader = BitReader::new(&bytes);
-        let err = parse_intra_block_aic(&mut reader, true).expect_err("forbidden LEVEL");
+        let err = parse_intra_block_aic(&mut reader, true, false).expect_err("forbidden LEVEL");
         assert_eq!(err, Error::BadTcoefEscapeLevel);
     }
 
@@ -402,7 +412,7 @@ mod tests {
     fn escape_level_0x80_is_forbidden() {
         let bytes = encode_escape_event_unchecked(true, 0, 0x80);
         let mut reader = BitReader::new(&bytes);
-        let err = parse_intra_block_aic(&mut reader, true).expect_err("0x80 is forbidden");
+        let err = parse_intra_block_aic(&mut reader, true, false).expect_err("0x80 is forbidden");
         assert_eq!(err, Error::BadTcoefEscapeLevel);
     }
 
@@ -414,7 +424,7 @@ mod tests {
         // on the i8 conversion path).
         let bytes = encode_escape_event(true, 0, -127);
         let mut reader = BitReader::new(&bytes);
-        let block = parse_intra_block_aic(&mut reader, true).expect("0x81 is legal");
+        let block = parse_intra_block_aic(&mut reader, true, false).expect("0x81 is legal");
         assert_eq!(block.coefficients[0], -127);
     }
 
@@ -424,7 +434,7 @@ mod tests {
     fn escape_level_positive_127_decodes() {
         let bytes = encode_escape_event(true, 0, 127);
         let mut reader = BitReader::new(&bytes);
-        let block = parse_intra_block_aic(&mut reader, true).expect("+127 is legal");
+        let block = parse_intra_block_aic(&mut reader, true, false).expect("+127 is legal");
         assert_eq!(block.coefficients[0], 127);
     }
 
@@ -466,7 +476,7 @@ mod tests {
         }
         let bytes = finish_aligned(w);
         let mut reader = BitReader::new(&bytes);
-        let block = parse_intra_block_aic(&mut reader, true).expect("8-event block");
+        let block = parse_intra_block_aic(&mut reader, true, false).expect("8-event block");
         let expected_slots: &[(usize, i16)] = &[
             (0, 5),
             (2, -3),
@@ -502,7 +512,7 @@ mod tests {
     fn had_intradc_always_false_in_aic() {
         let bytes = encode_row_l1_r0_lvl1(true); // LAST=1 RUN=0 LEVEL=-1
         let mut reader = BitReader::new(&bytes);
-        let block = parse_intra_block_aic(&mut reader, true).expect("single-event block");
+        let block = parse_intra_block_aic(&mut reader, true, false).expect("single-event block");
         assert!(
             !block.had_intradc,
             "AIC never sets had_intradc, even with non-zero DC"
@@ -521,7 +531,7 @@ mod tests {
         for &(run, expected_slot) in &[(1u8, 1usize), (3u8, 3usize), (7u8, 7usize)] {
             let bytes = encode_escape_event(true, run, 1);
             let mut reader = BitReader::new(&bytes);
-            let block = parse_intra_block_aic(&mut reader, true).expect("legal block");
+            let block = parse_intra_block_aic(&mut reader, true, false).expect("legal block");
             assert_eq!(
                 block.coefficients[0], 0,
                 "DC slot must stay 0 when RUN > 0 swallows it"

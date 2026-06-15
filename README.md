@@ -71,7 +71,10 @@ planar 4:2:0 `YuvFrame`:
   DQUANT parser, the §T.3 chrominance `QUANT_C` step, and the §T.4
   EXTENDED-ESCAPE / EXTENDED-LEVEL extended coefficient range, driving
   an MQ-active picture reconstruction end-to-end for the baseline INTRA
-  / INTER path.
+  / INTER path **and** the Annex I Advanced INTRA Coding path (the
+  §T.3 `QUANT_C` chroma dequant and the §T.5-rule-2 EXTENDED-ESCAPE
+  extension to the Table I.2 VLC both thread through the AIC INTRA
+  reconstruction).
 
 ## Usage
 
