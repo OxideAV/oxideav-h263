@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex T Modified Quantization mode — §T.4 Modified coefficient range
+  (EXTENDED-ESCAPE / EXTENDED-LEVEL) (round 308):
+  - `BlockContext::modified_quant` flag threads the §T.4 interpretation
+    into `parse_block`. When set, the §5.4.2 ESCAPE LEVEL field value
+    `1000 0000` — forbidden in baseline — becomes the EXTENDED-ESCAPE
+    marker, introducing an 11-bit EXTENDED-LEVEL field that represents
+    AC coefficient magnitudes greater than 127. When clear the baseline
+    rule applies (`1000 0000` forbidden); `0000 0000` stays forbidden in
+    both modes.
+  - New `extended_level_from_wire(wire) -> i16` decodes the §T.4 /
+    Figure T.1 transform: the 11 wire bits are cyclically rotated left
+    by 5 (the inverse of the encoder's rotate-right-by-5 that prevents
+    start-code emulation) and the result is sign-extended as an 11-bit
+    two's-complement LEVEL.
+  - Out of scope (reported, not guessed): the §T.4 |REC| < 4096 and
+    `QUANT < 8` §T.5 usage restrictions (encoder-side), and the full
+    MQ-active picture reconstruction driver (the extended-PTYPE picture
+    path still refuses the OPPTYPE MQ bit with `NotImplemented`; §T.4 is
+    reachable via `parse_block` with `modified_quant: true`).
+  - 9 new tests (`cargo test -p oxideav-h263`: 566, was 557).
+
 - Annex T Modified Quantization mode — §T.2 Modified DQUANT + §T.3
   chrominance QUANT_C (round 302):
   - New `annex_t` module. `parse_modified_dquant(reader, prior_quant)

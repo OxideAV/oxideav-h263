@@ -1430,6 +1430,7 @@ fn decode_pb_b_part(
                 BlockContext {
                     has_intradc: false,
                     has_coefficients: true,
+                    ..Default::default()
                 },
             )?;
             reconstruct_inter_block_with_prediction(&block, bquant, &pred)
@@ -1451,6 +1452,7 @@ fn decode_pb_b_part(
             BlockContext {
                 has_intradc: false,
                 has_coefficients: true,
+                ..Default::default()
             },
         )?;
         reconstruct_inter_block_with_prediction(&block, bquant, &pred_cb)
@@ -1464,6 +1466,7 @@ fn decode_pb_b_part(
             BlockContext {
                 has_intradc: false,
                 has_coefficients: true,
+                ..Default::default()
             },
         )?;
         reconstruct_inter_block_with_prediction(&block, bquant, &pred_cr)
@@ -2388,6 +2391,7 @@ fn decode_one_macroblock(
                 BlockContext {
                     has_intradc: true,
                     has_coefficients: has_ac,
+                    ..Default::default()
                 },
             )?;
             let samples = reconstruct_intra_block(&block, quant);
@@ -2400,6 +2404,7 @@ fn decode_one_macroblock(
             BlockContext {
                 has_intradc: true,
                 has_coefficients: cbpc & 0b10 != 0,
+                ..Default::default()
             },
         )?;
         let cb_samples = reconstruct_intra_block(&cb_block, quant);
@@ -2410,6 +2415,7 @@ fn decode_one_macroblock(
             BlockContext {
                 has_intradc: true,
                 has_coefficients: cbpc & 0b01 != 0,
+                ..Default::default()
             },
         )?;
         let cr_samples = reconstruct_intra_block(&cr_block, quant);
@@ -2487,6 +2493,7 @@ fn decode_one_macroblock(
                 BlockContext {
                     has_intradc: false,
                     has_coefficients: true,
+                    ..Default::default()
                 },
             )?;
             reconstruct_inter_block_with_prediction(&block, quant, &prediction)
@@ -2508,6 +2515,7 @@ fn decode_one_macroblock(
             BlockContext {
                 has_intradc: false,
                 has_coefficients: true,
+                ..Default::default()
             },
         )?;
         reconstruct_inter_block_with_prediction(&block, quant, &cb_pred)
@@ -2528,6 +2536,7 @@ fn decode_one_macroblock(
             BlockContext {
                 has_intradc: false,
                 has_coefficients: true,
+                ..Default::default()
             },
         )?;
         reconstruct_inter_block_with_prediction(&block, quant, &cr_pred)
@@ -2979,6 +2988,7 @@ fn decode_inter4v_macroblock(
                 BlockContext {
                     has_intradc: false,
                     has_coefficients: true,
+                    ..Default::default()
                 },
             )?;
             reconstruct_inter_block_with_prediction(&block, quant, &prediction)
@@ -3005,6 +3015,7 @@ fn decode_inter4v_macroblock(
             BlockContext {
                 has_intradc: false,
                 has_coefficients: true,
+                ..Default::default()
             },
         )?;
         reconstruct_inter_block_with_prediction(&block, quant, &cb_pred)
@@ -3025,6 +3036,7 @@ fn decode_inter4v_macroblock(
             BlockContext {
                 has_intradc: false,
                 has_coefficients: true,
+                ..Default::default()
             },
         )?;
         reconstruct_inter_block_with_prediction(&block, quant, &cr_pred)

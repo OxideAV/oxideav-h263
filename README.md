@@ -5,6 +5,48 @@ A pure-Rust ITU-T H.263 baseline video codec for the
 
 ## Status
 
+**Round 39 (workspace round 308) — Annex T Modified Quantization mode:
+§T.4 Modified coefficient range (EXTENDED-ESCAPE / EXTENDED-LEVEL).
+The §5.4.2 TCOEF ESCAPE LEVEL field `1000 0000`, forbidden in
+baseline, now decodes as the §T.4 EXTENDED-ESCAPE marker when Modified
+Quantization mode is in use, introducing an 11-bit EXTENDED-LEVEL field
+that represents AC coefficient magnitudes greater than 127.**
+
+* `BlockContext::modified_quant` flag threads the §T.4 interpretation
+  into `parse_block` / the TCOEF decoder. When set, an ESCAPE event
+  whose 8-bit LEVEL is `1000 0000` reads a following 11-bit
+  EXTENDED-LEVEL field instead of being rejected; `0000 0000` stays
+  forbidden in both modes and a non-marker LEVEL still decodes as the
+  baseline 8-bit two's-complement value.
+* `extended_level_from_wire(wire) -> i16` implements the §T.4 /
+  Figure T.1 transform: the 11 wire bits are cyclically rotated left
+  by 5 — the inverse of the encoder's rotate-right-by-5 that prevents
+  start-code emulation — and sign-extended as an 11-bit two's-complement
+  LEVEL. A full-range round-trip test pins the rotation against its
+  encoder inverse across all −1024..=1023 LEVELs.
+* Refused (reported, not guessed): the §T.4 |REC| < 4096 and
+  `QUANT < 8` §T.5 encoder-side usage restrictions, and the full
+  MQ-active picture reconstruction driver — the extended-PTYPE picture
+  path still refuses the OPPTYPE Modified-Quantization bit with
+  `NotImplemented`, so §T.4 is reachable via `parse_block` with
+  `modified_quant: true` (plus the §5.3.6 DQUANT-VLC / §T.3 QUANT_C
+  primitives from round 302) rather than through a single picture
+  entry point.
+
+9 new tests land: the §T.4 / Figure T.1 wire-transform full-range
+round-trip (all −1024..=1023 LEVELs survive
+encode-then-decode), the rotation spot-check against the hand-derived
+LEVEL=+1 → wire `0x040` and LEVEL=−1 → wire `0x7FF` shapes, the
+end-to-end EXTENDED-ESCAPE decode of a positive (+200) and a negative
+(−300, RUN=3) magnitude-> 127 coefficient, the maximum in-range LEVEL
+(+1023), the `1000 0000` marker staying baseline-forbidden without MQ,
+`0000 0000` staying forbidden under MQ, an ordinary in-range (+127)
+ESCAPE LEVEL being unaffected under MQ, and the truncated
+EXTENDED-LEVEL EOF path. `cargo test -p oxideav-h263` reports 566
+passed (previously 557).
+
+---
+
 **Round 38 (workspace round 302) — Annex T Modified Quantization mode:
 §T.2 Modified DQUANT + §T.3 chrominance QUANT_C. The §5.3.6 DQUANT
 field, previously decodable only as the baseline 2-bit Table 13

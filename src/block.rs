@@ -127,7 +127,7 @@ pub const ZIGZAG_TO_BLOCK_POS: [u8; COEFFS_PER_BLOCK] = [
 ];
 
 /// Per-block context the parser needs from the surrounding macroblock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlockContext {
     /// `true` if INTRADC (§5.4.1) is on the wire for this block.
     /// Per §5.4: present for *every* block when the macroblock is
@@ -139,6 +139,14 @@ pub struct BlockContext {
     /// presence of *any* coefficient; for INTRA blocks the bit is
     /// the presence of *non-INTRADC* (i.e. AC) coefficients.
     pub has_coefficients: bool,
+    /// `true` if Annex T Modified Quantization mode (§T.4) is in
+    /// use for this block. When set, the §5.4.2 ESCAPE LEVEL field
+    /// `1000 0000` is no longer forbidden: it is the
+    /// EXTENDED-ESCAPE marker introducing an 11-bit EXTENDED-LEVEL
+    /// field (§T.4 / Figure T.1) that represents AC coefficient
+    /// magnitudes greater than 127. When clear, the baseline
+    /// §5.4.2 rule applies (`1000 0000` is forbidden).
+    pub modified_quant: bool,
 }
 
 /// A single 8x8 transform-coefficient block as decoded from the
@@ -213,7 +221,7 @@ pub fn parse_block(reader: &mut BitReader<'_>, ctx: BlockContext) -> Result<H263
         let mut scan_pos: usize = if ctx.has_intradc { 1 } else { 0 };
 
         loop {
-            let event = decode_tcoef_event(reader)?;
+            let event = decode_tcoef_event(reader, ctx.modified_quant)?;
             // Advance past `RUN` zero coefficients, then write LEVEL.
             scan_pos = scan_pos
                 .checked_add(event.run as usize)
@@ -268,7 +276,7 @@ fn intradc_reconstruction(code: u8) -> Result<i16> {
 /// Returns the event with `level` carrying the **signed** integer
 /// (the sign bit `s` from the table is folded in; ESCAPE LEVEL is
 /// interpreted as two's-complement 8-bit).
-fn decode_tcoef_event(reader: &mut BitReader<'_>) -> Result<TcoefEvent> {
+fn decode_tcoef_event(reader: &mut BitReader<'_>, modified_quant: bool) -> Result<TcoefEvent> {
     // Decode by reading bits incrementally and matching against the
     // 103-row table (102 VLC entries + 1 ESCAPE prefix). Each row
     // gives `(bit_count, code_msb_left, last, run, abs_level)` where
@@ -280,7 +288,7 @@ fn decode_tcoef_event(reader: &mut BitReader<'_>) -> Result<TcoefEvent> {
         acc = (acc << 1) | (b as u32);
         len += 1;
         if let Some(entry) = lookup_tcoef_prefix(len, acc) {
-            return finalise_tcoef(reader, entry);
+            return finalise_tcoef(reader, entry, modified_quant);
         }
     }
     // Beyond 7 bits — keep reading up to 13.
@@ -289,7 +297,7 @@ fn decode_tcoef_event(reader: &mut BitReader<'_>) -> Result<TcoefEvent> {
         acc = (acc << 1) | (b as u32);
         len += 1;
         if let Some(entry) = lookup_tcoef_prefix(len, acc) {
-            return finalise_tcoef(reader, entry);
+            return finalise_tcoef(reader, entry, modified_quant);
         }
     }
     Err(Error::BadTcoefCode)
@@ -340,7 +348,16 @@ fn lookup_tcoef_prefix(bits: u8, code: u32) -> Option<TcoefEntry> {
 
 /// Apply the trailing sign bit (or the ESCAPE-mode fixed-length
 /// fields) to produce a fully-decoded [`TcoefEvent`].
-fn finalise_tcoef(reader: &mut BitReader<'_>, entry: TcoefEntry) -> Result<TcoefEvent> {
+///
+/// `modified_quant` selects the Annex T §T.4 interpretation of the
+/// ESCAPE LEVEL field: when set, the 8-bit LEVEL value `1000 0000`
+/// is the EXTENDED-ESCAPE marker (rather than a forbidden code) and
+/// is followed by an 11-bit EXTENDED-LEVEL field.
+fn finalise_tcoef(
+    reader: &mut BitReader<'_>,
+    entry: TcoefEntry,
+    modified_quant: bool,
+) -> Result<TcoefEvent> {
     match entry {
         TcoefEntry::Vlc {
             last,
@@ -360,9 +377,25 @@ fn finalise_tcoef(reader: &mut BitReader<'_>, entry: TcoefEntry) -> Result<Tcoef
             let last_bit = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
             let run = reader.read_u32(6).map_err(|_| Error::UnexpectedEof)? as u8;
             let level_bits = reader.read_u32(8).map_err(|_| Error::UnexpectedEof)? as u8;
-            // §5.4.2 forbidden codes (baseline; Annex T relaxes 1000_0000).
-            if level_bits == 0x00 || level_bits == 0x80 {
+            // §5.4.2 baseline forbids `0000 0000` and `1000 0000`.
+            // §T.4 (Modified Quantization mode) re-purposes `1000 0000`
+            // as the EXTENDED-ESCAPE marker; `0000 0000` stays forbidden.
+            if level_bits == 0x00 {
                 return Err(Error::BadTcoefEscapeLevel);
+            }
+            if level_bits == 0x80 {
+                if !modified_quant {
+                    return Err(Error::BadTcoefEscapeLevel);
+                }
+                // §T.4 EXTENDED-ESCAPE: an 11-bit EXTENDED-LEVEL field
+                // follows, carrying an AC LEVEL with magnitude > 127.
+                let wire = reader.read_u32(11).map_err(|_| Error::UnexpectedEof)? as u16;
+                let level = extended_level_from_wire(wire);
+                return Ok(TcoefEvent {
+                    last: last_bit,
+                    run,
+                    level,
+                });
             }
             // Two's complement: bit 7 set means negative.
             let level: i16 = (level_bits as i8) as i16;
@@ -372,6 +405,32 @@ fn finalise_tcoef(reader: &mut BitReader<'_>, entry: TcoefEntry) -> Result<Tcoef
                 level,
             })
         }
+    }
+}
+
+/// Decode the §T.4 EXTENDED-LEVEL field into a signed `LEVEL`.
+///
+/// `wire` holds the 11 bits read MSB-first off the bitstream
+/// (only the low 11 bits are significant). Per §T.4 / Figure T.1
+/// the encoder takes the least-significant 11 bits of the two's-
+/// complement representation of LEVEL and cyclically rotates them
+/// **right** by 5 positions to form the wire value (the rotation
+/// prevents start-code emulation). Decoding therefore rotates the
+/// 11-bit wire value cyclically **left** by 5 positions to recover
+/// the 11-bit two's-complement LEVEL, which is then sign-extended.
+///
+/// Wire layout (MSB→LSB):  b5 b4 b3 b2 b1 b11 b10 b9 b8 b7 b6
+/// Recovered LEVEL (MSB→LSB): b11 b10 b9 b8 b7 b6 b5 b4 b3 b2 b1
+fn extended_level_from_wire(wire: u16) -> i16 {
+    const MASK: u16 = 0x07FF; // low 11 bits
+    let w = wire & MASK;
+    // Cyclic left-rotate by 5 within an 11-bit field.
+    let rotated = ((w << 5) | (w >> (11 - 5))) & MASK;
+    // Sign-extend the 11-bit two's-complement value (bit 10 = sign).
+    if rotated & 0x0400 != 0 {
+        (rotated as i16) - 0x0800
+    } else {
+        rotated as i16
     }
 }
 
@@ -567,6 +626,7 @@ mod tests {
         BlockContext {
             has_intradc: true,
             has_coefficients: true,
+            ..Default::default()
         }
     }
 
@@ -574,6 +634,7 @@ mod tests {
         BlockContext {
             has_intradc: true,
             has_coefficients: false,
+            ..Default::default()
         }
     }
 
@@ -581,6 +642,7 @@ mod tests {
         BlockContext {
             has_intradc: false,
             has_coefficients: true,
+            ..Default::default()
         }
     }
 
@@ -588,7 +650,27 @@ mod tests {
         BlockContext {
             has_intradc: false,
             has_coefficients: false,
+            ..Default::default()
         }
+    }
+
+    /// INTER block context with Annex T Modified Quantization (§T.4)
+    /// active, so the ESCAPE LEVEL `1000 0000` is the EXTENDED-ESCAPE
+    /// marker rather than a forbidden code.
+    fn inter_ctx_mq() -> BlockContext {
+        BlockContext {
+            has_intradc: false,
+            has_coefficients: true,
+            modified_quant: true,
+        }
+    }
+
+    /// Test-side encoder for the §T.4 EXTENDED-LEVEL wire field:
+    /// take the low 11 bits of LEVEL's two's-complement form and
+    /// cyclically rotate them **right** by 5 (Figure T.1).
+    fn extended_level_to_wire(level: i16) -> u16 {
+        let v = (level as u16) & 0x07FF;
+        ((v >> 5) | (v << (11 - 5))) & 0x07FF
     }
 
     fn finish_aligned(mut w: BitWriter) -> Vec<u8> {
@@ -820,6 +902,171 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------
+    // Annex T §T.4 — Modified coefficient range (EXTENDED-ESCAPE /
+    // EXTENDED-LEVEL).
+    // ----------------------------------------------------------------
+
+    /// Pure-function round-trip: the §T.4 / Figure T.1 wire transform
+    /// is its own inverse (rotate-right-5 followed by rotate-left-5),
+    /// across the entire 11-bit two's-complement LEVEL range.
+    #[test]
+    fn extended_level_round_trip_full_range() {
+        for level in -1024i16..=1023 {
+            let wire = extended_level_to_wire(level);
+            assert!(wire <= 0x07FF);
+            assert_eq!(
+                extended_level_from_wire(wire),
+                level,
+                "round-trip failed for LEVEL = {level}"
+            );
+        }
+    }
+
+    /// §T.4 worked-shape check: the 5-bit cyclic rotation actually
+    /// rearranges the bits per Figure T.1 (it is not the identity).
+    /// LEVEL = +1 has two's-complement low-11 bits `000 0000 0001`
+    /// (b1 = 1, all others 0); cyclically rotating right by 5 moves
+    /// b1 into wire position b1's slot (the 6th from the MSB), giving
+    /// wire `000 0100 0000` = 0x40. The decoder's rotate-left-5
+    /// inverts it back to +1.
+    #[test]
+    fn extended_level_rotation_matches_figure_t1() {
+        assert_eq!(extended_level_to_wire(1), 0x040);
+        assert_eq!(extended_level_from_wire(0x040), 1);
+        // LEVEL = -1 → low-11 bits all ones → rotation leaves all ones.
+        assert_eq!(extended_level_to_wire(-1), 0x7FF);
+        assert_eq!(extended_level_from_wire(0x7FF), -1);
+    }
+
+    /// §T.4 end-to-end: with Modified Quantization mode active an
+    /// ESCAPE followed by the `1000 0000` EXTENDED-ESCAPE marker and
+    /// an 11-bit EXTENDED-LEVEL decodes a magnitude > 127 (here +200).
+    #[test]
+    fn extended_escape_positive_level_decodes() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b0000_011, 7); // ESCAPE prefix
+        w.write_bit(true); // LAST = 1
+        w.write_u32(0, 6); // RUN = 0
+        w.write_u32(0x80, 8); // EXTENDED-ESCAPE marker
+        w.write_u32(extended_level_to_wire(200) as u32, 11);
+        let bytes = finish_aligned(w);
+
+        let mut r = BitReader::new(&bytes);
+        let blk = parse_block(&mut r, inter_ctx_mq()).expect("parse");
+        assert_eq!(blk.coefficients[0], 200);
+        assert_eq!(blk.tcoef_event_count, 1);
+    }
+
+    /// §T.4 end-to-end with a negative extended LEVEL (-300).
+    #[test]
+    fn extended_escape_negative_level_decodes() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b0000_011, 7);
+        w.write_bit(true);
+        w.write_u32(3, 6); // RUN = 3
+        w.write_u32(0x80, 8); // EXTENDED-ESCAPE marker
+        w.write_u32(extended_level_to_wire(-300) as u32, 11);
+        let bytes = finish_aligned(w);
+
+        let mut r = BitReader::new(&bytes);
+        let blk = parse_block(&mut r, inter_ctx_mq()).expect("parse");
+        // RUN=3 from scan_pos 0 → coefficient lands at slot 3.
+        assert_eq!(blk.coefficients[3], -300);
+    }
+
+    /// §T.4 extreme: the maximum representable inverse-quantizable
+    /// magnitude noted in §T.4 (true coefficient values up to 2040).
+    /// LEVEL = +2040 fits the 11-bit signed range (−1024..=1023)? No —
+    /// it does not, so the largest in-range positive LEVEL is +1023.
+    #[test]
+    fn extended_escape_max_in_range_level() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b0000_011, 7);
+        w.write_bit(true);
+        w.write_u32(0, 6);
+        w.write_u32(0x80, 8);
+        w.write_u32(extended_level_to_wire(1023) as u32, 11);
+        let bytes = finish_aligned(w);
+
+        let mut r = BitReader::new(&bytes);
+        let blk = parse_block(&mut r, inter_ctx_mq()).expect("parse");
+        assert_eq!(blk.coefficients[0], 1023);
+    }
+
+    /// §T.4: without Modified Quantization mode the `1000 0000`
+    /// ESCAPE LEVEL stays the baseline forbidden code (no 11-bit
+    /// field is consumed).
+    #[test]
+    fn extended_escape_marker_forbidden_without_mq() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b0000_011, 7);
+        w.write_bit(true);
+        w.write_u32(0, 6);
+        w.write_u32(0x80, 8);
+        w.write_u32(0, 11); // bytes that would be EXTENDED-LEVEL
+        let bytes = finish_aligned(w);
+
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_block(&mut r, inter_ctx_with_coefs()).unwrap_err(),
+            Error::BadTcoefEscapeLevel
+        );
+    }
+
+    /// §T.4: LEVEL `0000 0000` remains forbidden even under Modified
+    /// Quantization mode (only `1000 0000` is re-purposed).
+    #[test]
+    fn extended_escape_level_zero_still_forbidden_under_mq() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b0000_011, 7);
+        w.write_bit(true);
+        w.write_u32(0, 6);
+        w.write_u32(0x00, 8);
+        let bytes = finish_aligned(w);
+
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_block(&mut r, inter_ctx_mq()).unwrap_err(),
+            Error::BadTcoefEscapeLevel
+        );
+    }
+
+    /// §T.4: a normal (non-marker) ESCAPE LEVEL still decodes as the
+    /// baseline 8-bit two's-complement value when Modified
+    /// Quantization mode is active (the in-range −127..=127 path).
+    #[test]
+    fn ordinary_escape_level_unaffected_under_mq() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b0000_011, 7);
+        w.write_bit(true);
+        w.write_u32(0, 6);
+        w.write_u32(0x7F, 8); // LEVEL = +127
+        let bytes = finish_aligned(w);
+
+        let mut r = BitReader::new(&bytes);
+        let blk = parse_block(&mut r, inter_ctx_mq()).expect("parse");
+        assert_eq!(blk.coefficients[0], 127);
+    }
+
+    /// §T.4: a truncated EXTENDED-LEVEL field (marker present but the
+    /// 11 bits run off the end of the buffer) is an EOF.
+    #[test]
+    fn extended_escape_truncated_extended_level_eof() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b0000_011, 7);
+        w.write_bit(true);
+        w.write_u32(0, 6);
+        w.write_u32(0x80, 8); // marker, but no EXTENDED-LEVEL follows
+        let bytes = finish_aligned(w);
+
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_block(&mut r, inter_ctx_mq()).unwrap_err(),
+            Error::UnexpectedEof
+        );
+    }
+
     /// A RUN that would overflow the 64-slot scan must be rejected.
     /// Encode RUN=63 with LAST=1 starting at INTRA scan_pos=1 →
     /// scan_pos jumps to 64, which is out of range.
@@ -1000,6 +1247,7 @@ mod tests {
             BlockContext {
                 has_intradc: mb.mb_type.unwrap().is_intra(),
                 has_coefficients: false, // CBPY bit 3 = 0 for block 1
+                ..Default::default()
             },
         )
         .expect("block");
