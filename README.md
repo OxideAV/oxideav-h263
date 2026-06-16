@@ -93,9 +93,20 @@ planar 4:2:0 `YuvFrame`:
   interior filter (Figure Q.8 9/3/3/1 bilinear weights) and the §Q.6.2
   boundary filter (Figure Q.9 corner copy + 3:1 edge interpolation), all
   with §Q.6 division-by-truncation semantics. Exposed as the pure
-  `upsample_prediction_error` primitive; the surrounding 32×32-macroblock
-  RRU decode pipeline (pseudo-MV §Q.4, enlarged OBMC §Q.5, reference
-  extension §Q.3, block boundary filter §Q.7) is not yet wired.
+  `upsample_prediction_error` primitive.
+* **Annex Q §Q.7** — Reduced-Resolution Update block boundary filter run
+  along the edges of the 16×16 reconstructed blocks: the §Q.7.1 default
+  two-tap kernel (`A1 = (3A+B+2)/4`, `B1 = (A+3B+2)/4` with truncating
+  division) and the §Q.7.2 Deblocking-Filter-mode variant (the §J.3
+  four-tap filter with `STRENGTH = +∞`, which collapses `UpDownRamp` to
+  the identity so `d1 = (A−4B+4C−D)/8`). Both honour the §J.3 edge
+  ordering (horizontal-before-vertical), the coded-MB filter-on
+  condition, and the picture-edge skip, with slice/ISD-segment skips
+  surfaced through a per-edge condition closure. Exposed as the
+  `rru_filter_plane` plane-level driver (plus the `rru_default_tap`
+  kernel); the surrounding 32×32-macroblock RRU decode pipeline
+  (pseudo-MV §Q.4, enlarged OBMC §Q.5, reference extension §Q.3) is not
+  yet wired.
 
 ## Usage
 
@@ -176,11 +187,12 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   CPM, and Arbitrary Slice Ordering.
 * Annex O B/EI/EP scalability picture macroblocks; Annexes N / O / P
   PLUSPTYPE sub-bitstreams.
-* Annex Q Reduced-Resolution Update mode end-to-end (only the §Q.6
-  prediction-error up-sampling primitive is implemented; the 32×32
-  macroblock layer, §Q.4 pseudo-MV reconstruction, §Q.5 enlarged OBMC,
-  §Q.3 reference extension and §Q.7 block boundary filter are not yet
-  wired).
+* Annex Q Reduced-Resolution Update mode end-to-end (the §Q.6
+  prediction-error up-sampling primitive and the §Q.7 block boundary
+  filter are implemented as pure primitives; the 32×32 macroblock layer,
+  §Q.4 pseudo-MV reconstruction, §Q.5 enlarged OBMC and §Q.3 reference
+  extension are not yet wired, so the §Q.7 driver is not yet invoked from
+  an end-to-end RRU reconstruction).
 * GSTUF stuffing auto-detection and GSBI (CPM = "1").
 * End-of-sequence markers (EOS / EOSBS).
 * Encoder. The crate is decode-only.

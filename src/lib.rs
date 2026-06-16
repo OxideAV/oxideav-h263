@@ -226,6 +226,7 @@ pub mod pb_layer;
 pub mod picture;
 pub mod picture_header;
 pub mod plus_ptype;
+pub mod rru_filter;
 pub mod rru_upsample;
 pub mod slice_header;
 
@@ -284,6 +285,9 @@ pub use plus_ptype::{
     Opptype, PlusPictureType, PlusPtypeHeader, PlusSourceFormat, SliceStructuredSubmode, Uui,
     CPCFC_BITS, CPFMT_BITS, EPAR_BITS, ETR_BITS, MPPTYPE_BITS, OPPTYPE_BITS, SSS_BITS, UFEP_BITS,
     UFEP_FULL, UFEP_MANDATORY_ONLY,
+};
+pub use rru_filter::{
+    rru_default_tap, rru_filter_plane, RruEdgeCondition, RruFilterMode, RRU_BLOCK_DIM,
 };
 pub use rru_upsample::{
     upsample_prediction_error, RRU_IN_DIM, RRU_IN_LEN, RRU_OUT_DIM, RRU_OUT_LEN,

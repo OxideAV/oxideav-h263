@@ -8,6 +8,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex Q.7 Reduced-Resolution Update block boundary filter (round 326):
+  - New `rru_filter` module implements the §Q.7 filter run along the
+    edges of the 16×16 reconstructed blocks (not the 8×8 edges of the
+    baseline §J.3 filter).
+  - **§Q.7.1** — `RruFilterMode::Default` applies the two-tap kernel
+    `A1 = (3·A + B + 2)/4`, `B1 = (A + 3·B + 2)/4` (truncating division)
+    across the boundary, exposed standalone as `rru_default_tap`.
+  - **§Q.7.2** — `RruFilterMode::Deblocking` reuses the §J.3 four-tap
+    deblocking filter with `STRENGTH = +∞` (the published
+    `deblock::STRENGTH_RRU_INFINITE` sentinel), which collapses
+    `UpDownRamp(x, ∞)` to the identity so `d1 = (A−4B+4C−D)/8` and
+    `d2 = clipd1((A−D)/4, d1/2)`, exactly as §Q.7.2 restates it.
+  - `rru_filter_plane` is the plane-level driver: it honours the §Q.7
+    /§J.3 edge ordering (every horizontal edge first, then every
+    vertical edge), the coded-MB filter-on condition, and the
+    picture-edge skip; slice (Annex K) and ISD-segment (Annex R) skips
+    are surfaced through a per-edge `RruEdgeCondition` closure, mirroring
+    `deblock::deblock_plane`.
+  - Out of scope (reported, not guessed): the surrounding RRU
+    reconstruction (32×32 macroblock layer, §Q.4 pseudo-MV, §Q.5
+    enlarged OBMC, §Q.3 reference extension) is not yet wired, so the
+    §Q.7 driver is a pure primitive not yet invoked end-to-end.
+  - Tests: ten `rru_filter` unit tests (two-tap kernel formula, default
+    filter on stepped/constant planes for vertical + horizontal
+    boundaries, skip-condition suppression, picture-edge skip on a
+    single-block plane, the §Q.7.2 vertical-edge worked example, and the
+    two-pass ordering guard). `cargo test -p oxideav-h263`: 594 (was
+    576 reported; +18 over the prior count).
+
 - Annex S Alternative INTER VLC mode (round 318):
   - **§S.2** — `block::parse_inter_block_alt_inter_vlc` decodes each
     INTER coefficient block per §S.2.2: the codewords are interpreted
