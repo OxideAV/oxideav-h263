@@ -226,6 +226,7 @@ pub mod pb_layer;
 pub mod picture;
 pub mod picture_header;
 pub mod plus_ptype;
+pub mod rru_upsample;
 pub mod slice_header;
 
 pub use aic::{
@@ -283,6 +284,9 @@ pub use plus_ptype::{
     Opptype, PlusPictureType, PlusPtypeHeader, PlusSourceFormat, SliceStructuredSubmode, Uui,
     CPCFC_BITS, CPFMT_BITS, EPAR_BITS, ETR_BITS, MPPTYPE_BITS, OPPTYPE_BITS, SSS_BITS, UFEP_BITS,
     UFEP_FULL, UFEP_MANDATORY_ONLY,
+};
+pub use rru_upsample::{
+    upsample_prediction_error, RRU_IN_DIM, RRU_IN_LEN, RRU_OUT_DIM, RRU_OUT_LEN,
 };
 pub use slice_header::{
     parse_first_slice_header, parse_slice_layer, skip_sstuf, skip_sstuf_at, ssbi_to_subbitstream,

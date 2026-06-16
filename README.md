@@ -87,6 +87,15 @@ planar 4:2:0 `YuvFrame`:
   §T.3 `QUANT_C` chroma dequant and the §T.5-rule-2 EXTENDED-ESCAPE
   extension to the Table I.2 VLC both thread through the AIC INTRA
   reconstruction).
+* **Annex Q §Q.6** — Reduced-Resolution Update mode prediction-error
+  up-sampling: the 8×8 reduced-resolution reconstructed prediction-error
+  block is up-sampled to a 16×16 block with the block-closed §Q.6.1
+  interior filter (Figure Q.8 9/3/3/1 bilinear weights) and the §Q.6.2
+  boundary filter (Figure Q.9 corner copy + 3:1 edge interpolation), all
+  with §Q.6 division-by-truncation semantics. Exposed as the pure
+  `upsample_prediction_error` primitive; the surrounding 32×32-macroblock
+  RRU decode pipeline (pseudo-MV §Q.4, enlarged OBMC §Q.5, reference
+  extension §Q.3, block boundary filter §Q.7) is not yet wired.
 
 ## Usage
 
@@ -167,6 +176,11 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   CPM, and Arbitrary Slice Ordering.
 * Annex O B/EI/EP scalability picture macroblocks; Annexes N / O / P
   PLUSPTYPE sub-bitstreams.
+* Annex Q Reduced-Resolution Update mode end-to-end (only the §Q.6
+  prediction-error up-sampling primitive is implemented; the 32×32
+  macroblock layer, §Q.4 pseudo-MV reconstruction, §Q.5 enlarged OBMC,
+  §Q.3 reference extension and §Q.7 block boundary filter are not yet
+  wired).
 * GSTUF stuffing auto-detection and GSBI (CPM = "1").
 * End-of-sequence markers (EOS / EOSBS).
 * Encoder. The crate is decode-only.
