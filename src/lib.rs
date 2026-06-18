@@ -273,8 +273,8 @@ pub use pb_layer::{
 };
 pub use picture::{
     decode_improved_pb_picture, decode_pb_picture, decode_picture, decode_picture_layer,
-    decode_picture_layer_with_inherited, DecodeOptions, DecodePictureOutcome, PbFramePair,
-    PictureLayout, YuvFrame,
+    decode_picture_layer_with_inherited, decode_picture_no_gob0_header, DecodeOptions,
+    DecodePictureOutcome, PbFramePair, PictureLayout, YuvFrame,
 };
 pub use picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,

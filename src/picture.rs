@@ -664,7 +664,79 @@ pub fn decode_picture(
     let header = parse_picture_header(&mut reader)?;
     let layout =
         PictureLayout::for_source_format(header.source_format).ok_or(Error::NotImplemented)?;
-    decode_after_picture_header(&mut reader, &header, &layout, reference, options, None)
+    decode_after_picture_header(
+        &mut reader,
+        &header,
+        &layout,
+        reference,
+        options,
+        None,
+        None,
+    )
+}
+
+/// Decode a single baseline-PTYPE H.263 picture from `data`, honouring
+/// the §5.2.2 rule that the **first GOB of a picture (group number 0)
+/// carries no GOB header** — its quantiser is the picture-layer PQUANT
+/// (§5.1.19) rather than a GOB-0 GQUANT.
+///
+/// This is the spec-conformant complement to [`decode_picture`]. Where
+/// [`decode_picture`] expects every GOB — including the topmost — to
+/// carry a GBSC + GN + GFID + GQUANT header on the wire (a synthetic
+/// layout the lower-level layer tests are built around), this entry
+/// point parses the §5.1.19 PQUANT field that follows PTYPE in the
+/// non-extended picture header (CPM = "0"), uses it as the QUANT in
+/// force for GOB 0, and then reads a header only for GOBs `1..N`.
+///
+/// `reader` is positioned at the Picture Start Code, exactly as for
+/// [`decode_picture`]. The picture header must be the non-extended
+/// (PTYPE bits 6-8 ≠ `"111"`) form; the PLUSPTYPE / Annex-G PB / Annex-K
+/// slice paths carry PQUANT and the GOB-0 elision through their own
+/// dedicated drivers.
+///
+/// # Errors
+///
+/// The union of [`decode_picture`]'s errors plus
+/// [`Error::InvalidQuantiser`] when the 5-bit PQUANT field is `0`
+/// (§5.1.19 limits QUANT to the natural-binary range `1..=31`).
+///
+/// Continuous-Presence-Multipoint multiplexing (CPM = "1", §5.1.20) is
+/// refused: the 2-bit PSBI that follows a set CPM bit, and the per-GOB
+/// GSBI it implies, are not framed by this driver.
+pub fn decode_picture_no_gob0_header(
+    data: &[u8],
+    reference: Option<&YuvFrame>,
+    options: DecodeOptions,
+) -> Result<YuvFrame> {
+    let mut reader = BitReader::new(data);
+    let header = parse_picture_header(&mut reader)?;
+    let layout =
+        PictureLayout::for_source_format(header.source_format).ok_or(Error::NotImplemented)?;
+
+    // §5.1.19 — PQUANT (5 bits, QUANT range 1..=31). In the non-extended
+    // picture header it follows PTYPE directly.
+    let pquant = reader.read_u32(5).map_err(|_| Error::UnexpectedEof)? as u8;
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+
+    // §5.1.20 — CPM (1 bit). The "1" branch pulls in PSBI + per-GOB GSBI
+    // (Annex C) that this driver does not frame; refuse rather than
+    // mis-align the first GOB's macroblock data.
+    let cpm = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    if cpm {
+        return Err(Error::NotImplemented);
+    }
+
+    decode_after_picture_header(
+        &mut reader,
+        &header,
+        &layout,
+        reference,
+        options,
+        None,
+        Some(pquant),
+    )
 }
 
 /// Decode a single H.263 picture from `data`, dispatching on the
@@ -819,6 +891,7 @@ pub fn decode_picture_layer_with_inherited(
                 reference,
                 options,
                 None,
+                None,
             )?;
             // §5.1.4.5 rule 3 — a picture without PLUSPTYPE clears all
             // inferred mode state.
@@ -872,6 +945,7 @@ pub fn decode_picture_layer_with_inherited(
                     &layout,
                     reference,
                     shim_options,
+                    None,
                     None,
                 )?,
             };
@@ -1052,6 +1126,7 @@ pub fn decode_pb_picture(
             left_bpb_forward_mv: None,
             b_frame: &mut b_frame,
         }),
+        None,
     )?;
     Ok(PbFramePair { p_frame, b_frame })
 }
@@ -1190,6 +1265,7 @@ pub fn decode_improved_pb_picture(
             left_bpb_forward_mv: None,
             b_frame: &mut b_frame,
         }),
+        None,
     )?;
     Ok(PbFramePair { p_frame, b_frame })
 }
@@ -1843,6 +1919,7 @@ fn decode_after_picture_header(
     reference: Option<&YuvFrame>,
     options: DecodeOptions,
     mut pb: Option<PbPictureCtx<'_>>,
+    gob0_pquant: Option<u8>,
 ) -> Result<YuvFrame> {
     // Unsupported header-signalled modes — refuse rather than guess.
     // SAC is refused outright. A PB-frames picture must arrive through
@@ -1896,19 +1973,41 @@ fn decode_after_picture_header(
     // grid. Always allocated; only read/written by the AIC code path.
     let mut aic_state = AicState::new(mb_cols, mb_rows_total);
 
-    // Walk GOBs top-to-bottom (§4.2.1 vertical scan). Every GOB —
-    // including the topmost — is expected to carry a GOB header in the
-    // baseline driver. The spec permits "GOB 0" to omit its header
-    // (its QUANT then being the picture-layer PQUANT), but PQUANT lives
-    // in the extended/optional header block this baseline subset does
-    // not decode; requiring a header for every GOB keeps the driver
-    // self-contained against the layer set we parse. The header is
-    // therefore always "present" for the §6.1.1 rule-3 "outside the
-    // GOB at the top" border test.
+    // Walk GOBs top-to-bottom (§4.2.1 vertical scan).
+    //
+    // Per §5.2 / §5.2.2, the first GOB of every picture (group number
+    // 0) carries **no** GOB header — "as group number 0 is used in the
+    // PSC" — and its QUANT is the picture-layer PQUANT (§5.1.19). When
+    // the caller supplies `gob0_pquant = Some(pquant)` (the
+    // spec-conformant path: PQUANT has been read from the picture
+    // header), GOB 0 is decoded header-less at that QUANT and only GOBs
+    // `1..num_gobs` parse a GBSC + GN + GFID + GQUANT header.
+    //
+    // When `gob0_pquant` is `None` the driver keeps the legacy
+    // round-2 convention where every GOB — including the topmost —
+    // carries a header on the wire (its GQUANT priming the row); this
+    // preserves the synthetic-fixture layout the lower-level tests are
+    // built around without forcing them to thread PQUANT.
+    //
+    // Either way every GOB's top row is a fresh §6.1.1 / §I.3 video
+    // picture segment, so `gob_header_present` is reported `true` for
+    // the §6.1.1 rule-3 "outside the GOB at the top" border test: GOB 0
+    // is the topmost GOB, so its above-neighbour row is the picture
+    // boundary regardless of whether a header was on the wire.
     let gob_header_present = true;
     for gob_index in 0..num_gobs as usize {
-        let gob = parse_gob_layer(reader)?;
-        let gob_quant = gob.quantiser;
+        let gob_quant = if gob_index == 0 {
+            match gob0_pquant {
+                // Spec-conformant GOB-0 header elision: QUANT = PQUANT,
+                // no bits consumed for a GOB-0 header.
+                Some(pquant) => pquant,
+                // Legacy convention: GOB 0 carries a header like any
+                // other GOB.
+                None => parse_gob_layer(reader)?.quantiser,
+            }
+        } else {
+            parse_gob_layer(reader)?.quantiser
+        };
         let gob_top_row = gob_index * mb_rows_per_gob as usize;
         // Every GOB header opens a fresh §I.3 "video picture segment"
         // for the baseline (no Annex K) driver — a candidate neighbour
@@ -3745,6 +3844,147 @@ mod tests {
         let frame = decode_picture(&data, None, DecodeOptions::default()).expect("decode");
         assert!(frame.y.iter().all(|&p| p == 64));
         assert!(frame.cb.iter().all(|&p| p == 64));
+    }
+
+    /// Build a §5.2.2-conformant QCIF INTRA picture: the picture header
+    /// carries §5.1.19 PQUANT + §5.1.20 CPM after PTYPE, the first GOB
+    /// (group number 0) carries **no** GOB header — its QUANT is PQUANT —
+    /// and only GOBs 1..8 carry a GBSC + GN + GFID + GQUANT header. The
+    /// macroblock layout is otherwise identical to
+    /// [`build_qcif_intra_dc_picture`].
+    fn build_qcif_intra_dc_picture_gob0_elided(intradc_code: u8, pquant: u8) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        // Picture header: QCIF, INTRA, all flags off.
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true); // PTYPE bit1
+        w.write_bit(false); // PTYPE bit2
+        w.write_bit(false); // split-screen
+        w.write_bit(false); // doc-camera
+        w.write_bit(false); // freeze
+        w.write_u32(0b010, 3); // source format QCIF
+        w.write_bit(false); // coding type INTRA
+        w.write_bit(false); // umv
+        w.write_bit(false); // sac
+        w.write_bit(false); // ap
+        w.write_bit(false); // pb
+                            // §5.1.19 PQUANT (5 bits) + §5.1.20 CPM = "0".
+        w.write_u32(pquant as u32, 5);
+        w.write_bit(false); // CPM off
+
+        let emit_macroblocks = |w: &mut BitWriter| {
+            for _mb in 0..11 {
+                // MCBPC = `1` -> I-picture type INTRA, cbpc 00.
+                w.write_bit(true);
+                // CBPY = `0011`: no AC in any luma block.
+                w.write_bit(false);
+                w.write_bit(false);
+                w.write_bit(true);
+                w.write_bit(true);
+                for _blk in 0..6 {
+                    w.write_u32(intradc_code as u32, 8);
+                }
+            }
+        };
+
+        // GOB 0: NO header — macroblock data immediately follows the
+        // picture header (§5.2.2).
+        emit_macroblocks(&mut w);
+        // GOBs 1..8: full GOB headers.
+        for _gob in 1..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(pquant as u32, GQUANT_BITS);
+            emit_macroblocks(&mut w);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    #[test]
+    fn decode_gob0_elided_intra_dc_uniform_frame() {
+        // PQUANT = 8 reproduces the QUANT the legacy fixture's GOB-0
+        // GQUANT carries: INTRADC 0x10 -> level 128 -> 16 per pixel.
+        let data = build_qcif_intra_dc_picture_gob0_elided(0x10, 8);
+        let frame =
+            decode_picture_no_gob0_header(&data, None, DecodeOptions::default()).expect("decode");
+        assert_eq!((frame.luma_width, frame.luma_height), (176, 144));
+        assert!(frame.y.iter().all(|&p| p == 16), "luma not uniform 16");
+        assert!(frame.cb.iter().all(|&p| p == 16), "cb not uniform 16");
+        assert!(frame.cr.iter().all(|&p| p == 16), "cr not uniform 16");
+    }
+
+    #[test]
+    fn decode_gob0_elided_matches_legacy_header_layout() {
+        // The §5.2.2 GOB-0-elided stream and the legacy every-GOB-header
+        // stream describe the same picture (same QUANT = 8, same
+        // macroblocks), so they must reconstruct identical frames.
+        let elided = build_qcif_intra_dc_picture_gob0_elided(0x40, 8);
+        let legacy = build_qcif_intra_dc_picture(0x40);
+        let via_elided =
+            decode_picture_no_gob0_header(&elided, None, DecodeOptions::default()).expect("elided");
+        let via_legacy = decode_picture(&legacy, None, DecodeOptions::default()).expect("legacy");
+        assert_eq!(via_elided.y, via_legacy.y);
+        assert_eq!(via_elided.cb, via_legacy.cb);
+        assert_eq!(via_elided.cr, via_legacy.cr);
+    }
+
+    #[test]
+    fn decode_gob0_elided_pquant_drives_gob0_quant() {
+        // GOB 0 is header-less, so its QUANT is PQUANT. Change PQUANT and
+        // the GOB-0 (top) macroblock rows must dequantise differently
+        // from the GOB-1.. rows, which here re-use PQUANT in their GQUANT.
+        // With PQUANT = 8 the whole frame is the uniform 64 baseline.
+        let data = build_qcif_intra_dc_picture_gob0_elided(0x40, 8);
+        let frame =
+            decode_picture_no_gob0_header(&data, None, DecodeOptions::default()).expect("decode");
+        // The first GOB spans the top mb-row(s); sample (0,0) is in GOB 0
+        // and must reflect the PQUANT-driven dequant (uniform 64 here).
+        assert_eq!(frame.y[0], 64, "GOB-0 top-left must dequant via PQUANT");
+    }
+
+    #[test]
+    fn decode_gob0_elided_rejects_zero_pquant() {
+        // §5.1.19 — PQUANT is the natural-binary QUANT in 1..=31; 0 is
+        // invalid.
+        let data = build_qcif_intra_dc_picture_gob0_elided(0x10, 0);
+        assert_eq!(
+            decode_picture_no_gob0_header(&data, None, DecodeOptions::default()).unwrap_err(),
+            Error::InvalidQuantiser,
+        );
+    }
+
+    #[test]
+    fn decode_gob0_elided_rejects_cpm_on() {
+        // A CPM = "1" picture pulls in PSBI + per-GOB GSBI this driver
+        // does not frame; it must be refused, not mis-aligned.
+        let mut w = BitWriter::new();
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8);
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_u32(0b010, 3);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_u32(8, 5); // PQUANT
+        w.write_bit(true); // CPM on
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        assert_eq!(
+            decode_picture_no_gob0_header(&data, None, DecodeOptions::default()).unwrap_err(),
+            Error::NotImplemented,
+        );
     }
 
     #[test]

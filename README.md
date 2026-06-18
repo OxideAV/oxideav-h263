@@ -29,7 +29,11 @@ planar 4:2:0 `YuvFrame`:
   (§5.1.4 onward: UFEP / OPPTYPE / MPPTYPE + CPM / PSBI / CPFMT /
   EPAR / CPCFC / ETR / UUI / SSS).
 * **GOB layer (§5.2)** — GBSC, Group Number, GOB Frame ID, GQUANT
-  (CPM = "0" branch).
+  (CPM = "0" branch), plus the §5.2.2 first-GOB (group-number-0)
+  header elision: the `decode_picture_no_gob0_header` entry point reads
+  the §5.1.19 PQUANT / §5.1.20 CPM picture-header fields, decodes the
+  header-less GOB 0 at QUANT = PQUANT, and parses a GOB header only for
+  GOBs 1..N (CPM = "1" refused).
 * **Macroblock layer (§5.3)** — COD, MCBPC (Tables 7 / 8), CBPY
   (Table 12), DQUANT, and MVD / MVD2-4 (Table 14).
 * **Block layer (§5.4)** — INTRADC 8-bit FLC (Table 15) and TCOEF
@@ -175,8 +179,11 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 
 * INTER4V macroblocks outside Advanced Prediction mode (the PLUSPTYPE
   Deblocking-Filter mode INTER4V+Q row).
-* GOB-0-header elision (the driver requires every GOB to carry a header
-  on the wire).
+* GOB-0-header elision in the *legacy* `decode_picture` /
+  `decode_picture_layer` / PB / Annex-K-slice drivers (those still expect
+  every GOB, including the topmost, to carry a header on the wire). The
+  spec-conformant §5.2.2 elision is available through the dedicated
+  `decode_picture_no_gob0_header` baseline entry point.
 * Multi-picture sequence demuxing (PSC scanning / reference management
   across a stream stays caller-side).
 * Annex N (Reference Picture Selection) and slice-boundary /

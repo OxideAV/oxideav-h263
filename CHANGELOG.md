@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §5.2.2 first-GOB (group-number-0) header elision (round 330):
+  - New `decode_picture_no_gob0_header` baseline entry point honours the
+    §5.2.2 rule that the first GOB of every picture (group number 0)
+    carries **no** GOB header — "as group number 0 is used in the PSC".
+  - It reads the §5.1.19 PQUANT (5-bit, range 1..=31) and §5.1.20 CPM
+    fields that follow PTYPE in the non-extended picture header, decodes
+    the header-less GOB 0 at QUANT = PQUANT, and parses a GBSC + GN +
+    GFID + GQUANT header only for GOBs 1..N.
+  - CPM = "1" (the §5.1.20 / Annex C multiplex with its trailing PSBI
+    and per-GOB GSBI) is refused (`Error::NotImplemented`); PQUANT = 0 is
+    rejected (`Error::InvalidQuantiser`).
+  - The internal `decode_after_picture_header` driver gained an optional
+    `gob0_pquant` argument: `Some(pquant)` elides the GOB-0 header,
+    `None` preserves the legacy convention (every GOB carries a header on
+    the wire) the existing `decode_picture` / `decode_picture_layer` / PB
+    / Annex-K-slice fixtures are built around.
+  - Five tests: a uniform-frame decode, a byte-for-byte match against the
+    legacy every-GOB-header layout, PQUANT-driven GOB-0 dequant, and the
+    PQUANT-0 / CPM-on rejections.
 - Annex Q.7 Reduced-Resolution Update block boundary filter (round 326):
   - New `rru_filter` module implements the §Q.7 filter run along the
     edges of the 16×16 reconstructed blocks (not the 8×8 edges of the
