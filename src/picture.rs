@@ -1641,8 +1641,10 @@ fn plus_ptype_to_baseline_shim(
         PlusPictureType::Intra => H263PictureCodingType::Intra,
         // The Improved PB-frame's P-part is a P-picture (§M.1).
         PlusPictureType::Inter | PlusPictureType::ImprovedPb => H263PictureCodingType::Inter,
-        // B / EI / EP are refused by `parse_plus_ptype` already and
-        // therefore never reach this arm; keep the catch-all explicit.
+        // B / EI / EP are the Annex O scalability-layer picture types.
+        // `parse_plus_ptype` now frames their §5.1.11/§5.1.12 ELNUM /
+        // RLNUM header fields, but the layered B/EI/EP macroblock decode
+        // is not staged, so refuse here.
         _ => return Err(Error::NotImplemented),
     };
 
@@ -1706,11 +1708,20 @@ fn plus_ptype_to_baseline_shim(
     // Structured (Annex K) is *not* refused here: when its OPPTYPE bit
     // is set the caller routes to the dedicated slice driver via the
     // [`SliceStructuredRouting`] returned below.
+    // §5.1.13–§5.1.16 — Reference Picture Selection mode (Annex N) is
+    // framed by `parse_plus_ptype` (RPSMF / TRPI / TRP / BCI), but its
+    // multi-reference selection (the §5.1.15 TRP picture-memory lookup)
+    // is a stream-level concern the single-picture API does not manage.
+    // Detect RPS-on from the parsed header fields (TRPI is present iff
+    // RPS is in use, regardless of UFEP) and refuse rather than silently
+    // decode against the wrong reference.
+    let rps_in_use = extended.plus.trpi.is_some();
     if opptype_sac
         || opptype_independent_segment_decoding
         || opptype_custom_pcf
         || extended.plus.cpm
         || extended.plus.mpptype.reduced_resolution_update
+        || rps_in_use
     {
         return Err(Error::NotImplemented);
     }
@@ -6446,6 +6457,7 @@ mod tests {
             advanced_prediction: false,
             advanced_intra: false,
             deblocking: false,
+            reference_picture_selection: false,
         };
         let outcome =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited)
@@ -6481,6 +6493,7 @@ mod tests {
             advanced_prediction: false,
             advanced_intra: false,
             deblocking: false,
+            reference_picture_selection: false,
         };
         let r =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited);
@@ -6616,6 +6629,7 @@ mod tests {
             advanced_prediction: false,
             advanced_intra: true,
             deblocking: false,
+            reference_picture_selection: false,
         };
         let outcome =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited)
@@ -6682,6 +6696,7 @@ mod tests {
                 advanced_prediction: false,
                 advanced_intra: true,
                 deblocking: true,
+                reference_picture_selection: false,
             },
             "UFEP=001 OPPTYPE snapshot captured into outcome.inherited"
         );
@@ -6701,6 +6716,7 @@ mod tests {
             advanced_prediction: true,
             advanced_intra: true,
             deblocking: true,
+            reference_picture_selection: false,
         };
         let outcome =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), primed)
@@ -6755,6 +6771,7 @@ mod tests {
             advanced_prediction: true,
             advanced_intra: true,
             deblocking: false,
+            reference_picture_selection: false,
         };
         let outcome =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited)
@@ -6774,11 +6791,11 @@ mod tests {
         );
     }
 
-    /// [`InheritedExtendedState::from_opptype`] captures only the bits
-    /// the driver stages; refused mode bits (SAC / SS / IS / AIV / MQ /
-    /// RPS) are dropped because a UFEP=000 picture inheriting any of
-    /// them would have already been refused at the prior UFEP=001
-    /// picture.
+    /// [`InheritedExtendedState::from_opptype`] captures the bits a
+    /// UFEP=000 follow-up needs to frame its header: the staged decode
+    /// modes plus the Annex N RPS flag (which gates the §5.1.13–§5.1.16
+    /// RPS fields on a UFEP=000 header). Refused mode bits
+    /// (SAC / SS / IS / AIV / MQ) are dropped.
     #[test]
     fn inherited_extended_state_from_opptype_captures_only_staged_bits() {
         let snap = InheritedExtendedState::from_opptype(crate::plus_ptype::Opptype {
@@ -6805,6 +6822,7 @@ mod tests {
                 advanced_prediction: true,
                 advanced_intra: true,
                 deblocking: true,
+                reference_picture_selection: false,
             }
         );
     }

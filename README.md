@@ -27,7 +27,10 @@ planar 4:2:0 `YuvFrame`:
   source format sub-QCIF..16CIF, INTRA / INTER coding type, optional
   Annex D/E/F/G mode flags), and the extended PLUSPTYPE header
   (§5.1.4 onward: UFEP / OPPTYPE / MPPTYPE + CPM / PSBI / CPFMT /
-  EPAR / CPCFC / ETR / UUI / SSS).
+  EPAR / CPCFC / ETR / UUI / SSS), plus the §5.1.11–§5.1.16
+  scalability / reference-picture-selection fixed-length fields
+  ELNUM / RLNUM / RPSMF / TRPI / TRP and the BCI codeword (the
+  variable-length §5.1.17 BCM and §5.1.18 RPRP payloads are refused).
 * **GOB layer (§5.2)** — GBSC, Group Number, GOB Frame ID, GQUANT
   (CPM = "0" branch), plus the §5.2.2 first-GOB (group-number-0)
   header elision: the `decode_picture_no_gob0_header` entry point reads
@@ -186,14 +189,20 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   `decode_picture_no_gob0_header` baseline entry point.
 * Multi-picture sequence demuxing (PSC scanning / reference management
   across a stream stays caller-side).
-* Annex N (Reference Picture Selection) and slice-boundary /
-  Independent-Segment-Decoding deblock skip rules.
+* Annex N (Reference Picture Selection) end-to-end: the §5.1.11–§5.1.16
+  picture-header fields (RPSMF / TRPI / TRP / BCI) are parsed, but the
+  §5.1.15 TRP multi-reference picture-memory lookup and the
+  §5.1.17 / §N.4.2 Back-Channel Message (videomux BCM) are not staged, so
+  an RPS-in-use picture is refused at decode time.
+* Slice-boundary / Independent-Segment-Decoding deblock skip rules.
 * PB-frames and Improved PB-frames (Annex G / M) end-to-end
   reconstruction.
 * Annex K Rectangular Slice submode, Annex K with Advanced Prediction /
   CPM, and Arbitrary Slice Ordering.
-* Annex O B/EI/EP scalability picture macroblocks; Annexes N / O / P
-  PLUSPTYPE sub-bitstreams.
+* Annex O B/EI/EP scalability picture macroblocks (the §5.1.11 / §5.1.12
+  ELNUM / RLNUM picture-header fields are parsed, but the layered
+  B/EI/EP macroblock decode is refused) and the Annex P RPRP
+  reference-picture-resampling sub-bitstream.
 * Annex Q Reduced-Resolution Update mode end-to-end (the §Q.6
   prediction-error up-sampling primitive and the §Q.7 block boundary
   filter are implemented as pure primitives; the 32×32 macroblock layer,

@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §5.1.11–§5.1.16 PLUSPTYPE scalability / reference-picture-selection
+  header fields (round 336):
+  - `parse_plus_ptype` now frames the §5.1.11 ELNUM (4 bits, present for
+    any layered B/EI/EP picture), §5.1.12 RLNUM (4 bits, UFEP=001 only),
+    §5.1.13 RPSMF (3 bits, RPS + UFEP=001; reserved `000`–`011` rejected),
+    §5.1.14 TRPI (1 bit, RPS; forced 0 on I/EI per §5.1.14), §5.1.15 TRP
+    (10 bits, present iff TRPI=1), and §5.1.16 BCI (`"1"` / `"01"`)
+    fields in their Figure-8 order, instead of refusing the whole header.
+  - A `BCI == "1"` (videomux §5.1.17 BCM follows) and the §5.1.18 RPRP
+    (Annex P) variable-length payloads remain `Error::PlusPtypeUnsupported`
+    — those layouts are externally-negotiated and not staged.
+  - New public `Rpsmf` enum and `PlusPtypeHeader::{elnum, rlnum, rpsmf,
+    trpi, trp}` fields; `InheritedExtendedState` gains
+    `reference_picture_selection` so a UFEP=000 follow-up frames its RPS
+    fields.
+  - `decode_picture_layer` keeps refusing B/EI/EP layered-MB decode and
+    now also refuses an RPS-in-use picture (the §5.1.15 TRP multi-
+    reference lookup is a stream-level concern the single-picture API
+    does not manage).
+  - 11 new `plus_ptype` tests cover the full-update and inherited-UFEP=000
+    field-presence matrix plus the RPSMF-reserved / TRPI-on-INTRA /
+    BCI-`"1"` / BCI-`"00"` rejections.
 - §5.2.2 first-GOB (group-number-0) header elision (round 330):
   - New `decode_picture_no_gob0_header` baseline entry point honours the
     §5.2.2 rule that the first GOB of every picture (group number 0)

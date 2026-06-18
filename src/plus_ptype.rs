@@ -49,12 +49,21 @@
 //!   on in OPPTYPE and `UFEP = "001"`.
 //! * §5.1.10 — **SSS** (2 bits): present only when the Slice Structured
 //!   mode is on in OPPTYPE and `UFEP = "001"`.
-//! * §5.1.11–§5.1.18 — the scalability / reference-picture-selection
-//!   fields ELNUM, RLNUM, RPSMF, TRPI, TRP, BCI, BCM, RPRP. These carry
-//!   variable-length and externally-negotiated sub-bitstreams (Annexes
-//!   N, O, P) that are not staged for byte-level parsing here. The
-//!   parser stops with [`PlusPtypeUnsupported`] if the corresponding
-//!   mode bits are set, rather than mis-framing the remaining header.
+//! * §5.1.11–§5.1.15 — the scalability (Annex O) and reference-picture-
+//!   selection (Annex N) fixed-length fields ELNUM (4), RLNUM (4),
+//!   RPSMF (3), TRPI (1) and TRP (10) are parsed. ELNUM is present when
+//!   the picture type is a layered B / EI / EP picture (any UFEP);
+//!   RLNUM / RPSMF only on a UFEP=001 full update; TRPI when RPS is in
+//!   use (any UFEP); TRP when TRPI signals it.
+//! * §5.1.16 — the variable-length BCI codeword (`"1"` / `"01"`) is
+//!   parsed. A BCI of `"1"` signals a following §5.1.17 BCM whose
+//!   §N.4.2 videomux-dependent layout is not staged, so the parser stops
+//!   with [`PlusPtypeUnsupported`] in that case (BCI is `"01"` whenever
+//!   the videomux submode is not in use, which is the forward-channel
+//!   default).
+//! * §5.1.18 — RPRP (Annex P reference-picture-resampling parameters)
+//!   carries a variable-length payload that is not staged; the parser
+//!   stops with [`PlusPtypeUnsupported`] when the RPR mode bit is set.
 //!
 //! All bit numbering follows the spec's 1-based "Bit N" convention; the
 //! implementation reads MSB-first via [`oxideav_core::bits::BitReader`].
@@ -79,6 +88,14 @@ pub const CPCFC_BITS: u32 = 8;
 pub const ETR_BITS: u32 = 2;
 /// Length in bits of SSS (§5.1.10).
 pub const SSS_BITS: u32 = 2;
+/// Length in bits of ELNUM (§5.1.11).
+pub const ELNUM_BITS: u32 = 4;
+/// Length in bits of RLNUM (§5.1.12).
+pub const RLNUM_BITS: u32 = 4;
+/// Length in bits of RPSMF (§5.1.13).
+pub const RPSMF_BITS: u32 = 3;
+/// Length in bits of TRP (§5.1.15).
+pub const TRP_BITS: u32 = 10;
 
 /// UFEP value indicating the full optional part (OPPTYPE) is present.
 pub const UFEP_FULL: u32 = 0b001;
@@ -152,17 +169,22 @@ pub struct InheritedExtendedState {
     /// §5.1.4.4 — Annex J Deblocking Filter mode bit from the last
     /// UFEP=001 OPPTYPE.
     pub deblocking: bool,
+    /// §5.1.4.4 — Annex N Reference Picture Selection mode bit from the
+    /// last UFEP=001 OPPTYPE. A UFEP=000 picture inheriting this gates
+    /// the §5.1.13–§5.1.16 RPS picture-header fields (RPSMF / TRPI / TRP
+    /// / BCI), whose presence depends on the mode being in use.
+    pub reference_picture_selection: bool,
 }
 
 impl InheritedExtendedState {
     /// Build the inherited snapshot the next UFEP=000 picture needs from
     /// the just-parsed [`Opptype`] of a UFEP=001 picture (§5.1.4.4).
     ///
-    /// Only the mode bits the [`crate::decode_picture_layer`] driver
-    /// honours are retained; mode bits the driver refuses (SAC, SS, IS,
-    /// AIV, MQ, RPS) are dropped since a follow-up UFEP=000 inheriting
-    /// any of them would already have been refused at this UFEP=001
-    /// picture.
+    /// Only the mode bits a UFEP=000 follow-up picture needs to frame its
+    /// header are retained: the staged decode modes plus the Annex N RPS
+    /// flag (which gates the §5.1.13–§5.1.16 RPS fields on a UFEP=000
+    /// header where there is no OPPTYPE). Mode bits the driver refuses
+    /// (SAC, SS, IS, AIV, MQ) are dropped.
     pub fn from_opptype(opptype: Opptype) -> Self {
         Self {
             custom_pcf: opptype.custom_pcf,
@@ -172,6 +194,7 @@ impl InheritedExtendedState {
             advanced_prediction: opptype.advanced_prediction,
             advanced_intra: opptype.advanced_intra,
             deblocking: opptype.deblocking,
+            reference_picture_selection: opptype.reference_picture_selection,
         }
     }
 
@@ -350,6 +373,23 @@ pub struct SliceStructuredSubmode {
     pub arbitrary_order: bool,
 }
 
+/// §5.1.13 Reference Picture Selection Mode Flags (RPSMF, 3 bits).
+///
+/// Indicates which type of back-channel messages the encoder needs. The
+/// `"000".."011"` codes are reserved; this enum carries only the four
+/// defined values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rpsmf {
+    /// `"100"` — neither ACK nor NACK signals needed.
+    Neither,
+    /// `"101"` — ACK signals to be returned.
+    NeedAck,
+    /// `"110"` — NACK signals to be returned.
+    NeedNack,
+    /// `"111"` — both ACK and NACK signals to be returned.
+    NeedBoth,
+}
+
 /// A fully parsed extended-PTYPE (PLUSPTYPE) picture header.
 ///
 /// Fields that are absent on the wire (because their presence rule did
@@ -386,6 +426,29 @@ pub struct PlusPtypeHeader {
     /// §5.1.10 — Slice Structured submode, present iff SS mode on and
     /// `ufep == 0b001`.
     pub sss: Option<SliceStructuredSubmode>,
+    /// §5.1.11 — Enhancement Layer Number, present iff the Temporal /
+    /// SNR / Spatial Scalability mode is in use (the picture type is
+    /// B / EI / EP), regardless of UFEP. The base layer is layer 1; the
+    /// first enhancement layer is layer 2.
+    pub elnum: Option<u8>,
+    /// §5.1.12 — Reference Layer Number, present iff the Scalability mode
+    /// is in use and `ufep == 0b001`. When absent it is inferred per
+    /// §5.1.12 (equal to ELNUM for B-pictures with surrounding EI/EP in
+    /// the same layer).
+    pub rlnum: Option<u8>,
+    /// §5.1.13 — Reference Picture Selection Mode Flags, present iff the
+    /// Reference Picture Selection mode (Annex N) is in use and
+    /// `ufep == 0b001`. When absent the last transmitted value remains in
+    /// effect (§5.1.13).
+    pub rpsmf: Option<Rpsmf>,
+    /// §5.1.14 — Temporal Reference for Prediction Indication, present
+    /// iff the Reference Picture Selection mode is in use, regardless of
+    /// UFEP. `true` signals that the §5.1.15 TRP field follows.
+    pub trpi: Option<bool>,
+    /// §5.1.15 — Temporal Reference for Prediction (10 bits), present iff
+    /// `trpi == Some(true)`. The two MSBs are the reference picture's ETR
+    /// (zero when no custom PCF was in use) and the eight LSBs are its TR.
+    pub trp: Option<u16>,
 }
 
 impl PlusPtypeHeader {
@@ -500,11 +563,12 @@ fn parse_mpptype(reader: &mut BitReader<'_>) -> Result<Mpptype> {
 /// custom-PCF flag that gates ETR); pass [`InheritedExtendedState::default`]
 /// for a fresh stream.
 ///
-/// Returns [`Error::PlusPtypeUnsupported`] when the header signals one
-/// of the variable-length / externally-negotiated sub-bitstreams
-/// (reference-picture-selection, slice-structured, scalability layers,
-/// or reference-picture-resampling) whose byte-level layout is not
-/// staged here, rather than mis-framing the remaining header.
+/// The §5.1.11–§5.1.15 scalability / RPS fixed-length fields (ELNUM,
+/// RLNUM, RPSMF, TRPI, TRP) and the §5.1.16 BCI codeword are parsed.
+/// Returns [`Error::PlusPtypeUnsupported`] only for the genuinely
+/// variable-length / externally-negotiated payloads whose byte-level
+/// layout is not staged here: a §5.1.17 BCM signalled by `BCI == "1"`
+/// (videomux), or §5.1.18 RPRP when the RPR mode bit is set.
 pub fn parse_plus_ptype(
     reader: &mut BitReader<'_>,
     inherited: InheritedExtendedState,
@@ -595,28 +659,118 @@ pub fn parse_plus_ptype(
         None
     };
 
-    // §5.1.11–§5.1.18 — the scalability / RPS / RPR sub-bitstreams that
-    // follow SSS carry variable-length and externally-negotiated layout
-    // (Annexes N, O, P) which is not staged for parsing here. Slice
-    // structuring (SSS) itself is fully parsed above; the refusals below
-    // cover only the layered fields. Refuse rather than mis-frame the
-    // remaining header.
-    let rps_on = opptype
-        .map(|o| o.reference_picture_selection)
-        .unwrap_or(false);
-    if rps_on {
-        return Err(Error::PlusPtypeUnsupported);
-    }
-    if mpptype.reference_picture_resampling {
-        return Err(Error::PlusPtypeUnsupported);
-    }
-    // EI / EP / B picture types are the scalability layers of Annex O,
-    // whose ELNUM / RLNUM fields follow here; their layered decode is
-    // out of scope for this header parser.
-    if matches!(
+    // §5.1.11–§5.1.18 — the scalability (Annex O), reference-picture-
+    // selection (Annex N), and reference-picture-resampling (Annex P)
+    // fields that follow SSS in the Figure-8 order:
+    //   ELNUM RLNUM RPSMF TRPI TRP BCI BCM RPRP
+    //
+    // The Scalability mode is "in use" when this header's picture type is
+    // a layered B / EI / EP picture (Annex O). RPS-mode presence is the
+    // OPPTYPE bit-11 flag (inherited when UFEP == 000, where there is no
+    // OPPTYPE). UFEP gates the fields that are only re-sent on a full
+    // update (RLNUM, RPSMF).
+    let scalability_on = matches!(
         mpptype.picture_type,
         PlusPictureType::BPicture | PlusPictureType::EiPicture | PlusPictureType::EpPicture
-    ) {
+    );
+    let rps_on = match opptype {
+        Some(o) => o.reference_picture_selection,
+        None => inherited.reference_picture_selection,
+    };
+    let ufep_full = ufep == UFEP_FULL;
+
+    // §5.1.11 — ELNUM (4 bits), present iff Scalability in use (any UFEP).
+    let elnum = if scalability_on {
+        Some(
+            reader
+                .read_u32(ELNUM_BITS)
+                .map_err(|_| Error::UnexpectedEof)? as u8,
+        )
+    } else {
+        None
+    };
+
+    // §5.1.12 — RLNUM (4 bits), present iff Scalability in use and UFEP=001.
+    let rlnum = if scalability_on && ufep_full {
+        Some(
+            reader
+                .read_u32(RLNUM_BITS)
+                .map_err(|_| Error::UnexpectedEof)? as u8,
+        )
+    } else {
+        None
+    };
+
+    // §5.1.13 — RPSMF (3 bits), present iff RPS in use and UFEP=001.
+    let rpsmf = if rps_on && ufep_full {
+        let raw = reader
+            .read_u32(RPSMF_BITS)
+            .map_err(|_| Error::UnexpectedEof)?;
+        Some(match raw {
+            0b100 => Rpsmf::Neither,
+            0b101 => Rpsmf::NeedAck,
+            0b110 => Rpsmf::NeedNack,
+            0b111 => Rpsmf::NeedBoth,
+            // 000-011 are reserved (§5.1.13).
+            _ => return Err(Error::PlusPtypeReservedField),
+        })
+    } else {
+        None
+    };
+
+    // §5.1.14 — TRPI (1 bit), present iff RPS in use (any UFEP). §5.1.14
+    // requires TRPI == 0 for an I- or EI-picture.
+    let trpi = if rps_on {
+        let bit = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+        if bit
+            && matches!(
+                mpptype.picture_type,
+                PlusPictureType::Intra | PlusPictureType::EiPicture
+            )
+        {
+            return Err(Error::PlusPtypeReservedField);
+        }
+        Some(bit)
+    } else {
+        None
+    };
+
+    // §5.1.15 — TRP (10 bits), present iff TRPI == 1.
+    let trp = if trpi == Some(true) {
+        Some(
+            reader
+                .read_u32(TRP_BITS)
+                .map_err(|_| Error::UnexpectedEof)? as u16,
+        )
+    } else {
+        None
+    };
+
+    // §5.1.16 — BCI (1 or 2 bits), present iff RPS in use. "1" signals a
+    // following BCM; "01" signals absence / end. BCI must be "01" unless
+    // the RPS videomux submode is in use. We parse the BCI codeword but
+    // refuse a present BCM field, whose §N.4.2 layout depends on the
+    // externally-negotiated videomux state (videomux is never the
+    // forward-channel default — BCI is "01" there). RPRP (Annex P) is
+    // likewise not staged.
+    if rps_on {
+        let first = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+        if first {
+            // BCI == "1": a BCM (§5.1.17 / §N.4.2) follows. Its
+            // variable-length, videomux-dependent layout is not staged.
+            return Err(Error::PlusPtypeUnsupported);
+        }
+        // BCI began with "0"; the codeword is "01".
+        let second = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+        if !second {
+            // "00" is not a defined BCI codeword (§5.1.16).
+            return Err(Error::PlusPtypeReservedField);
+        }
+    }
+
+    // §5.1.18 — RPRP (Annex P) carries variable-length resampling
+    // parameters that are not staged for parsing here.
+    if mpptype.reference_picture_resampling {
         return Err(Error::PlusPtypeUnsupported);
     }
 
@@ -632,6 +786,11 @@ pub fn parse_plus_ptype(
         etr,
         uui,
         sss,
+        elnum,
+        rlnum,
+        rpsmf,
+        trpi,
+        trp,
     })
 }
 
@@ -1033,21 +1192,169 @@ mod tests {
     }
 
     #[test]
-    fn rps_mode_is_unsupported() {
+    fn rps_mode_full_update_parses_rpsmf_trpi_bci() {
+        // UFEP=001, RPS on, P-picture: RPSMF (3) + TRPI (1) + BCI parse.
         let mut w = BitWriter::new();
         w.write_u32(UFEP_FULL, 3);
         write_opptype(
             &mut w, 0b010, false, false, false, false, false, false, false, true, // RPS on
             false, false, false,
         );
+        write_mpptype(&mut w, 0b001, false, false, false); // P-picture
+        w.write_bit(false); // CPM
+        w.write_u32(0b101, RPSMF_BITS); // RPSMF = NeedAck
+        w.write_bit(true); // TRPI = 1 -> TRP follows
+        w.write_u32(0x12, TRP_BITS); // TRP = 18
+        w.write_bit(false); // BCI bit 1
+        w.write_bit(true); // BCI bit 2 -> "01": no BCM
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let hdr = parse(&w.finish(), InheritedExtendedState::default()).expect("parse");
+        assert_eq!(hdr.rpsmf, Some(Rpsmf::NeedAck));
+        assert_eq!(hdr.trpi, Some(true));
+        assert_eq!(hdr.trp, Some(0x12));
+        // No scalability picture type -> ELNUM/RLNUM absent.
+        assert!(hdr.elnum.is_none());
+        assert!(hdr.rlnum.is_none());
+    }
+
+    #[test]
+    fn rps_mode_trpi_zero_omits_trp() {
+        let mut w = BitWriter::new();
+        w.write_u32(UFEP_FULL, 3);
+        write_opptype(
+            &mut w, 0b010, false, false, false, false, false, false, false, true, false, false,
+            false,
+        );
         write_mpptype(&mut w, 0b001, false, false, false);
-        w.write_bit(false);
+        w.write_bit(false); // CPM
+        w.write_u32(0b100, RPSMF_BITS); // RPSMF = Neither
+        w.write_bit(false); // TRPI = 0 -> no TRP
+        w.write_bit(false); // BCI "0..."
+        w.write_bit(true); // BCI "01"
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let hdr = parse(&w.finish(), InheritedExtendedState::default()).expect("parse");
+        assert_eq!(hdr.rpsmf, Some(Rpsmf::Neither));
+        assert_eq!(hdr.trpi, Some(false));
+        assert!(hdr.trp.is_none());
+    }
+
+    #[test]
+    fn rps_mode_inherited_no_ufep_parses_trpi_bci_without_rpsmf() {
+        // UFEP=000 inheriting RPS-on: RPSMF is absent (UFEP gate), but
+        // TRPI + BCI are still present (any-UFEP gate).
+        let mut w = BitWriter::new();
+        w.write_u32(UFEP_MANDATORY_ONLY, 3);
+        write_mpptype(&mut w, 0b001, false, false, false); // P-picture
+        w.write_bit(false); // CPM
+        w.write_bit(true); // TRPI = 1
+        w.write_u32(0x2A, TRP_BITS); // TRP
+        w.write_bit(false); // BCI "0..."
+        w.write_bit(true); // BCI "01"
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let inherited = InheritedExtendedState {
+            reference_picture_selection: true,
+            source_format: Some(PlusSourceFormat::Qcif),
+            ..InheritedExtendedState::default()
+        };
+        let hdr = parse(&w.finish(), inherited).expect("parse");
+        assert!(hdr.rpsmf.is_none(), "RPSMF gated by UFEP=001");
+        assert_eq!(hdr.trpi, Some(true));
+        assert_eq!(hdr.trp, Some(0x2A));
+    }
+
+    #[test]
+    fn rpsmf_reserved_code_rejected() {
+        let mut w = BitWriter::new();
+        w.write_u32(UFEP_FULL, 3);
+        write_opptype(
+            &mut w, 0b010, false, false, false, false, false, false, false, true, false, false,
+            false,
+        );
+        write_mpptype(&mut w, 0b001, false, false, false);
+        w.write_bit(false); // CPM
+        w.write_u32(0b011, RPSMF_BITS); // reserved RPSMF
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        assert_eq!(
+            parse(&w.finish(), InheritedExtendedState::default()).unwrap_err(),
+            Error::PlusPtypeReservedField
+        );
+    }
+
+    #[test]
+    fn trpi_set_on_intra_rejected() {
+        // §5.1.14: TRPI shall be 0 for an I- or EI-picture.
+        let mut w = BitWriter::new();
+        w.write_u32(UFEP_FULL, 3);
+        write_opptype(
+            &mut w, 0b010, false, false, false, false, false, false, false, true, false, false,
+            false,
+        );
+        write_mpptype(&mut w, 0b000, false, false, false); // I-picture
+        w.write_bit(false); // CPM
+        w.write_u32(0b100, RPSMF_BITS); // RPSMF
+        w.write_bit(true); // TRPI = 1 -> illegal on I-picture
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        assert_eq!(
+            parse(&w.finish(), InheritedExtendedState::default()).unwrap_err(),
+            Error::PlusPtypeReservedField
+        );
+    }
+
+    #[test]
+    fn bci_signalling_bcm_is_unsupported() {
+        // BCI == "1" signals a (videomux) BCM field whose §N.4.2 layout
+        // is not staged -> refuse rather than mis-frame.
+        let mut w = BitWriter::new();
+        w.write_u32(UFEP_FULL, 3);
+        write_opptype(
+            &mut w, 0b010, false, false, false, false, false, false, false, true, false, false,
+            false,
+        );
+        write_mpptype(&mut w, 0b001, false, false, false);
+        w.write_bit(false); // CPM
+        w.write_u32(0b100, RPSMF_BITS); // RPSMF
+        w.write_bit(false); // TRPI = 0
+        w.write_bit(true); // BCI = "1" -> BCM present
         while !w.is_byte_aligned() {
             w.write_bit(false);
         }
         assert_eq!(
             parse(&w.finish(), InheritedExtendedState::default()).unwrap_err(),
             Error::PlusPtypeUnsupported
+        );
+    }
+
+    #[test]
+    fn bci_double_zero_rejected() {
+        // "00" is not a defined BCI codeword (only "1" / "01").
+        let mut w = BitWriter::new();
+        w.write_u32(UFEP_FULL, 3);
+        write_opptype(
+            &mut w, 0b010, false, false, false, false, false, false, false, true, false, false,
+            false,
+        );
+        write_mpptype(&mut w, 0b001, false, false, false);
+        w.write_bit(false); // CPM
+        w.write_u32(0b100, RPSMF_BITS); // RPSMF
+        w.write_bit(false); // TRPI = 0
+        w.write_bit(false); // BCI "0..."
+        w.write_bit(false); // "00" invalid
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        assert_eq!(
+            parse(&w.finish(), InheritedExtendedState::default()).unwrap_err(),
+            Error::PlusPtypeReservedField
         );
     }
 
@@ -1071,7 +1378,8 @@ mod tests {
     }
 
     #[test]
-    fn b_picture_type_is_unsupported() {
+    fn b_picture_full_update_parses_elnum_rlnum() {
+        // UFEP=001 B-picture (scalability in use): ELNUM (4) + RLNUM (4).
         let mut w = BitWriter::new();
         w.write_u32(UFEP_FULL, 3);
         write_opptype(
@@ -1079,14 +1387,68 @@ mod tests {
             false,
         );
         write_mpptype(&mut w, 0b011, false, false, false); // B-picture
-        w.write_bit(false);
+        w.write_bit(false); // CPM
+        w.write_u32(2, ELNUM_BITS); // ELNUM = 2 (first enhancement layer)
+        w.write_u32(1, RLNUM_BITS); // RLNUM = 1 (base layer)
         while !w.is_byte_aligned() {
             w.write_bit(false);
         }
-        assert_eq!(
-            parse(&w.finish(), InheritedExtendedState::default()).unwrap_err(),
-            Error::PlusPtypeUnsupported
+        let hdr = parse(&w.finish(), InheritedExtendedState::default()).expect("parse");
+        assert_eq!(hdr.mpptype.picture_type, PlusPictureType::BPicture);
+        assert_eq!(hdr.elnum, Some(2));
+        assert_eq!(hdr.rlnum, Some(1));
+    }
+
+    #[test]
+    fn ei_picture_no_ufep_parses_elnum_without_rlnum() {
+        // UFEP=000 EI-picture: ELNUM present (any UFEP), RLNUM absent
+        // (UFEP=001 gate).
+        let mut w = BitWriter::new();
+        w.write_u32(UFEP_MANDATORY_ONLY, 3);
+        write_mpptype(&mut w, 0b100, false, false, false); // EI-picture
+        w.write_bit(false); // CPM
+        w.write_u32(3, ELNUM_BITS); // ELNUM = 3
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let inherited = InheritedExtendedState {
+            source_format: Some(PlusSourceFormat::Qcif),
+            ..InheritedExtendedState::default()
+        };
+        let hdr = parse(&w.finish(), inherited).expect("parse");
+        assert_eq!(hdr.mpptype.picture_type, PlusPictureType::EiPicture);
+        assert_eq!(hdr.elnum, Some(3));
+        assert!(hdr.rlnum.is_none(), "RLNUM gated by UFEP=001");
+    }
+
+    #[test]
+    fn ep_picture_with_rps_parses_scalability_and_rps_fields() {
+        // UFEP=001 EP-picture with RPS on: the full Figure-8 order
+        // ELNUM RLNUM RPSMF TRPI [TRP] BCI parses end-to-end.
+        let mut w = BitWriter::new();
+        w.write_u32(UFEP_FULL, 3);
+        write_opptype(
+            &mut w, 0b010, false, false, false, false, false, false, false, true, // RPS on
+            false, false, false,
         );
+        write_mpptype(&mut w, 0b101, false, false, false); // EP-picture
+        w.write_bit(false); // CPM
+        w.write_u32(2, ELNUM_BITS); // ELNUM
+        w.write_u32(2, RLNUM_BITS); // RLNUM
+        w.write_u32(0b110, RPSMF_BITS); // RPSMF = NeedNack
+        w.write_bit(true); // TRPI = 1
+        w.write_u32(0x0FF, TRP_BITS); // TRP
+        w.write_bit(false); // BCI "0..."
+        w.write_bit(true); // BCI "01"
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let hdr = parse(&w.finish(), InheritedExtendedState::default()).expect("parse");
+        assert_eq!(hdr.elnum, Some(2));
+        assert_eq!(hdr.rlnum, Some(2));
+        assert_eq!(hdr.rpsmf, Some(Rpsmf::NeedNack));
+        assert_eq!(hdr.trpi, Some(true));
+        assert_eq!(hdr.trp, Some(0x0FF));
     }
 
     #[test]
