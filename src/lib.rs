@@ -228,6 +228,7 @@ pub mod picture_header;
 pub mod plus_ptype;
 pub mod rru_filter;
 pub mod rru_upsample;
+pub mod scalability;
 pub mod slice_header;
 
 pub use aic::{
@@ -417,6 +418,21 @@ pub enum Error {
     /// in strictly-increasing MBA order (ASO off, §K.1), or after the
     /// final slice some macroblock of the picture remained undecoded.
     BadSliceCoverage,
+    /// An Annex O scalability-layer macroblock-type VLC (Table O.1 for
+    /// B-pictures, Table O.2 for EP-pictures, Table O.3 for
+    /// EI-pictures) did not match any defined codeword.
+    BadScalabilityMbType,
+    /// An Annex O CBPC VLC (Table O.4) did not match any of the four
+    /// defined codewords.
+    BadScalabilityCbpc,
+    /// A scalability enhancement-layer picture (B / EI / EP) could not
+    /// be reconstructed because its declared §5.1.12 reference layer
+    /// dimensions are incompatible with the supplied reference-layer
+    /// picture (the SNR-scalability decode path requires the reference
+    /// layer to have the enhancement layer's exact picture geometry;
+    /// the §O.6 spatial-scalability upsample path is a separate,
+    /// not-yet-staged step).
+    BadScalabilityReferenceGeometry,
 }
 
 impl core::fmt::Display for Error {
@@ -527,6 +543,18 @@ impl core::fmt::Display for Error {
             Error::BadSliceCoverage => write!(
                 f,
                 "oxideav-h263: Annex K slices did not tile the picture exactly once (overlap, MBA order, or gap)"
+            ),
+            Error::BadScalabilityMbType => write!(
+                f,
+                "oxideav-h263: Annex O MBTYPE/MCBPC code not found in Table O.1/O.2/O.3"
+            ),
+            Error::BadScalabilityCbpc => write!(
+                f,
+                "oxideav-h263: Annex O CBPC code not found in Table O.4"
+            ),
+            Error::BadScalabilityReferenceGeometry => write!(
+                f,
+                "oxideav-h263: Annex O enhancement-layer reference geometry incompatible (SNR-scalability path needs identical reference-layer dimensions)"
             ),
         }
     }
