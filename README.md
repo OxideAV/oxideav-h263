@@ -199,10 +199,15 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   reconstruction.
 * Annex K Rectangular Slice submode, Annex K with Advanced Prediction /
   CPM, and Arbitrary Slice Ordering.
-* Annex O B/EI/EP scalability picture macroblocks (the §5.1.11 / §5.1.12
-  ELNUM / RLNUM picture-header fields are parsed, but the layered
-  B/EI/EP macroblock decode is refused) and the Annex P RPRP
-  reference-picture-resampling sub-bitstream.
+* Annex O **B-picture** (temporal-scalability) macroblocks: the EI- and
+  EP-picture enhancement layers reconstruct end-to-end
+  (`decode_ei_picture` / `decode_ep_picture` — upward, forward,
+  bidirectional and INTRA prediction against the reference and same-layer
+  pictures), but the B-picture's backward / direct-mode (§O.5.2) decode
+  is not yet wired. The §O.6 spatial-scalability upsample of a smaller
+  reference layer and the Annex P RPRP reference-picture-resampling
+  sub-bitstream are also not staged (a reference-layer geometry mismatch
+  is refused with `BadScalabilityReferenceGeometry`).
 * Annex Q Reduced-Resolution Update mode end-to-end (the §Q.6
   prediction-error up-sampling primitive and the §Q.7 block boundary
   filter are implemented as pure primitives; the 32×32 macroblock layer,

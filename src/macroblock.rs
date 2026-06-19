@@ -719,7 +719,7 @@ fn decode_mcbpc_p(reader: &mut BitReader<'_>, lz: u32) -> Result<(MbType, u8)> {
 /// | `00010`   |  8  | `1000`          | 3  | `0`    |
 /// | `000011`  |  9  | `1001`          | 4  | `1`    |
 /// | `000010`  |  6  | `0110`          | 4  | `0`    |
-fn decode_cbpy(reader: &mut BitReader<'_>) -> Result<u8> {
+pub(crate) fn decode_cbpy(reader: &mut BitReader<'_>) -> Result<u8> {
     let lz = reader.read_unary().map_err(|_| Error::UnexpectedEof)?;
     Ok(match lz {
         0 => {
@@ -791,6 +791,23 @@ fn decode_cbpy(reader: &mut BitReader<'_>) -> Result<u8> {
 /// motion-vector predictor). Round 3 returns the natural-range
 /// half-pel `Vector` column; mapping to the wrap-around branch is
 /// deferred to the (future) MV-reconstruction stage.
+/// §5.3.6 — read the baseline 2-bit DQUANT differential (Table 13) and
+/// apply it to `quant_before`, clipping the result to `1..=31`. Shared
+/// by the baseline driver and the Annex O scalability driver (the
+/// scalability "+ Q" macroblock rows use the same §5.3.6 / Table 13
+/// form per §O.4.5).
+pub(crate) fn read_dquant_baseline(reader: &mut BitReader<'_>, quant_before: u8) -> Result<u8> {
+    let raw = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)?;
+    let diff: i16 = match raw {
+        0b00 => -1,
+        0b01 => -2,
+        0b10 => 1,
+        0b11 => 2,
+        _ => unreachable!("read_u32(2) <= 3"),
+    };
+    Ok((quant_before as i16 + diff).clamp(1, 31) as u8)
+}
+
 pub(crate) fn decode_mvd_component(reader: &mut BitReader<'_>) -> Result<i8> {
     // 64-row literal transcription of Table 14, kept in
     // index-order so the row layout matches the printed spec

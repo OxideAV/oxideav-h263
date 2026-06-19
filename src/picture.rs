@@ -84,15 +84,17 @@ use crate::block_aic::parse_intra_block_aic;
 use crate::deblock::{deblock_plane, strength_for_quant, EdgeCondition};
 use crate::gob_header::parse_gob_layer;
 use crate::idct::BLOCK_DIM;
-use crate::macroblock::{parse_macroblock, H263Macroblock, MbContext, MbType, Mvd};
+use crate::macroblock::{
+    decode_mvd_component, parse_macroblock, H263Macroblock, MbContext, MbType, Mvd,
+};
 use crate::motion::{
     chroma_mv, chroma_mv_4mv, motion_compensate_block, obmc_predict_block, predict_mv_median,
     reconstruct_mv, reconstruct_mv_umv, select_4mv_candidates, LumaBlockIndex, Mb4Mv,
     Mb4MvNeighbourhood, MotionVector, RefPlane, RemoteMv, RCONTROL_DEFAULT,
 };
 use crate::pb_layer::{
-    cbpb_block_present, pb_b_predict_macroblock, pb_bquant, BpbCodingMode, PbBMacroblockPrediction,
-    PbBReferencePlanes,
+    cbpb_block_present, pb_b_bidir_pixel, pb_b_predict_macroblock, pb_bquant, BpbCodingMode,
+    PbBMacroblockPrediction, PbBReferencePlanes,
 };
 use crate::picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
@@ -100,6 +102,9 @@ use crate::picture_header::{
 };
 use crate::plus_ptype::{
     InheritedExtendedState, PlusPictureType, PlusSourceFormat, SliceStructuredSubmode, Uui,
+};
+use crate::scalability::{
+    decode_mb_header_b_ep, decode_mb_header_ei, ScalabilityPictureType, ScalabilityPredType,
 };
 use crate::slice_header::{
     parse_first_slice_header, parse_slice_layer, skip_sstuf, SliceHeaderContext, SQUANT_BITS,
@@ -911,6 +916,26 @@ pub fn decode_picture_layer_with_inherited(
                 // UFEP=001 or non-PLUSPTYPE picture).
                 None => inherited,
             };
+            // Annex O §O.1.2 — an EI-picture is an SNR / spatial
+            // scalability enhancement layer predicted only by upward
+            // prediction from the reference-layer picture (supplied as
+            // `reference`). It has no §G.4 temporal-reference context
+            // and does not route through the baseline GOB shim (which
+            // refuses the EI / EP / B picture types). Dispatch it to the
+            // dedicated upward-prediction driver.
+            if matches!(
+                extended.plus.mpptype.picture_type,
+                PlusPictureType::EiPicture
+            ) {
+                let layout = ei_layout_for(&extended)?;
+                let reference = reference.ok_or(Error::BadScalabilityReferenceGeometry)?;
+                let frame = decode_ei_picture(&mut reader, &extended, &layout, reference, options)?;
+                return Ok(DecodePictureOutcome {
+                    frame,
+                    inherited: next_inherited,
+                });
+            }
+
             let PlusShimOutcome {
                 header,
                 layout,
@@ -2131,6 +2156,1121 @@ fn decode_after_picture_header(
     }
 
     Ok(frame)
+}
+
+/// Copy an 8×8 block at `(x0, y0)` from `src` (with row stride
+/// `stride`) into a flat `[u8; 64]` in raster order. Used to fetch the
+/// co-located reference-layer block for Annex O upward prediction
+/// (§O.1.2 — for EI/EP "the prediction from the reference layer uses no
+/// motion vectors").
+fn fetch_block(src: &[u8], stride: usize, x0: usize, y0: usize) -> [u8; COEFFS_PER_BLOCK] {
+    let mut out = [0u8; COEFFS_PER_BLOCK];
+    for by in 0..BLOCK_DIM {
+        let s = (y0 + by) * stride + x0;
+        out[by * BLOCK_DIM..by * BLOCK_DIM + BLOCK_DIM].copy_from_slice(&src[s..s + BLOCK_DIM]);
+    }
+    out
+}
+
+/// Resolve the [`PictureLayout`] of an enhancement-layer picture from
+/// its parsed extended header. The EI / EP / B picture types do not run
+/// through `plus_ptype_to_baseline_shim` (which refuses them), so they
+/// resolve their own layout here from the OPPTYPE source format (or the
+/// CPFMT custom dimensions). A UFEP=000 enhancement picture with no
+/// OPPTYPE is refused — the SNR-scalability entry points require a
+/// self-describing UFEP=001 header.
+fn ei_layout_for(extended: &H263ExtendedPicture) -> Result<PictureLayout> {
+    let opptype = extended.plus.opptype.ok_or(Error::NotImplemented)?;
+    match opptype.source_format {
+        PlusSourceFormat::SubQcif => {
+            PictureLayout::for_source_format(H263SourceFormat::SubQcif).ok_or(Error::NotImplemented)
+        }
+        PlusSourceFormat::Qcif => {
+            PictureLayout::for_source_format(H263SourceFormat::Qcif).ok_or(Error::NotImplemented)
+        }
+        PlusSourceFormat::Cif => {
+            PictureLayout::for_source_format(H263SourceFormat::Cif).ok_or(Error::NotImplemented)
+        }
+        PlusSourceFormat::Cif4 => {
+            PictureLayout::for_source_format(H263SourceFormat::Cif4).ok_or(Error::NotImplemented)
+        }
+        PlusSourceFormat::Cif16 => {
+            PictureLayout::for_source_format(H263SourceFormat::Cif16).ok_or(Error::NotImplemented)
+        }
+        PlusSourceFormat::Custom => {
+            let cpfmt = extended.plus.cpfmt.ok_or(Error::NotImplemented)?;
+            PictureLayout::for_custom_dimensions(cpfmt.luma_width(), cpfmt.luma_height())
+                .ok_or(Error::NotImplemented)
+        }
+    }
+}
+
+/// Annex O §O.1.2 — decode an **EI-picture** (SNR-scalability
+/// enhancement layer) into reconstructed pixels.
+///
+/// An EI-picture is predicted exclusively by *upward* prediction from
+/// the temporally-simultaneous reference-layer picture, with **no
+/// motion vectors** (§O.4 / Figure O.7). Each macroblock is either:
+///
+/// * **Upward** — the co-located reference-layer block is the
+///   prediction; any §O.4.4 INTER-coded texture residual (CBPY / CBPC
+///   lit blocks) is added on top (§6.3.1 summation + §6.3.2 clip), or
+/// * **INTRA** — fully self-contained (INTRADC + AC), reconstructed
+///   exactly like a baseline INTRA macroblock (§6.2).
+///
+/// `reader` is positioned at the §5.1.19 PQUANT field (immediately
+/// after the parsed PLUSPTYPE + §5.1.11 ELNUM scalability fields).
+/// `reference` is the reconstructed reference-layer picture for this
+/// temporal instant (an I-, P-, EI-, or EP-picture per §O.1.3).
+///
+/// This driver covers the **SNR-scalability** geometry where the
+/// reference layer already has the enhancement layer's exact
+/// dimensions. The §O.6 spatial-scalability upsample (a factor-of-two
+/// interpolation of a smaller reference layer) is a separate step; a
+/// size mismatch here returns
+/// [`Error::BadScalabilityReferenceGeometry`] rather than mis-predict.
+///
+/// The CPM, RRU, AP, SAC, and Annex-K slice-structured modes are not
+/// staged on this enhancement-layer path and are refused.
+pub fn decode_ei_picture(
+    reader: &mut BitReader<'_>,
+    extended: &H263ExtendedPicture,
+    layout: &PictureLayout,
+    reference: &YuvFrame,
+    _options: DecodeOptions,
+) -> Result<YuvFrame> {
+    decode_upward_predicted_picture(
+        reader,
+        extended,
+        layout,
+        reference,
+        ScalabilityPictureType::EiPicture,
+    )
+}
+
+/// Shared upward-prediction driver for the Annex O enhancement-layer
+/// picture types that read their macroblock header through
+/// [`crate::scalability`]. Currently only the EI-picture is wired (no
+/// motion vectors); EP / B (which add forward / backward motion
+/// compensation) route through this once their MV reconstruction is
+/// staged.
+fn decode_upward_predicted_picture(
+    reader: &mut BitReader<'_>,
+    extended: &H263ExtendedPicture,
+    layout: &PictureLayout,
+    reference: &YuvFrame,
+    pic_type: ScalabilityPictureType,
+) -> Result<YuvFrame> {
+    // This driver stages the EI no-motion-vector path only.
+    debug_assert_eq!(pic_type, ScalabilityPictureType::EiPicture);
+
+    // Refuse the enhancement-layer optional modes this path does not
+    // stage (CPM multiplex, Advanced Prediction, SAC, Annex-K slice
+    // structure). The §O.6 spatial-scalability upsample is gated below
+    // on geometry.
+    let plus = &extended.plus;
+    if plus.cpm
+        || plus
+            .opptype
+            .is_some_and(|o| o.advanced_prediction || o.sac || o.slice_structured)
+    {
+        return Err(Error::NotImplemented);
+    }
+
+    let luma_w = layout.luma_width as usize;
+    let luma_h = layout.luma_height as usize;
+    let chroma_w = luma_w / 2;
+    let chroma_h = luma_h / 2;
+    let mb_cols = luma_w / 16;
+    let mb_rows_total = luma_h / 16;
+    if mb_cols == 0 || mb_rows_total == 0 {
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+
+    // §O.1.2 SNR-scalability requires the reference layer to already
+    // carry this picture's geometry. The §O.6 spatial-scalability
+    // upsample (reference layer half-sized in one or both dimensions)
+    // is a separate, not-yet-staged step.
+    if reference.luma_width != luma_w || reference.luma_height != luma_h {
+        return Err(Error::BadScalabilityReferenceGeometry);
+    }
+
+    let mut frame = YuvFrame {
+        y: vec![0u8; luma_w * luma_h],
+        cb: vec![0u8; chroma_w * chroma_h],
+        cr: vec![0u8; chroma_w * chroma_h],
+        luma_width: luma_w,
+        luma_height: luma_h,
+    };
+
+    // §5.1.19 — PQUANT (5 bits).
+    let pquant = reader
+        .read_u32(SQUANT_BITS)
+        .map_err(|_| Error::UnexpectedEof)? as u8;
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+
+    let luma_stride = luma_w;
+    let chroma_stride = chroma_w;
+
+    // Walk GOBs top-to-bottom (§4.2.1). GOB 0 carries no header (its
+    // QUANT is PQUANT); GOBs 1.. parse a GBSC + GN + GFID + GQUANT
+    // header. There are no TRB / DBQUANT fields in EI pictures (§O.3).
+    let num_gobs = layout.num_gobs as usize;
+    let mb_rows_per_gob = layout.mb_rows_per_gob as usize;
+
+    for gob_index in 0..num_gobs {
+        let gob_quant = if gob_index == 0 {
+            pquant
+        } else {
+            parse_gob_layer(reader)?.quantiser
+        };
+        let gob_top_row = gob_index * mb_rows_per_gob;
+
+        for local_row in 0..mb_rows_per_gob {
+            let row = gob_top_row + local_row;
+            if row >= mb_rows_total {
+                break;
+            }
+            let mut current_quant = gob_quant;
+            for col in 0..mb_cols {
+                decode_ei_macroblock(
+                    reader,
+                    &mut frame,
+                    reference,
+                    col,
+                    row,
+                    luma_stride,
+                    chroma_stride,
+                    &mut current_quant,
+                )?;
+            }
+        }
+    }
+
+    Ok(frame)
+}
+
+/// Decode and reconstruct one EI-picture macroblock at grid `(col,
+/// row)` into `frame`, predicting from `reference` (same-size
+/// reference layer). `current_quant` is updated by any DQUANT.
+#[allow(clippy::too_many_arguments)]
+fn decode_ei_macroblock(
+    reader: &mut BitReader<'_>,
+    frame: &mut YuvFrame,
+    reference: &YuvFrame,
+    col: usize,
+    row: usize,
+    luma_stride: usize,
+    chroma_stride: usize,
+    current_quant: &mut u8,
+) -> Result<()> {
+    let mb_x = col * 16;
+    let mb_y = row * 16;
+    let c_x = col * 8;
+    let c_y = row * 8;
+
+    let header = decode_mb_header_ei(reader)?;
+
+    // §O.4.2 — "Upward (skipped)" (COD = 1): upward prediction with a
+    // zero motion vector and no coefficients. Copy the four luma + two
+    // chroma co-located reference blocks verbatim.
+    if !header.coded {
+        copy_macroblock_blocks(
+            frame,
+            reference,
+            mb_x,
+            mb_y,
+            c_x,
+            c_y,
+            luma_stride,
+            chroma_stride,
+        );
+        return Ok(());
+    }
+
+    // §O.4.5 — DQUANT uses the baseline §5.3.6 / Table 13 form.
+    if header.has_dquant {
+        *current_quant = crate::macroblock::read_dquant_baseline(reader, *current_quant)?;
+    }
+    let quant = *current_quant;
+
+    // §O.4.4 — CBPY VLC. The decoder returns the natural-binary
+    // (INTRA-orientation) pattern; INTER-orientation macroblocks
+    // complement it. EI upward and INTRA MBs both use the INTRA column,
+    // so no complement is applied here, but honour the resolved flag
+    // for symmetry with the EP / B drivers.
+    let cbpy_raw = crate::macroblock::decode_cbpy(reader)?;
+    let cbpy = if header.cbpy_uses_intra_column {
+        cbpy_raw
+    } else {
+        (!cbpy_raw) & 0b1111
+    };
+    let cbpc = header.cbpc;
+
+    if header.is_intra() {
+        // INTRA macroblock — every block carries INTRADC; CBPY / CBPC
+        // gate the AC. Identical to the baseline §6.2 INTRA path.
+        for blk in 0..4 {
+            let has_ac = (cbpy >> (3 - blk)) & 1 == 1;
+            let block = parse_block(
+                reader,
+                BlockContext {
+                    has_intradc: true,
+                    has_coefficients: has_ac,
+                    modified_quant: false,
+                },
+            )?;
+            let samples = reconstruct_intra_block(&block, quant);
+            let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+            blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+        }
+        let cb_block = parse_block(
+            reader,
+            BlockContext {
+                has_intradc: true,
+                has_coefficients: cbpc & 0b10 != 0,
+                modified_quant: false,
+            },
+        )?;
+        let cb_samples = reconstruct_intra_block(&cb_block, quant);
+        blit_block(&mut frame.cb, chroma_stride, c_x, c_y, &cb_samples);
+
+        let cr_block = parse_block(
+            reader,
+            BlockContext {
+                has_intradc: true,
+                has_coefficients: cbpc & 0b01 != 0,
+                modified_quant: false,
+            },
+        )?;
+        let cr_samples = reconstruct_intra_block(&cr_block, quant);
+        blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
+        return Ok(());
+    }
+
+    // Upward-predicted macroblock — the co-located reference-layer
+    // block is the prediction (§O.1.2, no motion vector); the
+    // INTER-coded texture residual (where CBPY / CBPC light a block) is
+    // added on top per §6.3.1 / §6.3.2.
+    debug_assert_eq!(header.pred_type, ScalabilityPredType::Upward);
+    for blk in 0..4 {
+        let has_ac = (cbpy >> (3 - blk)) & 1 == 1;
+        let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+        let pred = fetch_block(&reference.y, luma_stride, bx, by);
+        let samples = if has_ac {
+            let block = parse_block(
+                reader,
+                BlockContext {
+                    has_intradc: false,
+                    has_coefficients: true,
+                    modified_quant: false,
+                },
+            )?;
+            reconstruct_inter_block_with_prediction(&block, quant, &pred)
+        } else {
+            pred
+        };
+        blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+    }
+
+    let cb_pred = fetch_block(&reference.cb, chroma_stride, c_x, c_y);
+    let cb_samples = if cbpc & 0b10 != 0 {
+        let block = parse_block(
+            reader,
+            BlockContext {
+                has_intradc: false,
+                has_coefficients: true,
+                modified_quant: false,
+            },
+        )?;
+        reconstruct_inter_block_with_prediction(&block, quant, &cb_pred)
+    } else {
+        cb_pred
+    };
+    blit_block(&mut frame.cb, chroma_stride, c_x, c_y, &cb_samples);
+
+    let cr_pred = fetch_block(&reference.cr, chroma_stride, c_x, c_y);
+    let cr_samples = if cbpc & 0b01 != 0 {
+        let block = parse_block(
+            reader,
+            BlockContext {
+                has_intradc: false,
+                has_coefficients: true,
+                modified_quant: false,
+            },
+        )?;
+        reconstruct_inter_block_with_prediction(&block, quant, &cr_pred)
+    } else {
+        cr_pred
+    };
+    blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
+
+    Ok(())
+}
+
+/// Copy the six co-located reference blocks of a macroblock (four
+/// luminance, one Cb, one Cr) verbatim from `reference` at the
+/// macroblock's grid position. This is the §O.4.2 "Upward (skipped)"
+/// (EI) and "Forward (skipped)" (EP, zero motion vector) reconstruction.
+#[allow(clippy::too_many_arguments)]
+fn copy_macroblock_blocks(
+    frame: &mut YuvFrame,
+    reference: &YuvFrame,
+    mb_x: usize,
+    mb_y: usize,
+    c_x: usize,
+    c_y: usize,
+    luma_stride: usize,
+    chroma_stride: usize,
+) {
+    for blk in 0..4 {
+        let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+        let pred = fetch_block(&reference.y, luma_stride, bx, by);
+        blit_block(&mut frame.y, luma_stride, bx, by, &pred);
+    }
+    let cb = fetch_block(&reference.cb, chroma_stride, c_x, c_y);
+    blit_block(&mut frame.cb, chroma_stride, c_x, c_y, &cb);
+    let cr = fetch_block(&reference.cr, chroma_stride, c_x, c_y);
+    blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr);
+}
+
+/// A per-block prediction source for an Annex O enhancement-layer INTER
+/// macroblock. Implementors produce the 8×8 luma prediction at a luma
+/// block origin and the 8×8 chroma predictions at the macroblock's
+/// chroma origin; the caller adds the §6.3.1 IDCT residual where the
+/// coded-block pattern lights a block.
+trait BlockPredictor {
+    /// Predict the 8×8 luma block whose top-left is `(bx, by)`.
+    fn predict_luma(&self, reference_stride: usize, bx: usize, by: usize)
+        -> [u8; COEFFS_PER_BLOCK];
+    /// Predict the 8×8 Cb block whose top-left is `(cx, cy)`.
+    fn predict_cb(&self, cx: usize, cy: usize) -> [u8; COEFFS_PER_BLOCK];
+    /// Predict the 8×8 Cr block whose top-left is `(cx, cy)`.
+    fn predict_cr(&self, cx: usize, cy: usize) -> [u8; COEFFS_PER_BLOCK];
+}
+
+/// §O.4.2 upward prediction — the co-located reference-layer block, no
+/// motion vector.
+struct UpwardPredictor<'a> {
+    upward_ref: &'a YuvFrame,
+}
+
+impl BlockPredictor for UpwardPredictor<'_> {
+    fn predict_luma(&self, stride: usize, bx: usize, by: usize) -> [u8; COEFFS_PER_BLOCK] {
+        fetch_block(&self.upward_ref.y, stride, bx, by)
+    }
+    fn predict_cb(&self, cx: usize, cy: usize) -> [u8; COEFFS_PER_BLOCK] {
+        fetch_block(&self.upward_ref.cb, self.upward_ref.chroma_width(), cx, cy)
+    }
+    fn predict_cr(&self, cx: usize, cy: usize) -> [u8; COEFFS_PER_BLOCK] {
+        fetch_block(&self.upward_ref.cr, self.upward_ref.chroma_width(), cx, cy)
+    }
+}
+
+/// §O.4 forward prediction — motion-compensated from the same-layer
+/// forward reference with the macroblock's forward vector.
+struct ForwardPredictor<'a> {
+    forward_ref: &'a YuvFrame,
+    mv: MotionVector,
+}
+
+impl BlockPredictor for ForwardPredictor<'_> {
+    fn predict_luma(&self, _stride: usize, bx: usize, by: usize) -> [u8; COEFFS_PER_BLOCK] {
+        let plane = RefPlane::new(
+            &self.forward_ref.y,
+            self.forward_ref.luma_width,
+            self.forward_ref.luma_height,
+        );
+        motion_compensate_block(&plane, bx, by, self.mv, RCONTROL_DEFAULT)
+    }
+    fn predict_cb(&self, cx: usize, cy: usize) -> [u8; COEFFS_PER_BLOCK] {
+        let plane = RefPlane::new(
+            &self.forward_ref.cb,
+            self.forward_ref.chroma_width(),
+            self.forward_ref.chroma_height(),
+        );
+        motion_compensate_block(&plane, cx, cy, chroma_mv(self.mv), RCONTROL_DEFAULT)
+    }
+    fn predict_cr(&self, cx: usize, cy: usize) -> [u8; COEFFS_PER_BLOCK] {
+        let plane = RefPlane::new(
+            &self.forward_ref.cr,
+            self.forward_ref.chroma_width(),
+            self.forward_ref.chroma_height(),
+        );
+        motion_compensate_block(&plane, cx, cy, chroma_mv(self.mv), RCONTROL_DEFAULT)
+    }
+}
+
+/// §O.4 bidirectional prediction — the per-pixel truncating average of a
+/// forward and a backward prediction (§O.4 / §G.5). For an EP-picture
+/// the "backward" reference is the upward (reference-layer) prediction
+/// with a zero motion vector; for a B-picture it is the temporally
+/// subsequent reference-layer picture with `backward_mv`.
+struct BidirPredictor<'a> {
+    forward_ref: &'a YuvFrame,
+    upward_ref: &'a YuvFrame,
+    forward_mv: MotionVector,
+    backward_mv: MotionVector,
+}
+
+impl BidirPredictor<'_> {
+    fn blend(fwd: [u8; COEFFS_PER_BLOCK], bwd: [u8; COEFFS_PER_BLOCK]) -> [u8; COEFFS_PER_BLOCK] {
+        let mut out = [0u8; COEFFS_PER_BLOCK];
+        for (o, (&f, &b)) in out.iter_mut().zip(fwd.iter().zip(bwd.iter())) {
+            *o = pb_b_bidir_pixel(f, b);
+        }
+        out
+    }
+}
+
+impl BlockPredictor for BidirPredictor<'_> {
+    fn predict_luma(&self, _stride: usize, bx: usize, by: usize) -> [u8; COEFFS_PER_BLOCK] {
+        let fwd_plane = RefPlane::new(
+            &self.forward_ref.y,
+            self.forward_ref.luma_width,
+            self.forward_ref.luma_height,
+        );
+        let bwd_plane = RefPlane::new(
+            &self.upward_ref.y,
+            self.upward_ref.luma_width,
+            self.upward_ref.luma_height,
+        );
+        let fwd = motion_compensate_block(&fwd_plane, bx, by, self.forward_mv, RCONTROL_DEFAULT);
+        let bwd = motion_compensate_block(&bwd_plane, bx, by, self.backward_mv, RCONTROL_DEFAULT);
+        Self::blend(fwd, bwd)
+    }
+    fn predict_cb(&self, cx: usize, cy: usize) -> [u8; COEFFS_PER_BLOCK] {
+        let fwd_plane = RefPlane::new(
+            &self.forward_ref.cb,
+            self.forward_ref.chroma_width(),
+            self.forward_ref.chroma_height(),
+        );
+        let bwd_plane = RefPlane::new(
+            &self.upward_ref.cb,
+            self.upward_ref.chroma_width(),
+            self.upward_ref.chroma_height(),
+        );
+        let fwd = motion_compensate_block(
+            &fwd_plane,
+            cx,
+            cy,
+            chroma_mv(self.forward_mv),
+            RCONTROL_DEFAULT,
+        );
+        let bwd = motion_compensate_block(
+            &bwd_plane,
+            cx,
+            cy,
+            chroma_mv(self.backward_mv),
+            RCONTROL_DEFAULT,
+        );
+        Self::blend(fwd, bwd)
+    }
+    fn predict_cr(&self, cx: usize, cy: usize) -> [u8; COEFFS_PER_BLOCK] {
+        let fwd_plane = RefPlane::new(
+            &self.forward_ref.cr,
+            self.forward_ref.chroma_width(),
+            self.forward_ref.chroma_height(),
+        );
+        let bwd_plane = RefPlane::new(
+            &self.upward_ref.cr,
+            self.upward_ref.chroma_width(),
+            self.upward_ref.chroma_height(),
+        );
+        let fwd = motion_compensate_block(
+            &fwd_plane,
+            cx,
+            cy,
+            chroma_mv(self.forward_mv),
+            RCONTROL_DEFAULT,
+        );
+        let bwd = motion_compensate_block(
+            &bwd_plane,
+            cx,
+            cy,
+            chroma_mv(self.backward_mv),
+            RCONTROL_DEFAULT,
+        );
+        Self::blend(fwd, bwd)
+    }
+}
+
+/// Reconstruct the six 8×8 blocks of an Annex O enhancement-layer INTRA
+/// macroblock (§6.2): every block carries INTRADC; CBPY (luma) and CBPC
+/// (chroma) gate the AC. Shared by the EI, EP and B INTRA paths.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_intra_macroblock_blocks(
+    reader: &mut BitReader<'_>,
+    frame: &mut YuvFrame,
+    quant: u8,
+    cbpy: u8,
+    cbpc: u8,
+    mb_x: usize,
+    mb_y: usize,
+    c_x: usize,
+    c_y: usize,
+    luma_stride: usize,
+    chroma_stride: usize,
+) -> Result<()> {
+    for blk in 0..4 {
+        let has_ac = (cbpy >> (3 - blk)) & 1 == 1;
+        let block = parse_block(
+            reader,
+            BlockContext {
+                has_intradc: true,
+                has_coefficients: has_ac,
+                modified_quant: false,
+            },
+        )?;
+        let samples = reconstruct_intra_block(&block, quant);
+        let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+        blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+    }
+    let cb_block = parse_block(
+        reader,
+        BlockContext {
+            has_intradc: true,
+            has_coefficients: cbpc & 0b10 != 0,
+            modified_quant: false,
+        },
+    )?;
+    let cb_samples = reconstruct_intra_block(&cb_block, quant);
+    blit_block(&mut frame.cb, chroma_stride, c_x, c_y, &cb_samples);
+
+    let cr_block = parse_block(
+        reader,
+        BlockContext {
+            has_intradc: true,
+            has_coefficients: cbpc & 0b01 != 0,
+            modified_quant: false,
+        },
+    )?;
+    let cr_samples = reconstruct_intra_block(&cr_block, quant);
+    blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
+    Ok(())
+}
+
+/// Reconstruct the six blocks of an Annex O enhancement-layer INTER
+/// macroblock: the prediction comes from `predictor` and the §6.3.1
+/// IDCT residual is added wherever the coded-block pattern lights a
+/// block. Shared by the EP and B forward / backward / upward /
+/// bidirectional paths.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_inter_predicted_macroblock(
+    reader: &mut BitReader<'_>,
+    frame: &mut YuvFrame,
+    predictor: &dyn BlockPredictor,
+    quant: u8,
+    cbpy: u8,
+    cbpc: u8,
+    mb_x: usize,
+    mb_y: usize,
+    c_x: usize,
+    c_y: usize,
+    luma_stride: usize,
+    chroma_stride: usize,
+) -> Result<()> {
+    for blk in 0..4 {
+        let has_coef = (cbpy >> (3 - blk)) & 1 == 1;
+        let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+        let pred = predictor.predict_luma(luma_stride, bx, by);
+        let samples = if has_coef {
+            let block = parse_block(
+                reader,
+                BlockContext {
+                    has_intradc: false,
+                    has_coefficients: true,
+                    modified_quant: false,
+                },
+            )?;
+            reconstruct_inter_block_with_prediction(&block, quant, &pred)
+        } else {
+            pred
+        };
+        blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+    }
+
+    let cb_pred = predictor.predict_cb(c_x, c_y);
+    let cb_samples = if cbpc & 0b10 != 0 {
+        let block = parse_block(
+            reader,
+            BlockContext {
+                has_intradc: false,
+                has_coefficients: true,
+                modified_quant: false,
+            },
+        )?;
+        reconstruct_inter_block_with_prediction(&block, quant, &cb_pred)
+    } else {
+        cb_pred
+    };
+    blit_block(&mut frame.cb, chroma_stride, c_x, c_y, &cb_samples);
+
+    let cr_pred = predictor.predict_cr(c_x, c_y);
+    let cr_samples = if cbpc & 0b01 != 0 {
+        let block = parse_block(
+            reader,
+            BlockContext {
+                has_intradc: false,
+                has_coefficients: true,
+                modified_quant: false,
+            },
+        )?;
+        reconstruct_inter_block_with_prediction(&block, quant, &cr_pred)
+    } else {
+        cr_pred
+    };
+    blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
+    Ok(())
+}
+
+/// Annex O §O.1.2 — decode an **EP-picture** ("Enhancement" P-picture)
+/// into reconstructed pixels.
+///
+/// An EP-picture is the forward + upward predicted enhancement-layer
+/// picture type (§O.4, Figure O.6 macroblock syntax shared with the
+/// B-picture). Its per-macroblock prediction (Table O.2) is one of:
+///
+/// * **Forward** — motion-compensated from the *previous EI- or
+///   EP-picture in the same enhancement layer* (`forward_ref`), using a
+///   forward motion vector reconstructed from MVDFW against the §O.5.1
+///   forward-only median predictor.
+/// * **Upward** — the co-located block of the temporally-simultaneous
+///   reference-layer picture (`upward_ref`), with **no** motion vector
+///   (§O.4.2). Identical to the EI upward prediction.
+/// * **Bi-dir** — the per-pixel truncating average of the forward
+///   (same-layer, MVDFW) and upward (reference-layer, zero-MV)
+///   predictions (§O.4 "the prediction pixel values are calculated by
+///   averaging the forward and backward prediction pixels"; for an
+///   EP-picture the "backward" reference is the upward one).
+/// * **INTRA** — fully self-contained, reconstructed exactly like a
+///   baseline INTRA macroblock (§6.2).
+///
+/// `reader` is positioned at the §5.1.19 PQUANT field. `forward_ref` is
+/// the previously-decoded same-layer EI/EP picture; `upward_ref` is the
+/// reconstructed reference-layer picture for this temporal instant. Both
+/// must already carry this picture's geometry — the §O.6
+/// spatial-scalability upsample of a smaller reference layer is a
+/// separate, not-yet-staged step, so a size mismatch returns
+/// [`Error::BadScalabilityReferenceGeometry`].
+///
+/// CPM, RRU, AP, SAC and Annex-K slice-structured modes are not staged
+/// on this enhancement-layer path and are refused.
+pub fn decode_ep_picture(
+    reader: &mut BitReader<'_>,
+    extended: &H263ExtendedPicture,
+    layout: &PictureLayout,
+    forward_ref: &YuvFrame,
+    upward_ref: &YuvFrame,
+    _options: DecodeOptions,
+) -> Result<YuvFrame> {
+    // Refuse the enhancement-layer optional modes this path does not
+    // stage.
+    let plus = &extended.plus;
+    if plus.cpm
+        || plus
+            .opptype
+            .is_some_and(|o| o.advanced_prediction || o.sac || o.slice_structured)
+    {
+        return Err(Error::NotImplemented);
+    }
+
+    let luma_w = layout.luma_width as usize;
+    let luma_h = layout.luma_height as usize;
+    let chroma_w = luma_w / 2;
+    let chroma_h = luma_h / 2;
+    let mb_cols = luma_w / 16;
+    let mb_rows_total = luma_h / 16;
+    if mb_cols == 0 || mb_rows_total == 0 {
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+
+    // Both references must already carry the enhancement-layer geometry
+    // (§O.1.2 SNR-scalability); §O.6 upsample of a smaller reference
+    // layer is a separate, not-yet-staged step.
+    for r in [forward_ref, upward_ref] {
+        if r.luma_width != luma_w || r.luma_height != luma_h {
+            return Err(Error::BadScalabilityReferenceGeometry);
+        }
+    }
+
+    let mut frame = YuvFrame {
+        y: vec![0u8; luma_w * luma_h],
+        cb: vec![0u8; chroma_w * chroma_h],
+        cr: vec![0u8; chroma_w * chroma_h],
+        luma_width: luma_w,
+        luma_height: luma_h,
+    };
+
+    // §5.1.19 — PQUANT (5 bits).
+    let pquant = reader
+        .read_u32(SQUANT_BITS)
+        .map_err(|_| Error::UnexpectedEof)? as u8;
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+
+    let luma_stride = luma_w;
+    let chroma_stride = chroma_w;
+
+    // §O.5.1 — the forward motion-vector predictor uses the §6.1.1
+    // median of forward neighbours, with the rule that a neighbour
+    // without a forward vector contributes a zero candidate. The grid
+    // records each macroblock's reconstructed forward vector (zero for
+    // upward / intra / not-coded macroblocks, which are exactly the
+    // §6.1.1 "set to zero" candidates).
+    let mut fwd_grid = vec![MbGridEntry::OUTSIDE; mb_cols * mb_rows_total];
+
+    let num_gobs = layout.num_gobs as usize;
+    let mb_rows_per_gob = layout.mb_rows_per_gob as usize;
+
+    for gob_index in 0..num_gobs {
+        let gob_quant = if gob_index == 0 {
+            pquant
+        } else {
+            parse_gob_layer(reader)?.quantiser
+        };
+        let gob_top_row = gob_index * mb_rows_per_gob;
+        // Each GOB is a §6.1.1 video picture segment for predictor
+        // purposes (a GOB header resets the top-border candidates).
+        let segment = gob_index as u32;
+
+        for local_row in 0..mb_rows_per_gob {
+            let row = gob_top_row + local_row;
+            if row >= mb_rows_total {
+                break;
+            }
+            let mut current_quant = gob_quant;
+            for col in 0..mb_cols {
+                let mut entry = decode_ep_macroblock(
+                    reader,
+                    &mut frame,
+                    forward_ref,
+                    upward_ref,
+                    &fwd_grid,
+                    mb_cols,
+                    col,
+                    row,
+                    gob_top_row,
+                    segment,
+                    luma_stride,
+                    chroma_stride,
+                    &mut current_quant,
+                )?;
+                entry.segment = segment;
+                fwd_grid[row * mb_cols + col] = entry;
+            }
+        }
+    }
+
+    Ok(frame)
+}
+
+/// Decode and reconstruct one EP-picture macroblock at grid `(col,
+/// row)`, returning the [`MbGridEntry`] that records this macroblock's
+/// reconstructed forward motion vector for the §O.5.1 predictor of
+/// later macroblocks.
+#[allow(clippy::too_many_arguments)]
+fn decode_ep_macroblock(
+    reader: &mut BitReader<'_>,
+    frame: &mut YuvFrame,
+    forward_ref: &YuvFrame,
+    upward_ref: &YuvFrame,
+    fwd_grid: &[MbGridEntry],
+    mb_cols: usize,
+    col: usize,
+    row: usize,
+    gob_top_row: usize,
+    segment: u32,
+    luma_stride: usize,
+    chroma_stride: usize,
+    current_quant: &mut u8,
+) -> Result<MbGridEntry> {
+    let mb_x = col * 16;
+    let mb_y = row * 16;
+    let c_x = col * 8;
+    let c_y = row * 8;
+
+    let header = decode_mb_header_b_ep(reader, ScalabilityPictureType::EpPicture)?;
+
+    // §O.4.2 "Forward (skipped)" (COD = 1): forward prediction with a
+    // zero motion vector and no coefficients. Copy the co-located
+    // same-layer forward-reference blocks verbatim.
+    if !header.coded {
+        copy_macroblock_blocks(
+            frame,
+            forward_ref,
+            mb_x,
+            mb_y,
+            c_x,
+            c_y,
+            luma_stride,
+            chroma_stride,
+        );
+        return Ok(ep_grid_entry(
+            ScalabilityPredType::Forward,
+            MotionVector::new(0, 0),
+            true,
+        ));
+    }
+
+    // Field order per Figure O.6: `COD MBTYPE CBPC CBPY DQUANT MVDFW
+    // MVDBW Block`. The scalability header already consumed COD, MBTYPE
+    // and CBPC; CBPY (§O.4.4), DQUANT (§O.4.5) and MVDFW (§O.4.6) follow.
+
+    // §O.4.4 — CBPY is present only on rows that carry texture (the
+    // `has_cbp` flag); the "(no texture)" rows omit it. The decoder
+    // returns the natural-binary (INTRA-orientation) pattern; INTER
+    // rows complement it.
+    let cbpy = if header.has_cbp {
+        let cbpy_raw = crate::macroblock::decode_cbpy(reader)?;
+        if header.cbpy_uses_intra_column {
+            cbpy_raw
+        } else {
+            (!cbpy_raw) & 0b1111
+        }
+    } else {
+        0
+    };
+    let cbpc = header.cbpc;
+
+    // §O.4.5 — DQUANT (baseline §5.3.6 / Table 13 form), only on "+ Q"
+    // rows.
+    if header.has_dquant {
+        *current_quant = crate::macroblock::read_dquant_baseline(reader, *current_quant)?;
+    }
+    let quant = *current_quant;
+
+    // §O.4.6 — MVDFW (forward vector data) precedes the block layer when
+    // the row carries it. EP-pictures never carry MVDBW.
+    let forward_mv = if header.has_mvdfw {
+        let mvd = Mvd {
+            dx_half: decode_mvd_component(reader)?,
+            dy_half: decode_mvd_component(reader)?,
+        };
+        let predictor = predict_forward_mv(fwd_grid, mb_cols, col, row, gob_top_row, segment);
+        reconstruct_mv(predictor, mvd)
+    } else {
+        MotionVector::new(0, 0)
+    };
+
+    if header.is_intra() {
+        reconstruct_intra_macroblock_blocks(
+            reader,
+            frame,
+            quant,
+            cbpy,
+            cbpc,
+            mb_x,
+            mb_y,
+            c_x,
+            c_y,
+            luma_stride,
+            chroma_stride,
+        )?;
+        return Ok(ep_grid_entry(
+            ScalabilityPredType::Intra,
+            MotionVector::new(0, 0),
+            false,
+        ));
+    }
+
+    // Build the prediction planes for this macroblock per the resolved
+    // prediction type, then add any §6.3.1 INTER texture residual.
+    match header.pred_type {
+        ScalabilityPredType::Upward => {
+            reconstruct_inter_predicted_macroblock(
+                reader,
+                frame,
+                &UpwardPredictor { upward_ref },
+                quant,
+                cbpy,
+                cbpc,
+                mb_x,
+                mb_y,
+                c_x,
+                c_y,
+                luma_stride,
+                chroma_stride,
+            )?;
+            Ok(ep_grid_entry(
+                ScalabilityPredType::Upward,
+                MotionVector::new(0, 0),
+                false,
+            ))
+        }
+        ScalabilityPredType::Forward => {
+            reconstruct_inter_predicted_macroblock(
+                reader,
+                frame,
+                &ForwardPredictor {
+                    forward_ref,
+                    mv: forward_mv,
+                },
+                quant,
+                cbpy,
+                cbpc,
+                mb_x,
+                mb_y,
+                c_x,
+                c_y,
+                luma_stride,
+                chroma_stride,
+            )?;
+            Ok(ep_grid_entry(
+                ScalabilityPredType::Forward,
+                forward_mv,
+                false,
+            ))
+        }
+        ScalabilityPredType::Bidirectional => {
+            reconstruct_inter_predicted_macroblock(
+                reader,
+                frame,
+                &BidirPredictor {
+                    forward_ref,
+                    upward_ref,
+                    forward_mv,
+                    // EP "backward" is the upward (reference-layer)
+                    // prediction with a zero motion vector (§O.4).
+                    backward_mv: MotionVector::new(0, 0),
+                },
+                quant,
+                cbpy,
+                cbpc,
+                mb_x,
+                mb_y,
+                c_x,
+                c_y,
+                luma_stride,
+                chroma_stride,
+            )?;
+            Ok(ep_grid_entry(
+                ScalabilityPredType::Bidirectional,
+                forward_mv,
+                false,
+            ))
+        }
+        // Backward / Direct never appear in an EP-picture (Table O.2).
+        ScalabilityPredType::Backward | ScalabilityPredType::Direct => {
+            Err(Error::BadScalabilityMbType)
+        }
+        ScalabilityPredType::Intra => unreachable!("INTRA handled above"),
+    }
+}
+
+/// Build the [`MbGridEntry`] recording an EP/B macroblock's
+/// reconstructed forward motion vector for the §O.5.1 predictor. Only
+/// the `mv` (macroblock-level forward vector) and `not_coded` flags feed
+/// the forward predictor; `intra` is recorded so an INTRA neighbour
+/// contributes a zero candidate.
+fn ep_grid_entry(pred: ScalabilityPredType, fwd_mv: MotionVector, not_coded: bool) -> MbGridEntry {
+    // A macroblock contributes a *forward* candidate only if it actually
+    // carries a forward vector (forward / bidirectional). Upward, intra
+    // and not-coded macroblocks contribute the zero candidate, which we
+    // model by leaving `mv` zero and flagging them so the predictor
+    // treats them as the §O.5.1 "no forward vector → zero" case.
+    let has_forward = matches!(
+        pred,
+        ScalabilityPredType::Forward | ScalabilityPredType::Bidirectional
+    ) && !not_coded;
+    MbGridEntry {
+        intra: matches!(pred, ScalabilityPredType::Intra),
+        // `not_coded` here doubles as "no forward vector" so the
+        // predictor's `candidate_value` returns zero for it.
+        not_coded: !has_forward,
+        mv: if has_forward {
+            fwd_mv
+        } else {
+            MotionVector::new(0, 0)
+        },
+        mvs4: [if has_forward {
+            fwd_mv
+        } else {
+            MotionVector::new(0, 0)
+        }; 4],
+        segment: u32::MAX, // overwritten by the caller via grid index
+    }
+}
+
+/// §O.5.1 forward motion-vector predictor: the §6.1.1 median of the
+/// forward vectors of the left, above and above-right macroblocks, with
+/// a neighbour that carries no forward vector contributing zero. The
+/// border rules (picture / GOB / segment edges) match §6.1.1 exactly.
+fn predict_forward_mv(
+    grid: &[MbGridEntry],
+    mb_cols: usize,
+    col: usize,
+    row: usize,
+    gob_top_row: usize,
+    segment: u32,
+) -> MotionVector {
+    // Reuse the baseline §6.1.1 predictor: the forward grid records a
+    // zero `mv` + `not_coded = true` for any macroblock without a
+    // forward vector (set by [`ep_grid_entry`]), so `predict_mv`'s
+    // rule-1 (a not-coded candidate is zero) reproduces §O.5.1's "no
+    // forward vector → zero" behaviour. `pb_frames = false` so an INTRA
+    // candidate also collapses to zero. The per-entry `segment` is
+    // stamped at writeback, so the §6.1.1 same-segment border test fires
+    // on GOB boundaries exactly as for the baseline driver.
+    //
+    // `gob_header_present = true`: every GOB in the enhancement-layer
+    // grid carries a header (GOB 0 excepted, but its top border is the
+    // picture edge anyway), matching the segment-per-GOB stamping.
+    predict_mv(grid, mb_cols, col, row, gob_top_row, true, false, segment)
+}
+
+/// Parse a PLUSPTYPE picture-layer header from `data` and, if it is an
+/// Annex O **EP-picture**, decode it against the two supplied
+/// references.
+///
+/// Unlike [`decode_picture_layer_with_inherited`] (one reference), an
+/// EP-picture needs two reconstructed sources (§O.4): `forward_ref` is
+/// the previously-decoded EI- or EP-picture in the *same* enhancement
+/// layer (the forward-prediction source) and `upward_ref` is the
+/// temporally-simultaneous *reference-layer* picture (the upward /
+/// EP-"backward" source). The caller manages cross-layer reference
+/// memory and supplies both.
+///
+/// # Errors
+///
+/// * [`Error::NotImplemented`] — `data` is not a PLUSPTYPE picture, or
+///   its picture type is not EP, or a not-yet-staged optional mode is
+///   signalled.
+/// * [`Error::BadScalabilityReferenceGeometry`] — either reference does
+///   not already carry the enhancement-layer geometry (the §O.6
+///   spatial-scalability upsample path is not staged here).
+/// * the union of [`decode_ep_picture`]'s errors.
+pub fn decode_ep_picture_layer(
+    data: &[u8],
+    forward_ref: &YuvFrame,
+    upward_ref: &YuvFrame,
+    options: DecodeOptions,
+    inherited: InheritedExtendedState,
+) -> Result<YuvFrame> {
+    let mut reader = BitReader::new(data);
+    let layer = parse_picture_layer(&mut reader, inherited)?;
+    let extended = match layer {
+        H263PictureLayer::Extended(extended) => extended,
+        H263PictureLayer::Baseline(_) => return Err(Error::NotImplemented),
+    };
+    if !matches!(
+        extended.plus.mpptype.picture_type,
+        PlusPictureType::EpPicture
+    ) {
+        return Err(Error::NotImplemented);
+    }
+    let layout = ei_layout_for(&extended)?;
+    decode_ep_picture(
+        &mut reader,
+        &extended,
+        &layout,
+        forward_ref,
+        upward_ref,
+        options,
+    )
 }
 
 /// `true` iff the reader is positioned (after discarding up to seven
@@ -5407,6 +6547,591 @@ mod tests {
         w.write_bit(true); // SCE-guard
                            // §5.1.20 — CPM = 0.
         w.write_bit(false);
+    }
+
+    /// Write a QCIF PLUSPTYPE **EI-picture** header (UFEP=001, RPS off),
+    /// ending after the §5.1.11 ELNUM + §5.1.12 RLNUM scalability fields
+    /// and the §5.1.20 CPM bit — i.e. positioned at the §5.1.19 PQUANT
+    /// field, exactly where [`decode_ei_picture`] expects the reader.
+    fn write_plus_qcif_ei_header(w: &mut BitWriter) {
+        // §5.1.1 / §5.1.2 — PSC + TR.
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+                           // §5.1.3 — PTYPE bits 1-2 = "10".
+        w.write_bit(true);
+        w.write_bit(false);
+        // PTYPE bits 3-5 = "000".
+        w.write_u32(0b000, 3);
+        // PTYPE bits 6-8 = "111" -> extended PTYPE.
+        w.write_u32(0b111, 3);
+        // §5.1.4.1 — UFEP = "001" (OPPTYPE present).
+        w.write_u32(0b001, 3);
+        // §5.1.4.2 — OPPTYPE (18 bits, MSB first). QCIF, all modes off.
+        w.write_u32(0b010, 3); // bits 1-3 source format = QCIF
+        w.write_bit(false); // bit 4 custom_pcf
+        w.write_bit(false); // bit 5 UMV
+        w.write_bit(false); // bit 6 SAC
+        w.write_bit(false); // bit 7 AP
+        w.write_bit(false); // bit 8 AIC
+        w.write_bit(false); // bit 9 DF
+        w.write_bit(false); // bit 10 SS
+        w.write_bit(false); // bit 11 RPS
+        w.write_bit(false); // bit 12 IS
+        w.write_bit(false); // bit 13 AIV
+        w.write_bit(false); // bit 14 MQ
+        w.write_bit(true); // bit 15 SCE-guard
+        w.write_u32(0b000, 3); // bits 16-18 reserved
+                               // §5.1.4.3 — MPPTYPE (9 bits): picture type "100" (EI),
+                               // RPR=0, RRU=0, RTYPE=0, reserved "00", SCE-guard "1".
+        w.write_u32(0b100, 3); // picture type EI
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+                           // §5.1.11 — ELNUM (4 bits): first enhancement layer = 2.
+        w.write_u32(2, 4);
+        // §5.1.12 — RLNUM (4 bits, present at UFEP=001): base layer = 1.
+        w.write_u32(1, 4);
+        // §5.1.20 — CPM = 0.
+        w.write_bit(false);
+    }
+
+    /// A deterministic non-uniform QCIF reference-layer frame for the
+    /// EI upward-prediction tests: each sample is a function of its
+    /// position so a pure copy is distinguishable from a zero fill.
+    fn synthetic_qcif_reference() -> YuvFrame {
+        let lw = 176usize;
+        let lh = 144usize;
+        let cw = 88usize;
+        let ch = 72usize;
+        let mut y = vec![0u8; lw * lh];
+        for (i, p) in y.iter_mut().enumerate() {
+            *p = ((i * 7 + 13) % 251) as u8;
+        }
+        let mut cb = vec![0u8; cw * ch];
+        for (i, p) in cb.iter_mut().enumerate() {
+            *p = ((i * 5 + 3) % 239) as u8;
+        }
+        let mut cr = vec![0u8; cw * ch];
+        for (i, p) in cr.iter_mut().enumerate() {
+            *p = ((i * 11 + 29) % 241) as u8;
+        }
+        YuvFrame {
+            y,
+            cb,
+            cr,
+            luma_width: lw,
+            luma_height: lh,
+        }
+    }
+
+    /// An all-upward-skipped EI-picture (every macroblock COD=1) must
+    /// reconstruct to a verbatim copy of the reference layer (§O.4.2
+    /// "Upward (skipped)" + §O.1.2 no-motion-vector upward prediction).
+    #[test]
+    fn ei_all_skipped_copies_reference_layer() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_ei_header(&mut w);
+        // §5.1.19 — PQUANT (5 bits).
+        w.write_u32(8, SQUANT_BITS);
+        // 9 GOBs of 1 MB-row each; GOB 0 is header-less (QUANT=PQUANT),
+        // GOBs 1..8 carry a GBSC + GN + GFID + GQUANT header.
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                // §O.4.1 — COD = 1 (Upward skipped).
+                w.write_bit(true);
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let reference = synthetic_qcif_reference();
+        let outcome = decode_picture_layer_with_inherited(
+            &data,
+            Some(&reference),
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode EI");
+        assert_eq!(outcome.frame.y, reference.y, "luma copied verbatim");
+        assert_eq!(outcome.frame.cb, reference.cb, "Cb copied verbatim");
+        assert_eq!(outcome.frame.cr, reference.cr, "Cr copied verbatim");
+    }
+
+    /// An EI-picture whose macroblocks are coded as Upward with no
+    /// texture (MCBPC `1` = Upward CBPC 00, CBPY = `0011` = no luma AC)
+    /// also reconstructs to a verbatim reference copy — the coded path
+    /// with an all-zero coded-block pattern is the upward prediction
+    /// itself.
+    #[test]
+    fn ei_upward_no_texture_copies_reference_layer() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_ei_header(&mut w);
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(false); // COD = 0 (coded)
+                                    // MCBPC = `1` -> Upward, CBPC 00.
+                w.write_bit(true);
+                // CBPY = `0011` (Table 12 index 0): CBPY(INTRA) = 0000,
+                // no luma AC. EI Upward uses the INTRA CBPY column, so
+                // the pattern is taken as-is.
+                w.write_bit(false);
+                w.write_bit(false);
+                w.write_bit(true);
+                w.write_bit(true);
+                // CBPC 00 and CBPY 0000 -> no block data follows.
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let reference = synthetic_qcif_reference();
+        let outcome = decode_picture_layer_with_inherited(
+            &data,
+            Some(&reference),
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode EI");
+        assert_eq!(outcome.frame.y, reference.y);
+        assert_eq!(outcome.frame.cb, reference.cb);
+        assert_eq!(outcome.frame.cr, reference.cr);
+    }
+
+    /// An EI-picture whose every macroblock is INTRA-DC-only
+    /// reconstructs independently of the reference layer: each block
+    /// carries only INTRADC (code 0x10 -> level 128 -> IDCT spreads
+    /// 128/8 = 16 to every pixel), so the whole frame is uniform 16
+    /// regardless of the reference content. Exercises the EI INTRA
+    /// macroblock path (MCBPC INTRA codeword + INTRADC reconstruction).
+    #[test]
+    fn ei_intra_dc_only_is_uniform_field() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_ei_header(&mut w);
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(false); // COD = 0 (coded)
+                                    // MCBPC = `00000001` -> INTRA, CBPC 00.
+                w.write_u32(0b00000001, 8);
+                // CBPY = `0011` (Table 12 index 0): CBPY(INTRA) = 0000,
+                // no luma AC.
+                w.write_bit(false);
+                w.write_bit(false);
+                w.write_bit(true);
+                w.write_bit(true);
+                // Six blocks, each just INTRADC 0x10.
+                for _blk in 0..6 {
+                    w.write_u32(0x10, 8);
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let reference = synthetic_qcif_reference();
+        let outcome = decode_picture_layer_with_inherited(
+            &data,
+            Some(&reference),
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode EI");
+        assert!(
+            outcome.frame.y.iter().all(|&p| p == 16),
+            "every luma sample is the INTRADC field, not the reference"
+        );
+        assert!(outcome.frame.cb.iter().all(|&p| p == 16));
+        assert!(outcome.frame.cr.iter().all(|&p| p == 16));
+    }
+
+    /// A geometry mismatch between the EI enhancement layer and the
+    /// supplied reference layer is the §O.6 spatial-scalability case,
+    /// which this SNR path does not stage: it must surface
+    /// [`Error::BadScalabilityReferenceGeometry`] rather than mis-copy.
+    #[test]
+    fn ei_geometry_mismatch_is_rejected() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_ei_header(&mut w);
+        w.write_u32(8, SQUANT_BITS);
+        w.write_bit(true); // one COD=1 MB is enough; error fires earlier
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        // A sub-QCIF (128x96) reference cannot serve a QCIF EI layer.
+        let small = YuvFrame {
+            y: vec![100u8; 128 * 96],
+            cb: vec![100u8; 64 * 48],
+            cr: vec![100u8; 64 * 48],
+            luma_width: 128,
+            luma_height: 96,
+        };
+        let err = decode_picture_layer_with_inherited(
+            &data,
+            Some(&small),
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, Error::BadScalabilityReferenceGeometry);
+    }
+
+    /// Write a QCIF PLUSPTYPE **EP-picture** header (UFEP=001, RPS off),
+    /// positioned at the §5.1.19 PQUANT field — where
+    /// [`decode_ep_picture`] expects the reader. Identical to the EI
+    /// header except the §5.1.4.3 MPPTYPE picture-type field is "101"
+    /// (EP) rather than "100" (EI).
+    fn write_plus_qcif_ep_header(w: &mut BitWriter) {
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true); // PTYPE bits 1-2 = "10"
+        w.write_bit(false);
+        w.write_u32(0b000, 3); // PTYPE bits 3-5
+        w.write_u32(0b111, 3); // PTYPE bits 6-8 -> extended
+        w.write_u32(0b001, 3); // UFEP = 001
+        w.write_u32(0b010, 3); // OPPTYPE source format = QCIF
+        for _ in 0..11 {
+            w.write_bit(false); // OPPTYPE bits 4-14 all off
+        }
+        w.write_bit(true); // bit 15 SCE-guard
+        w.write_u32(0b000, 3); // bits 16-18 reserved
+        w.write_u32(0b101, 3); // MPPTYPE picture type EP
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+        w.write_u32(2, 4); // ELNUM = 2
+        w.write_u32(1, 4); // RLNUM = 1
+        w.write_bit(false); // CPM = 0
+    }
+
+    /// A second deterministic QCIF frame, distinct from
+    /// [`synthetic_qcif_reference`], to act as the EP forward
+    /// (same-layer) reference so forward and upward predictions are
+    /// distinguishable.
+    fn synthetic_qcif_forward() -> YuvFrame {
+        let (lw, lh, cw, ch) = (176usize, 144usize, 88usize, 72usize);
+        let mut y = vec![0u8; lw * lh];
+        for (i, p) in y.iter_mut().enumerate() {
+            *p = ((i * 3 + 100) % 233) as u8;
+        }
+        let mut cb = vec![0u8; cw * ch];
+        for (i, p) in cb.iter_mut().enumerate() {
+            *p = ((i * 13 + 7) % 229) as u8;
+        }
+        let mut cr = vec![0u8; cw * ch];
+        for (i, p) in cr.iter_mut().enumerate() {
+            *p = ((i * 17 + 19) % 227) as u8;
+        }
+        YuvFrame {
+            y,
+            cb,
+            cr,
+            luma_width: lw,
+            luma_height: lh,
+        }
+    }
+
+    /// An all-Forward-skipped EP-picture (every macroblock COD=1) is a
+    /// verbatim copy of the *forward* (same-layer) reference — §O.4.2
+    /// "Forward (skipped)" is forward prediction with a zero motion
+    /// vector. The upward (reference-layer) frame must NOT appear.
+    #[test]
+    fn ep_all_skipped_copies_forward_reference() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_ep_header(&mut w);
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(true); // COD = 1 (Forward skipped)
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let forward = synthetic_qcif_forward();
+        let upward = synthetic_qcif_reference();
+        let frame = decode_ep_picture_layer(
+            &data,
+            &forward,
+            &upward,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode EP");
+        assert_eq!(frame.y, forward.y, "luma copies the forward reference");
+        assert_eq!(frame.cb, forward.cb);
+        assert_eq!(frame.cr, forward.cr);
+    }
+
+    /// An EP-picture coded entirely as "Upward (no texture)" (MBTYPE
+    /// `010`) copies the *upward* (reference-layer) frame verbatim, with
+    /// no motion vector (§O.4.2). Distinguishes the upward source from
+    /// the forward source.
+    #[test]
+    fn ep_upward_no_texture_copies_upward_reference() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_ep_header(&mut w);
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(false); // COD = 0 (coded)
+                                    // MBTYPE = `010` -> Upward (no texture):
+                                    // no CBPC, no CBPY, no MVD, no blocks.
+                w.write_bit(false);
+                w.write_bit(true);
+                w.write_bit(false);
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let forward = synthetic_qcif_forward();
+        let upward = synthetic_qcif_reference();
+        let frame = decode_ep_picture_layer(
+            &data,
+            &forward,
+            &upward,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode EP");
+        assert_eq!(frame.y, upward.y, "luma copies the upward reference");
+        assert_eq!(frame.cb, upward.cb);
+        assert_eq!(frame.cr, upward.cr);
+    }
+
+    /// An EP-picture coded entirely as Forward with a zero MVD and an
+    /// all-zero coded-block pattern copies the forward reference. Table
+    /// O.2 has no "Forward (no texture)" row, so the Forward row (`1`,
+    /// CBPC + CBPY present) is used with an all-zero coded-block pattern:
+    /// CBPC = 00, the INTER-column CBPY decodes to 0000 (no luma AC), and
+    /// a zero MVDFW against the zero predictor yields the zero motion
+    /// vector — so the co-located forward block is copied verbatim.
+    #[test]
+    fn ep_forward_zero_mv_copies_forward_reference() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_ep_header(&mut w);
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(false); // COD = 0 (coded)
+                                    // MBTYPE = `1` -> Forward (CBPC + CBPY + MVDFW).
+                w.write_bit(true);
+                // CBPC = `0` -> 00 (no chroma AC).
+                w.write_bit(false);
+                // CBPY: Forward uses the INTER column (complemented). To
+                // get coded pattern 0000 the natural-binary read must be
+                // 1111, whose Table-12 code is `11`.
+                w.write_bit(true);
+                w.write_bit(true);
+                // MVDFW = (0, 0): Table-14 code `1` for each component is
+                // the zero half-pel difference.
+                w.write_bit(true); // dx = 0
+                w.write_bit(true); // dy = 0
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let forward = synthetic_qcif_forward();
+        let upward = synthetic_qcif_reference();
+        let frame = decode_ep_picture_layer(
+            &data,
+            &forward,
+            &upward,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode EP");
+        assert_eq!(frame.y, forward.y, "zero-MV forward copies forward ref");
+        assert_eq!(frame.cb, forward.cb);
+        assert_eq!(frame.cr, forward.cr);
+    }
+
+    /// An EP-picture coded entirely Bi-dir (no texture) (MBTYPE `00010`)
+    /// with zero motion vectors reconstructs to the per-pixel truncating
+    /// average of the forward and upward references (§O.4 averaging).
+    #[test]
+    fn ep_bidir_zero_mv_averages_references() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_ep_header(&mut w);
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(false); // COD = 0 (coded)
+                                    // MBTYPE = `00010` -> Bi-dir (no texture):
+                                    // no MVD (zero vectors), no blocks.
+                w.write_u32(0b00010, 5);
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let forward = synthetic_qcif_forward();
+        let upward = synthetic_qcif_reference();
+        let frame = decode_ep_picture_layer(
+            &data,
+            &forward,
+            &upward,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode EP");
+        for (i, &p) in frame.y.iter().enumerate() {
+            let expect = ((forward.y[i] as u16 + upward.y[i] as u16) / 2) as u8;
+            assert_eq!(p, expect, "luma {i} is the truncating average");
+        }
+        for (i, &p) in frame.cb.iter().enumerate() {
+            let expect = ((forward.cb[i] as u16 + upward.cb[i] as u16) / 2) as u8;
+            assert_eq!(p, expect, "Cb {i}");
+        }
+    }
+
+    /// An all-INTRA-DC EP-picture reconstructs independently of either
+    /// reference: each block carries only INTRADC 0x10 (level 128 ->
+    /// uniform 16 after IDCT), so the whole frame is 16.
+    #[test]
+    fn ep_intra_dc_only_is_uniform_field() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_ep_header(&mut w);
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(false); // COD = 0
+                                    // MBTYPE = `0000001` -> INTRA (Table O.2).
+                w.write_u32(0b0000001, 7);
+                // CBPC = `0` -> 00 (no chroma AC).
+                w.write_bit(false);
+                // CBPY = `0011` (INTRA column, no luma AC).
+                w.write_bit(false);
+                w.write_bit(false);
+                w.write_bit(true);
+                w.write_bit(true);
+                for _blk in 0..6 {
+                    w.write_u32(0x10, 8); // INTRADC each block
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let forward = synthetic_qcif_forward();
+        let upward = synthetic_qcif_reference();
+        let frame = decode_ep_picture_layer(
+            &data,
+            &forward,
+            &upward,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode EP");
+        assert!(frame.y.iter().all(|&p| p == 16));
+        assert!(frame.cb.iter().all(|&p| p == 16));
+        assert!(frame.cr.iter().all(|&p| p == 16));
+    }
+
+    /// EP geometry guard: a forward or upward reference that does not
+    /// already carry the enhancement-layer dimensions is refused.
+    #[test]
+    fn ep_geometry_mismatch_is_rejected() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_ep_header(&mut w);
+        w.write_u32(8, SQUANT_BITS);
+        w.write_bit(true);
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let forward = synthetic_qcif_forward();
+        let small = YuvFrame {
+            y: vec![100u8; 128 * 96],
+            cb: vec![100u8; 64 * 48],
+            cr: vec![100u8; 64 * 48],
+            luma_width: 128,
+            luma_height: 96,
+        };
+        let err = decode_ep_picture_layer(
+            &data,
+            &forward,
+            &small,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, Error::BadScalabilityReferenceGeometry);
     }
 
     /// Write a QCIF PLUSPTYPE **P-picture** (INTER) header with the

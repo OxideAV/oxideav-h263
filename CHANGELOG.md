@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex O §O.1.2 **EP-picture** ("Enhancement" P-picture) end-to-end
+  reconstruction (round 343):
+  - New `decode_ep_picture` + `decode_ep_picture_layer` decode the
+    forward + upward predicted enhancement-layer picture against two
+    references — `forward_ref` (the previous same-layer EI/EP picture)
+    and `upward_ref` (the temporally-simultaneous reference-layer
+    picture). All four Table-O.2 prediction types reconstruct: Forward
+    (motion-compensated from the same-layer reference with an MVDFW
+    vector reconstructed against the §O.5.1 forward-only median
+    predictor), Upward (co-located reference-layer block, no vector),
+    Bi-dir (per-pixel truncating average of the forward and upward
+    predictions, §O.4), and INTRA (§6.2).
+  - Figure-O.6 macroblock field order `COD MBTYPE CBPC CBPY DQUANT
+    MVDFW Block` is honoured, with CBPY / DQUANT / MVDFW each gated on
+    the resolved `ScalabilityMbHeader` presence flags; the §O.4.4 CBPY
+    INTRA/INTER column selection is applied per prediction type.
+  - Shared `BlockPredictor` trait (Upward / Forward / Bidir) and the
+    `reconstruct_{intra,inter}_*_macroblock` helpers factor the
+    enhancement-layer block reconstruction so the EI driver and the
+    forthcoming B-picture driver share one code path.
+  - 6 new `picture` tests cover Forward-skipped (copies the forward
+    reference), Upward-no-texture (copies the upward reference),
+    Forward-with-zero-MV, Bi-dir averaging, INTRA-DC, and the
+    reference-geometry guard.
+
 - §5.1.11–§5.1.16 PLUSPTYPE scalability / reference-picture-selection
   header fields (round 336):
   - `parse_plus_ptype` now frames the §5.1.11 ELNUM (4 bits, present for
