@@ -254,8 +254,8 @@ pub use deblock::{
 };
 pub use dequant::{dequantise_ac, scatter_into_block, AC_REC_MAX, AC_REC_MIN};
 pub use gob_header::{
-    parse_gob_layer, parse_gob_layer_from_bytes, GobLayer, GBSC_BITS, GBSC_VALUE, GFID_BITS,
-    GN_BITS, GOB_HEADER_BITS_NO_CPM, GQUANT_BITS,
+    gob_header_present, parse_gob_layer, parse_gob_layer_from_bytes, GobLayer, GBSC_BITS,
+    GBSC_VALUE, GFID_BITS, GN_BITS, GOB_HEADER_BITS_NO_CPM, GQUANT_BITS,
 };
 pub use idct::{idct_8x8, reconstruct_intra_samples, BLOCK_DIM, IDCT_OUT_MAX, IDCT_OUT_MIN};
 pub use intra_tcoef::{decode_intra_tcoef_event, IntraTcoefEvent, INTRA_TCOEF_REGULAR_ENTRIES};

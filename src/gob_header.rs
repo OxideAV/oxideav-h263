@@ -184,6 +184,88 @@ pub fn parse_gob_layer_from_bytes(data: &[u8]) -> Result<GobLayer> {
     parse_gob_layer(&mut reader)
 }
 
+/// Detect whether a GOB-layer header (a GBSC start code, optionally
+/// preceded by §5.2.1 GSTUF stuffing) begins at the reader's current
+/// position, **consuming the GSTUF bits when a header is found** so a
+/// subsequent [`parse_gob_layer`] starts on the GBSC's first bit.
+///
+/// §5.2 says that for every GOB except number 0 "the GOB header may be
+/// empty, depending on the encoder strategy" — an encoder is free to
+/// omit the GBSC/GN/GFID/GQUANT entirely and let macroblock data run
+/// continuously across the GOB boundary. A decoder that walks the GOB
+/// grid therefore cannot assume a header precedes each GOB's first
+/// macroblock row; it must look for the start code and fall through to
+/// the macroblock layer when none is present. FFmpeg's native H.263
+/// encoder, for one, emits no non-empty GOB headers for the standard
+/// formats, so every fixture below GOB 0 reaches this path.
+///
+/// ## Detection rule (§5.2.1 / §5.2.2)
+///
+/// GBSC is the 17-bit word `0000 0000 0000 0000 1`; its 16 leading
+/// zeros cannot occur inside legal macroblock data (start-code
+/// emulation is prevented by the bitstream construction), so a run of
+/// 16 zero bits unambiguously marks a start code rather than coefficient
+/// data. §5.2.1 lets the encoder insert GSTUF — "less than 8 zero-bits"
+/// whose last bit is the LSB of a byte — directly before GBSC so that
+/// "the start of the GBSC codeword is byte aligned". §5.2.2 phrases the
+/// same alignment as optional ("GOB start codes *may* be byte aligned"),
+/// so this detector accepts a GBSC that begins:
+///
+/// 1. immediately at the current bit position (no GSTUF), or
+/// 2. at the next byte boundary, provided every skipped bit up to that
+///    boundary is zero (a valid GSTUF run of 1..=7 bits).
+///
+/// On a positive detection the GSTUF bits (case 2) are consumed and the
+/// reader is left on the MSB of GBSC; on a negative detection the reader
+/// position is unchanged. The 17 bits of GBSC itself are **not**
+/// consumed in either case — [`parse_gob_layer`] re-reads them.
+///
+/// Returns `false` (rather than erroring) when fewer than 16 bits remain,
+/// so a caller probing past the final GOB of a picture simply sees "no
+/// header".
+pub fn gob_header_present(reader: &mut BitReader<'_>) -> bool {
+    // Case 1 — GBSC directly at the current position (no GSTUF).
+    if peek_is_gbsc(reader) {
+        return true;
+    }
+
+    // Case 2 — a GSTUF run of 1..=7 zero bits that byte-aligns the GBSC.
+    // GSTUF is only meaningful when the reader is not already byte
+    // aligned; if it is aligned, case 1 already covered the only legal
+    // GBSC position.
+    let bit_in_byte = (reader.bit_position() & 7) as u32;
+    if bit_in_byte == 0 {
+        return false;
+    }
+    // 1..=7 bits to reach the next byte boundary.
+    let stuff = 8 - bit_in_byte;
+    // The candidate GSTUF bits must all be zero (§5.2.1).
+    let mut probe = *reader;
+    match probe.peek_u32(stuff + GBSC_BITS) {
+        Ok(bits) => {
+            let stuff_bits = bits >> GBSC_BITS; // the leading GSTUF run.
+            let gbsc = bits & ((1 << GBSC_BITS) - 1);
+            if stuff_bits == 0 && gbsc == GBSC_VALUE {
+                // Discard the GSTUF (§5.2.1: "Decoders shall be designed
+                // to discard GSTUF"), leaving the reader on GBSC's MSB.
+                let _ = reader.skip(stuff);
+                true
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Peek the next 17 bits and report whether they equal [`GBSC_VALUE`],
+/// without consuming anything. Returns `false` when fewer than 17 bits
+/// remain.
+fn peek_is_gbsc(reader: &BitReader<'_>) -> bool {
+    let mut probe = *reader;
+    matches!(probe.peek_u32(GBSC_BITS), Ok(v) if v == GBSC_VALUE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +415,92 @@ mod tests {
             parse_gob_layer_from_bytes(&bytes).unwrap_err(),
             Error::UnexpectedEof
         );
+    }
+
+    #[test]
+    fn detector_finds_byte_aligned_gbsc_with_gstuf() {
+        // Six bits of macroblock data, then a 2-bit GSTUF run that
+        // byte-aligns a real GOB header. The detector must report
+        // "present" and leave the reader on the GBSC MSB so a follow-up
+        // parse_gob_layer succeeds.
+        let mut w = BitWriter::new();
+        w.write_u32(0b101011, 6); // pretend MB data (must be non-zero-run)
+                                  // GSTUF: 2 zero bits to reach the next byte boundary.
+        w.write_bit(false);
+        w.write_bit(false);
+        // Now byte-aligned; emit a real header.
+        w.write_u32(GBSC_VALUE, GBSC_BITS);
+        w.write_u32(3, GN_BITS);
+        w.write_u32(0, GFID_BITS);
+        w.write_u32(9, GQUANT_BITS);
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let bytes = w.finish();
+
+        let mut r = BitReader::new(&bytes);
+        r.skip(6).expect("skip mb data");
+        assert!(gob_header_present(&mut r));
+        // The 2 GSTUF bits were consumed; reader is on GBSC's MSB.
+        assert_eq!(r.bit_position(), 8);
+        let gob = parse_gob_layer(&mut r).expect("parse after detect");
+        assert_eq!(gob.number, 3);
+        assert_eq!(gob.quantiser, 9);
+    }
+
+    #[test]
+    fn detector_finds_gbsc_at_current_position_no_gstuf() {
+        // GBSC begins exactly at the current (already byte-aligned)
+        // position — no GSTUF needed.
+        let bytes = build_gob_header(5, 0, 4);
+        let mut r = BitReader::new(&bytes);
+        assert!(gob_header_present(&mut r));
+        // No bits consumed by detection (no GSTUF present here).
+        assert_eq!(r.bit_position(), 0);
+        let gob = parse_gob_layer(&mut r).expect("parse");
+        assert_eq!(gob.number, 5);
+    }
+
+    #[test]
+    fn detector_reports_absent_when_macroblock_data_follows() {
+        // A non-zero bit pattern (no 16-zero run) is plain macroblock
+        // data, not a GOB header. The detector must not consume bits.
+        let mut w = BitWriter::new();
+        // 0xB5... has no run of 16 zeros.
+        w.write_u32(0xB5A3_C71D, 32);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert!(!gob_header_present(&mut r));
+        assert_eq!(r.bit_position(), 0);
+    }
+
+    #[test]
+    fn detector_rejects_nonzero_gstuf_bits() {
+        // A would-be GSTUF run that contains a 1 bit is not valid
+        // stuffing; the detector must NOT treat the following aligned
+        // GBSC as a header (that 1 bit is macroblock data).
+        let mut w = BitWriter::new();
+        w.write_u32(0b100000, 6); // 6 bits, leading 1 — first bit is data
+                                  // 2 bits to byte boundary, but make one of them a 1.
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_u32(GBSC_VALUE, GBSC_BITS);
+        w.write_u32(0, 7);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        r.skip(6).expect("skip");
+        assert!(!gob_header_present(&mut r));
+        // No GSTUF consumed.
+        assert_eq!(r.bit_position(), 6);
+    }
+
+    #[test]
+    fn detector_reports_absent_at_end_of_stream() {
+        // Fewer than 16 bits remain — probing past the final GOB.
+        let bytes = [0xFFu8];
+        let mut r = BitReader::new(&bytes);
+        r.skip(2).expect("skip");
+        assert!(!gob_header_present(&mut r));
     }
 
     #[test]
