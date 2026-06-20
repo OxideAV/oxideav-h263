@@ -98,7 +98,7 @@ use crate::pb_layer::{
 };
 use crate::picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
-    H263PictureHeader, H263PictureLayer, H263SourceFormat,
+    H263PictureHeader, H263PictureLayer, H263SourceFormat, PSC_BITS, PSC_VALUE,
 };
 use crate::plus_ptype::{
     InheritedExtendedState, PlusPictureType, PlusSourceFormat, SliceStructuredSubmode, Uui,
@@ -782,6 +782,79 @@ fn skip_pei_psupp(reader: &mut BitReader<'_>) -> Result<()> {
         // §5.1.25 — 8 bits of PSUPP follow a set PEI bit.
         reader.skip(8).map_err(|_| Error::UnexpectedEof)?;
     }
+}
+
+/// Locate the byte offset of the next Picture Start Code in `data` at or
+/// after byte `from`, scanning only byte boundaries.
+///
+/// §5.1.28 guarantees a decoder can find pictures on byte boundaries:
+/// "Encoders shall insert [PSTUF] for byte alignment of the next PSC …
+/// so that the video bitstream including PSTUF is a multiple of 8 bits".
+/// The PSC itself is the 22-bit word `0x000020`; its top 16 bits are
+/// zero, so a byte-aligned PSC begins with two `0x00` bytes followed by a
+/// byte whose top two bits are `10`. Returns `None` if no further PSC is
+/// present.
+fn find_next_psc(data: &[u8], from: usize) -> Option<usize> {
+    let mut byte = from;
+    while byte + 3 <= data.len() {
+        // Cheap pre-filter: a byte-aligned PSC's first two bytes are 0x00.
+        if data[byte] == 0x00 && data[byte + 1] == 0x00 {
+            let mut probe = BitReader::new(&data[byte..]);
+            if matches!(probe.peek_u32(PSC_BITS), Ok(v) if v == PSC_VALUE) {
+                return Some(byte);
+            }
+        }
+        byte += 1;
+    }
+    None
+}
+
+/// Decode a full H.263 baseline elementary stream — one or more pictures
+/// concatenated on the wire — into a vector of reconstructed frames.
+///
+/// The stream is split on byte-aligned Picture Start Codes (§5.1.1 /
+/// §5.1.28): the encoder pads with PSTUF so that every PSC after the
+/// first lands on a byte boundary, which lets the demuxer find picture
+/// boundaries without fully parsing each picture's variable-length
+/// macroblock data. Each picture is decoded through
+/// [`decode_picture_no_gob0_header`] (the §5.2.2 GOB-0-elided baseline
+/// path that reads PQUANT from the picture header and tolerates the
+/// §5.2 optional GOB headers real encoders emit), and the reconstructed
+/// frame of picture *n* becomes the reference for the INTER prediction of
+/// picture *n+1*.
+///
+/// `options` apply to every picture in the stream.
+///
+/// # Errors
+///
+/// * [`Error::BadPictureStartCode`] if `data` does not begin with a PSC
+///   (after any leading bytes — the first PSC is located the same way as
+///   the subsequent ones).
+/// * The union of [`decode_picture_no_gob0_header`]'s errors for any
+///   picture in the stream.
+///
+/// PB / Improved-PB / scalability (EI/EP/B) and CPM streams are refused
+/// by the per-picture driver and therefore by this entry point; they have
+/// their own dedicated drivers.
+pub fn decode_sequence(data: &[u8], options: DecodeOptions) -> Result<Vec<YuvFrame>> {
+    let first = find_next_psc(data, 0).ok_or(Error::BadPictureStartCode)?;
+    let mut frames: Vec<YuvFrame> = Vec::new();
+    let mut start = first;
+    loop {
+        // The picture spans from its PSC to the next PSC (exclusive), or
+        // to end-of-stream for the final picture.
+        let next = find_next_psc(data, start + 1);
+        let end = next.unwrap_or(data.len());
+        let picture = &data[start..end];
+        let reference = frames.last();
+        let frame = decode_picture_no_gob0_header(picture, reference, options)?;
+        frames.push(frame);
+        match next {
+            Some(n) => start = n,
+            None => break,
+        }
+    }
+    Ok(frames)
 }
 
 /// Decode a single H.263 picture from `data`, dispatching on the
