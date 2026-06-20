@@ -733,6 +733,23 @@ pub fn decode_picture_no_gob0_header(
         return Err(Error::NotImplemented);
     }
 
+    // §5.1.22 / §5.1.23 — TRB + DBQUANT are present only for PB / Improved
+    // PB pictures. Those flow through [`decode_pb_picture`]; a PB picture
+    // arriving here would mis-frame, so refuse it (the downstream driver
+    // would also refuse via the `pb_frames != pb.is_some()` guard, but
+    // catching it before the PEI loop keeps the framing explicit).
+    if header.pb_frames {
+        return Err(Error::NotImplemented);
+    }
+
+    // §5.1.24 / §5.1.25 — PEI + PSUPP. The Extra Insertion Information bit
+    // gates an optional 8-bit PSUPP field, each followed by another PEI
+    // bit, repeating until a PEI of "0". A decoder that does not support
+    // the Annex L supplemental-enhancement payload "shall be designed to
+    // discard PSUPP" — so we consume and drop the loop, leaving the reader
+    // on the first bit of GOB-0 macroblock data.
+    skip_pei_psupp(&mut reader)?;
+
     decode_after_picture_header(
         &mut reader,
         &header,
@@ -742,6 +759,29 @@ pub fn decode_picture_no_gob0_header(
         None,
         Some(pquant),
     )
+}
+
+/// Consume the §5.1.24 PEI / §5.1.25 PSUPP extension loop at the reader's
+/// current position, discarding any supplemental-enhancement payload.
+///
+/// PEI is a single bit; when set, 8 bits of PSUPP follow and then another
+/// PEI bit, and so on until a PEI bit of "0". Annex L gives PSUPP its
+/// semantics, but §5.1.25 directs decoders that do not implement those
+/// extended capabilities to discard PSUPP — so this helper only advances
+/// the bit cursor past the loop.
+///
+/// # Errors
+///
+/// [`Error::UnexpectedEof`] if the buffer ends mid-loop.
+fn skip_pei_psupp(reader: &mut BitReader<'_>) -> Result<()> {
+    loop {
+        let pei = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+        if !pei {
+            return Ok(());
+        }
+        // §5.1.25 — 8 bits of PSUPP follow a set PEI bit.
+        reader.skip(8).map_err(|_| Error::UnexpectedEof)?;
+    }
 }
 
 /// Decode a single H.263 picture from `data`, dispatching on the
@@ -2249,31 +2289,61 @@ fn decode_after_picture_header(
     // preserves the synthetic-fixture layout the lower-level tests are
     // built around without forcing them to thread PQUANT.
     //
-    // Either way every GOB's top row is a fresh §6.1.1 / §I.3 video
-    // picture segment, so `gob_header_present` is reported `true` for
-    // the §6.1.1 rule-3 "outside the GOB at the top" border test: GOB 0
-    // is the topmost GOB, so its above-neighbour row is the picture
-    // boundary regardless of whether a header was on the wire.
-    let gob_header_present = true;
+    // §5.2 GOB-header optionality. For every GOB except number 0 "the
+    // GOB header may be empty, depending on the encoder strategy" — the
+    // encoder may omit GSTUF/GBSC/GN/GFID/GQUANT and run macroblock data
+    // straight across the GOB boundary (FFmpeg's native H.263 encoder
+    // does exactly this for the standard formats). When a header is
+    // absent the GOB is NOT a fresh §6.1.1 / §I.3 video picture segment:
+    // the QUANT carries over from the previous GOB's final macroblock,
+    // and the median-MV / AIC predictor candidates reach across the GOB
+    // boundary into the GOB above (no segment-id change, no top-border
+    // copy of MV1). When a header is present it primes a new QUANT and
+    // opens a new segment.
+    //
+    // The optional-header detection only applies on the spec-conformant
+    // `gob0_pquant = Some(_)` path (real elementary streams). The legacy
+    // `gob0_pquant = None` convention — every GOB, including GOB 0,
+    // carries a mandatory header on the wire — is preserved unchanged so
+    // the synthetic-fixture layer tests keep their meaning.
+    let optional_gob_headers = gob0_pquant.is_some();
+    // QUANT in force, threaded across GOB boundaries when a GOB has no
+    // header. Primed from PQUANT for the spec-conformant path.
+    let mut picture_quant = gob0_pquant.unwrap_or(0);
+    // §6.1.1 / §I.3 "video picture segment" id. Increments only when a
+    // GOB header is present (a new segment); a header-less GOB stays in
+    // the segment of the GOB above it.
+    let mut current_segment: u32 = 0;
     for gob_index in 0..num_gobs as usize {
-        let gob_quant = if gob_index == 0 {
+        // Resolve this GOB's QUANT, segment id, and whether the §6.1.1
+        // rule-3 "outside the GOB at the top" border applies.
+        let (gob_quant, aic_segment, gob_header_present) = if gob_index == 0 {
             match gob0_pquant {
                 // Spec-conformant GOB-0 header elision: QUANT = PQUANT,
-                // no bits consumed for a GOB-0 header.
-                Some(pquant) => pquant,
+                // no bits consumed for a GOB-0 header. GOB 0 is always a
+                // segment top (its above-neighbour is the picture edge).
+                Some(pquant) => (pquant, 0u32, true),
                 // Legacy convention: GOB 0 carries a header like any
                 // other GOB.
-                None => parse_gob_layer(reader)?.quantiser,
+                None => (parse_gob_layer(reader)?.quantiser, 0u32, true),
+            }
+        } else if optional_gob_headers {
+            // GOBs 1..N: a header is present only if a GBSC (optionally
+            // after a GSTUF run) is on the wire here. Otherwise the GOB
+            // continues the previous segment at the carried-over QUANT.
+            if crate::gob_header::gob_header_present(reader) {
+                let gob = parse_gob_layer(reader)?;
+                picture_quant = gob.quantiser;
+                current_segment += 1;
+                (gob.quantiser, current_segment, true)
+            } else {
+                (picture_quant, current_segment, false)
             }
         } else {
-            parse_gob_layer(reader)?.quantiser
+            // Legacy mandatory-header path.
+            (parse_gob_layer(reader)?.quantiser, gob_index as u32, true)
         };
         let gob_top_row = gob_index * mb_rows_per_gob as usize;
-        // Every GOB header opens a fresh §I.3 "video picture segment"
-        // for the baseline (no Annex K) driver — a candidate neighbour
-        // in a different GOB is collapsed to `Neighbour::None` by the
-        // segment-id mismatch check.
-        let aic_segment = gob_index as u32;
 
         for local_row in 0..mb_rows_per_gob as usize {
             let row = gob_top_row + local_row;
@@ -2372,6 +2442,12 @@ fn decode_after_picture_header(
                     aic_segment,
                 );
             }
+            // §5.2 carry-over: a header-less GOB inherits the QUANT in
+            // force at the end of the previous GOB (the last macroblock's
+            // QUANT after any §5.3.4 DQUANT), not a fresh GOB-header
+            // GQUANT. Snapshot it so the next GOB can pick it up when no
+            // header is on the wire.
+            picture_quant = current_quant;
         }
     }
 
@@ -4978,6 +5054,38 @@ mod tests {
     use crate::picture_header::{H263SourceFormat, PSC_BITS, PSC_VALUE};
     use oxideav_core::bits::BitWriter;
 
+    #[test]
+    fn skip_pei_psupp_consumes_zero_bit_only() {
+        // A single PEI = "0" bit means no PSUPP; the helper consumes
+        // exactly one bit and the sentinel that follows is intact.
+        let mut w = BitWriter::new();
+        w.write_bit(false); // PEI = 0
+        w.write_u32(0b1010_1010, 8); // sentinel
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        skip_pei_psupp(&mut r).expect("skip");
+        assert_eq!(r.bit_position(), 1);
+        assert_eq!(r.read_u32(8).expect("sentinel"), 0b1010_1010);
+    }
+
+    #[test]
+    fn skip_pei_psupp_consumes_multiple_psupp_octets() {
+        // PEI=1, PSUPP byte, PEI=1, PSUPP byte, PEI=0 — three PEI bits +
+        // two 8-bit PSUPP octets = 19 bits total.
+        let mut w = BitWriter::new();
+        w.write_bit(true);
+        w.write_u32(0x5A, 8);
+        w.write_bit(true);
+        w.write_u32(0xC3, 8);
+        w.write_bit(false);
+        w.write_u32(0xFF, 8); // sentinel
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        skip_pei_psupp(&mut r).expect("skip");
+        assert_eq!(r.bit_position(), 1 + 8 + 1 + 8 + 1);
+        assert_eq!(r.read_u32(8).expect("sentinel"), 0xFF);
+    }
+
     /// Source-format helpers must agree with the spec's GOB/MB tables.
     #[test]
     fn qcif_layout_constants() {
@@ -5246,6 +5354,7 @@ mod tests {
                             // §5.1.19 PQUANT (5 bits) + §5.1.20 CPM = "0".
         w.write_u32(pquant as u32, 5);
         w.write_bit(false); // CPM off
+        w.write_bit(false); // §5.1.24 PEI = "0" (no PSUPP)
 
         let emit_macroblocks = |w: &mut BitWriter| {
             for _mb in 0..11 {
