@@ -449,6 +449,14 @@ pub struct PlusPtypeHeader {
     /// `trpi == Some(true)`. The two MSBs are the reference picture's ETR
     /// (zero when no custom PCF was in use) and the eight LSBs are its TR.
     pub trp: Option<u16>,
+    /// §5.1.18 / §P.2 — explicit Reference Picture Resampling parameters,
+    /// present iff the §5.1.4.3 RPR mode bit is set and the picture type
+    /// is INTER / B / Improved-PB. Carries the §P.2.1 WDA, eight §P.2.2
+    /// warping parameters, the §P.2.3 fill mode and the optional §P.2.4
+    /// fill colour. `None` when the RPR mode bit is off (the §P.1
+    /// implicit-resampling case is decided by the picture / reference
+    /// size mismatch at the driver, not by this field).
+    pub rprp: Option<crate::annex_p::RprParams>,
 }
 
 impl PlusPtypeHeader {
@@ -768,11 +776,26 @@ pub fn parse_plus_ptype(
         }
     }
 
-    // §5.1.18 — RPRP (Annex P) carries variable-length resampling
-    // parameters that are not staged for parsing here.
-    if mpptype.reference_picture_resampling {
-        return Err(Error::PlusPtypeUnsupported);
-    }
+    // §5.1.18 / §P.2 — RPRP (Annex P) carries the explicit reference-
+    // picture-resampling parameters: a §P.2.1 WDA, eight §P.2.2 warping
+    // parameters (Table D.3 VLC), a §P.2.3 fill mode and an optional
+    // §P.2.4 fill colour. We parse it for INTER / B / Improved-PB
+    // pictures (the eight-warping-parameter case). The EP-picture
+    // explicit RPR case (§P.2.2 paragraph 2 — lower-layer parameter
+    // reuse / refinement) is not staged: refuse it rather than mis-parse
+    // the variable-length field.
+    let rprp = if mpptype.reference_picture_resampling {
+        match mpptype.picture_type {
+            PlusPictureType::Inter | PlusPictureType::BPicture | PlusPictureType::ImprovedPb => {
+                Some(crate::annex_p::parse_rprp(reader, mpptype.rounding_type)?)
+            }
+            // EP-picture / EI-picture explicit RPR: lower-layer
+            // refinement form not staged here.
+            _ => return Err(Error::PlusPtypeUnsupported),
+        }
+    } else {
+        None
+    };
 
     Ok(PlusPtypeHeader {
         ufep: ufep as u8,
@@ -791,6 +814,7 @@ pub fn parse_plus_ptype(
         rpsmf,
         trpi,
         trp,
+        rprp,
     })
 }
 
@@ -1359,15 +1383,54 @@ mod tests {
     }
 
     #[test]
-    fn rpr_mode_is_unsupported() {
+    fn rpr_mode_inter_parses_rprp_field() {
+        // §P.2 — an INTER-picture with the RPR mode bit set now carries
+        // and parses the §5.1.18 RPRP field (WDA + eight all-zero warping
+        // parameters with their pair emulation-prevention bits + fill
+        // mode), rather than being refused.
         let mut w = BitWriter::new();
         w.write_u32(UFEP_FULL, 3);
         write_opptype(
             &mut w, 0b010, false, false, false, false, false, false, false, false, false, false,
             false,
         );
-        write_mpptype(&mut w, 0b001, true, false, false); // RPR on
-        w.write_bit(false);
+        write_mpptype(&mut w, 0b001, true, false, false); // INTER, RPR on
+        w.write_bit(false); // CPM
+                            // RPRP: WDA = "11" (1/16-pixel).
+        w.write_u32(0b11, 2);
+        // Eight all-zero warping parameters: four pairs of (zero, zero,
+        // emulation-prevention "1").
+        for _pair in 0..4 {
+            w.write_bit(true);
+            w.write_bit(true);
+            w.write_bit(true);
+        }
+        // FILL_MODE = "11" (clip).
+        w.write_u32(0b11, 2);
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let header = parse(&w.finish(), InheritedExtendedState::default()).unwrap();
+        let rprp = header.rprp.expect("RPRP must be parsed for INTER + RPR");
+        assert_eq!(rprp.wda, crate::annex_p::Wda::Sixteenth);
+        assert_eq!(rprp.warp, [0; 8]);
+        assert_eq!(rprp.fill, crate::annex_p::FillMode::Clip);
+    }
+
+    #[test]
+    fn rpr_mode_ep_picture_is_unsupported() {
+        // §P.2.2 paragraph 2 — the EP-picture explicit-RPR case reuses /
+        // refines the lower-layer warping parameters and is not staged;
+        // it is still refused.
+        let mut w = BitWriter::new();
+        w.write_u32(UFEP_FULL, 3);
+        write_opptype(
+            &mut w, 0b010, false, false, false, false, false, false, false, false, false, false,
+            false,
+        );
+        write_mpptype(&mut w, 0b101, true, false, false); // EP-picture, RPR on
+        w.write_bit(false); // CPM
+        w.write_u32(2, ELNUM_BITS); // ELNUM (scalability in use)
         while !w.is_byte_aligned() {
             w.write_bit(false);
         }

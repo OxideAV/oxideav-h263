@@ -38,6 +38,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     RTYPE bit) and feeds the warped frame to the GOB / slice driver. An
     all-skipped QCIF INTER-picture decoded against a sub-QCIF reference
     reconstructs to the exact `resample_yuv` output.
+  - **End-to-end explicit RPR**: the §5.1.18 RPRP picture-header field is
+    now parsed (was refused with `PlusPtypeUnsupported`) for INTER / B /
+    Improved-PB pictures into `PlusPtypeHeader::rprp`, and
+    `decode_picture_layer` warps the reference with those explicit
+    parameters before motion compensation via the new `explicit_resample`
+    helper. The EP-picture explicit-RPR case (§P.2.2 lower-layer
+    refinement) remains refused. An all-skipped QCIF INTER-picture
+    signalling RPR-on with an all-zero-warp / clip RPRP field
+    reconstructs to the exact `resample_yuv` output.
 - Annex O §O.1.2 **EP-picture** ("Enhancement" P-picture) end-to-end
   reconstruction (round 343):
   - New `decode_ep_picture` + `decode_ep_picture_layer` decode the
