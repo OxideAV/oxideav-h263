@@ -1011,7 +1011,7 @@ pub fn decode_picture_layer_with_inherited(
 
 /// Decode one PLUSPTYPE picture under the Annex N **Reference Picture
 /// Selection** mode (forward-channel), selecting the prediction
-/// reference from a caller-managed [`RpsReferenceStore`].
+/// reference from a caller-managed [`crate::annex_n::RpsReferenceStore`].
 ///
 /// Annex N lets the encoder predict each picture from a chosen
 /// previously-decoded reference rather than always the most recent
@@ -1019,7 +1019,8 @@ pub fn decode_picture_layer_with_inherited(
 ///
 /// 1. Parses the picture layer (the §5.1.14 / §5.1.15 TRPI / TRP fields
 ///    are framed by [`crate::plus_ptype`]).
-/// 2. Selects the §N.5 reference via [`RpsReferenceStore::select_reference`]
+/// 2. Selects the §N.5 reference via
+///    [`crate::annex_n::RpsReferenceStore::select_reference`]
 ///    — the stored picture whose Temporal Reference equals TRP, or the
 ///    most recent anchor when TRP is absent. A TRP referencing a picture
 ///    not in the store yields [`Error::NotImplemented`] (the §N.5

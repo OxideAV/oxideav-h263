@@ -33,7 +33,8 @@
 //!
 //! All arithmetic is integer; `///` (truncation toward negative
 //! infinity) is realised with arithmetic shifts / [`i64::div_euclid`],
-//! and `//` (round-half-away-from-zero) with [`div_round_half_away`].
+//! and `//` (round-half-away-from-zero) with the module's
+//! `div_round_half_away` helper.
 //!
 //! ## Scope
 //!
