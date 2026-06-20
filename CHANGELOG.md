@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex N **Reference Picture Selection (RPS)** forward-channel decode
+  (round 347): new `annex_n` module + `decode_picture_layer_rps` entry
+  decode an RPS ("NEWPRED") stream that predicts each picture from a
+  chosen previously-decoded reference rather than always the most recent
+  anchor.
+  - `RpsReferenceStore` is the §N.5 decoder picture memory keyed by the
+    10-bit Temporal Reference (ETR ∥ TR via `compose_tr`), with
+    first-in-first-out eviction at capacity and same-TR replacement.
+  - `select_reference` implements the §N.4.1.4 / §N.5 rule: when
+    TRPI = 1 the stored picture whose TR equals TRP is the reference;
+    when TRP is absent the most recent anchor is used "as when not in
+    the Reference Picture Selection mode". A TRP referencing an absent
+    picture surfaces as the §N.5 forced-INTRA-update case.
+  - `decode_picture_layer_rps` parses the picture, selects the §N.5
+    reference from the store, decodes against it (RPS now permitted
+    through the shim via the new `allow_rps` flag), and stores the
+    decoded anchor under its TR. An end-to-end test seeds two distinct
+    INTRA anchors (TR=10 / TR=20) and shows a TRP=10 RPS INTER-picture
+    reconstructs a copy of the *older* TR=10 anchor through pixels.
+  - The §N.4.2 back-channel (BCM ACK/NACK) messages are explicitly out
+    of scope — they flow decoder → encoder and do not affect
+    forward-channel pixels; the §5.1.16 BCI codeword is still framed by
+    `plus_ptype` (a present BCM refused).
 - Annex P **Reference Picture Resampling (RPR)** resampling engine
   (round 347): new `annex_p` module implements the §P.3 / §P.4.2
   integer warp that resamples the previous decoded reference picture

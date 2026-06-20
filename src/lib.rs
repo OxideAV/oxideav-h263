@@ -212,6 +212,7 @@ use oxideav_core::RuntimeContext;
 pub mod aic;
 pub mod aic_dequant;
 pub mod aic_predict;
+pub mod annex_n;
 pub mod annex_p;
 pub mod annex_t;
 pub mod block;

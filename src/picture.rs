@@ -942,7 +942,9 @@ pub fn decode_picture_layer_with_inherited(
                 options: shim_options,
                 slice_structured,
                 improved_pb,
-            } = plus_ptype_to_baseline_shim(&extended, options, inherited)?;
+            } = plus_ptype_to_baseline_shim(
+                &extended, options, inherited, /* allow_rps */ false,
+            )?;
             // An Improved PB-frame (Annex M) decodes into a (P, B) pair,
             // not a single frame: it must go through
             // [`decode_improved_pb_picture`], which supplies the B-frame
@@ -1005,6 +1007,113 @@ pub fn decode_picture_layer_with_inherited(
             })
         }
     }
+}
+
+/// Decode one PLUSPTYPE picture under the Annex N **Reference Picture
+/// Selection** mode (forward-channel), selecting the prediction
+/// reference from a caller-managed [`RpsReferenceStore`].
+///
+/// Annex N lets the encoder predict each picture from a chosen
+/// previously-decoded reference rather than always the most recent
+/// anchor. This entry:
+///
+/// 1. Parses the picture layer (the §5.1.14 / §5.1.15 TRPI / TRP fields
+///    are framed by [`crate::plus_ptype`]).
+/// 2. Selects the §N.5 reference via [`RpsReferenceStore::select_reference`]
+///    — the stored picture whose Temporal Reference equals TRP, or the
+///    most recent anchor when TRP is absent. A TRP referencing a picture
+///    not in the store yields [`Error::NotImplemented`] (the §N.5
+///    "forced INTRA update" case the single-picture API cannot satisfy).
+/// 3. Decodes the picture against that reference, permitting the RPS
+///    mode through the shim.
+/// 4. Inserts the decoded picture into the store under its 10-bit
+///    Temporal Reference (§N.4.1.4: ETR ∥ TR) so it can serve as a
+///    later reference — anchor pictures only (B-pictures are not stored
+///    per §N.5; this entry handles INTRA / INTER pictures).
+///
+/// The §N.4.2 back-channel (BCM ACK / NACK) messages are out of scope:
+/// they flow decoder → encoder on a separate logical channel and do not
+/// affect the forward-channel pixels.
+pub fn decode_picture_layer_rps(
+    data: &[u8],
+    store: &mut crate::annex_n::RpsReferenceStore,
+    options: DecodeOptions,
+) -> Result<YuvFrame> {
+    let mut reader = BitReader::new(data);
+    let layer = parse_picture_layer(&mut reader, InheritedExtendedState::default())?;
+    let extended = match layer {
+        H263PictureLayer::Extended(e) => e,
+        // RPS mode is signalled only through PLUSPTYPE (§5.1.4.4 bit 11).
+        H263PictureLayer::Baseline(_) => return Err(Error::NotImplemented),
+    };
+
+    // §N.5 — select the reference picture from the store. The selection
+    // is driven by the picture-header TRPI / TRP (the GOB / slice-layer
+    // §N.4.1 per-segment re-selection is a further refinement not yet
+    // staged through this single-picture entry).
+    let selected_tr =
+        crate::annex_n::compose_tr(extended.prefix.temporal_reference, extended.plus.etr);
+    let selected_ref: Option<YuvFrame> =
+        match store.select_reference(extended.plus.trpi, extended.plus.trp) {
+            Some(r) => Some(r.clone()),
+            None => {
+                // TRPI requested a TRP not in the store — the §N.5
+                // forced-INTRA-update case. An INTRA picture needs no
+                // reference, so only refuse when a reference was required.
+                if matches!(
+                    extended.plus.mpptype.picture_type,
+                    PlusPictureType::Inter | PlusPictureType::ImprovedPb
+                ) {
+                    return Err(Error::NotImplemented);
+                }
+                None
+            }
+        };
+
+    // Dispatch through the shim with RPS permitted (the reference is
+    // already resolved). Improved-PB and the layered B/EI/EP types are
+    // not handled by this single-frame RPS entry.
+    let PlusShimOutcome {
+        header,
+        layout,
+        options: shim_options,
+        slice_structured,
+        improved_pb,
+    } = plus_ptype_to_baseline_shim(
+        &extended,
+        options,
+        InheritedExtendedState::default(),
+        /* allow_rps */ true,
+    )?;
+    if improved_pb {
+        return Err(Error::NotImplemented);
+    }
+
+    let reference = selected_ref.as_ref();
+    let frame = match slice_structured {
+        Some(sss) => decode_slice_structured_after_header(
+            &mut reader,
+            &header,
+            &layout,
+            sss,
+            reference,
+            shim_options,
+        )?,
+        None => decode_after_picture_header(
+            &mut reader,
+            &header,
+            &layout,
+            reference,
+            shim_options,
+            None,
+            None,
+        )?,
+    };
+
+    // §N.5 — store the correctly-decoded anchor under its TR for use as
+    // a later reference (first-in, first-out eviction inside the store).
+    store.insert(selected_tr, frame.clone());
+    Ok(frame)
 }
 
 /// The two decoded pictures of an Annex G PB-frame, returned by
@@ -1247,7 +1356,12 @@ pub fn decode_improved_pb_picture(
         options: shim_options,
         slice_structured,
         improved_pb,
-    } = plus_ptype_to_baseline_shim(&extended, options, InheritedExtendedState::default())?;
+    } = plus_ptype_to_baseline_shim(
+        &extended,
+        options,
+        InheritedExtendedState::default(),
+        /* allow_rps */ false,
+    )?;
     if !improved_pb {
         // Not an Improved PB-frame — the caller should use
         // [`decode_picture_layer`] for a plain INTRA / INTER picture.
@@ -1755,6 +1869,7 @@ fn plus_ptype_to_baseline_shim(
     extended: &H263ExtendedPicture,
     options: DecodeOptions,
     inherited: InheritedExtendedState,
+    allow_rps: bool,
 ) -> Result<PlusShimOutcome> {
     // §5.1.4.3 — INTRA / INTER picture types are decodable through the
     // GOB / slice drivers; the Improved PB-frame type (`"010"`, Annex M)
@@ -1841,17 +1956,20 @@ fn plus_ptype_to_baseline_shim(
     // §5.1.13–§5.1.16 — Reference Picture Selection mode (Annex N) is
     // framed by `parse_plus_ptype` (RPSMF / TRPI / TRP / BCI), but its
     // multi-reference selection (the §5.1.15 TRP picture-memory lookup)
-    // is a stream-level concern the single-picture API does not manage.
-    // Detect RPS-on from the parsed header fields (TRPI is present iff
-    // RPS is in use, regardless of UFEP) and refuse rather than silently
-    // decode against the wrong reference.
+    // is a stream-level concern. When `allow_rps` is set the caller
+    // (`decode_picture_layer_rps`) has already resolved the §N.5
+    // reference picture from its store via the TRP, so the GOB / slice
+    // driver decodes against the correct reference; otherwise the
+    // single-picture entry refuses RPS-on rather than silently decode
+    // against the wrong reference. Detect RPS-on from the parsed header
+    // fields (TRPI is present iff RPS is in use, regardless of UFEP).
     let rps_in_use = extended.plus.trpi.is_some();
     if opptype_sac
         || opptype_independent_segment_decoding
         || opptype_custom_pcf
         || extended.plus.cpm
         || extended.plus.mpptype.reduced_resolution_update
-        || rps_in_use
+        || (rps_in_use && !allow_rps)
     {
         return Err(Error::NotImplemented);
     }
@@ -7537,6 +7655,175 @@ mod tests {
         assert_eq!(frame.y, exp_y, "explicit-RPR luma must match resample_yuv");
         assert_eq!(frame.cb, exp_cb, "explicit-RPR Cb must match resample_yuv");
         assert_eq!(frame.cr, exp_cr, "explicit-RPR Cr must match resample_yuv");
+    }
+
+    /// Write a QCIF PLUSPTYPE INTRA-picture header with a chosen
+    /// Temporal Reference and all optional modes off, then a constant-DC
+    /// INTRA body (every block INTRADC = `intradc`, no AC). Used to seed
+    /// the Annex N reference store with distinguishable anchors.
+    fn build_plus_qcif_intra_dc_picture(tr: u8, intradc: u32) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(tr as u32, 8); // TR
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_u32(0b000, 3);
+        w.write_u32(0b111, 3); // extended PTYPE
+        w.write_u32(0b001, 3); // UFEP = 001
+        w.write_u32(0b010, 3); // source format = QCIF
+        for _ in 0..11 {
+            w.write_bit(false); // custom_pcf..IS, AIV, MQ (bits 4-14 off)
+        }
+        w.write_bit(true); // SCE-guard (bit 15)
+        w.write_u32(0b000, 3); // reserved
+        w.write_u32(0b000, 3); // picture type INTRA
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+        w.write_bit(false); // CPM = 0
+        for _gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for _mb in 0..11 {
+                w.write_bit(true); // MCBPC INTRA, cbpc 00
+                w.write_u32(0b0011, 4); // CBPY(INTRA) "0000"
+                for _blk in 0..6 {
+                    w.write_u32(intradc, 8);
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// Write a QCIF PLUSPTYPE INTER-picture header with the §5.1.4.4
+    /// RPS mode bit (bit 11) set, then the §5.1.13–§5.1.16 RPS fields
+    /// (RPSMF, TRPI, optional TRP, BCI = "01"), then all-skipped
+    /// macroblocks. `trp = Some(t)` predicts from the stored picture
+    /// whose TR is `t`; `None` predicts from the most recent anchor.
+    fn build_plus_qcif_inter_rps_skipped(trp: Option<u16>) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(99, 8); // TR (the new picture's own TR)
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_u32(0b000, 3);
+        w.write_u32(0b111, 3); // extended PTYPE
+        w.write_u32(0b001, 3); // UFEP = 001
+        w.write_u32(0b010, 3); // source format = QCIF
+        w.write_bit(false); // custom_pcf
+        w.write_bit(false); // UMV
+        w.write_bit(false); // SAC
+        w.write_bit(false); // AP
+        w.write_bit(false); // AIC
+        w.write_bit(false); // DF
+        w.write_bit(false); // SS
+        w.write_bit(true); // RPS ON (bit 11)
+        w.write_bit(false); // IS
+        w.write_bit(false); // AIV
+        w.write_bit(false); // MQ
+        w.write_bit(true); // SCE-guard
+        w.write_u32(0b000, 3); // reserved
+        w.write_u32(0b001, 3); // picture type INTER
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+        w.write_bit(false); // CPM = 0
+                            // §5.1.13 RPSMF (UFEP=001): "100" = Neither.
+        w.write_u32(0b100, crate::plus_ptype::RPSMF_BITS);
+        // §5.1.14 TRPI.
+        w.write_bit(trp.is_some());
+        // §5.1.15 TRP (present iff TRPI = 1).
+        if let Some(t) = trp {
+            w.write_u32(t as u32, crate::plus_ptype::TRP_BITS);
+        }
+        // §5.1.16 BCI = "01" (no back-channel message follows).
+        w.write_bit(false);
+        w.write_bit(true);
+        for _gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for _mb in 0..11 {
+                write_skipped_mb(&mut w);
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// Annex N §N.5 forward-channel Reference Picture Selection
+    /// end-to-end: two INTRA anchors with different Temporal References
+    /// (TR=10 → constant pixel A, TR=20 → constant pixel B) seed the
+    /// store; an RPS INTER-picture with TRPI=1, TRP=10 and all
+    /// macroblocks skipped must reconstruct a copy of the *older* TR=10
+    /// anchor (pixel A), not the most recent TR=20 anchor — proving TRP
+    /// selects the reference by stored Temporal Reference through pixels.
+    #[test]
+    fn decode_picture_layer_rps_trp_selects_older_anchor() {
+        let mut store = crate::annex_n::RpsReferenceStore::new();
+
+        // INTRADC 0x10 → DC level 128 → pixel 16; INTRADC 0x40 → level
+        // 512 → pixel 64. Two visually distinct flat anchors.
+        let anchor_a = decode_picture_layer_rps(
+            &build_plus_qcif_intra_dc_picture(10, 0x10),
+            &mut store,
+            DecodeOptions::default(),
+        )
+        .expect("TR=10 INTRA anchor must decode");
+        let anchor_b = decode_picture_layer_rps(
+            &build_plus_qcif_intra_dc_picture(20, 0x40),
+            &mut store,
+            DecodeOptions::default(),
+        )
+        .expect("TR=20 INTRA anchor must decode");
+        assert_ne!(
+            anchor_a.y[0], anchor_b.y[0],
+            "the two anchors must be visually distinct"
+        );
+        assert_eq!(store.len(), 2);
+
+        // RPS INTER with TRP=10: predict from the OLDER anchor.
+        let frame = decode_picture_layer_rps(
+            &build_plus_qcif_inter_rps_skipped(Some(10)),
+            &mut store,
+            DecodeOptions::default(),
+        )
+        .expect("RPS INTER predicting from TR=10 must decode");
+        // All MBs skipped → a zero-MV copy of the selected reference.
+        assert_eq!(
+            frame.y, anchor_a.y,
+            "TRP=10 must select the TR=10 anchor, not the most recent TR=20"
+        );
+        assert_ne!(
+            frame.y, anchor_b.y,
+            "TRP=10 must NOT select the most recent TR=20 anchor"
+        );
+
+        // And TRP absent (or TRPI=0) falls back to the most recent
+        // anchor — now TR=99 (the picture just decoded was stored).
+        let frame_recent = decode_picture_layer_rps(
+            &build_plus_qcif_inter_rps_skipped(None),
+            &mut store,
+            DecodeOptions::default(),
+        )
+        .expect("RPS INTER with TRPI=0 must decode");
+        // The most-recent anchor is the TR=99 RPS picture just stored,
+        // which itself copied anchor_a — so the fallback equals anchor_a.
+        assert_eq!(frame_recent.y, anchor_a.y);
     }
 
     /// Annex P §P.1 implicit Reference Picture Resampling end-to-end:
