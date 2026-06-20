@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Annex P **Reference Picture Resampling (RPR)** resampling engine
+  (round 347): new `annex_p` module implements the §P.3 / §P.4.2
+  integer warp that resamples the previous decoded reference picture
+  into a "warped" reference before motion compensation.
+  - `resample_plane` / `resample_yuv` compute the §P.3 corner
+    displacements from the eight warping parameters in 1/32-pixel
+    luminance accuracy, derive the §P.3 virtual-frame `H' / V'` powers
+    of two, bilinearly extrapolate the LT/RT/LB/RB virtual-point
+    displacements (`//` round-half-away-from-zero), and run the §P.4.2
+    raster loop with the four-tap bilinear `filter` and the §P.2.3 fill
+    mode (clip / black / gray / color) plus §P.3 `RCRPR` rounding
+    control.
+  - `read_table_d3` decodes the §D.3 reversible Table-D.3 VLC
+    (range -4095..=4095), verified against the §D.3 worked `-13`
+    example; `parse_rprp` parses the §P.2 `RPRP` picture-header field
+    (WDA, eight Table-D.3 warping parameters with §P.2.2 pair emulation-
+    prevention bits, fill mode, optional §P.2.4 fill colour).
+  - `RprParams::implicit` builds the §P.1 implicit parameter set (zero
+    warping, clip fill, 1/16-pixel accuracy) for the predictively-
+    encoded resolution-change case.
 - Annex O §O.1.2 **EP-picture** ("Enhancement" P-picture) end-to-end
   reconstruction (round 343):
   - New `decode_ep_picture` + `decode_ep_picture_layer` decode the
