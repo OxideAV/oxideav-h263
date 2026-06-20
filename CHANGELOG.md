@@ -28,6 +28,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   - `RprParams::implicit` builds the §P.1 implicit parameter set (zero
     warping, clip fill, 1/16-pixel accuracy) for the predictively-
     encoded resolution-change case.
+  - **End-to-end implicit RPR**: `decode_picture_layer` now resamples a
+    size-mismatched reference before motion compensation when PLUSPTYPE
+    is present, the picture is an INTER-picture, and the RPR mode bit is
+    off (the §P.1 implicit resolution-change case) — previously such a
+    size mismatch was refused with `NotImplemented`. The new
+    `maybe_implicit_resample` helper warps the reference to the current
+    picture's size using `RprParams::implicit` (RCRPR = the picture's
+    RTYPE bit) and feeds the warped frame to the GOB / slice driver. An
+    all-skipped QCIF INTER-picture decoded against a sub-QCIF reference
+    reconstructs to the exact `resample_yuv` output.
 - Annex O §O.1.2 **EP-picture** ("Enhancement" P-picture) end-to-end
   reconstruction (round 343):
   - New `decode_ep_picture` + `decode_ep_picture_layer` decode the

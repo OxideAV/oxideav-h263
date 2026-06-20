@@ -951,6 +951,24 @@ pub fn decode_picture_layer_with_inherited(
             if improved_pb {
                 return Err(Error::NotImplemented);
             }
+            // Annex P §P.1 — implicit Reference Picture Resampling. When
+            // PLUSPTYPE is present, the picture is an INTER-picture, the
+            // RPR mode bit is *not* set, and the reference picture's size
+            // differs from the current picture's size, §P.1 invokes the
+            // resampling process with zero warping, clip fill, and
+            // 1/16-pixel accuracy. We warp the supplied reference to the
+            // current picture's size (using the current picture's RTYPE
+            // bit for RCRPR rounding control) before motion compensation.
+            // The explicit RPR-on path is not yet wired here.
+            let rpr_on = extended.plus.mpptype.reference_picture_resampling;
+            let resampled_ref = maybe_implicit_resample(
+                reference,
+                &layout,
+                &header,
+                rpr_on,
+                extended.plus.mpptype.rounding_type,
+            );
+            let effective_ref = resampled_ref.as_ref().or(reference);
             // Annex K Slice-Structured mode (OPPTYPE SS bit set) replaces
             // the GOB layer with the §K.2 slice layer; route to the
             // dedicated driver. Otherwise decode through the baseline GOB
@@ -961,14 +979,14 @@ pub fn decode_picture_layer_with_inherited(
                     &header,
                     &layout,
                     sss,
-                    reference,
+                    effective_ref,
                     shim_options,
                 )?,
                 None => decode_after_picture_header(
                     &mut reader,
                     &header,
                     &layout,
-                    reference,
+                    effective_ref,
                     shim_options,
                     None,
                     None,
@@ -1644,6 +1662,55 @@ struct PlusShimOutcome {
     options: DecodeOptions,
     slice_structured: SliceStructuredRouting,
     improved_pb: bool,
+}
+
+/// Annex P §P.1 — apply implicit Reference Picture Resampling to the
+/// supplied reference when the conditions of §P.1 hold.
+///
+/// Returns `Some(warped_frame)` when the reference exists, the picture
+/// is an INTER-picture, the RPR mode bit is not set, and the reference
+/// picture's size differs from the current picture's size; the warp uses
+/// zero warping parameters, clip fill mode, and 1/16-pixel displacement
+/// accuracy per §P.1, with `RCRPR` taken from the current picture's
+/// `RTYPE` bit (§P.3). Returns `None` otherwise (the caller falls back
+/// to the original reference).
+fn maybe_implicit_resample(
+    reference: Option<&YuvFrame>,
+    layout: &PictureLayout,
+    header: &H263PictureHeader,
+    rpr_on: bool,
+    rtype: bool,
+) -> Option<YuvFrame> {
+    if rpr_on {
+        return None;
+    }
+    if !matches!(header.coding_type, H263PictureCodingType::Inter) {
+        return None;
+    }
+    let r = reference?;
+    let cur_w = layout.luma_width as usize;
+    let cur_h = layout.luma_height as usize;
+    if r.luma_width == cur_w && r.luma_height == cur_h {
+        return None;
+    }
+    let params = crate::annex_p::RprParams::implicit(rtype);
+    let (y, cb, cr) = crate::annex_p::resample_yuv(
+        &r.y,
+        &r.cb,
+        &r.cr,
+        r.luma_width,
+        r.luma_height,
+        cur_w,
+        cur_h,
+        &params,
+    );
+    Some(YuvFrame {
+        y,
+        cb,
+        cr,
+        luma_width: cur_w,
+        luma_height: cur_h,
+    })
 }
 
 fn plus_ptype_to_baseline_shim(
@@ -7270,6 +7337,130 @@ mod tests {
         // A skipped macroblock far from MB(0,0) must be the verbatim
         // grey reference (zero-MV copy).
         assert_eq!(frame.y[100 * lw + 100], 128);
+    }
+
+    /// Write a QCIF PLUSPTYPE INTER-picture header with all optional
+    /// modes off (RPR off in particular), `rtype` selectable for the
+    /// §P.3 RCRPR rounding control of an implicit resample.
+    fn write_plus_qcif_inter_header(w: &mut BitWriter, rtype: bool) {
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true); // PTYPE bit 1
+        w.write_bit(false); // PTYPE bit 2
+        w.write_u32(0b000, 3); // PTYPE bits 3-5
+        w.write_u32(0b111, 3); // PTYPE bits 6-8 → extended
+        w.write_u32(0b001, 3); // UFEP = 001
+                               // OPPTYPE (18 bits).
+        w.write_u32(0b010, 3); // source format = QCIF
+        w.write_bit(false); // custom_pcf
+        w.write_bit(false); // UMV
+        w.write_bit(false); // SAC
+        w.write_bit(false); // AP
+        w.write_bit(false); // AIC
+        w.write_bit(false); // DF
+        w.write_bit(false); // SS
+        w.write_bit(false); // RPS
+        w.write_bit(false); // IS
+        w.write_bit(false); // AIV
+        w.write_bit(false); // MQ
+        w.write_bit(true); // SCE-guard
+        w.write_u32(0b000, 3); // reserved
+                               // MPPTYPE (9 bits): INTER, RPR=0, RRU=0, RTYPE, rsvd, guard.
+        w.write_u32(0b001, 3); // picture type INTER
+        w.write_bit(false); // RPR off
+        w.write_bit(false); // RRU
+        w.write_bit(rtype); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+        w.write_bit(false); // CPM = 0
+    }
+
+    /// Annex P §P.1 implicit Reference Picture Resampling end-to-end:
+    /// a QCIF (176×144) INTER-picture with all macroblocks skipped
+    /// (`COD = 1`, a pure zero-MV copy of the reference) is decoded
+    /// against a *sub-QCIF* (128×96) reference. Because the picture size
+    /// differs from the reference size and the RPR mode bit is off, §P.1
+    /// invokes the implicit resampling: the 128×96 reference is warped
+    /// up to 176×144 before the copy. The decoded frame must therefore
+    /// equal the standalone [`crate::annex_p::resample_yuv`] of the
+    /// reference, proving the implicit resample reached pixels through
+    /// the driver.
+    #[test]
+    fn decode_picture_layer_plus_implicit_rpr_resamples_reference() {
+        // Build a non-flat sub-QCIF reference so the resample is
+        // observable (a constant plane would be invariant under warp).
+        let rw = 128usize;
+        let rh = 96usize;
+        let mut ref_y = vec![0u8; rw * rh];
+        for (idx, p) in ref_y.iter_mut().enumerate() {
+            let x = idx % rw;
+            let y = idx / rw;
+            *p = ((x * 2 + y) % 200 + 16) as u8;
+        }
+        let cw = rw / 2;
+        let ch = rh / 2;
+        let mut ref_cb = vec![0u8; cw * ch];
+        let mut ref_cr = vec![0u8; cw * ch];
+        for (idx, p) in ref_cb.iter_mut().enumerate() {
+            *p = ((idx % 180) + 20) as u8;
+        }
+        for (idx, p) in ref_cr.iter_mut().enumerate() {
+            *p = ((idx * 3 % 180) + 20) as u8;
+        }
+        let reference = YuvFrame {
+            y: ref_y,
+            cb: ref_cb,
+            cr: ref_cr,
+            luma_width: rw,
+            luma_height: rh,
+        };
+
+        let mut w = BitWriter::new();
+        write_plus_qcif_inter_header(&mut w, /* rtype */ false);
+        for _gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for _mb in 0..11 {
+                write_skipped_mb(&mut w);
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let frame = decode_picture_layer(&data, Some(&reference), DecodeOptions::default())
+            .expect("implicit-RPR INTER picture must decode (size mismatch was refused)");
+        assert_eq!(frame.luma_width, 176);
+        assert_eq!(frame.luma_height, 144);
+
+        // The all-skipped INTER picture is a zero-MV copy of the warped
+        // reference, so it must equal the standalone resample.
+        let params = crate::annex_p::RprParams::implicit(false);
+        let (exp_y, exp_cb, exp_cr) = crate::annex_p::resample_yuv(
+            &reference.y,
+            &reference.cb,
+            &reference.cr,
+            rw,
+            rh,
+            176,
+            144,
+            &params,
+        );
+        assert_eq!(frame.y, exp_y, "implicit-RPR luma must match resample_yuv");
+        assert_eq!(frame.cb, exp_cb, "implicit-RPR Cb must match resample_yuv");
+        assert_eq!(frame.cr, exp_cr, "implicit-RPR Cr must match resample_yuv");
+
+        // The warped reference is genuinely upsampled, not a flat copy:
+        // some interior luma sample must differ from its row-0 value
+        // (the gradient survives the warp).
+        assert!(
+            frame.y.iter().any(|&p| p != frame.y[0]),
+            "the upsampled reference must carry the gradient into pixels"
+        );
     }
 
     /// Build a QCIF AIC INTRA picture using the PLUSPTYPE header path,
