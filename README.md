@@ -35,9 +35,19 @@ planar 4:2:0 `YuvFrame`:
 * **GOB layer (§5.2)** — GBSC, Group Number, GOB Frame ID, GQUANT
   (CPM = "0" branch), plus the §5.2.2 first-GOB (group-number-0)
   header elision: the `decode_picture_no_gob0_header` entry point reads
-  the §5.1.19 PQUANT / §5.1.20 CPM picture-header fields, decodes the
-  header-less GOB 0 at QUANT = PQUANT, and parses a GOB header only for
-  GOBs 1..N (CPM = "1" refused).
+  the §5.1.19 PQUANT / §5.1.20 CPM picture-header fields, the §5.1.24
+  PEI / §5.1.25 PSUPP extension loop, decodes the header-less GOB 0 at
+  QUANT = PQUANT, and treats every later GOB's header as **optional**
+  (§5.2): `gob_header_present` probes for a GBSC (after any §5.2.1
+  GSTUF byte-alignment); a present header primes a fresh QUANT and
+  video-picture segment, an absent one continues the previous segment
+  at the carried-over QUANT — so streams that omit empty GOB headers
+  (FFmpeg's native encoder for the standard formats) decode correctly
+  (CPM = "1" refused).
+* **Elementary-stream demux** — `decode_sequence` splits a multi-picture
+  baseline stream on byte-aligned Picture Start Codes (§5.1.1 /
+  §5.1.28), decoding each picture and threading the reconstructed frame
+  forward as the INTER reference for the next.
 * **Macroblock layer (§5.3)** — COD, MCBPC (Tables 7 / 8), CBPY
   (Table 12), DQUANT, and MVD / MVD2-4 (Table 14).
 * **Block layer (§5.4)** — INTRADC 8-bit FLC (Table 15) and TCOEF
@@ -156,6 +166,17 @@ let next = decode_picture(
 )?;
 ```
 
+For a complete baseline elementary stream (one or more pictures, as
+produced by a real encoder), `decode_sequence` splits on Picture Start
+Codes and threads the INTER reference automatically:
+
+```rust,ignore
+use oxideav_h263::{decode_sequence, DecodeOptions};
+
+// `stream` is a raw .h263 elementary stream (I + P + P + ...).
+let frames = decode_sequence(&stream, DecodeOptions::default())?;
+```
+
 The lower-level per-layer parsers and per-block reconstruction
 primitives the driver composes remain public for callers that need
 finer control:
@@ -254,7 +275,17 @@ built with the spec's bit layout (round-tripped via
 Tables 7 / 8 / 12 / 14 / 16, the inverse-quantisation invariants, IDCT
 accuracy against the Annex A error budget, motion / OBMC / deblock /
 AIC / PLUSPTYPE / slice-header coverage, and end-to-end picture-decode
-tests. Run with `cargo test -p oxideav-h263`.
+tests.
+
+`tests/fixture_decode.rs` adds end-to-end **conformance** tests against
+real H.263 elementary streams (FFmpeg's native encoder) vendored under
+`tests/fixtures/`: sub-QCIF / QCIF / CIF I-only and a QCIF I+P+P
+sequence. Because §6.2 leaves the inverse-transform arithmetic undefined
+and Annex A.7 only bounds the per-pixel peak error at 1, AC-bearing
+output is asserted within that ±1 tolerance; the flat sub-QCIF keyframe
+(no AC) is checked byte-exact plus a SHA-256 of its reference plane.
+
+Run with `cargo test -p oxideav-h263`.
 
 ## License
 
