@@ -42,7 +42,7 @@ planar 4:2:0 `YuvFrame`:
   GSTUF byte-alignment); a present header primes a fresh QUANT and
   video-picture segment, an absent one continues the previous segment
   at the carried-over QUANT — so streams that omit empty GOB headers
-  (FFmpeg's native encoder for the standard formats) decode correctly
+  (the reference encoder for the standard formats) decode correctly
   (CPM = "1" refused).
 * **Elementary-stream demux** — `decode_sequence` splits a multi-picture
   baseline stream on byte-aligned Picture Start Codes (§5.1.1 /
@@ -278,7 +278,7 @@ AIC / PLUSPTYPE / slice-header coverage, and end-to-end picture-decode
 tests.
 
 `tests/fixture_decode.rs` adds end-to-end **conformance** tests against
-real H.263 elementary streams (FFmpeg's native encoder) vendored under
+real H.263 elementary streams (the reference encoder) vendored under
 `tests/fixtures/`: sub-QCIF / QCIF / CIF I-only and a QCIF I+P+P
 sequence. Because §6.2 leaves the inverse-transform arithmetic undefined
 and Annex A.7 only bounds the per-pixel peak error at 1, AC-bearing

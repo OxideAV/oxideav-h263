@@ -195,7 +195,7 @@ pub fn parse_gob_layer_from_bytes(data: &[u8]) -> Result<GobLayer> {
 /// continuously across the GOB boundary. A decoder that walks the GOB
 /// grid therefore cannot assume a header precedes each GOB's first
 /// macroblock row; it must look for the start code and fall through to
-/// the macroblock layer when none is present. FFmpeg's native H.263
+/// the macroblock layer when none is present. the reference encoder's native H.263
 /// encoder, for one, emits no non-empty GOB headers for the standard
 /// formats, so every fixture below GOB 0 reaches this path.
 ///

@@ -1,7 +1,7 @@
 //! End-to-end fixture decode tests for the H.263 baseline driver.
 //!
 //! These drive the public [`decode_sequence`] / [`decode_picture_no_gob0_header`]
-//! entry points over real H.263 elementary streams produced by FFmpeg's
+//! entry points over real H.263 elementary streams produced by the reference encoder's
 //! native H.263 encoder and compare the reconstructed planar 4:2:0 output
 //! against the encoder-produced reference YUV that ships beside each
 //! stream (`tests/fixtures/<name>/{input.h263,expected.yuv}`).
@@ -13,7 +13,7 @@
 //! defined, but should meet the error tolerance specified in Annex A",
 //! and Annex A.7's first bullet bounds the per-pixel peak error at **1 in
 //! magnitude**. Two conforming decoders — ours (an f64 reference-DCT
-//! kernel) and FFmpeg's (a fast integer IDCT) — may therefore legally
+//! kernel) and the reference encoder's (a fast integer IDCT) — may therefore legally
 //! differ by up to ±1 per sample wherever a block carries AC energy.
 //!
 //! So the assertion for AC-bearing content is "every sample is within ±1

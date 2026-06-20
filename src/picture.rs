@@ -2365,7 +2365,7 @@ fn decode_after_picture_header(
     // §5.2 GOB-header optionality. For every GOB except number 0 "the
     // GOB header may be empty, depending on the encoder strategy" — the
     // encoder may omit GSTUF/GBSC/GN/GFID/GQUANT and run macroblock data
-    // straight across the GOB boundary (FFmpeg's native H.263 encoder
+    // straight across the GOB boundary (the reference encoder
     // does exactly this for the standard formats). When a header is
     // absent the GOB is NOT a fresh §6.1.1 / §I.3 video picture segment:
     // the QUANT carries over from the previous GOB's final macroblock,
