@@ -8,7 +8,8 @@ clean-room against [ITU-T Recommendation H.263 (01/2005)][spec].
 
 Decode-only. The crate implements the H.263 baseline picture / GOB /
 macroblock / block layers and reconstructs INTRA and INTER pictures
-end-to-end, plus a growing set of optional Annexes (D, F, I, K, T).
+end-to-end, plus a growing set of optional Annexes (D, F, I, J, K, M,
+N, O, P, Q, S, T).
 There is no encoder, and `register()` is currently a no-op pending a
 frame-yielding `oxideav_core::Decoder` adapter — callers drive the
 decoder through the free `decode_picture` entry point.
@@ -114,6 +115,26 @@ planar 4:2:0 `YuvFrame`:
   kernel); the surrounding 32×32-macroblock RRU decode pipeline
   (pseudo-MV §Q.4, enlarged OBMC §Q.5, reference extension §Q.3) is not
   yet wired.
+* **Annex N §N.5** — Reference Picture Selection mode (forward channel)
+  end-to-end: the `RpsReferenceStore` picture memory keys decoded
+  anchors by their 10-bit Temporal Reference (ETR ∥ TR), and
+  `decode_picture_layer_rps` selects the §N.4.1.4 prediction reference
+  by TRP (the stored picture whose TR equals TRP, or the most recent
+  anchor when TRP is absent) and decodes the picture against it — so an
+  RPS ("NEWPRED") picture predicting from a non-most-recent reference
+  reconstructs to pixels. The §N.4.2 back-channel BCM is out of scope
+  (decoder → encoder; no forward-channel pixel effect).
+* **Annex P §P.2 / §P.3** — Reference Picture Resampling: the §P.3 /
+  §P.4.2 integer bilinear warp engine (`resample_yuv`) resamples the
+  reference picture before motion compensation, driven from the §P.3
+  corner displacements, the virtual-frame `H' / V'` powers of two, the
+  §P.2.3 fill mode (clip / black / gray / color) and the §P.3 `RCRPR`
+  rounding control. Both invocation paths reach pixels through
+  `decode_picture_layer`: the §P.1 **implicit** resolution-change case
+  (a size-mismatched reference, zero warp / clip / 1/16-pixel) and the
+  §P.2 **explicit** RPRP field (WDA + eight Table-D.3 warping parameters
+  + fill mode, parsed for INTER / B / Improved-PB pictures). The
+  EP-picture explicit-RPR lower-layer-refinement case is not yet staged.
 
 ## Usage
 
@@ -189,11 +210,14 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   `decode_picture_no_gob0_header` baseline entry point.
 * Multi-picture sequence demuxing (PSC scanning / reference management
   across a stream stays caller-side).
-* Annex N (Reference Picture Selection) end-to-end: the §5.1.11–§5.1.16
-  picture-header fields (RPSMF / TRPI / TRP / BCI) are parsed, but the
-  §5.1.15 TRP multi-reference picture-memory lookup and the
-  §5.1.17 / §N.4.2 Back-Channel Message (videomux BCM) are not staged, so
-  an RPS-in-use picture is refused at decode time.
+* Annex N (Reference Picture Selection) **back-channel**: the
+  §5.1.17 / §N.4.2 Back-Channel Message (videomux BCM ACK/NACK) is not
+  staged — it flows decoder → encoder on a separate logical channel and
+  does not affect forward-channel pixels (a present BCM is refused). The
+  §N.4.1 GOB / slice-layer per-segment TRP re-selection is likewise not
+  yet threaded through the single-picture entry. (The forward-channel
+  picture-layer RPS reference selection now decodes to pixels — see the
+  supported list.)
 * Slice-boundary / Independent-Segment-Decoding deblock skip rules.
 * PB-frames and Improved PB-frames (Annex G / M) end-to-end
   reconstruction.
@@ -205,9 +229,11 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   bidirectional and INTRA prediction against the reference and same-layer
   pictures), but the B-picture's backward / direct-mode (§O.5.2) decode
   is not yet wired. The §O.6 spatial-scalability upsample of a smaller
-  reference layer and the Annex P RPRP reference-picture-resampling
-  sub-bitstream are also not staged (a reference-layer geometry mismatch
-  is refused with `BadScalabilityReferenceGeometry`).
+  reference layer inside the *scalability* driver is also not staged (a
+  reference-layer geometry mismatch is refused with
+  `BadScalabilityReferenceGeometry`); the standalone Annex P resampling
+  engine (see the supported list) is not yet threaded into the EP /
+  spatial-scalability path.
 * Annex Q Reduced-Resolution Update mode end-to-end (the §Q.6
   prediction-error up-sampling primitive and the §Q.7 block boundary
   filter are implemented as pure primitives; the 32×32 macroblock layer,
