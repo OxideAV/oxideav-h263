@@ -93,8 +93,8 @@ use crate::motion::{
     Mb4MvNeighbourhood, MotionVector, RefPlane, RemoteMv, RCONTROL_DEFAULT,
 };
 use crate::pb_layer::{
-    cbpb_block_present, pb_b_bidir_pixel, pb_b_predict_macroblock, pb_bquant, BpbCodingMode,
-    PbBMacroblockPrediction, PbBReferencePlanes,
+    cbpb_block_present, pb_b_bidir_pixel, pb_b_predict_macroblock, pb_b_vector, pb_bquant,
+    BpbCodingMode, PbBMacroblockPrediction, PbBReferencePlanes,
 };
 use crate::picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
@@ -3644,6 +3644,618 @@ pub fn decode_ep_picture_layer(
         upward_ref,
         options,
     )
+}
+
+/// The temporal-reference scalars a B-picture needs to derive its
+/// §O.5.2 direct-mode motion vectors from the co-located vectors of the
+/// temporally subsequent anchor.
+///
+/// Both are computed by the caller from the picture-layer Temporal
+/// References (the §5.1.2 TR, extended by ETR when present), exactly as
+/// for a PB-frame (§G.4 / §5.1.22):
+///
+/// * `trd` — the temporal-reference increment from the **previous**
+///   anchor (the forward reference) to the **subsequent** anchor (the
+///   backward reference). This is the span the co-located subsequent
+///   P-vector covers.
+/// * `trb` — the temporal-reference increment from the previous anchor
+///   to **this** B-picture.
+///
+/// Per §G.4, if `TRD` comes out negative it is wrapped by adding `d`
+/// (256 for the standard CIF frequency, 1024 for a custom clock); the
+/// caller performs that wrap before constructing this value so the two
+/// fields are always the post-wrap positive spans the §G.4 formulas
+/// require.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BPictureTemporal {
+    /// §5.1.22 TRB — previous-anchor → this-B-picture increment.
+    pub trb: i32,
+    /// §G.4 TRD — previous-anchor → subsequent-anchor increment.
+    pub trd: i32,
+}
+
+/// Decode and reconstruct an Annex O temporal-scalability **B-picture**
+/// (§O.4 / §O.5) against its two temporally surrounding anchors.
+///
+/// A B-picture is a non-reference enhancement picture predicted from one
+/// temporally **previous** anchor (`forward_ref`) and one temporally
+/// **subsequent** anchor (`backward_ref`), both already reconstructed
+/// and both carrying this picture's geometry (§O.1.1 temporal
+/// scalability — the §O.6 spatial-scalability upsample of a smaller
+/// reference is a separate, not-yet-staged step). The macroblock layer
+/// is the Table O.1 MBTYPE syntax decoded by
+/// [`crate::scalability::decode_mb_header_b_ep`]; the four explicit
+/// prediction types reconstruct as follows:
+///
+/// * **Forward** (§O.4) — motion-compensated from `forward_ref` with the
+///   §O.5.1 forward vector (MVDFW + forward-predictor median).
+/// * **Backward** (§O.4) — motion-compensated from `backward_ref` with
+///   the §O.5.1 backward vector (MVDBW + backward-predictor median).
+/// * **Bi-dir** (§O.4) — the per-pixel truncating average of the
+///   forward and backward predictions.
+/// * **INTRA** (§6.2) — no prediction.
+///
+/// **Direct mode** (§O.5.2) is the COD-skipped and the explicit
+/// "Direct" / "Direct + Q" rows: no vector differences are sent and the
+/// forward / backward vectors are computed from the co-located vector of
+/// the subsequent anchor by the §G.4 scaling with `MVD = 0`. The caller
+/// supplies that co-located vector field through `subsequent_mvs` — one
+/// [`MotionVector`] per macroblock in raster order (the macroblock-level
+/// forward vector the subsequent P-/EP-picture decoded), plus the
+/// [`BPictureTemporal`] `trb` / `trd` spans the §G.4 scaling needs. When
+/// the co-located subsequent macroblock was INTRA-coded its vector is
+/// taken as zero (§O.5.2 final sentence); the caller signals that by
+/// passing a zero vector for that macroblock.
+///
+/// Derived direct-mode vectors are **not** used as predictors for the
+/// surrounding §O.5.1 medians (§O.5.2): a direct macroblock contributes
+/// a zero candidate to both the forward and backward grids.
+///
+/// `reader` is positioned at the first bit after the picture header
+/// (the §5.1.19 PQUANT field). The B-picture's own modes are restricted
+/// to the baseline single-MV path: CPM, Advanced Prediction, SAC and the
+/// Annex-K slice structure are refused.
+///
+/// # Errors
+///
+/// * [`Error::NotImplemented`] — a refused optional mode is signalled.
+/// * [`Error::BadScalabilityReferenceGeometry`] — a reference does not
+///   carry the B-picture geometry.
+/// * [`Error::UnsupportedPictureGeometry`] — a degenerate (0-MB) layout.
+/// * [`Error::InvalidQuantiser`] — PQUANT out of `[1, 31]`.
+/// * the macroblock-layer / block-layer parse errors.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_b_picture(
+    reader: &mut BitReader<'_>,
+    extended: &H263ExtendedPicture,
+    layout: &PictureLayout,
+    forward_ref: &YuvFrame,
+    backward_ref: &YuvFrame,
+    subsequent_mvs: &[MotionVector],
+    temporal: BPictureTemporal,
+    _options: DecodeOptions,
+) -> Result<YuvFrame> {
+    // Refuse the optional modes this baseline B-picture path does not
+    // stage (§O.3 inherits the §5.1.4 PLUSPTYPE option flags).
+    let plus = &extended.plus;
+    if plus.cpm
+        || plus
+            .opptype
+            .is_some_and(|o| o.advanced_prediction || o.sac || o.slice_structured)
+    {
+        return Err(Error::NotImplemented);
+    }
+    if temporal.trd == 0 {
+        // §G.4 formulas divide by TRD; a zero span is undecodable.
+        return Err(Error::NotImplemented);
+    }
+
+    let luma_w = layout.luma_width as usize;
+    let luma_h = layout.luma_height as usize;
+    let chroma_w = luma_w / 2;
+    let chroma_h = luma_h / 2;
+    let mb_cols = luma_w / 16;
+    let mb_rows_total = luma_h / 16;
+    if mb_cols == 0 || mb_rows_total == 0 {
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+
+    // Both anchors must already carry the B-picture geometry (§O.1.1).
+    for r in [forward_ref, backward_ref] {
+        if r.luma_width != luma_w || r.luma_height != luma_h {
+            return Err(Error::BadScalabilityReferenceGeometry);
+        }
+    }
+    // The co-located vector field must cover every macroblock.
+    if subsequent_mvs.len() != mb_cols * mb_rows_total {
+        return Err(Error::NotImplemented);
+    }
+
+    let mut frame = YuvFrame {
+        y: vec![0u8; luma_w * luma_h],
+        cb: vec![0u8; chroma_w * chroma_h],
+        cr: vec![0u8; chroma_w * chroma_h],
+        luma_width: luma_w,
+        luma_height: luma_h,
+    };
+
+    // §5.1.19 — PQUANT (5 bits).
+    let pquant = reader
+        .read_u32(SQUANT_BITS)
+        .map_err(|_| Error::UnexpectedEof)? as u8;
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+
+    let luma_stride = luma_w;
+    let chroma_stride = chroma_w;
+
+    // §O.5.1 — forward and backward vectors are predicted *separately*,
+    // each from neighbours that carry a vector of the *same* type (a
+    // neighbour without that vector type contributes the zero
+    // candidate). Two grids therefore drive the two §6.1.1 medians.
+    let mut fwd_grid = vec![MbGridEntry::OUTSIDE; mb_cols * mb_rows_total];
+    let mut bwd_grid = vec![MbGridEntry::OUTSIDE; mb_cols * mb_rows_total];
+
+    let num_gobs = layout.num_gobs as usize;
+    let mb_rows_per_gob = layout.mb_rows_per_gob as usize;
+
+    for gob_index in 0..num_gobs {
+        let gob_quant = if gob_index == 0 {
+            pquant
+        } else {
+            parse_gob_layer(reader)?.quantiser
+        };
+        let gob_top_row = gob_index * mb_rows_per_gob;
+        let segment = gob_index as u32;
+
+        for local_row in 0..mb_rows_per_gob {
+            let row = gob_top_row + local_row;
+            if row >= mb_rows_total {
+                break;
+            }
+            let mut current_quant = gob_quant;
+            for col in 0..mb_cols {
+                let (fwd_entry, bwd_entry) = decode_b_macroblock(
+                    reader,
+                    &mut frame,
+                    BMacroblockRefs {
+                        forward_ref,
+                        backward_ref,
+                        subsequent_mvs,
+                    },
+                    &fwd_grid,
+                    &bwd_grid,
+                    temporal,
+                    mb_cols,
+                    col,
+                    row,
+                    gob_top_row,
+                    segment,
+                    luma_stride,
+                    chroma_stride,
+                    &mut current_quant,
+                )?;
+                let idx = row * mb_cols + col;
+                fwd_grid[idx] = MbGridEntry {
+                    segment,
+                    ..fwd_entry
+                };
+                bwd_grid[idx] = MbGridEntry {
+                    segment,
+                    ..bwd_entry
+                };
+            }
+        }
+    }
+
+    Ok(frame)
+}
+
+/// Parse a PLUSPTYPE picture-layer header from `data` and, if it is an
+/// Annex O **B-picture**, decode it against its two temporally
+/// surrounding anchors.
+///
+/// `forward_ref` is the temporally previous anchor and `backward_ref`
+/// the temporally subsequent anchor (both reconstructed, both carrying
+/// the B-picture geometry). `subsequent_mvs` is the co-located
+/// macroblock-level forward-vector field of the subsequent anchor (one
+/// [`MotionVector`] per macroblock in raster order; zero where the
+/// co-located macroblock was INTRA), and `temporal` carries the §G.4
+/// `trb` / `trd` spans — both feed §O.5.2 direct mode. The caller owns
+/// cross-layer reference + anchor-vector bookkeeping and supplies them
+/// (mirroring [`decode_ep_picture_layer`]).
+///
+/// # Errors
+///
+/// * [`Error::NotImplemented`] — `data` is not a PLUSPTYPE picture, or
+///   its picture type is not B, or a not-yet-staged optional mode is
+///   signalled, or `subsequent_mvs` does not cover every macroblock.
+/// * the union of [`decode_b_picture`]'s errors.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_b_picture_layer(
+    data: &[u8],
+    forward_ref: &YuvFrame,
+    backward_ref: &YuvFrame,
+    subsequent_mvs: &[MotionVector],
+    temporal: BPictureTemporal,
+    options: DecodeOptions,
+    inherited: InheritedExtendedState,
+) -> Result<YuvFrame> {
+    let mut reader = BitReader::new(data);
+    let layer = parse_picture_layer(&mut reader, inherited)?;
+    let extended = match layer {
+        H263PictureLayer::Extended(extended) => extended,
+        H263PictureLayer::Baseline(_) => return Err(Error::NotImplemented),
+    };
+    if !matches!(
+        extended.plus.mpptype.picture_type,
+        PlusPictureType::BPicture
+    ) {
+        return Err(Error::NotImplemented);
+    }
+    let layout = ei_layout_for(&extended)?;
+    decode_b_picture(
+        &mut reader,
+        &extended,
+        &layout,
+        forward_ref,
+        backward_ref,
+        subsequent_mvs,
+        temporal,
+        options,
+    )
+}
+
+/// The three reference inputs a B-picture macroblock draws on, grouped
+/// to keep [`decode_b_macroblock`]'s argument list tractable.
+#[derive(Clone, Copy)]
+struct BMacroblockRefs<'a> {
+    forward_ref: &'a YuvFrame,
+    backward_ref: &'a YuvFrame,
+    subsequent_mvs: &'a [MotionVector],
+}
+
+/// Decode and reconstruct one B-picture macroblock at grid `(col,
+/// row)`, returning the `(forward, backward)` [`MbGridEntry`] pair that
+/// records this macroblock's reconstructed forward and backward vectors
+/// for the §O.5.1 predictors of later macroblocks. A macroblock that
+/// carries no vector of a given type (or a direct-mode macroblock, whose
+/// derived vectors are §O.5.2-excluded from prediction) returns the zero
+/// / `not_coded` entry for that grid.
+#[allow(clippy::too_many_arguments)]
+fn decode_b_macroblock(
+    reader: &mut BitReader<'_>,
+    frame: &mut YuvFrame,
+    refs: BMacroblockRefs<'_>,
+    fwd_grid: &[MbGridEntry],
+    bwd_grid: &[MbGridEntry],
+    temporal: BPictureTemporal,
+    mb_cols: usize,
+    col: usize,
+    row: usize,
+    gob_top_row: usize,
+    segment: u32,
+    luma_stride: usize,
+    chroma_stride: usize,
+    current_quant: &mut u8,
+) -> Result<(MbGridEntry, MbGridEntry)> {
+    let mb_x = col * 16;
+    let mb_y = row * 16;
+    let c_x = col * 8;
+    let c_y = row * 8;
+
+    let header = decode_mb_header_b_ep(reader, ScalabilityPictureType::BPicture)?;
+
+    // §O.4.2 "Direct (skipped)" (COD = 1) — direct prediction, no data.
+    if !header.coded {
+        reconstruct_b_direct_macroblock(
+            reader,
+            frame,
+            &refs,
+            temporal,
+            mb_cols,
+            col,
+            row,
+            mb_x,
+            mb_y,
+            c_x,
+            c_y,
+            luma_stride,
+            chroma_stride,
+            *current_quant,
+            /* coded = */ false,
+            /* cbpy = */ 0,
+            /* cbpc = */ 0,
+        )?;
+        // §O.5.2 — direct-mode vectors are not used for prediction.
+        return Ok((b_no_vector_entry(), b_no_vector_entry()));
+    }
+
+    // Field order (Figure O.6): COD MBTYPE CBPC CBPY DQUANT MVDFW MVDBW
+    // Block. The header consumed COD, MBTYPE and CBPC.
+    let cbpy = if header.has_cbp {
+        let cbpy_raw = crate::macroblock::decode_cbpy(reader)?;
+        if header.cbpy_uses_intra_column {
+            cbpy_raw
+        } else {
+            (!cbpy_raw) & 0b1111
+        }
+    } else {
+        0
+    };
+    let cbpc = header.cbpc;
+
+    if header.has_dquant {
+        *current_quant = crate::macroblock::read_dquant_baseline(reader, *current_quant)?;
+    }
+    let quant = *current_quant;
+
+    if header.is_intra() {
+        reconstruct_intra_macroblock_blocks(
+            reader,
+            frame,
+            quant,
+            cbpy,
+            cbpc,
+            mb_x,
+            mb_y,
+            c_x,
+            c_y,
+            luma_stride,
+            chroma_stride,
+        )?;
+        // INTRA carries neither a forward nor a backward vector.
+        return Ok((b_no_vector_entry(), b_no_vector_entry()));
+    }
+
+    // §O.4.6 — MVDFW precedes MVDBW; each is present only when the
+    // resolved row carries it (Table O.1). Forward and backward use
+    // independent §O.5.1 predictors.
+    let forward_mv = if header.has_mvdfw {
+        let mvd = Mvd {
+            dx_half: decode_mvd_component(reader)?,
+            dy_half: decode_mvd_component(reader)?,
+        };
+        let predictor = predict_forward_mv(fwd_grid, mb_cols, col, row, gob_top_row, segment);
+        reconstruct_mv(predictor, mvd)
+    } else {
+        MotionVector::new(0, 0)
+    };
+    let backward_mv = if header.has_mvdbw {
+        let mvd = Mvd {
+            dx_half: decode_mvd_component(reader)?,
+            dy_half: decode_mvd_component(reader)?,
+        };
+        let predictor = predict_forward_mv(bwd_grid, mb_cols, col, row, gob_top_row, segment);
+        reconstruct_mv(predictor, mvd)
+    } else {
+        MotionVector::new(0, 0)
+    };
+
+    match header.pred_type {
+        ScalabilityPredType::Forward => {
+            reconstruct_inter_predicted_macroblock(
+                reader,
+                frame,
+                &ForwardPredictor {
+                    forward_ref: refs.forward_ref,
+                    mv: forward_mv,
+                },
+                quant,
+                cbpy,
+                cbpc,
+                mb_x,
+                mb_y,
+                c_x,
+                c_y,
+                luma_stride,
+                chroma_stride,
+            )?;
+            Ok((b_vector_entry(forward_mv), b_no_vector_entry()))
+        }
+        ScalabilityPredType::Backward => {
+            reconstruct_inter_predicted_macroblock(
+                reader,
+                frame,
+                // Backward prediction is a single-reference motion
+                // compensation from the subsequent anchor — structurally
+                // identical to forward prediction, just a different
+                // reference + vector.
+                &ForwardPredictor {
+                    forward_ref: refs.backward_ref,
+                    mv: backward_mv,
+                },
+                quant,
+                cbpy,
+                cbpc,
+                mb_x,
+                mb_y,
+                c_x,
+                c_y,
+                luma_stride,
+                chroma_stride,
+            )?;
+            Ok((b_no_vector_entry(), b_vector_entry(backward_mv)))
+        }
+        ScalabilityPredType::Bidirectional => {
+            reconstruct_inter_predicted_macroblock(
+                reader,
+                frame,
+                &BidirPredictor {
+                    forward_ref: refs.forward_ref,
+                    upward_ref: refs.backward_ref,
+                    forward_mv,
+                    backward_mv,
+                },
+                quant,
+                cbpy,
+                cbpc,
+                mb_x,
+                mb_y,
+                c_x,
+                c_y,
+                luma_stride,
+                chroma_stride,
+            )?;
+            Ok((b_vector_entry(forward_mv), b_vector_entry(backward_mv)))
+        }
+        // The explicit "Direct" / "Direct + Q" rows (no MVD; texture may
+        // be present): reconstruct the §O.5.2 derived prediction, then
+        // add any coded residual.
+        ScalabilityPredType::Direct => {
+            reconstruct_b_direct_macroblock(
+                reader,
+                frame,
+                &refs,
+                temporal,
+                mb_cols,
+                col,
+                row,
+                mb_x,
+                mb_y,
+                c_x,
+                c_y,
+                luma_stride,
+                chroma_stride,
+                quant,
+                /* coded = */ true,
+                cbpy,
+                cbpc,
+            )?;
+            Ok((b_no_vector_entry(), b_no_vector_entry()))
+        }
+        // Upward / Intra never appear as a coded B MBTYPE row here.
+        ScalabilityPredType::Upward | ScalabilityPredType::Intra => {
+            Err(Error::BadScalabilityMbType)
+        }
+    }
+}
+
+/// Reconstruct a §O.5.2 **direct-mode** B macroblock. The forward and
+/// backward vectors are derived from the co-located vector of the
+/// subsequent anchor by the §G.4 scaling with `MVD = 0`
+/// ([`pb_b_vector`]); the prediction is the §O.4 truncating bidirectional
+/// average of the two motion-compensated predictions. When `coded` the
+/// caller has already read CBPY / CBPC / DQUANT and any §6.3.1 residual
+/// is added on top.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_b_direct_macroblock(
+    reader: &mut BitReader<'_>,
+    frame: &mut YuvFrame,
+    refs: &BMacroblockRefs<'_>,
+    temporal: BPictureTemporal,
+    mb_cols: usize,
+    col: usize,
+    row: usize,
+    mb_x: usize,
+    mb_y: usize,
+    c_x: usize,
+    c_y: usize,
+    luma_stride: usize,
+    chroma_stride: usize,
+    quant: u8,
+    coded: bool,
+    cbpy: u8,
+    cbpc: u8,
+) -> Result<()> {
+    // §O.5.2 / §G.4 — derive (MVF, MVB) from the co-located subsequent
+    // P-vector with MVD = 0. A co-located INTRA macroblock is signalled
+    // by a zero vector (the caller's contract), which §G.4 scales to a
+    // zero MVF / MVB pair — i.e. exactly §O.5.2's "value zero" rule.
+    let p_mv = refs.subsequent_mvs[row * mb_cols + col];
+    let (forward_mv, backward_mv) = pb_b_vector(p_mv, None, temporal.trb, temporal.trd);
+
+    let predictor = BidirPredictor {
+        forward_ref: refs.forward_ref,
+        upward_ref: refs.backward_ref,
+        forward_mv,
+        backward_mv,
+    };
+
+    if coded {
+        reconstruct_inter_predicted_macroblock(
+            reader,
+            frame,
+            &predictor,
+            quant,
+            cbpy,
+            cbpc,
+            mb_x,
+            mb_y,
+            c_x,
+            c_y,
+            luma_stride,
+            chroma_stride,
+        )
+    } else {
+        // COD-skipped direct mode: prediction only, no residual.
+        write_predicted_macroblock(
+            frame,
+            &predictor,
+            mb_x,
+            mb_y,
+            c_x,
+            c_y,
+            luma_stride,
+            chroma_stride,
+        );
+        Ok(())
+    }
+}
+
+/// Build the [`MbGridEntry`] for a B macroblock that carries a vector of
+/// the grid's type (forward or backward), so the §O.5.1 predictor reads
+/// its value.
+fn b_vector_entry(mv: MotionVector) -> MbGridEntry {
+    MbGridEntry {
+        intra: false,
+        not_coded: false,
+        mv,
+        mvs4: [mv; 4],
+        segment: u32::MAX, // stamped at writeback
+    }
+}
+
+/// Build the [`MbGridEntry`] for a B macroblock that carries **no**
+/// vector of the grid's type (so the §O.5.1 "no vector of same type →
+/// zero candidate" rule applies). Direct / INTRA / single-direction
+/// macroblocks use this for the grid(s) they do not feed.
+fn b_no_vector_entry() -> MbGridEntry {
+    MbGridEntry {
+        intra: false,
+        // `not_coded` folds into the predictor's zero-candidate rule.
+        not_coded: true,
+        mv: MotionVector::new(0, 0),
+        mvs4: [MotionVector::new(0, 0); 4],
+        segment: u32::MAX,
+    }
+}
+
+/// Write the six 8×8 prediction blocks of an enhancement-layer INTER
+/// macroblock straight into `frame` with no residual (the COD-skipped /
+/// no-texture case). Shares the [`BlockPredictor`] abstraction with
+/// [`reconstruct_inter_predicted_macroblock`].
+#[allow(clippy::too_many_arguments)]
+fn write_predicted_macroblock<P: BlockPredictor>(
+    frame: &mut YuvFrame,
+    predictor: &P,
+    mb_x: usize,
+    mb_y: usize,
+    c_x: usize,
+    c_y: usize,
+    luma_stride: usize,
+    chroma_stride: usize,
+) {
+    for blk in 0..4 {
+        let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+        let pred = predictor.predict_luma(luma_stride, bx, by);
+        blit_block(&mut frame.y, luma_stride, bx, by, &pred);
+    }
+    let cb = predictor.predict_cb(c_x, c_y);
+    blit_block(&mut frame.cb, chroma_stride, c_x, c_y, &cb);
+    let cr = predictor.predict_cr(c_x, c_y);
+    blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr);
 }
 
 /// `true` iff the reader is positioned (after discarding up to seven
@@ -7533,6 +8145,389 @@ mod tests {
             &data,
             &forward,
             &small,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, Error::BadScalabilityReferenceGeometry);
+    }
+
+    // ----- Annex O B-picture (temporal scalability) -----
+
+    /// Write a QCIF PLUSPTYPE **B-picture** header (UFEP=001), positioned
+    /// at the §5.1.19 PQUANT field. Identical to the EP header except the
+    /// §5.1.4.3 MPPTYPE picture-type field is `"011"` (B-picture).
+    fn write_plus_qcif_b_header(w: &mut BitWriter) {
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true); // PTYPE bits 1-2 = "10"
+        w.write_bit(false);
+        w.write_u32(0b000, 3); // PTYPE bits 3-5
+        w.write_u32(0b111, 3); // PTYPE bits 6-8 -> extended
+        w.write_u32(0b001, 3); // UFEP = 001
+        w.write_u32(0b010, 3); // OPPTYPE source format = QCIF
+        for _ in 0..11 {
+            w.write_bit(false); // OPPTYPE bits 4-14 all off
+        }
+        w.write_bit(true); // bit 15 SCE-guard
+        w.write_u32(0b000, 3); // bits 16-18 reserved
+        w.write_u32(0b011, 3); // MPPTYPE picture type = B
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+        w.write_u32(2, 4); // ELNUM = 2
+        w.write_u32(1, 4); // RLNUM = 1
+        w.write_bit(false); // CPM = 0
+    }
+
+    /// A QCIF zero-vector co-located field (every co-located subsequent
+    /// macroblock had a zero forward vector — e.g. all INTRA or all
+    /// zero-MV). Direct mode then derives a zero MVF / MVB pair.
+    fn zero_subsequent_mvs() -> Vec<MotionVector> {
+        vec![MotionVector::new(0, 0); 11 * 9]
+    }
+
+    /// `temporal` with `TRB = TRD` (the B-picture sits at the subsequent
+    /// anchor's instant) so that, with a zero co-located vector, the
+    /// §G.4 scaling is trivially zero regardless of the spans.
+    fn unit_temporal() -> BPictureTemporal {
+        BPictureTemporal { trb: 1, trd: 2 }
+    }
+
+    /// An all-Direct-skipped B-picture (every macroblock COD=1) with a
+    /// zero co-located subsequent vector field is the §O.4 bidirectional
+    /// truncating average of the two anchors with zero motion: each
+    /// pixel is `(forward + backward) / 2` (§O.4 / pb_b_bidir_pixel).
+    #[test]
+    fn b_all_direct_skipped_averages_anchors_zero_mv() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_b_header(&mut w);
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(true); // COD = 1 (Direct skipped)
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let forward = synthetic_qcif_forward();
+        let backward = synthetic_qcif_reference();
+        let frame = decode_b_picture_layer(
+            &data,
+            &forward,
+            &backward,
+            &zero_subsequent_mvs(),
+            unit_temporal(),
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode B");
+        // Every pixel is the §O.4 truncating bidirectional average of
+        // the co-located forward and backward samples (zero motion).
+        for (i, &y) in frame.y.iter().enumerate() {
+            let expect = crate::pb_layer::pb_b_bidir_pixel(forward.y[i], backward.y[i]);
+            assert_eq!(y, expect, "luma[{i}] bidir average");
+        }
+        for (i, &c) in frame.cb.iter().enumerate() {
+            assert_eq!(
+                c,
+                crate::pb_layer::pb_b_bidir_pixel(forward.cb[i], backward.cb[i])
+            );
+        }
+        for (i, &c) in frame.cr.iter().enumerate() {
+            assert_eq!(
+                c,
+                crate::pb_layer::pb_b_bidir_pixel(forward.cr[i], backward.cr[i])
+            );
+        }
+    }
+
+    /// A B-picture coded entirely as "Forward (no texture)" (MBTYPE
+    /// `100`) with a zero MVDFW copies the *forward* (previous) anchor
+    /// verbatim — single-reference forward motion compensation, no
+    /// residual. The backward anchor must NOT appear.
+    #[test]
+    fn b_all_forward_no_texture_copies_forward_anchor() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_b_header(&mut w);
+        w.write_u32(8, SQUANT_BITS);
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(false); // COD = 0 (coded)
+                                    // MBTYPE `100` = Forward (no texture): MVDFW present,
+                                    // no CBP.
+                w.write_bit(true);
+                w.write_bit(false);
+                w.write_bit(false);
+                // MVDFW = (0, 0): Table 14 code for difference 0 is the
+                // single bit `1` per component.
+                w.write_bit(true); // dx
+                w.write_bit(true); // dy
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let forward = synthetic_qcif_forward();
+        let backward = synthetic_qcif_reference();
+        let frame = decode_b_picture_layer(
+            &data,
+            &forward,
+            &backward,
+            &zero_subsequent_mvs(),
+            unit_temporal(),
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode B");
+        assert_eq!(frame.y, forward.y, "luma copies the forward anchor");
+        assert_eq!(frame.cb, forward.cb);
+        assert_eq!(frame.cr, forward.cr);
+    }
+
+    /// A B-picture coded entirely as "Backward (no texture)" (MBTYPE
+    /// `010`) with a zero MVDBW copies the *backward* (subsequent) anchor
+    /// verbatim. Distinguishes the backward source from the forward one.
+    #[test]
+    fn b_all_backward_no_texture_copies_backward_anchor() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_b_header(&mut w);
+        w.write_u32(8, SQUANT_BITS);
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(false); // COD = 0
+                                    // MBTYPE `010` = Backward (no texture): MVDBW present,
+                                    // no CBP.
+                w.write_bit(false);
+                w.write_bit(true);
+                w.write_bit(false);
+                // MVDBW = (0, 0).
+                w.write_bit(true);
+                w.write_bit(true);
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let forward = synthetic_qcif_forward();
+        let backward = synthetic_qcif_reference();
+        let frame = decode_b_picture_layer(
+            &data,
+            &forward,
+            &backward,
+            &zero_subsequent_mvs(),
+            unit_temporal(),
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode B");
+        assert_eq!(frame.y, backward.y, "luma copies the backward anchor");
+        assert_eq!(frame.cb, backward.cb);
+        assert_eq!(frame.cr, backward.cr);
+    }
+
+    /// A B-picture coded entirely as "Bi-dir (no texture)" (MBTYPE
+    /// `00100`) with zero forward and backward MVDs is the §O.4
+    /// bidirectional truncating average of the two anchors — identical to
+    /// the all-direct-skipped result here (both reduce to zero-motion
+    /// bidirectional), but reached through the explicit MBTYPE path.
+    #[test]
+    fn b_all_bidir_no_texture_averages_anchors() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_b_header(&mut w);
+        w.write_u32(8, SQUANT_BITS);
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(false); // COD = 0
+                                    // MBTYPE `00100` = Bi-dir (no texture): MVDFW + MVDBW,
+                                    // no CBP.
+                w.write_bit(false);
+                w.write_bit(false);
+                w.write_bit(true);
+                w.write_bit(false);
+                w.write_bit(false);
+                // MVDFW = (0, 0), MVDBW = (0, 0).
+                w.write_bit(true);
+                w.write_bit(true);
+                w.write_bit(true);
+                w.write_bit(true);
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let forward = synthetic_qcif_forward();
+        let backward = synthetic_qcif_reference();
+        let frame = decode_b_picture_layer(
+            &data,
+            &forward,
+            &backward,
+            &zero_subsequent_mvs(),
+            unit_temporal(),
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode B");
+        for (i, &y) in frame.y.iter().enumerate() {
+            assert_eq!(
+                y,
+                crate::pb_layer::pb_b_bidir_pixel(forward.y[i], backward.y[i])
+            );
+        }
+    }
+
+    /// §O.5.2 direct mode with a non-zero co-located subsequent vector:
+    /// the derived forward / backward vectors come from the §G.4 scaling
+    /// of that vector with MVD = 0, and the result is the bidirectional
+    /// average of the two motion-compensated anchors. Cross-checks the
+    /// derived vectors against [`pb_b_vector`] directly.
+    #[test]
+    fn b_direct_derives_vectors_from_subsequent_field() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_b_header(&mut w);
+        w.write_u32(8, SQUANT_BITS);
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(true); // COD = 1 (Direct skipped)
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let forward = synthetic_qcif_forward();
+        let backward = synthetic_qcif_reference();
+        // Uniform co-located vector (4 half-pel right, 2 half-pel down).
+        let p_mv = MotionVector::new(4, 2);
+        let subsequent = vec![p_mv; 11 * 9];
+        let temporal = BPictureTemporal { trb: 1, trd: 3 };
+
+        let frame = decode_b_picture_layer(
+            &data,
+            &forward,
+            &backward,
+            &subsequent,
+            temporal,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode B");
+
+        // Independently derive the same prediction for one interior MB
+        // and confirm the driver produced it.
+        let (mvf, mvb) = pb_b_vector(p_mv, None, temporal.trb, temporal.trd);
+        let predictor = BidirPredictor {
+            forward_ref: &forward,
+            upward_ref: &backward,
+            forward_mv: mvf,
+            backward_mv: mvb,
+        };
+        // Interior luma block at MB (col=2, row=2), block 0.
+        let (bx, by) = luma_block_origin(2 * 16, 2 * 16, 0);
+        let expect = predictor.predict_luma(176, bx, by);
+        for (k, &e) in expect.iter().enumerate() {
+            let py = by + k / 8;
+            let px = bx + k % 8;
+            assert_eq!(frame.y[py * 176 + px], e, "direct-mode pixel {k}");
+        }
+    }
+
+    /// The co-located vector field must cover every macroblock; a short
+    /// field is refused (rather than panic on an out-of-range index).
+    #[test]
+    fn b_short_subsequent_field_is_rejected() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_b_header(&mut w);
+        w.write_u32(8, SQUANT_BITS);
+        w.write_bit(true);
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let forward = synthetic_qcif_forward();
+        let backward = synthetic_qcif_reference();
+        let err = decode_b_picture_layer(
+            &data,
+            &forward,
+            &backward,
+            &[MotionVector::new(0, 0)], // too short
+            unit_temporal(),
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, Error::NotImplemented);
+    }
+
+    /// B geometry guard: an anchor that does not already carry the
+    /// enhancement-layer dimensions is refused.
+    #[test]
+    fn b_geometry_mismatch_is_rejected() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_b_header(&mut w);
+        w.write_u32(8, SQUANT_BITS);
+        w.write_bit(true);
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let forward = synthetic_qcif_forward();
+        let small = YuvFrame {
+            y: vec![100u8; 128 * 96],
+            cb: vec![100u8; 64 * 48],
+            cr: vec![100u8; 64 * 48],
+            luma_width: 128,
+            luma_height: 96,
+        };
+        let err = decode_b_picture_layer(
+            &data,
+            &forward,
+            &small,
+            &zero_subsequent_mvs(),
+            unit_temporal(),
             DecodeOptions::default(),
             InheritedExtendedState::default(),
         )
