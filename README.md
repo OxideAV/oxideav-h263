@@ -145,6 +145,28 @@ planar 4:2:0 `YuvFrame`:
   §P.2 **explicit** RPRP field (WDA + eight Table-D.3 warping parameters
   + fill mode, parsed for INTER / B / Improved-PB pictures). The
   EP-picture explicit-RPR lower-layer-refinement case is not yet staged.
+* **Annex O §O.4 / §O.5** — temporal-scalability **B-pictures** decode
+  end-to-end (`decode_b_picture` / `decode_b_picture_layer`): the Table
+  O.1 MBTYPE layer drives Forward / Backward / Bi-dir / INTRA
+  reconstruction against the two temporally surrounding anchors, with
+  *separate* §O.5.1 forward / backward predictor grids (same-type-only
+  median), and §O.5.2 **direct mode** (the COD-skipped row and the
+  explicit Direct / Direct+Q rows) deriving the forward / backward
+  vectors from the co-located subsequent-anchor vector by the §G.4
+  scaling with `MVD = 0` (a co-located INTRA macroblock contributing the
+  §O.5.2 zero vector). The EI- and EP-picture enhancement layers also
+  reconstruct end-to-end (`decode_ei_picture` / `decode_ep_picture` —
+  upward, forward, bidirectional and INTRA prediction). The §N.4.2
+  back-channel and the B-picture INTER4V / Advanced-Prediction submodes
+  are out of scope.
+* **Annex O §O.6** — spatial-scalability reference up-sampling: the
+  Figure O.8 / O.9 2-D and Figure O.10 / O.11 1-D (horizontal / vertical)
+  interpolation filters (`upsample_plane_2d` /
+  `upsample_plane_1d_horizontal` / `upsample_plane_1d_vertical`),
+  threaded into the EI / EP upward-prediction path so a factor-of-two
+  smaller reference layer (§O.1.3) is up-sampled to the enhancement
+  geometry before prediction (a non-factor-of-two mismatch is still
+  refused with `BadScalabilityReferenceGeometry`).
 
 ## Usage
 
@@ -244,17 +266,11 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   reconstruction.
 * Annex K Rectangular Slice submode, Annex K with Advanced Prediction /
   CPM, and Arbitrary Slice Ordering.
-* Annex O **B-picture** (temporal-scalability) macroblocks: the EI- and
-  EP-picture enhancement layers reconstruct end-to-end
-  (`decode_ei_picture` / `decode_ep_picture` — upward, forward,
-  bidirectional and INTRA prediction against the reference and same-layer
-  pictures), but the B-picture's backward / direct-mode (§O.5.2) decode
-  is not yet wired. The §O.6 spatial-scalability upsample of a smaller
-  reference layer inside the *scalability* driver is also not staged (a
-  reference-layer geometry mismatch is refused with
-  `BadScalabilityReferenceGeometry`); the standalone Annex P resampling
-  engine (see the supported list) is not yet threaded into the EP /
-  spatial-scalability path.
+* Annex O CPM-multiplexed / Advanced-Prediction / SAC / Annex-K-slice
+  enhancement-layer pictures (refused on the EI / EP / B paths); the
+  Annex P explicit-warp resampling engine (see the supported list) is
+  not yet threaded into the EP / spatial-scalability path (only the §O.6
+  factor-of-two upsample is wired there).
 * Annex Q Reduced-Resolution Update mode end-to-end (the §Q.6
   prediction-error up-sampling primitive and the §Q.7 block boundary
   filter are implemented as pure primitives; the 32×32 macroblock layer,
