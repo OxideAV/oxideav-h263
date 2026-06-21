@@ -2578,6 +2578,68 @@ fn ei_layout_for(extended: &H263ExtendedPicture) -> Result<PictureLayout> {
     }
 }
 
+/// §O.6 — produce a reference-layer picture at the enhancement-layer
+/// geometry, up-sampling by a factor of two horizontally, vertically, or
+/// both (spatial scalability, §O.1.3) when the reference is smaller.
+///
+/// Returns:
+///
+/// * `Ok(None)` — the reference already carries the target geometry (SNR
+///   scalability, §O.1.2); the caller predicts from it directly.
+/// * `Ok(Some(frame))` — the reference was a factor-of-two smaller in one
+///   or both dimensions; the returned [`YuvFrame`] is the §O.6-upsampled
+///   reference at `(luma_w, luma_h)`.
+/// * `Err(Error::BadScalabilityReferenceGeometry)` — the geometry
+///   relationship is neither identity nor a clean factor-of-two
+///   reduction in each axis (the only §O.6 cases).
+///
+/// Luma and both chroma planes are up-sampled with the matching §O.6
+/// filter for the per-axis ratio (2-D, 1-D horizontal, or 1-D vertical).
+fn upsample_reference_to(
+    reference: &YuvFrame,
+    luma_w: usize,
+    luma_h: usize,
+) -> Result<Option<YuvFrame>> {
+    use crate::scal_upsample::{
+        upsample_plane_1d_horizontal, upsample_plane_1d_vertical, upsample_plane_2d,
+    };
+
+    let rw = reference.luma_width;
+    let rh = reference.luma_height;
+    if rw == luma_w && rh == luma_h {
+        return Ok(None);
+    }
+
+    // The only §O.6 relationships are a clean ×2 in width and/or height.
+    let h_double = rw * 2 == luma_w;
+    let v_double = rh * 2 == luma_h;
+    let h_same = rw == luma_w;
+    let v_same = rh == luma_h;
+    if !((h_double || h_same) && (v_double || v_same)) {
+        return Err(Error::BadScalabilityReferenceGeometry);
+    }
+
+    let cw = rw / 2;
+    let ch = rh / 2;
+    // Apply the same per-axis filter to luma and to both chroma planes.
+    let pick = |plane: &[u8], w: usize, h: usize| -> Vec<u8> {
+        match (h_double, v_double) {
+            (true, true) => upsample_plane_2d(plane, w, h),
+            (true, false) => upsample_plane_1d_horizontal(plane, w, h),
+            (false, true) => upsample_plane_1d_vertical(plane, w, h),
+            (false, false) => plane.to_vec(),
+        }
+    };
+
+    Ok(Some(YuvFrame {
+        y: pick(&reference.y, rw, rh),
+        cb: pick(&reference.cb, cw, ch),
+        cr: pick(&reference.cr, cw, ch),
+        luma_width: luma_w,
+        luma_height: luma_h,
+    }))
+}
+
 /// Annex O §O.1.2 — decode an **EI-picture** (SNR-scalability
 /// enhancement layer) into reconstructed pixels.
 ///
@@ -2660,13 +2722,12 @@ fn decode_upward_predicted_picture(
         return Err(Error::UnsupportedPictureGeometry);
     }
 
-    // §O.1.2 SNR-scalability requires the reference layer to already
-    // carry this picture's geometry. The §O.6 spatial-scalability
-    // upsample (reference layer half-sized in one or both dimensions)
-    // is a separate, not-yet-staged step.
-    if reference.luma_width != luma_w || reference.luma_height != luma_h {
-        return Err(Error::BadScalabilityReferenceGeometry);
-    }
+    // §O.1.2 SNR-scalability uses a reference already at this geometry;
+    // §O.1.3 spatial scalability up-samples a factor-of-two-smaller
+    // reference by the §O.6 filter first (a non-factor-of-two mismatch
+    // is rejected inside [`upsample_reference_to`]).
+    let upsampled = upsample_reference_to(reference, luma_w, luma_h)?;
+    let reference: &YuvFrame = upsampled.as_ref().unwrap_or(reference);
 
     let mut frame = YuvFrame {
         y: vec![0u8; luma_w * luma_h],
@@ -3260,14 +3321,16 @@ pub fn decode_ep_picture(
         return Err(Error::UnsupportedPictureGeometry);
     }
 
-    // Both references must already carry the enhancement-layer geometry
-    // (§O.1.2 SNR-scalability); §O.6 upsample of a smaller reference
-    // layer is a separate, not-yet-staged step.
-    for r in [forward_ref, upward_ref] {
-        if r.luma_width != luma_w || r.luma_height != luma_h {
-            return Err(Error::BadScalabilityReferenceGeometry);
-        }
+    // The same-layer forward reference is always at the enhancement
+    // geometry (§O.4). The upward (reference-layer) source is at this
+    // geometry for SNR scalability (§O.1.2), or a factor-of-two smaller
+    // for spatial scalability (§O.1.3) — in which case it is §O.6
+    // up-sampled to the enhancement geometry before prediction.
+    if forward_ref.luma_width != luma_w || forward_ref.luma_height != luma_h {
+        return Err(Error::BadScalabilityReferenceGeometry);
     }
+    let upward_upsampled = upsample_reference_to(upward_ref, luma_w, luma_h)?;
+    let upward_ref: &YuvFrame = upward_upsampled.as_ref().unwrap_or(upward_ref);
 
     let mut frame = YuvFrame {
         y: vec![0u8; luma_w * luma_h],
@@ -7684,6 +7747,75 @@ mod tests {
         assert_eq!(outcome.frame.y, reference.y, "luma copied verbatim");
         assert_eq!(outcome.frame.cb, reference.cb, "Cb copied verbatim");
         assert_eq!(outcome.frame.cr, reference.cr, "Cr copied verbatim");
+    }
+
+    /// §O.1.3 / §O.6 spatial scalability: an all-upward-skipped QCIF
+    /// EI-picture whose reference layer is a factor-of-two-smaller
+    /// (88×72) picture must reconstruct to the §O.6 **2-D-upsampled**
+    /// reference (every macroblock is the upsampled co-located block).
+    /// This exercises the previously-refused spatial-scalability path.
+    #[test]
+    fn ei_spatial_scalability_upsamples_half_size_reference() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_ei_header(&mut w);
+        w.write_u32(8, SQUANT_BITS);
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(true); // Upward skipped
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        // Half-QCIF reference layer (88×72 luma, 44×36 chroma) with
+        // deterministic, non-uniform content.
+        let (rw, rh, rcw, rch) = (88usize, 72usize, 44usize, 36usize);
+        let mut ry = vec![0u8; rw * rh];
+        for (i, p) in ry.iter_mut().enumerate() {
+            *p = ((i * 7 + 3) % 251) as u8;
+        }
+        let mut rcb = vec![0u8; rcw * rch];
+        for (i, p) in rcb.iter_mut().enumerate() {
+            *p = ((i * 5 + 11) % 239) as u8;
+        }
+        let mut rcr = vec![0u8; rcw * rch];
+        for (i, p) in rcr.iter_mut().enumerate() {
+            *p = ((i * 9 + 17) % 233) as u8;
+        }
+        let reference = YuvFrame {
+            y: ry.clone(),
+            cb: rcb.clone(),
+            cr: rcr.clone(),
+            luma_width: rw,
+            luma_height: rh,
+        };
+
+        let outcome = decode_picture_layer_with_inherited(
+            &data,
+            Some(&reference),
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("decode spatial-scalability EI");
+
+        assert_eq!(outcome.frame.luma_width, 176);
+        assert_eq!(outcome.frame.luma_height, 144);
+        // The reconstructed picture is the §O.6 2-D upsample of the
+        // reference (the upward-skipped copy of the upsampled layer).
+        let exp_y = crate::scal_upsample::upsample_plane_2d(&ry, rw, rh);
+        let exp_cb = crate::scal_upsample::upsample_plane_2d(&rcb, rcw, rch);
+        let exp_cr = crate::scal_upsample::upsample_plane_2d(&rcr, rcw, rch);
+        assert_eq!(outcome.frame.y, exp_y, "luma is the §O.6 upsample");
+        assert_eq!(outcome.frame.cb, exp_cb, "Cb is the §O.6 upsample");
+        assert_eq!(outcome.frame.cr, exp_cr, "Cr is the §O.6 upsample");
     }
 
     /// An EI-picture whose macroblocks are coded as Upward with no

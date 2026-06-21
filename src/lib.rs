@@ -230,6 +230,7 @@ pub mod picture_header;
 pub mod plus_ptype;
 pub mod rru_filter;
 pub mod rru_upsample;
+pub mod scal_upsample;
 pub mod scalability;
 pub mod slice_header;
 
@@ -295,6 +296,9 @@ pub use rru_filter::{
 };
 pub use rru_upsample::{
     upsample_prediction_error, RRU_IN_DIM, RRU_IN_LEN, RRU_OUT_DIM, RRU_OUT_LEN,
+};
+pub use scal_upsample::{
+    upsample_plane_1d_horizontal, upsample_plane_1d_vertical, upsample_plane_2d,
 };
 pub use slice_header::{
     parse_first_slice_header, parse_slice_layer, skip_sstuf, skip_sstuf_at, ssbi_to_subbitstream,
