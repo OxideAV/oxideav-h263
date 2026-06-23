@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **H.263+ (PLUSPTYPE) elementary streams now decode through
+  `decode_sequence`** (round 362): the multi-picture demuxer detects the
+  §5.1.3 extended-PTYPE source-format selector (`"111"`) per picture and
+  routes extended pictures through `decode_picture_layer_with_inherited`,
+  threading the §5.1.4.4 / §5.1.4.5 inherited extended-mode state forward
+  (a baseline picture resets it). Baseline pictures keep the §5.2.2
+  GOB-0-elided path. Three new end-to-end conformance fixtures
+  (`tests/fixtures/{qp-high,qp-low,h263p-modern}`) decode within the
+  Annex A.7 ±1 IDCT tolerance, with their reference-YUV SHA-256s guarded
+  against corruption.
+- **§5.1.19 PQUANT + §5.2.2 GOB-0 header elision on the extended
+  GOB / RPS decode paths** (round 362): `decode_picture_layer` (GOB
+  branch) and `decode_picture_layer_rps` now read the picture-layer
+  PQUANT that follows the PLUSPTYPE / CPFMT / RPRP block (Figure 6
+  part 1) and the §5.1.24 PEI / §5.1.25 PSUPP loop, then decode the
+  header-less group-number-0 GOB at QUANT = PQUANT — matching the wire a
+  real H.263+ encoder emits (it omits the GOB-0 header). The synthetic
+  PLUSPTYPE test buffers were updated to the spec-conformant layout
+  (PQUANT after CPM, GOB 0 elided).
+- **Custom Picture Clock Frequency (§5.1.7 / §5.1.8) no longer refused**
+  on the PLUSPTYPE decode path (round 362): CPCFC + ETR are fully framed
+  by the picture-layer parser and their semantics are timing-only — the
+  wider temporal reference feeds only §G.4 PB-frame scaling and Annex N
+  reference selection, neither reachable on the GOB / slice decode path —
+  so a custom-PCF picture decodes to the same pixels as a standard-PCF
+  one.
+
 - Annex N **Reference Picture Selection (RPS)** forward-channel decode
   (round 347): new `annex_n` module + `decode_picture_layer_rps` entry
   decode an RPS ("NEWPRED") stream that predicts each picture from a

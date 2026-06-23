@@ -45,9 +45,20 @@ planar 4:2:0 `YuvFrame`:
   (the reference encoder for the standard formats) decode correctly
   (CPM = "1" refused).
 * **Elementary-stream demux** — `decode_sequence` splits a multi-picture
-  baseline stream on byte-aligned Picture Start Codes (§5.1.1 /
-  §5.1.28), decoding each picture and threading the reconstructed frame
-  forward as the INTER reference for the next.
+  stream on byte-aligned Picture Start Codes (§5.1.1 / §5.1.28),
+  decoding each picture and threading the reconstructed frame forward as
+  the INTER reference for the next. It dispatches per picture on the
+  §5.1.3 source-format selector: a baseline-PTYPE picture takes the
+  §5.2.2 GOB-0-elided path, an extended-PTYPE (PLUSPTYPE / H.263+)
+  picture routes through the full PLUSPTYPE driver (H.263+ Annex modes,
+  slice-structured layout, reference resampling) while the §5.1.4.4 /
+  §5.1.4.5 inherited extended-mode snapshot threads forward (a baseline
+  picture resets it). The extended GOB and Annex N RPS paths read the
+  §5.1.19 PQUANT that follows the PLUSPTYPE / CPFMT / RPRP block and
+  elide the group-number-0 GOB header (§5.2.2), so the H.263+ wire a
+  real encoder emits decodes end-to-end. Custom Picture Clock Frequency
+  (§5.1.7 / §5.1.8) is accepted (CPCFC / ETR are framed but timing-only,
+  with no effect on reconstructed pixels).
 * **Macroblock layer (§5.3)** — COD, MCBPC (Tables 7 / 8), CBPY
   (Table 12), DQUANT, and MVD / MVD2-4 (Table 14).
 * **Block layer (§5.4)** — INTRADC 8-bit FLC (Table 15) and TCOEF
@@ -251,8 +262,10 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   every GOB, including the topmost, to carry a header on the wire). The
   spec-conformant §5.2.2 elision is available through the dedicated
   `decode_picture_no_gob0_header` baseline entry point.
-* Multi-picture sequence demuxing (PSC scanning / reference management
-  across a stream stays caller-side).
+* Multi-picture sequence demuxing for the legacy per-layer baseline
+  drivers (`decode_picture` / PB / Annex-K-slice) — those stay
+  caller-side. The `decode_sequence` driver handles both baseline-PTYPE
+  and extended-PTYPE (PLUSPTYPE / H.263+) INTRA / INTER picture streams.
 * Annex N (Reference Picture Selection) **back-channel**: the
   §5.1.17 / §N.4.2 Back-Channel Message (videomux BCM ACK/NACK) is not
   staged — it flows decoder → encoder on a separate logical channel and
@@ -295,8 +308,11 @@ tests.
 
 `tests/fixture_decode.rs` adds end-to-end **conformance** tests against
 real H.263 elementary streams (the reference encoder) vendored under
-`tests/fixtures/`: sub-QCIF / QCIF / CIF I-only and a QCIF I+P+P
-sequence. Because §6.2 leaves the inverse-transform arithmetic undefined
+`tests/fixtures/`: sub-QCIF / QCIF / CIF I-only, a QCIF I+P+P sequence,
+the QP=2 / QP=31 quantiser-boundary keyframes, and an H.263+ (PLUSPTYPE)
+QCIF I+P+P stream (`h263p-modern`) that exercises the `decode_sequence`
+extended-PTYPE dispatch + custom-PCF framing + GOB-0 elision.
+Because §6.2 leaves the inverse-transform arithmetic undefined
 and Annex A.7 only bounds the per-pixel peak error at 1, AC-bearing
 output is asserted within that ±1 tolerance; the flat sub-QCIF keyframe
 (no AC) is checked byte-exact plus a SHA-256 of its reference plane.

@@ -140,6 +140,46 @@ fn qcif_i_then_p_frames_within_idct_tolerance() {
     assert_eq!(got.len(), 3 * (176 * 144 + 2 * (88 * 72)));
 }
 
+#[test]
+fn qcif_qp_high_i_only_within_idct_tolerance() {
+    // Baseline H.263 QCIF keyframe at PQUANT=31 (the maximum quantiser).
+    // Exercises the §5.4.2.2 inverse-quant `2*QP+1` / `2*QP` parity at the
+    // upper QP boundary where AC coefficients are most heavily attenuated.
+    let (input, expected) = fixture!("qp-high");
+    let got = decode_all(input);
+    assert_within_idct_tolerance("qp-high", &got, expected);
+    assert_eq!(got.len(), 176 * 144 + 2 * (88 * 72));
+}
+
+#[test]
+fn qcif_qp_low_i_only_within_idct_tolerance() {
+    // Baseline H.263 QCIF keyframe at PQUANT=2 (the minimum quantiser):
+    // near-lossless coding, the largest fixture in the corpus. A decoder
+    // that mis-implements de-quantisation diverges most visibly here.
+    let (input, expected) = fixture!("qp-low");
+    let got = decode_all(input);
+    assert_within_idct_tolerance("qp-low", &got, expected);
+    assert_eq!(got.len(), 176 * 144 + 2 * (88 * 72));
+}
+
+#[test]
+fn h263p_modern_plusptype_within_idct_tolerance() {
+    // H.263+ (1998) baseline picture-header form: PTYPE source-format =
+    // "111" selects the extended PLUSPTYPE header, with every Annex bit
+    // cleared except the H.263+ default custom-PCF. Exercises the
+    // `decode_sequence` PLUSPTYPE dispatch (extended-header detection +
+    // §5.1.4.4 inherited-state threading), the §5.1.7 / §5.1.8 CPCFC / ETR
+    // framing, and the §5.2.2 GOB-0-header elision on the extended GOB
+    // driver. The stream is one I-frame followed by two P-frames at QCIF.
+    let (input, expected) = fixture!("h263p-modern");
+    let frames =
+        decode_sequence(input, DecodeOptions::default()).expect("decode_sequence h263p-modern");
+    assert_eq!(frames.len(), 3, "h263p-modern is I + P + P");
+    let got = decode_all(input);
+    assert_within_idct_tolerance("h263p-modern", &got, expected);
+    assert_eq!(got.len(), 3 * (176 * 144 + 2 * (88 * 72)));
+}
+
 // --- minimal SHA-256 (FIPS 180-4), test-only, no external crate ---
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -241,6 +281,39 @@ fn sha256(data: &[u8]) -> [u8; 32] {
         out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     out
+}
+
+#[test]
+fn vendored_fixture_expected_yuv_sha256() {
+    // Guard the newly-vendored reference YUVs against silent corruption,
+    // the same way `tiny_sqcif_matches_recorded_sha256` does. The digests
+    // are the ones recorded in each fixture's docs notes.md.
+    for (name, want) in [
+        (
+            "qp-high",
+            "1c8b87565eba7c92153b63cd9a0eaa7c0b5d5d532519b5bc7cb7c1ce351af10c",
+        ),
+        (
+            "qp-low",
+            "963c0243f04890c22c4aee11ed373fbebd35192e0ed7d6bd6cf1cb38c5873ede",
+        ),
+        (
+            "h263p-modern",
+            "7418cf95376076df42caef4294262da252d02f85205a864abd62d16ff6b36a78",
+        ),
+    ] {
+        let expected: &[u8] = match name {
+            "qp-high" => fixture!("qp-high").1,
+            "qp-low" => fixture!("qp-low").1,
+            "h263p-modern" => fixture!("h263p-modern").1,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            sha256_hex(expected),
+            want,
+            "{name} expected.yuv SHA-256 mismatch — vendored fixture corrupted?"
+        );
+    }
 }
 
 #[test]

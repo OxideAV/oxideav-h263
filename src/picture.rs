@@ -839,6 +839,12 @@ fn find_next_psc(data: &[u8], from: usize) -> Option<usize> {
 pub fn decode_sequence(data: &[u8], options: DecodeOptions) -> Result<Vec<YuvFrame>> {
     let first = find_next_psc(data, 0).ok_or(Error::BadPictureStartCode)?;
     let mut frames: Vec<YuvFrame> = Vec::new();
+    // §5.1.4.4 / §5.1.4.5 — the inherited extended-mode state threaded from
+    // one PLUSPTYPE picture to the next so a UFEP="000" picture can inherit
+    // its OPPTYPE mode set + source-format from the prior UFEP="001"
+    // picture. A baseline-PTYPE picture resets this to the spec default
+    // (rule 3), which the extended driver already returns on its outcome.
+    let mut inherited = InheritedExtendedState::default();
     let mut start = first;
     loop {
         // The picture spans from its PSC to the next PSC (exclusive), or
@@ -847,7 +853,23 @@ pub fn decode_sequence(data: &[u8], options: DecodeOptions) -> Result<Vec<YuvFra
         let end = next.unwrap_or(data.len());
         let picture = &data[start..end];
         let reference = frames.last();
-        let frame = decode_picture_no_gob0_header(picture, reference, options)?;
+        // §5.1.3 PTYPE bits 6-8 = "111" selects the extended (PLUSPTYPE)
+        // header form. Baseline-PTYPE pictures take the §5.2.2 GOB-0-elided
+        // path; extended-PTYPE pictures route through the full PLUSPTYPE
+        // driver (which handles the H.263+ Annex modes, slice-structured
+        // layout, and reference resampling) and thread the §5.1.4.4
+        // inherited-state snapshot forward.
+        let frame = if picture_header_is_extended(picture)? {
+            let outcome =
+                decode_picture_layer_with_inherited(picture, reference, options, inherited)?;
+            inherited = outcome.inherited;
+            outcome.frame
+        } else {
+            // A non-PLUSPTYPE picture clears the inherited mode state
+            // (§5.1.4.5 rule 3) for any following UFEP="000" picture.
+            inherited = InheritedExtendedState::default();
+            decode_picture_no_gob0_header(picture, reference, options)?
+        };
         frames.push(frame);
         match next {
             Some(n) => start = n,
@@ -855,6 +877,36 @@ pub fn decode_sequence(data: &[u8], options: DecodeOptions) -> Result<Vec<YuvFra
         }
     }
     Ok(frames)
+}
+
+/// Peek whether the picture beginning at `data`'s Picture Start Code uses
+/// the extended (PLUSPTYPE) header form — PTYPE bits 6-8 = `"111"`
+/// (§5.1.3).
+///
+/// The first eight PTYPE-region fields are fixed-width, so the
+/// source-format selector sits at a constant bit offset from the PSC:
+/// PSC (22) + Temporal Reference (8) + PTYPE bits 1-5 (5) = 35 bits, then
+/// the 3-bit source-format field. This reads those 38 bits without
+/// consuming the picture, so the caller can route to the baseline or
+/// extended driver before the real parse.
+///
+/// # Errors
+///
+/// * [`Error::BadPictureStartCode`] if `data` does not begin with a PSC.
+/// * [`Error::UnexpectedEof`] if the buffer is shorter than the 38-bit
+///   prefix.
+fn picture_header_is_extended(data: &[u8]) -> Result<bool> {
+    let mut reader = BitReader::new(data);
+    let psc = reader
+        .read_u32(PSC_BITS)
+        .map_err(|_| Error::UnexpectedEof)?;
+    if psc != PSC_VALUE {
+        return Err(Error::BadPictureStartCode);
+    }
+    // Temporal Reference (8) + PTYPE bits 1-5 (5) precede the source format.
+    reader.skip(8 + 5).map_err(|_| Error::UnexpectedEof)?;
+    let source_format = reader.read_u32(3).map_err(|_| Error::UnexpectedEof)?;
+    Ok(source_format == 0b111)
 }
 
 /// Decode a single H.263 picture from `data`, dispatching on the
@@ -1104,15 +1156,34 @@ pub fn decode_picture_layer_with_inherited(
                     effective_ref,
                     shim_options,
                 )?,
-                None => decode_after_picture_header(
-                    &mut reader,
-                    &header,
-                    &layout,
-                    effective_ref,
-                    shim_options,
-                    None,
-                    None,
-                )?,
+                None => {
+                    // §5.1.19 — PQUANT (5 bits). With PLUSPTYPE present the
+                    // field order (Figure 6 part 1) places PQUANT
+                    // immediately after the PLUSPTYPE / CPFMT block (CPM is
+                    // part of that block and already parsed; the RPS / RPR
+                    // fields between are refused by the shim). It primes the
+                    // QUANT for the header-less first GOB (§5.2.2: group
+                    // number 0 carries no GOB header) until a later GOB's
+                    // GQUANT takes over.
+                    let pquant = reader.read_u32(5).map_err(|_| Error::UnexpectedEof)? as u8;
+                    if pquant == 0 || pquant > 31 {
+                        return Err(Error::InvalidQuantiser);
+                    }
+                    // §5.1.24 / §5.1.25 — PEI + PSUPP extension loop. A
+                    // decoder without the Annex L supplemental-enhancement
+                    // capability discards PSUPP; consume the loop to leave
+                    // the reader on the first bit of GOB-0 macroblock data.
+                    skip_pei_psupp(&mut reader)?;
+                    decode_after_picture_header(
+                        &mut reader,
+                        &header,
+                        &layout,
+                        effective_ref,
+                        shim_options,
+                        None,
+                        Some(pquant),
+                    )?
+                }
             };
             Ok(DecodePictureOutcome {
                 frame,
@@ -1213,15 +1284,25 @@ pub fn decode_picture_layer_rps(
             reference,
             shim_options,
         )?,
-        None => decode_after_picture_header(
-            &mut reader,
-            &header,
-            &layout,
-            reference,
-            shim_options,
-            None,
-            None,
-        )?,
+        None => {
+            // §5.1.19 PQUANT (after the PLUSPTYPE / RPS fields, which
+            // `parse_picture_layer` has consumed) + §5.1.24 PEI loop, then
+            // the §5.2.2 GOB-0-elided GOB driver.
+            let pquant = reader.read_u32(5).map_err(|_| Error::UnexpectedEof)? as u8;
+            if pquant == 0 || pquant > 31 {
+                return Err(Error::InvalidQuantiser);
+            }
+            skip_pei_psupp(&mut reader)?;
+            decode_after_picture_header(
+                &mut reader,
+                &header,
+                &layout,
+                reference,
+                shim_options,
+                None,
+                Some(pquant),
+            )?
+        }
     };
 
     // §N.5 — store the correctly-decoded anchor under its TR for use as
@@ -2016,7 +2097,9 @@ fn plus_ptype_to_baseline_shim(
     // unless the caller has explicitly supplied state.
     let (
         source_format_plus,
-        opptype_custom_pcf,
+        // Custom-PCF is parsed but does not gate decode (timing-only, see
+        // the refusal block below); kept named for the OPPTYPE tuple shape.
+        _opptype_custom_pcf,
         opptype_umv,
         opptype_advanced_prediction,
         opptype_advanced_intra,
@@ -2077,10 +2160,17 @@ fn plus_ptype_to_baseline_shim(
     // single-picture entry refuses RPS-on rather than silently decode
     // against the wrong reference. Detect RPS-on from the parsed header
     // fields (TRPI is present iff RPS is in use, regardless of UFEP).
+    // §5.1.7 / §5.1.8 — Custom Picture Clock Frequency is **not** refused:
+    // the CPCFC (frame-rate divisor) and ETR (extended temporal-reference
+    // MSBs) fields are fully framed by `parse_plus_ptype`, and their
+    // §5.1.7 / §5.1.8 semantics are timing-only — they do not alter the
+    // macroblock-layer reconstruction. The wider temporal reference only
+    // feeds §G.4 PB-frame scaling and the Annex N reference selection,
+    // neither of which is reachable on this GOB / slice decode path. So a
+    // custom-PCF picture decodes to the same pixels as a standard-PCF one.
     let rps_in_use = extended.plus.trpi.is_some();
     if opptype_sac
         || opptype_independent_segment_decoding
-        || opptype_custom_pcf
         || extended.plus.cpm
         || extended.plus.mpptype.reduced_resolution_update
         || (rps_in_use && !allow_rps)
@@ -7628,6 +7718,23 @@ mod tests {
         w.write_bit(true); // SCE-guard
                            // §5.1.20 — CPM = 0.
         w.write_bit(false);
+        // §5.1.19 PQUANT (QUANT = 8) + §5.1.24 PEI = "0". On the PLUSPTYPE
+        // wire these follow the CPM bit (Figure 6 part 1); the GOB-layer
+        // driver reads PQUANT as the header-less GOB-0 quantiser (§5.2.2).
+        write_plus_pquant_pei(w, 8);
+    }
+
+    /// Append the §5.1.19 PQUANT (5 bits) + §5.1.24 PEI = "0" fields that
+    /// follow the §5.1.20 CPM bit (and any §5.1.5 CPFMT / §5.1.18 RPRP
+    /// payload) on the PLUSPTYPE wire (Figure 6 part 1). The GOB-layer
+    /// driver reads PQUANT as the header-less GOB-0 quantiser (§5.2.2) and
+    /// consumes the PEI/PSUPP loop before the first macroblock. `pquant`
+    /// must equal the QUANT the builder's GOB-0 macroblock body expects,
+    /// since GOB 0 carries no GQUANT header to override it.
+    #[cfg(test)]
+    fn write_plus_pquant_pei(w: &mut BitWriter, pquant: u32) {
+        w.write_u32(pquant, 5); // §5.1.19 PQUANT
+        w.write_bit(false); // §5.1.24 PEI = "0"
     }
 
     /// Write a QCIF PLUSPTYPE **EI-picture** header (UFEP=001, RPS off),
@@ -8711,6 +8818,7 @@ mod tests {
         w.write_bit(true); // SCE-guard
                            // §5.1.20 — CPM = 0.
         w.write_bit(false);
+        write_plus_pquant_pei(w, 8);
     }
 
     /// Append an Annex S INTER macroblock to `w`: MVD = (0, 0), MCBPC
@@ -8761,10 +8869,13 @@ mod tests {
         let mut w = BitWriter::new();
         write_plus_qcif_inter_aiv_header(&mut w);
         for gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(8, GQUANT_BITS);
+            // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT).
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
             for mb in 0..11 {
                 if gob == 0 && mb == 0 {
                     write_inter_annex_s_mb(&mut w);
@@ -8840,6 +8951,7 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
         w.write_bit(false); // CPM = 0
+        write_plus_pquant_pei(w, 8);
     }
 
     /// Write a QCIF PLUSPTYPE INTER-picture header with the §5.1.4.3 RPR
@@ -8889,6 +9001,7 @@ mod tests {
         }
         // §P.2.3 FILL_MODE (2 bits).
         w.write_u32(fill_bits, 2);
+        write_plus_pquant_pei(w, 8);
     }
 
     /// Annex P §P.2 explicit Reference Picture Resampling end-to-end:
@@ -8924,11 +9037,14 @@ mod tests {
         let mut w = BitWriter::new();
         // WDA = "11" (1/16-pixel), fill = "11" (clip).
         write_plus_qcif_inter_rpr_header(&mut w, 0b11, 0b11);
-        for _gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(8, GQUANT_BITS);
+        for gob in 0..9 {
+            // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT = 8).
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
             for _mb in 0..11 {
                 write_skipped_mb(&mut w);
             }
@@ -8994,11 +9110,15 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
         w.write_bit(false); // CPM = 0
-        for _gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(8, GQUANT_BITS);
+        write_plus_pquant_pei(&mut w, 8);
+        for gob in 0..9 {
+            // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT).
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
             for _mb in 0..11 {
                 w.write_bit(true); // MCBPC INTRA, cbpc 00
                 w.write_u32(0b0011, 4); // CBPY(INTRA) "0000"
@@ -9060,11 +9180,16 @@ mod tests {
         // §5.1.16 BCI = "01" (no back-channel message follows).
         w.write_bit(false);
         w.write_bit(true);
-        for _gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(8, GQUANT_BITS);
+        // §5.1.19 PQUANT = 8 (matches GOB-0 QUANT) + §5.1.24 PEI.
+        write_plus_pquant_pei(&mut w, 8);
+        for gob in 0..9 {
+            // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT = 8).
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
             for _mb in 0..11 {
                 write_skipped_mb(&mut w);
             }
@@ -9178,11 +9303,14 @@ mod tests {
 
         let mut w = BitWriter::new();
         write_plus_qcif_inter_header(&mut w, /* rtype */ false);
-        for _gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(8, GQUANT_BITS);
+        for gob in 0..9 {
+            // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT = 8).
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
             for _mb in 0..11 {
                 write_skipped_mb(&mut w);
             }
@@ -9236,11 +9364,17 @@ mod tests {
         let mut w = BitWriter::new();
         write_plus_qcif_intra_header(&mut w, advanced_intra, deblocking, false);
 
-        for _gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(8, GQUANT_BITS);
+        for gob in 0..9 {
+            // §5.2.2 — group number 0 carries no GOB header (its QUANT is
+            // the picture-layer PQUANT written by the header above);
+            // GOBs 1..8 carry a GBSC + GN + GFID + GQUANT header at the
+            // same QUANT = 8 so the reconstruction is identical.
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
             for _mb in 0..11 {
                 // MCBPC = `011` (Table 7 idx 3 — INTRA + CBPC = "11").
                 w.write_u32(0b011, 3);
@@ -9304,11 +9438,14 @@ mod tests {
         // INTRADC FLC + AC TCOEF.
         let mut w = BitWriter::new();
         write_plus_qcif_intra_header(&mut w, false, false, false);
-        for _gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(8, GQUANT_BITS);
+        for gob in 0..9 {
+            // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT).
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
             for _mb in 0..11 {
                 // MCBPC = `1` → I-picture INTRA, CBPC = `00`.
                 w.write_bit(true);
@@ -9897,6 +10034,7 @@ mod tests {
         w.write_u32(phi, 9);
         // CPCFC / ETR / UUI / SSS / EPAR are all absent in this
         // configuration (custom_pcf=0, UMV=0, SS=0, PAR != "1111").
+        write_plus_pquant_pei(w, 8);
     }
 
     /// Build a 176×144 (QCIF-sized) PLUSPTYPE INTRA picture using the
@@ -9908,11 +10046,14 @@ mod tests {
     fn build_custom_176x144_intra_dc_picture(dc_byte: u32) -> Vec<u8> {
         let mut w = BitWriter::new();
         write_plus_custom_intra_header(&mut w, 176, 144);
-        for _gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(8, GQUANT_BITS);
+        for gob in 0..9 {
+            // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT).
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
             for _mb in 0..11 {
                 // MCBPC = `1` → I-picture INTRA, CBPC = 00.
                 w.write_bit(true);
@@ -10104,12 +10245,17 @@ mod tests {
         // CPM = 0.
         w.write_bit(false);
         // No CPFMT / EPAR / CPCFC / ETR / UUI / SSS on UFEP=000.
+        // §5.1.19 PQUANT = 8 (matches GOB-0 QUANT) + §5.1.24 PEI, then
         // 9 GOBs × 11 MBs, each MB an INTRA-DC=128 baseline MB.
-        for _gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(8, GQUANT_BITS);
+        write_plus_pquant_pei(&mut w, 8);
+        for gob in 0..9 {
+            // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT = 8).
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
             for _mb in 0..11 {
                 w.write_bit(true); // MCBPC = "1"
                 w.write_bit(false); // CBPY = "0011"
@@ -10245,12 +10391,16 @@ mod tests {
                             // No CPFMT / EPAR / CPCFC / ETR / UUI / SSS — those are
                             // UFEP=001-only or gated off in this configuration.
                             //
-                            // 9 GOBs × 11 MBs.
-        for _gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(8, GQUANT_BITS);
+                            // §5.1.19 PQUANT = 8 + §5.1.24 PEI, then 9 GOBs × 11 MBs.
+        write_plus_pquant_pei(&mut w, 8);
+        for gob in 0..9 {
+            // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT = 8).
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
             for _mb in 0..11 {
                 if aic_in_body {
                     // MCBPC = `011` (Table 7 idx 3 — INTRA + CBPC = "11").
@@ -11179,6 +11329,9 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
         w.write_bit(false); // CPM
+                            // §5.1.19 PQUANT + §5.1.24 PEI are written by the caller (the MQ
+                            // bodies use varying GOB-0 QUANT — 16 / 8 / 4 — so the builder
+                            // supplies the matching PQUANT after this header).
     }
 
     /// Body shared by the §T.3 MQ-on/MQ-off comparison: a QCIF INTRA
@@ -11187,11 +11340,16 @@ mod tests {
     /// is used so the wire bytes are identical regardless of MQ, leaving
     /// the §T.3 chrominance QUANT_C the only decode-time difference.
     fn write_mq_chroma_ac_body(w: &mut BitWriter) {
-        for _gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(16, GQUANT_BITS); // QUANT = 16 → QUANT_C = 12
+        // §5.1.19 PQUANT = 16 (matches the GOB-0 QUANT) + §5.1.24 PEI.
+        write_plus_pquant_pei(w, 16);
+        for gob in 0..9 {
+            // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT = 16).
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(16, GQUANT_BITS); // QUANT = 16 → QUANT_C = 12
+            }
             for _mb in 0..11 {
                 // MCBPC = `011` (Table 7 idx 3 — INTRA, CBPC = "11").
                 w.write_u32(0b011, 3);
@@ -11300,13 +11458,18 @@ mod tests {
         let build = |with_extended: bool| -> Vec<u8> {
             let mut w = BitWriter::new();
             write_plus_qcif_intra_header_mq(&mut w, /* mq */ true, /* aic */ false);
-            for _gob in 0..9 {
-                w.write_u32(GBSC_VALUE, GBSC_BITS);
-                w.write_u32(1, GN_BITS);
-                w.write_u32(0, GFID_BITS);
-                // QUANT = 4 → QUANT_C = 4 (< 8, the §T.5 condition under
-                // which EXTENDED-ESCAPE is valid).
-                w.write_u32(4, GQUANT_BITS);
+            // §5.1.19 PQUANT = 4 (matches GOB-0 QUANT) + §5.1.24 PEI.
+            write_plus_pquant_pei(&mut w, 4);
+            for gob in 0..9 {
+                // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT = 4).
+                if gob != 0 {
+                    w.write_u32(GBSC_VALUE, GBSC_BITS);
+                    w.write_u32(gob, GN_BITS);
+                    w.write_u32(0, GFID_BITS);
+                    // QUANT = 4 → QUANT_C = 4 (< 8, the §T.5 condition
+                    // under which EXTENDED-ESCAPE is valid).
+                    w.write_u32(4, GQUANT_BITS);
+                }
                 for _mb in 0..11 {
                     w.write_u32(0b011, 3); // MCBPC INTRA CBPC "11"
                     w.write_u32(0b0011, 4); // CBPY(INTRA) "0000"
@@ -11365,11 +11528,16 @@ mod tests {
     fn decode_picture_layer_plus_mq_t2_dquant_decodes() {
         let mut w = BitWriter::new();
         write_plus_qcif_intra_header_mq(&mut w, /* mq */ true, /* aic */ false);
-        for _gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(8, GQUANT_BITS); // QUANT = 8
+        // §5.1.19 PQUANT = 8 (matches GOB-0 QUANT) + §5.1.24 PEI.
+        write_plus_pquant_pei(&mut w, 8);
+        for gob in 0..9 {
+            // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT = 8).
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS); // QUANT = 8
+            }
             for mb in 0..11 {
                 if mb == 0 {
                     // MCBPC = INTRA+Q (Table 7 idx 4) → code "0001".
@@ -11409,11 +11577,16 @@ mod tests {
     /// QUANT=16 → QUANT_C=12 dequantises the chroma AC differently
     /// while the luma AIC blocks always use QUANT.
     fn write_mq_aic_chroma_ac_body(w: &mut BitWriter) {
-        for _gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(16, GQUANT_BITS); // QUANT = 16 → QUANT_C = 12
+        // §5.1.19 PQUANT = 16 (matches the GOB-0 QUANT) + §5.1.24 PEI.
+        write_plus_pquant_pei(w, 16);
+        for gob in 0..9 {
+            // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT = 16).
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(16, GQUANT_BITS); // QUANT = 16 → QUANT_C = 12
+            }
             for _mb in 0..11 {
                 // MCBPC = `011` (Table 7 idx 3 — INTRA, CBPC = "11" so
                 // both chroma blocks carry coefficients).
@@ -11509,13 +11682,18 @@ mod tests {
         let build = |with_extended: bool| -> Vec<u8> {
             let mut w = BitWriter::new();
             write_plus_qcif_intra_header_mq(&mut w, /* mq */ true, /* aic */ true);
-            for _gob in 0..9 {
-                w.write_u32(GBSC_VALUE, GBSC_BITS);
-                w.write_u32(1, GN_BITS);
-                w.write_u32(0, GFID_BITS);
-                // QUANT = 4 → QUANT_C = 4 (< 8, the §T.5 condition under
-                // which EXTENDED-ESCAPE is valid).
-                w.write_u32(4, GQUANT_BITS);
+            // §5.1.19 PQUANT = 4 (matches GOB-0 QUANT) + §5.1.24 PEI.
+            write_plus_pquant_pei(&mut w, 4);
+            for gob in 0..9 {
+                // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT = 4).
+                if gob != 0 {
+                    w.write_u32(GBSC_VALUE, GBSC_BITS);
+                    w.write_u32(gob, GN_BITS);
+                    w.write_u32(0, GFID_BITS);
+                    // QUANT = 4 → QUANT_C = 4 (< 8, the §T.5 condition
+                    // under which EXTENDED-ESCAPE is valid).
+                    w.write_u32(4, GQUANT_BITS);
+                }
                 for _mb in 0..11 {
                     w.write_u32(0b011, 3); // MCBPC INTRA CBPC "11"
                     w.write_bit(false); // INTRA_MODE 0 (DcOnly)
