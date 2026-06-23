@@ -107,18 +107,22 @@ planar 4:2:0 `YuvFrame`:
   tables share one codeword inventory so the re-decode consumes the same
   bits); and, when both chrominance blocks of an INTER macroblock carry
   coefficients (`CBPC5 = CBPC6 = 1`), the CBPY codeword is the Table 12
-  INTRA pattern (no INTER complement, §S.3). Wired into the baseline
-  single-MV INTER path and auto-activated from the PLUSPTYPE OPPTYPE
-  bit 13; refused when combined with Advanced Prediction / INTER4V,
-  PB-frames, Slice-Structured or Modified Quantization.
+  INTRA pattern (no INTER complement, §S.3). Wired into both the baseline
+  single-MV INTER path and the Annex K Slice-Structured driver (via the
+  shared per-macroblock reconstruction), auto-activated from the
+  PLUSPTYPE OPPTYPE bit 13; refused only when combined with Advanced
+  Prediction / INTER4V or PB-frames. The `alt-inter-vlc` (AIV + AIC + MQ
+  + slice-structured) QCIF I+P+P conformance fixture decodes byte-exact.
 * **Annex T** — Modified Quantization mode: the §T.2 variable-length
   DQUANT parser, the §T.3 chrominance `QUANT_C` step, and the §T.4
   EXTENDED-ESCAPE / EXTENDED-LEVEL extended coefficient range, driving
   an MQ-active picture reconstruction end-to-end for the baseline INTRA
-  / INTER path **and** the Annex I Advanced INTRA Coding path (the
-  §T.3 `QUANT_C` chroma dequant and the §T.5-rule-2 EXTENDED-ESCAPE
-  extension to the Table I.2 VLC both thread through the AIC INTRA
-  reconstruction).
+  / INTER path, the Annex I Advanced INTRA Coding path, **and** the
+  Annex K Slice-Structured driver (the §T.3 `QUANT_C` chroma dequant and
+  the §T.5-rule-2 EXTENDED-ESCAPE extension to the Table I.2 VLC thread
+  through the shared per-macroblock reconstruction on all three). The
+  `advanced-intra-coding` (AIC + MQ + slice-structured) conformance
+  fixture decodes byte-exact.
 * **Annex Q §Q.6** — Reduced-Resolution Update mode prediction-error
   up-sampling: the 8×8 reduced-resolution reconstructed prediction-error
   block is up-sampled to a 16×16 block with the block-closed §Q.6.1

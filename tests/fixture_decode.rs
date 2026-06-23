@@ -198,6 +198,41 @@ fn slice_structured_mode_within_idct_tolerance() {
     assert_eq!(got.len(), 3 * (176 * 144 + 2 * (88 * 72)));
 }
 
+#[test]
+fn advanced_intra_coding_within_idct_tolerance() {
+    // H.263+ Annex I (Advanced Intra Coding) keyframe with Annex T
+    // Modified Quantization implicitly enabled and Annex K slice-structured
+    // layout (FFmpeg's H.263+ encoder pairs these). Exercises the AIC
+    // DC/AC prediction + AIC dc-scale table + §T.3 QUANT_C dequant threaded
+    // through the slice driver. Single QCIF keyframe.
+    let (input, expected) = fixture!("advanced-intra-coding");
+    let frames = decode_sequence(input, DecodeOptions::default())
+        .expect("decode_sequence advanced-intra-coding");
+    assert_eq!(
+        frames.len(),
+        1,
+        "advanced-intra-coding is a single keyframe"
+    );
+    let got = decode_all(input);
+    assert_within_idct_tolerance("advanced-intra-coding", &got, expected);
+    assert_eq!(got.len(), 176 * 144 + 2 * (88 * 72));
+}
+
+#[test]
+fn alt_inter_vlc_within_idct_tolerance() {
+    // H.263+ Annex S (Alternative Inter VLC) on top of Annex I AIC + Annex T
+    // Modified Quantization + Annex K slice-structured mode. Exercises the
+    // §S.2 INTER-VLC re-interpretation + §S.3 CBPY orientation threaded
+    // through the slice driver. QCIF I+P+P.
+    let (input, expected) = fixture!("alt-inter-vlc");
+    let frames =
+        decode_sequence(input, DecodeOptions::default()).expect("decode_sequence alt-inter-vlc");
+    assert_eq!(frames.len(), 3, "alt-inter-vlc is I + P + P");
+    let got = decode_all(input);
+    assert_within_idct_tolerance("alt-inter-vlc", &got, expected);
+    assert_eq!(got.len(), 3 * (176 * 144 + 2 * (88 * 72)));
+}
+
 // --- minimal SHA-256 (FIPS 180-4), test-only, no external crate ---
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -323,12 +358,22 @@ fn vendored_fixture_expected_yuv_sha256() {
             "slice-structured-mode",
             "0633dfd408e39596186b46d5eeca95550840efce77ede281b23a56f3d153f8ac",
         ),
+        (
+            "advanced-intra-coding",
+            "f436bb1f59ed0fe60b15615c6590cccb40ed17af266caf098ac270cfdb9ebef4",
+        ),
+        (
+            "alt-inter-vlc",
+            "7989d00f44949eb5e5dfd19774f569b7a1c32ad931a4efc1127a6a74208c76c0",
+        ),
     ] {
         let expected: &[u8] = match name {
             "qp-high" => fixture!("qp-high").1,
             "qp-low" => fixture!("qp-low").1,
             "h263p-modern" => fixture!("h263p-modern").1,
             "slice-structured-mode" => fixture!("slice-structured-mode").1,
+            "advanced-intra-coding" => fixture!("advanced-intra-coding").1,
+            "alt-inter-vlc" => fixture!("alt-inter-vlc").1,
             _ => unreachable!(),
         };
         assert_eq!(

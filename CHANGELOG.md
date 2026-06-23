@@ -6,6 +6,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Annex T Modified Quantization + Annex S Alternative INTER VLC now
+  thread through the Annex K Slice-Structured driver** (round 362): the
+  slice macroblock walker passes `options.modified_quant` into its
+  `MbContext` and routes the §S.2 / §S.3 Alternative INTER VLC through
+  the shared `decode_one_macroblock`, so the §T.3 QUANT_C chroma step +
+  §T.4 EXTENDED-ESCAPE range and the §S handling apply on slice-walked
+  macroblocks. The PLUSPTYPE shim no longer refuses `MQ + slice` or
+  `AIV + slice` (or `AIV + MQ`). Two new byte-exact conformance fixtures:
+  `advanced-intra-coding` (AIC + MQ + slice, single QCIF keyframe) and
+  `alt-inter-vlc` (AIV + AIC + MQ + slice, QCIF I+P+P), each with a
+  reference-YUV SHA-256 corruption guard.
+
 ### Fixed
 
 - **Annex K Slice-Structured mode now decodes real H.263+ streams**

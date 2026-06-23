@@ -2186,28 +2186,22 @@ fn plus_ptype_to_baseline_shim(
     // Slice-Structured (Annex K) or Modified Quantization (Annex T) is
     // refused rather than silently dropping the §S handling on those
     // blocks.
-    if opptype_alternative_inter_vlc
-        && (opptype_advanced_prediction
-            || opptype_slice_structured
-            || improved_pb
-            || opptype_modified_quantization)
-    {
+    if opptype_alternative_inter_vlc && (opptype_advanced_prediction || improved_pb) {
         return Err(Error::NotImplemented);
     }
 
     // Annex T Modified Quantization (§T.2 / §T.3 / §T.4) is wired into
-    // the baseline GOB-walker macroblock path and the Advanced INTRA
-    // Coding (Annex I) INTRA path: both thread the §T.3 QUANT_C chroma
-    // step and the §T.4 EXTENDED-ESCAPE coefficient range (§T.5 rule 2
-    // extends EXTENDED-ESCAPE to the Table I.2 VLC). The MQ dequant
-    // boundary is not yet threaded through the Advanced Prediction /
-    // INTER4V (Annex F), PB-frame (Annex G / M) or Slice-Structured
-    // (Annex K) reconstruction paths, so MQ combined with any of those
-    // is refused rather than silently dropping the §T.3 / §T.4 handling
-    // on those blocks.
-    if opptype_modified_quantization
-        && (opptype_advanced_prediction || opptype_slice_structured || improved_pb)
-    {
+    // the baseline GOB-walker macroblock path, the Advanced INTRA
+    // Coding (Annex I) INTRA path, and the Annex K Slice-Structured
+    // driver: all thread the §T.3 QUANT_C chroma step and the §T.4
+    // EXTENDED-ESCAPE coefficient range (§T.5 rule 2 extends
+    // EXTENDED-ESCAPE to the Table I.2 VLC) through the shared
+    // `decode_one_macroblock`. The MQ dequant boundary is not yet
+    // threaded through the Advanced Prediction / INTER4V (Annex F) or
+    // PB-frame (Annex G / M) reconstruction paths, so MQ combined with
+    // either of those is refused rather than silently dropping the
+    // §T.3 / §T.4 handling on those blocks.
+    if opptype_modified_quantization && (opptype_advanced_prediction || improved_pb) {
         return Err(Error::NotImplemented);
     }
 
@@ -4621,7 +4615,13 @@ fn decode_slice_structured_after_header(
                         // Annex M MODB form never engages here.
                         pb_annex_m: false,
                         quantiser_before: current_quant,
-                        modified_quant: false,
+                        // Annex T Modified Quantization — §T.2 variable-length
+                        // DQUANT parse threads through the slice-walked
+                        // macroblock the same way it does on the GOB path
+                        // (the §T.3 QUANT_C chroma step + §T.4 EXTENDED-ESCAPE
+                        // are applied in `decode_one_macroblock` via the
+                        // shared `options`).
+                        modified_quant: options.modified_quant,
                     },
                 )?;
                 if matches!(mb.mb_type, Some(MbType::Stuffing)) {
