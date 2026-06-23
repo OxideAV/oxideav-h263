@@ -4556,6 +4556,13 @@ fn decode_slice_structured_after_header(
         return Err(Error::SliceMbaOutOfRange);
     }
 
+    // §5.1.24 / §5.1.25 — PEI + PSUPP extension loop closes the picture
+    // header before the first slice. A decoder without the Annex L
+    // supplemental-enhancement capability discards PSUPP; consume the
+    // loop so the reader lands on the first slice's reduced header
+    // (§K.2.2: SEPB1 + MBA + …) rather than reading the PEI bit as SEPB1.
+    skip_pei_psupp(reader)?;
+
     // Build the §K.2 slice-header context (free-running, CPM / RRU off
     // — both refused by the routing layer).
     let ctx = SliceHeaderContext::from_picture_layout(layout, Some(sss), false, false);
@@ -9707,9 +9714,10 @@ mod tests {
     fn build_qcif_ss_single_slice_intra(dc_byte: u32) -> Vec<u8> {
         let mut w = BitWriter::new();
         write_qcif_ss_intra_header(&mut w);
-        // §5.1.19 — PQUANT (5 bits) = 8.
+        // §5.1.19 — PQUANT (5 bits) = 8, then §5.1.24 PEI = "0".
         w.write_u32(8, SQUANT_BITS);
-        // First slice reduced header: SEPB1=1, MBA=0 (7 bits), SEPB3=1.
+        w.write_bit(false); // PEI
+                            // First slice reduced header: SEPB1=1, MBA=0 (7 bits), SEPB3=1.
         w.write_u32(1, SEPB_BITS);
         w.write_u32(0, 7); // MBA
         w.write_u32(1, SEPB_BITS); // SEPB3
@@ -9759,7 +9767,8 @@ mod tests {
         let mut w = BitWriter::new();
         write_qcif_ss_intra_header(&mut w);
         w.write_u32(8, SQUANT_BITS); // PQUANT = 8
-                                     // Slice 0 reduced header (MBA 0).
+        w.write_bit(false); // §5.1.24 PEI = "0"
+                            // Slice 0 reduced header (MBA 0).
         w.write_u32(1, SEPB_BITS);
         w.write_u32(0, 7);
         w.write_u32(1, SEPB_BITS);
@@ -9817,6 +9826,7 @@ mod tests {
         let mut w = BitWriter::new();
         write_qcif_ss_intra_header(&mut w);
         w.write_u32(8, SQUANT_BITS); // PQUANT
+        w.write_bit(false); // §5.1.24 PEI = "0"
         w.write_u32(1, SEPB_BITS); // slice 0 SEPB1
         w.write_u32(0, 7); // slice 0 MBA = 0
         w.write_u32(1, SEPB_BITS); // SEPB3
@@ -9848,6 +9858,7 @@ mod tests {
         let mut w = BitWriter::new();
         write_qcif_ss_intra_header(&mut w);
         w.write_u32(8, SQUANT_BITS);
+        w.write_bit(false); // §5.1.24 PEI = "0"
         w.write_u32(1, SEPB_BITS);
         w.write_u32(0, 7);
         w.write_u32(1, SEPB_BITS);
@@ -9917,6 +9928,7 @@ mod tests {
         let mut w = BitWriter::new();
         write_qcif_ss_inter_header(&mut w);
         w.write_u32(8, SQUANT_BITS); // PQUANT
+        w.write_bit(false); // §5.1.24 PEI = "0"
         w.write_u32(1, SEPB_BITS); // slice 0 SEPB1
         w.write_u32(0, 7); // MBA 0
         w.write_u32(1, SEPB_BITS); // SEPB3
@@ -9947,6 +9959,7 @@ mod tests {
         let mut w = BitWriter::new();
         write_qcif_ss_inter_header(&mut w);
         w.write_u32(8, SQUANT_BITS); // PQUANT
+        w.write_bit(false); // §5.1.24 PEI = "0"
         w.write_u32(1, SEPB_BITS); // slice 0 SEPB1
         w.write_u32(0, 7); // MBA 0
         w.write_u32(1, SEPB_BITS); // SEPB3

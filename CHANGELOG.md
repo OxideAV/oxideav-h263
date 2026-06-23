@@ -6,6 +6,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Annex K Slice-Structured mode now decodes real H.263+ streams**
+  (round 362): `decode_slice_structured_after_header` was reading the
+  §5.1.24 PEI bit that closes the picture header as the first slice's
+  §K.2.3 SEPB1, failing with `BadSliceEmulationPreventionBit`. The driver
+  now consumes the §5.1.24 PEI / §5.1.25 PSUPP loop after PQUANT and
+  before the first reduced slice header. The vendored
+  `slice-structured-mode` QCIF I+P+P conformance fixture now decodes
+  byte-exact within the Annex A.7 ±1 IDCT tolerance. (The synthetic
+  slice-structured test buffers were updated to write the PEI bit.)
+
 ### Added
 
 - **H.263+ (PLUSPTYPE) elementary streams now decode through

@@ -95,7 +95,10 @@ planar 4:2:0 `YuvFrame`:
 * **Annex K §K.2** — Slice Structured mode: the slice-layer header
   parse (SSC + SEPB1/2/3 + optional SSBI + MBA + SQUANT + optional
   SWI + GFID, plus the first-slice reduced form) and the free-running
-  (non-Rectangular-Slice) end-to-end decode driver.
+  (non-Rectangular-Slice) end-to-end decode driver, including the
+  §5.1.24 PEI / §5.1.25 PSUPP picture-header tail consumed before the
+  first reduced slice header. The `slice-structured-mode` QCIF I+P+P
+  conformance fixture decodes byte-exact within the Annex A.7 tolerance.
 * **Annex S §S.2 / §S.3** — Alternative INTER VLC mode: each INTER
   coefficient block is interpreted with the baseline INTER VLC (Table
   16) first and re-interpreted with the Annex I INTRA VLC (Table I.2)

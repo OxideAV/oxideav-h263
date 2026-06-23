@@ -180,6 +180,24 @@ fn h263p_modern_plusptype_within_idct_tolerance() {
     assert_eq!(got.len(), 3 * (176 * 144 + 2 * (88 * 72)));
 }
 
+#[test]
+fn slice_structured_mode_within_idct_tolerance() {
+    // H.263+ Annex K Slice-Structured mode (free-running, non-rectangular):
+    // each picture replaces the GOB layer with §K.2 slices (SSC + reduced
+    // first-slice header + per-slice SEPB/MBA/SQUANT/GFID). Exercises the
+    // `decode_sequence` PLUSPTYPE dispatch into the slice driver, the
+    // §5.1.24 PEI consumption before the first slice, and the §K.1
+    // strictly-increasing-MBA free-running walk. The stream is a QCIF
+    // I+P+P sequence with 24 slice headers across the corpus.
+    let (input, expected) = fixture!("slice-structured-mode");
+    let frames = decode_sequence(input, DecodeOptions::default())
+        .expect("decode_sequence slice-structured-mode");
+    assert_eq!(frames.len(), 3, "slice-structured-mode is I + P + P");
+    let got = decode_all(input);
+    assert_within_idct_tolerance("slice-structured-mode", &got, expected);
+    assert_eq!(got.len(), 3 * (176 * 144 + 2 * (88 * 72)));
+}
+
 // --- minimal SHA-256 (FIPS 180-4), test-only, no external crate ---
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -301,11 +319,16 @@ fn vendored_fixture_expected_yuv_sha256() {
             "h263p-modern",
             "7418cf95376076df42caef4294262da252d02f85205a864abd62d16ff6b36a78",
         ),
+        (
+            "slice-structured-mode",
+            "0633dfd408e39596186b46d5eeca95550840efce77ede281b23a56f3d153f8ac",
+        ),
     ] {
         let expected: &[u8] = match name {
             "qp-high" => fixture!("qp-high").1,
             "qp-low" => fixture!("qp-low").1,
             "h263p-modern" => fixture!("h263p-modern").1,
+            "slice-structured-mode" => fixture!("slice-structured-mode").1,
             _ => unreachable!(),
         };
         assert_eq!(
