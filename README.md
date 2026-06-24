@@ -155,8 +155,12 @@ planar 4:2:0 `YuvFrame`:
   reference from the store "instead of the last decoded picture" (§N.5) —
   so a single picture can predict different GOBs from different stored
   references (a header-less GOB keeps the previous segment's reference,
-  TRP being valid "until the next PSC, GSC or SSC"). A per-GOB TRP not in
-  the store surfaces the §N.5 forced-INTRA-update case as
+  TRP being valid "until the next PSC, GSC or SSC"). The same per-segment
+  re-selection threads through the Annex K Slice-Structured driver: each
+  subsequent slice's NEWPRED fields (Figure N.3) re-select that slice's
+  reference, while the first reduced-header slice keeps the picture-layer
+  reference (parallel to GOB 0). A per-segment TRP not in the store
+  surfaces the §N.5 forced-INTRA-update case as
   `Error::NotImplemented`. The §N.4.2 back-channel BCM is out of scope
   (decoder → encoder; no forward-channel pixel effect; a present
   GOB-layer BCI of `"1"` is refused with `Error::BadBackChannelMessage`).
@@ -285,9 +289,8 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   §5.1.17 / §N.4.2 Back-Channel Message (videomux BCM ACK/NACK) is not
   staged — it flows decoder → encoder on a separate logical channel and
   does not affect forward-channel pixels (a present BCM is refused). The
-  §N.4.1 **GOB-layer** per-segment TRP re-selection now decodes to pixels
-  (see the supported list); the §N.4.1 **slice-layer** (Annex K) NEWPRED
-  fields are not yet threaded through the Slice-Structured driver.
+  §N.4.1 per-segment TRP re-selection now decodes to pixels on both the
+  GOB-layer and the Annex K slice-layer paths (see the supported list).
 * Slice-boundary / Independent-Segment-Decoding deblock skip rules.
 * PB-frames and Improved PB-frames (Annex G / M) end-to-end
   reconstruction.

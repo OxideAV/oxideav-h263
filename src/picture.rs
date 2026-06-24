@@ -1275,15 +1275,33 @@ pub fn decode_picture_layer_rps(
     }
 
     let reference = selected_ref.as_ref();
+    // Annex N §N.4.1 — re-selecting a reference per video picture segment
+    // (GOB or slice) only changes pixels for an INTER-picture (an INTRA
+    // segment needs no reference). Build the per-segment context for that
+    // case only.
+    let is_inter = matches!(header.coding_type, H263PictureCodingType::Inter);
+    let custom_pcf = extended.plus.custom_pcf(InheritedExtendedState::default());
     let frame = match slice_structured {
-        Some(sss) => decode_slice_structured_after_header(
-            &mut reader,
-            &header,
-            &layout,
-            sss,
-            reference,
-            shim_options,
-        )?,
+        Some(sss) => {
+            let rps_slice = if is_inter {
+                Some(RpsGobContext {
+                    store,
+                    custom_pcf,
+                    is_intra_or_ei: false,
+                })
+            } else {
+                None
+            };
+            decode_slice_structured_after_header_inner(
+                &mut reader,
+                &header,
+                &layout,
+                sss,
+                reference,
+                shim_options,
+                rps_slice,
+            )?
+        }
         None => {
             // §5.1.19 PQUANT (after the PLUSPTYPE / RPS fields, which
             // `parse_picture_layer` has consumed) + §5.1.24 PEI loop, then
@@ -1302,11 +1320,10 @@ pub fn decode_picture_layer_rps(
             // (an INTRA segment needs no reference). `reference` remains
             // the picture-layer §N.5 selection for GOB 0 (header-less, no
             // NEWPRED fields) and the size check.
-            let is_inter = matches!(header.coding_type, H263PictureCodingType::Inter);
             let rps_gob = if is_inter {
                 Some(RpsGobContext {
                     store,
-                    custom_pcf: extended.plus.custom_pcf(InheritedExtendedState::default()),
+                    custom_pcf,
                     is_intra_or_ei: false,
                 })
             } else {
@@ -4591,6 +4608,30 @@ fn decode_slice_structured_after_header(
     reference: Option<&YuvFrame>,
     options: DecodeOptions,
 ) -> Result<YuvFrame> {
+    decode_slice_structured_after_header_inner(
+        reader, header, layout, sss, reference, options, None,
+    )
+}
+
+/// Inner body of [`decode_slice_structured_after_header`] carrying the
+/// optional Annex N §N.4.1 per-slice reference-selection context. The
+/// public wrapper passes `rps_slice = None` (no behaviour change for the
+/// non-RPS slice-structured callers); the RPS slice path passes
+/// `Some(_)` so each subsequent slice header is followed by the §N.4.1
+/// NEWPRED fields (Figure N.3) and may re-select its prediction reference
+/// from the store. The first slice after the Picture Start Code uses the
+/// reduced header form and carries no NEWPRED fields — its reference is
+/// the picture-layer §N.5 selection, exactly as GOB 0's is.
+#[allow(clippy::too_many_arguments)]
+fn decode_slice_structured_after_header_inner(
+    reader: &mut BitReader<'_>,
+    header: &H263PictureHeader,
+    layout: &PictureLayout,
+    sss: SliceStructuredSubmode,
+    reference: Option<&YuvFrame>,
+    options: DecodeOptions,
+    rps_slice: Option<RpsGobContext<'_>>,
+) -> Result<YuvFrame> {
     // Header-signalled modes the slice driver does not stage. PB-frames
     // and SAC never reach here (the slice routing in
     // `decode_picture_layer_with_inherited` only fires for a non-PB
@@ -4680,6 +4721,12 @@ fn decode_slice_structured_after_header(
     let mut slice_mba = first.mba;
     let mut slice_quant: u8 = pquant;
 
+    // Annex N §N.4.1 — the prediction reference in force for the current
+    // slice. The first (reduced-header) slice carries no NEWPRED fields,
+    // so it starts on the picture-layer §N.5 selection; each subsequent
+    // slice's NEWPRED fields (Figure N.3) may re-select it.
+    let mut active_reference: Option<&YuvFrame> = reference;
+
     loop {
         // §K.1: enforce strictly-increasing MBA (ASO off).
         if let Some(p) = prev_mba {
@@ -4747,7 +4794,7 @@ fn decode_slice_structured_after_header(
             let (mv, mvs4) = decode_one_macroblock(
                 reader,
                 &mb,
-                reference,
+                active_reference,
                 &mut frame,
                 &grid,
                 mb_cols,
@@ -4804,6 +4851,28 @@ fn decode_slice_structured_after_header(
         slice_index += 1;
         slice_mba = next.mba;
         slice_quant = next.squant;
+
+        // Annex N §N.4.1 — a subsequent slice header carrying the NEWPRED
+        // fields (Figure N.3) re-selects this slice's prediction
+        // reference. The fields follow GFID and precede the macroblock
+        // data. A slice keeping its TRP absent stays on the previous
+        // reference ("TRP is valid until the next PSC, GSC or SSC" —
+        // §N.4.1.4 — but a fresh SSC resets the default to the most
+        // recent / picture-layer reference).
+        if let Some(rps) = rps_slice.as_ref() {
+            active_reference = reference;
+            let fields = crate::annex_n::parse_gob_newpred_fields(
+                reader,
+                rps.custom_pcf,
+                rps.is_intra_or_ei,
+            )?;
+            if let Some(trp) = fields.segment_trp() {
+                match rps.store.select_reference(Some(true), Some(trp)) {
+                    Some(r) => active_reference = Some(r),
+                    None => return Err(Error::NotImplemented),
+                }
+            }
+        }
     }
 
     // §K.1 — every macroblock must belong to exactly one slice.
@@ -10270,6 +10339,143 @@ mod tests {
         assert_eq!(frame.y, reference.y);
         assert_eq!(frame.cb, reference.cb);
         assert_eq!(frame.cr, reference.cr);
+    }
+
+    /// Write a QCIF Slice-Structured **+ Reference Picture Selection**
+    /// PLUSPTYPE INTER picture-layer header: OPPTYPE Slice-Structured
+    /// (bit 10) and RPS (bit 11) both set, then the §5.1.13–§5.1.16
+    /// picture-layer RPS fields (RPSMF = "100", picture-layer TRPI = 0,
+    /// BCI = "01"). The reader is left at the first bit of PQUANT.
+    fn write_qcif_ss_rps_inter_header(w: &mut BitWriter) {
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(99, 8); // TR
+        w.write_bit(true); // PTYPE bit1
+        w.write_bit(false); // bit2
+        w.write_bit(false); // split
+        w.write_bit(false); // doc-cam
+        w.write_bit(false); // freeze
+        w.write_u32(0b111, 3); // extended PTYPE
+        w.write_u32(0b001, 3); // UFEP = 001
+        w.write_u32(0b010, 3); // OPPTYPE source QCIF
+        for _ in 0..6 {
+            w.write_bit(false); // bits 4-9 off
+        }
+        w.write_bit(true); // bit 10 — SS
+        w.write_bit(true); // bit 11 — RPS
+        for _ in 0..3 {
+            w.write_bit(false); // bits 12-14 off
+        }
+        w.write_bit(true); // bit 15 SCE-guard
+        w.write_u32(0b000, 3); // bits 16-18
+        w.write_u32(0b001, 3); // MPPTYPE: INTER
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+        w.write_bit(false); // CPM
+        w.write_u32(0b00, 2); // SSS: free-running
+                              // §5.1.13 RPSMF (UFEP=001): "100".
+        w.write_u32(0b100, crate::plus_ptype::RPSMF_BITS);
+        w.write_bit(false); // §5.1.14 picture-layer TRPI = 0
+        w.write_bit(false); // §5.1.16 BCI "0"
+        w.write_bit(true); // BCI "1" → "01"
+    }
+
+    /// Annex N §N.4.1 slice-layer NEWPRED end-to-end: a two-slice QCIF
+    /// Slice-Structured + RPS INTER picture where slice 0 (reduced
+    /// header, no NEWPRED) predicts from the most recent anchor (B) and
+    /// slice 1's NEWPRED fields (Figure N.3) re-select the older anchor
+    /// (A). With every macroblock skipped, slice 0's macroblocks copy B
+    /// and slice 1's copy A — proving per-slice TRP switched the
+    /// reference.
+    #[test]
+    fn decode_slice_structured_rps_per_slice_trp_switches_reference() {
+        let mut store = crate::annex_n::RpsReferenceStore::new();
+        let anchor_a = decode_picture_layer_rps(
+            &build_plus_qcif_intra_dc_picture(10, 0x10),
+            &mut store,
+            DecodeOptions::default(),
+        )
+        .expect("anchor A");
+        let anchor_b = decode_picture_layer_rps(
+            &build_plus_qcif_intra_dc_picture(20, 0x40),
+            &mut store,
+            DecodeOptions::default(),
+        )
+        .expect("anchor B");
+        assert_ne!(anchor_a.y[0], anchor_b.y[0]);
+
+        let split = 40u32;
+        let mut w = BitWriter::new();
+        write_qcif_ss_rps_inter_header(&mut w);
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        w.write_bit(false); // §5.1.24 PEI = "0"
+                            // Slice 0 reduced header (MBA 0), no NEWPRED fields.
+        w.write_u32(1, SEPB_BITS); // SEPB1
+        w.write_u32(0, 7); // MBA 0
+        w.write_u32(1, SEPB_BITS); // SEPB3
+        for _ in 0..split {
+            write_skipped_mb(&mut w);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        // Slice 1 full header + §N.4.1 NEWPRED fields re-selecting TR=10.
+        w.write_u32(SSC_VALUE, SSC_BITS);
+        w.write_u32(1, SEPB_BITS); // SEPB1
+        w.write_u32(split, 7); // MBA
+        w.write_u32(8, SQUANT_BITS); // SQUANT
+        w.write_u32(1, SEPB_BITS); // SEPB3
+        w.write_u32(0, K_GFID_BITS); // GFID
+                                     // §N.4.1 NEWPRED: TRI = 0, TRPI = 1, TRP = 10, BCI = "01".
+        w.write_bit(false); // TRI
+        w.write_bit(true); // TRPI
+        w.write_u32(10, crate::annex_n::NEWPRED_TRP_BITS); // TRP
+        w.write_bit(false); // BCI "0"
+        w.write_bit(true); // BCI "1" → "01"
+        for _ in split..99 {
+            write_skipped_mb(&mut w);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let frame = decode_picture_layer_rps(&data, &mut store, DecodeOptions::default())
+            .expect("ss + per-slice RPS decode");
+
+        let mb_cols = 11usize;
+        let w_px = frame.luma_width;
+        // Slice 0 covers MBs 0..split → copies anchor B.
+        for mb in 0..split as usize {
+            let col = mb % mb_cols;
+            let row = mb / mb_cols;
+            let (x0, y0) = (col * 16, row * 16);
+            assert_eq!(
+                frame.y[y0 * w_px + x0],
+                anchor_b.y[y0 * w_px + x0],
+                "slice-0 MB {mb} must copy anchor B"
+            );
+        }
+        // Slice 1 covers MBs split..99 → copies anchor A.
+        for mb in split as usize..99 {
+            let col = mb % mb_cols;
+            let row = mb / mb_cols;
+            let (x0, y0) = (col * 16, row * 16);
+            assert_eq!(
+                frame.y[y0 * w_px + x0],
+                anchor_a.y[y0 * w_px + x0],
+                "slice-1 MB {mb} must copy anchor A (per-slice TRP)"
+            );
+        }
+        // Distinct anchors → the switch is observable.
+        let (sc, sr) = (
+            (split as usize % mb_cols) * 16,
+            (split as usize / mb_cols) * 16,
+        );
+        assert_ne!(frame.y[sr * w_px + sc], anchor_b.y[sr * w_px + sc]);
     }
 
     /// Write a PLUSPTYPE INTRA picture-layer header with the OPPTYPE

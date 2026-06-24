@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex N §N.4.1 per-slice Reference Picture Selection through the
+  Annex K Slice-Structured driver** (round 366): the slice driver now
+  parses the §N.4.1 slice-layer NEWPRED fields (Figure N.3) after each
+  subsequent slice header and re-selects that slice's prediction
+  reference from the §N.5 store, exactly as the GOB path does. The first
+  (reduced-header) slice after the Picture Start Code carries no NEWPRED
+  fields and keeps the picture-layer §N.5 reference (parallel to GOB 0).
+  The driver gained an `decode_slice_structured_after_header_inner` body
+  carrying the optional per-segment context (the public wrapper passes
+  `None`, no behaviour change for non-RPS slice callers).
+  `decode_picture_layer_rps` builds the context for INTER-pictures on
+  both the GOB and the Slice-Structured branch. New end-to-end test: a
+  two-slice QCIF SS+RPS INTER picture where slice 0 predicts from the
+  most recent anchor and slice 1's NEWPRED re-selects the older one —
+  the decoded macroblocks of each slice copy their respective anchors.
+
 - **Annex N §N.4.1 per-GOB Reference Picture Selection now reaches
   pixels end-to-end** (round 366): `decode_picture_layer_rps` threads the
   §N.4.1 GOB-layer NEWPRED fields through the GOB-walking driver for
