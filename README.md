@@ -143,15 +143,23 @@ planar 4:2:0 `YuvFrame`:
   kernel); the surrounding 32×32-macroblock RRU decode pipeline
   (pseudo-MV §Q.4, enlarged OBMC §Q.5, reference extension §Q.3) is not
   yet wired.
-* **Annex N §N.5** — Reference Picture Selection mode (forward channel)
-  end-to-end: the `RpsReferenceStore` picture memory keys decoded
-  anchors by their 10-bit Temporal Reference (ETR ∥ TR), and
-  `decode_picture_layer_rps` selects the §N.4.1.4 prediction reference
-  by TRP (the stored picture whose TR equals TRP, or the most recent
-  anchor when TRP is absent) and decodes the picture against it — so an
-  RPS ("NEWPRED") picture predicting from a non-most-recent reference
-  reconstructs to pixels. The §N.4.2 back-channel BCM is out of scope
-  (decoder → encoder; no forward-channel pixel effect).
+* **Annex N §N.4.1 / §N.5** — Reference Picture Selection mode (forward
+  channel) end-to-end, including **per-GOB** re-selection: the
+  `RpsReferenceStore` picture memory keys decoded anchors by their 10-bit
+  Temporal Reference (ETR ∥ TR), and `decode_picture_layer_rps` selects
+  the §N.4.1.4 prediction reference by the picture-layer TRP (the stored
+  picture whose TR equals TRP, or the most recent anchor when TRP is
+  absent). For INTER-pictures it further parses the §N.4.1 GOB-layer
+  NEWPRED fields (`annex_n::parse_gob_newpred_fields`: TRI / TR / TRPI /
+  TRP + BCI, Figure N.2) after each GOB header and re-selects that GOB's
+  reference from the store "instead of the last decoded picture" (§N.5) —
+  so a single picture can predict different GOBs from different stored
+  references (a header-less GOB keeps the previous segment's reference,
+  TRP being valid "until the next PSC, GSC or SSC"). A per-GOB TRP not in
+  the store surfaces the §N.5 forced-INTRA-update case as
+  `Error::NotImplemented`. The §N.4.2 back-channel BCM is out of scope
+  (decoder → encoder; no forward-channel pixel effect; a present
+  GOB-layer BCI of `"1"` is refused with `Error::BadBackChannelMessage`).
 * **Annex P §P.2 / §P.3** — Reference Picture Resampling: the §P.3 /
   §P.4.2 integer bilinear warp engine (`resample_yuv`) resamples the
   reference picture before motion compensation, driven from the §P.3
@@ -277,10 +285,9 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   §5.1.17 / §N.4.2 Back-Channel Message (videomux BCM ACK/NACK) is not
   staged — it flows decoder → encoder on a separate logical channel and
   does not affect forward-channel pixels (a present BCM is refused). The
-  §N.4.1 GOB / slice-layer per-segment TRP re-selection is likewise not
-  yet threaded through the single-picture entry. (The forward-channel
-  picture-layer RPS reference selection now decodes to pixels — see the
-  supported list.)
+  §N.4.1 **GOB-layer** per-segment TRP re-selection now decodes to pixels
+  (see the supported list); the §N.4.1 **slice-layer** (Annex K) NEWPRED
+  fields are not yet threaded through the Slice-Structured driver.
 * Slice-boundary / Independent-Segment-Decoding deblock skip rules.
 * PB-frames and Improved PB-frames (Annex G / M) end-to-end
   reconstruction.

@@ -1293,7 +1293,26 @@ pub fn decode_picture_layer_rps(
                 return Err(Error::InvalidQuantiser);
             }
             skip_pei_psupp(&mut reader)?;
-            decode_after_picture_header(
+            // Annex N §N.4.1 — an INTER-picture's per-GOB NEWPRED fields
+            // (Figure N.2) can re-select the prediction reference for each
+            // GOB from the store. We supply the GOB driver an
+            // `RpsGobContext` (the store, read-only, plus the custom-PCF
+            // TR width) only for INTER-pictures: it is the only picture
+            // type where the per-segment reference choice changes pixels
+            // (an INTRA segment needs no reference). `reference` remains
+            // the picture-layer §N.5 selection for GOB 0 (header-less, no
+            // NEWPRED fields) and the size check.
+            let is_inter = matches!(header.coding_type, H263PictureCodingType::Inter);
+            let rps_gob = if is_inter {
+                Some(RpsGobContext {
+                    store,
+                    custom_pcf: extended.plus.custom_pcf(InheritedExtendedState::default()),
+                    is_intra_or_ei: false,
+                })
+            } else {
+                None
+            };
+            decode_after_picture_header_inner(
                 &mut reader,
                 &header,
                 &layout,
@@ -1301,6 +1320,7 @@ pub fn decode_picture_layer_rps(
                 shim_options,
                 None,
                 Some(pquant),
+                rps_gob,
             )?
         }
     };
@@ -2361,6 +2381,28 @@ fn plus_ptype_to_baseline_shim(
     })
 }
 
+/// Annex N §N.4.1 per-segment reference-selection context for the GOB
+/// driver. When supplied, a GOB header in the bitstream is followed by
+/// the §N.4.1 NEWPRED fields (TRI / TR / TRPI / TRP + BCI); the driver
+/// parses them and re-selects this GOB's prediction reference from the
+/// store, "instead of the last decoded picture, if the TRP field exists"
+/// (§N.5). A GOB with no header (the §5.2 optional-header case) keeps the
+/// reference in force from the previous segment — TRP is valid "until the
+/// next PSC, GSC, or SSC" (§N.4.1.4).
+struct RpsGobContext<'a> {
+    /// The §N.5 picture memory. Borrowed immutably: the driver only reads
+    /// references during GOB decode; the caller inserts the finished
+    /// picture afterwards.
+    store: &'a crate::annex_n::RpsReferenceStore,
+    /// Whether a custom picture clock frequency is in use (selects the
+    /// §N.4.1.2 TR width, 8 vs 10 bits).
+    custom_pcf: bool,
+    /// Whether the picture is an I- or EI-picture (the §N.4.1.3 TRPI-zero
+    /// rule). Always `false` here — this context is only built for
+    /// INTER-pictures, which is where per-GOB re-selection has an effect.
+    is_intra_or_ei: bool,
+}
+
 /// Decode the macroblock layers of a picture given an already-parsed
 /// [`H263PictureHeader`] and a `reader` positioned immediately after
 /// the picture header (i.e. at the first bit of the first GOB header).
@@ -2375,8 +2417,38 @@ fn decode_after_picture_header(
     layout: &PictureLayout,
     reference: Option<&YuvFrame>,
     options: DecodeOptions,
+    pb: Option<PbPictureCtx<'_>>,
+    gob0_pquant: Option<u8>,
+) -> Result<YuvFrame> {
+    decode_after_picture_header_inner(
+        reader,
+        header,
+        layout,
+        reference,
+        options,
+        pb,
+        gob0_pquant,
+        None,
+    )
+}
+
+/// Inner body of [`decode_after_picture_header`] carrying the optional
+/// Annex N §N.4.1 per-GOB reference-selection context. The public-facing
+/// `decode_after_picture_header` passes `rps_gob = None` (no behaviour
+/// change for every legacy / baseline / PB / extended caller); the
+/// [`decode_picture_layer_rps`] GOB-RPS path passes `Some(_)` so each
+/// GOB header is followed by the §N.4.1 NEWPRED fields and may re-select
+/// its prediction reference from the store.
+#[allow(clippy::too_many_arguments)]
+fn decode_after_picture_header_inner(
+    reader: &mut BitReader<'_>,
+    header: &H263PictureHeader,
+    layout: &PictureLayout,
+    reference: Option<&YuvFrame>,
+    options: DecodeOptions,
     mut pb: Option<PbPictureCtx<'_>>,
     gob0_pquant: Option<u8>,
+    rps_gob: Option<RpsGobContext<'_>>,
 ) -> Result<YuvFrame> {
     // Unsupported header-signalled modes — refuse rather than guess.
     // SAC is refused outright. A PB-frames picture must arrive through
@@ -2471,6 +2543,13 @@ fn decode_after_picture_header(
     // GOB header is present (a new segment); a header-less GOB stays in
     // the segment of the GOB above it.
     let mut current_segment: u32 = 0;
+    // Annex N §N.4.1 — the prediction reference in force for the current
+    // video picture segment. It starts as the picture-layer selection
+    // (`reference`, already resolved by the §N.5 picture-header TRP) and
+    // is re-selected whenever a GOB header carrying NEWPRED fields chooses
+    // a different stored reference. A header-less GOB keeps the previous
+    // segment's reference ("TRP is valid until the next PSC, GSC or SSC").
+    let mut active_reference: Option<&YuvFrame> = reference;
     for gob_index in 0..num_gobs as usize {
         // Resolve this GOB's QUANT, segment id, and whether the §6.1.1
         // rule-3 "outside the GOB at the top" border applies.
@@ -2501,6 +2580,34 @@ fn decode_after_picture_header(
             (parse_gob_layer(reader)?.quantiser, gob_index as u32, true)
         };
         let gob_top_row = gob_index * mb_rows_per_gob as usize;
+
+        // Annex N §N.4.1 — a GOB header carrying the NEWPRED fields
+        // re-selects this segment's prediction reference. The fields
+        // follow the GOB header (Figure N.2) and precede the macroblock
+        // data; GOB 0 carries no GOB header (§5.2.2), so its reference
+        // stays the picture-layer §N.5 selection. A header-less GOB keeps
+        // the reference in force from the previous segment.
+        if let Some(rps) = rps_gob.as_ref() {
+            if gob_header_present && gob_index != 0 {
+                let fields = crate::annex_n::parse_gob_newpred_fields(
+                    reader,
+                    rps.custom_pcf,
+                    rps.is_intra_or_ei,
+                )?;
+                // §N.4.1.4 / §N.5 — when TRP is present, predict from the
+                // stored picture whose TR equals TRP; when absent, keep
+                // the most-recent / picture-layer reference unchanged.
+                if let Some(trp) = fields.segment_trp() {
+                    match rps.store.select_reference(Some(true), Some(trp)) {
+                        Some(r) => active_reference = Some(r),
+                        // §N.5 forced-INTRA-update case: the requested TRP
+                        // is not in the store. An INTER segment cannot be
+                        // reconstructed without its reference.
+                        None => return Err(Error::NotImplemented),
+                    }
+                }
+            }
+        }
 
         for local_row in 0..mb_rows_per_gob as usize {
             let row = gob_top_row + local_row;
@@ -2545,7 +2652,7 @@ fn decode_after_picture_header(
                 let (mv, mvs4) = decode_one_macroblock(
                     reader,
                     &mb,
-                    reference,
+                    active_reference,
                     &mut frame,
                     &grid,
                     mb_cols,
@@ -9196,6 +9303,14 @@ mod tests {
                 w.write_u32(gob, GN_BITS);
                 w.write_u32(0, GFID_BITS);
                 w.write_u32(8, GQUANT_BITS);
+                // §N.4.1 NEWPRED fields (Figure N.2): RPS is in use, so the
+                // GOB header carries TRI / TR / TRPI / TRP + BCI. Here every
+                // GOB keeps the picture-layer reference (TRI = 0, TRPI = 0,
+                // BCI = "01").
+                w.write_bit(false); // TRI = 0
+                w.write_bit(false); // TRPI = 0
+                w.write_bit(false); // BCI "0"
+                w.write_bit(true); // BCI "1" → "01"
             }
             for _mb in 0..11 {
                 write_skipped_mb(&mut w);
@@ -9205,6 +9320,170 @@ mod tests {
             w.write_bit(false);
         }
         w.finish()
+    }
+
+    /// Annex N §N.4.1 — build a QCIF PLUSPTYPE INTER-picture with the RPS
+    /// mode bit set, picture-layer TRPI = 0 (GOB 0 predicts from the most
+    /// recent anchor), but where GOB `newpred_gob` (1..=8) carries the
+    /// §N.4.1 NEWPRED fields with TRPI = 1 / TRP = `seg_trp`, re-selecting
+    /// a different stored reference for that GOB's row. Every macroblock is
+    /// skipped, so each GOB copies its selected reference row-for-row.
+    fn build_plus_qcif_inter_rps_per_gob(newpred_gob: u32, seg_trp: u16) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(99, 8); // TR (the new picture's own TR)
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_u32(0b000, 3);
+        w.write_u32(0b111, 3); // extended PTYPE
+        w.write_u32(0b001, 3); // UFEP = 001
+        w.write_u32(0b010, 3); // source format = QCIF
+        w.write_bit(false); // custom_pcf
+        w.write_bit(false); // UMV
+        w.write_bit(false); // SAC
+        w.write_bit(false); // AP
+        w.write_bit(false); // AIC
+        w.write_bit(false); // DF
+        w.write_bit(false); // SS
+        w.write_bit(true); // RPS ON (bit 11)
+        w.write_bit(false); // IS
+        w.write_bit(false); // AIV
+        w.write_bit(false); // MQ
+        w.write_bit(true); // SCE-guard
+        w.write_u32(0b000, 3); // reserved
+        w.write_u32(0b001, 3); // picture type INTER
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+        w.write_bit(false); // CPM = 0
+                            // §5.1.13 RPSMF (UFEP=001): "100" = Neither.
+        w.write_u32(0b100, crate::plus_ptype::RPSMF_BITS);
+        // §5.1.14 picture-layer TRPI = 0 (GOB 0 → most recent anchor).
+        w.write_bit(false);
+        // §5.1.16 picture-layer BCI = "01".
+        w.write_bit(false);
+        w.write_bit(true);
+        // §5.1.19 PQUANT = 8 + §5.1.24 PEI.
+        write_plus_pquant_pei(&mut w, 8);
+        for gob in 0..9u32 {
+            // §5.2.2 — GOB 0 carries no header. GOBs 1..8 carry a header;
+            // the selected GOB additionally carries the §N.4.1 NEWPRED
+            // fields choosing a different stored reference.
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+                // §N.4.1 NEWPRED fields: TRI = 0 (no TR), TRPI = 1 / TRP
+                // for the chosen GOB, TRPI = 0 otherwise; BCI = "01".
+                w.write_bit(false); // TRI
+                if gob == newpred_gob {
+                    w.write_bit(true); // TRPI = 1
+                    w.write_u32(u32::from(seg_trp), crate::annex_n::NEWPRED_TRP_BITS);
+                } else {
+                    w.write_bit(false); // TRPI = 0
+                }
+                w.write_bit(false); // BCI "0"
+                w.write_bit(true); // BCI "1" → "01"
+            }
+            for _mb in 0..11 {
+                write_skipped_mb(&mut w);
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// Annex N §N.4.1 GOB-layer NEWPRED end-to-end: an INTER-picture whose
+    /// per-GOB reference re-selection reaches pixels. Two distinct anchors
+    /// (TR=10 → pixel A, TR=20 → pixel B) seed the store; an all-skipped
+    /// INTER picture predicts GOB 0 from the most recent anchor (TR=20 →
+    /// B) but re-selects GOB 5 to predict from the *older* TR=10 anchor
+    /// (A) via the §N.4.1 GOB-layer TRP. The decoded frame must therefore
+    /// carry B in GOB 0's row and A in GOB 5's row — proving the per-GOB
+    /// TRP switched the reference mid-picture.
+    #[test]
+    fn decode_picture_layer_rps_per_gob_trp_switches_reference() {
+        let mut store = crate::annex_n::RpsReferenceStore::new();
+        let anchor_a = decode_picture_layer_rps(
+            &build_plus_qcif_intra_dc_picture(10, 0x10),
+            &mut store,
+            DecodeOptions::default(),
+        )
+        .expect("TR=10 anchor A must decode");
+        let anchor_b = decode_picture_layer_rps(
+            &build_plus_qcif_intra_dc_picture(20, 0x40),
+            &mut store,
+            DecodeOptions::default(),
+        )
+        .expect("TR=20 anchor B must decode");
+        assert_ne!(anchor_a.y[0], anchor_b.y[0]);
+
+        // GOB 5 re-selects the older TR=10 anchor (A); GOB 0 stays on the
+        // picture-layer most-recent anchor (TR=20 → B).
+        let frame = decode_picture_layer_rps(
+            &build_plus_qcif_inter_rps_per_gob(5, 10),
+            &mut store,
+            DecodeOptions::default(),
+        )
+        .expect("per-GOB RPS INTER must decode");
+
+        let mb_row = 16usize;
+        let w = frame.luma_width;
+        // GOB 0 (luma rows 0..16) copied anchor B.
+        for row in 0..mb_row {
+            for col in 0..w {
+                assert_eq!(
+                    frame.y[row * w + col],
+                    anchor_b.y[row * w + col],
+                    "GOB 0 row {row} must copy anchor B"
+                );
+            }
+        }
+        // GOB 5 (luma rows 80..96) copied anchor A, NOT anchor B.
+        let g5_top = 5 * mb_row;
+        for row in g5_top..g5_top + mb_row {
+            for col in 0..w {
+                assert_eq!(
+                    frame.y[row * w + col],
+                    anchor_a.y[row * w + col],
+                    "GOB 5 row {row} must copy anchor A (per-GOB TRP)"
+                );
+            }
+        }
+        // Because anchors A and B are flat-but-distinct, GOB 5's row
+        // differs from anchor B — the re-selection is observable.
+        assert_ne!(
+            frame.y[g5_top * w],
+            anchor_b.y[g5_top * w],
+            "GOB 5 must NOT carry the picture-layer anchor B"
+        );
+    }
+
+    /// §N.4.1.4 / §N.5 — a per-GOB TRP referencing a picture not in the
+    /// store is the forced-INTRA-update case the single-picture API
+    /// cannot satisfy: it surfaces as `Error::NotImplemented`.
+    #[test]
+    fn decode_picture_layer_rps_per_gob_missing_trp_refused() {
+        let mut store = crate::annex_n::RpsReferenceStore::new();
+        decode_picture_layer_rps(
+            &build_plus_qcif_intra_dc_picture(20, 0x40),
+            &mut store,
+            DecodeOptions::default(),
+        )
+        .expect("anchor must decode");
+        // GOB 5 requests TRP = 77, which was never stored.
+        let r = decode_picture_layer_rps(
+            &build_plus_qcif_inter_rps_per_gob(5, 77),
+            &mut store,
+            DecodeOptions::default(),
+        );
+        assert_eq!(r, Err(Error::NotImplemented));
     }
 
     /// Annex N §N.5 forward-channel Reference Picture Selection

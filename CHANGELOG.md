@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex N §N.4.1 per-GOB Reference Picture Selection now reaches
+  pixels end-to-end** (round 366): `decode_picture_layer_rps` threads the
+  §N.4.1 GOB-layer NEWPRED fields through the GOB-walking driver for
+  INTER-pictures. After each GOB header (Figure N.2) the driver parses
+  TRI / TR / TRPI / TRP + BCI and, when the GOB's TRP re-selects a
+  different stored reference, predicts that GOB's macroblocks from it
+  "instead of the last decoded picture" (§N.5) — a header-less GOB keeps
+  the previous segment's reference ("TRP is valid until the next PSC, GSC
+  or SSC", §N.4.1.4) and GOB 0 (header elided, §5.2.2) stays on the
+  picture-layer §N.5 selection. The §N.5 forced-INTRA-update case (a
+  per-GOB TRP not in the store) surfaces as `Error::NotImplemented`. The
+  driver gained an internal `RpsGobContext` and an
+  `decode_after_picture_header_inner` body; every legacy / baseline / PB
+  / extended caller passes `None` (no behaviour change). Two end-to-end
+  tests: a QCIF INTER picture where GOB 5 re-selects the older anchor
+  mid-picture (decoded frame carries anchor B in GOB 0's row and anchor A
+  in GOB 5's row, proving the switch reached pixels), and the
+  missing-per-GOB-TRP refusal. The existing picture-layer RPS test buffer
+  was updated to emit the now-mandatory NEWPRED GOB fields.
+
 - **Annex N §N.4.1 GOB/slice-layer NEWPRED field parser** (round 366):
   new `annex_n::parse_gob_newpred_fields` decodes the per-segment
   Reference Picture Selection fields appended to a GOB or slice header
