@@ -34,6 +34,150 @@
 //! the unit the single-picture decode API operates on.
 
 use crate::picture::YuvFrame;
+use crate::{Error, Result};
+use oxideav_core::bits::BitReader;
+
+/// Length in bits of the §N.4.1.4 GOB/slice-layer TRP field (always 10
+/// bits, unlike the picture-layer TR which is 8 or 10 bits per the
+/// custom-PCF state).
+pub const NEWPRED_TRP_BITS: u32 = 10;
+
+/// §N.4.1 — the per-segment (GOB or slice) NEWPRED reference-selection
+/// fields appended to the GOB / slice header when the Reference Picture
+/// Selection mode (Annex N) is in use.
+///
+/// Figure N.2 / N.3 insert these fields **after** the standard
+/// GBSC/GN/(GSBI)/GFID/GQUANT GOB header (or the SSC.../GFID slice
+/// header) and **before** the macroblock data:
+///
+/// ```text
+///   ... GFID GQUANT | TRI TR TRPI TRP | BCI [BCM] | Macroblock data
+/// ```
+///
+/// Their semantics mirror the §5.1.14 / §5.1.15 picture-header fields,
+/// but they re-select the prediction reference for the macroblocks of
+/// *this* segment only — "TRP is valid until the next PSC, GSC, or SSC"
+/// (§N.4.1.4). The §N.4.1.5 BCI codeword is parsed (and a present
+/// §N.4.1.6 BCM refused — it is a decoder → encoder message with no
+/// forward-channel pixel effect; a forward-channel BCI is always
+/// `"01"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GobNewpredFields {
+    /// §N.4.1.2 — the segment's own Temporal Reference, present iff
+    /// §N.4.1.1 TRI was `1`. When a custom picture clock frequency is in
+    /// use it is the 10-bit ETR∥TR concatenation, else the 8-bit TR.
+    pub tr: Option<u16>,
+    /// §N.4.1.3 — TRPI: whether the following §N.4.1.4 TRP field is
+    /// present. Must be `false` for an I- or EI-picture (the parser
+    /// enforces this against the picture type).
+    pub trpi: bool,
+    /// §N.4.1.4 — the 10-bit Temporal Reference of the reference picture
+    /// this segment predicts from, present iff `trpi`. When absent "the
+    /// most recent temporally previous anchor picture shall be used".
+    pub trp: Option<u16>,
+    /// Total number of bits this NEWPRED field group consumed (TRI + any
+    /// TR + TRPI + any TRP + the BCI codeword), so a caller composing a
+    /// bit cursor can advance past it.
+    pub field_bits: u32,
+}
+
+impl GobNewpredFields {
+    /// Resolve the prediction reference's Temporal Reference for this
+    /// segment. Returns `Some(trp)` when the segment re-selected a
+    /// reference (§N.4.1.4 TRP present), else `None` (the caller falls
+    /// back to "the most recent temporally previous anchor picture").
+    pub fn segment_trp(&self) -> Option<u16> {
+        if self.trpi {
+            self.trp
+        } else {
+            None
+        }
+    }
+}
+
+/// §N.4.1 — parse the per-segment NEWPRED fields (TRI / TR / TRPI / TRP
+/// / BCI) that follow a GOB or slice header when the Reference Picture
+/// Selection mode is in use.
+///
+/// `custom_pcf` selects the §N.4.1.2 TR width (10 bits with a custom
+/// picture clock frequency, else 8 bits). `is_intra_or_ei` enforces the
+/// §N.4.1.3 rule that TRPI must be `0` for an I- or EI-picture.
+///
+/// On success the reader is positioned at the first bit of the
+/// segment's macroblock data.
+///
+/// ### Errors
+///
+/// * [`Error::UnexpectedEof`] — the buffer ended inside the fields.
+/// * [`Error::PlusPtypeReservedField`] — TRPI was `1` on an I/EI
+///   picture (§N.4.1.3).
+/// * [`Error::BadBackChannelMessage`] — the BCI codeword signalled a
+///   present back-channel message (`"1"`) or carried the undefined
+///   `"00"` shape (§N.4.1.5).
+pub fn parse_gob_newpred_fields(
+    reader: &mut BitReader<'_>,
+    custom_pcf: bool,
+    is_intra_or_ei: bool,
+) -> Result<GobNewpredFields> {
+    let mut field_bits = 0u32;
+
+    // §N.4.1.1 — TRI (1 bit): is the TR field present?
+    let tri = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    field_bits += 1;
+
+    // §N.4.1.2 — TR (8 bits, or 10 with a custom PCF), present iff TRI.
+    let tr = if tri {
+        let width = if custom_pcf { 10 } else { 8 };
+        let v = reader.read_u32(width).map_err(|_| Error::UnexpectedEof)? as u16;
+        field_bits += width;
+        Some(v)
+    } else {
+        None
+    };
+
+    // §N.4.1.3 — TRPI (1 bit).
+    let trpi = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    field_bits += 1;
+    if trpi && is_intra_or_ei {
+        // §N.4.1.3 — "TRPI shall be equal to zero whenever the picture
+        // is an I- or EI-picture."
+        return Err(Error::PlusPtypeReservedField);
+    }
+
+    // §N.4.1.4 — TRP (10 bits), present iff TRPI.
+    let trp = if trpi {
+        let v = reader
+            .read_u32(NEWPRED_TRP_BITS)
+            .map_err(|_| Error::UnexpectedEof)? as u16;
+        field_bits += NEWPRED_TRP_BITS;
+        Some(v)
+    } else {
+        None
+    };
+
+    // §N.4.1.5 — BCI (1 or 2 bits). "1" signals a following §N.4.1.6
+    // BCM; "01" signals its absence (the forward-channel default). The
+    // BCM is a decoder → encoder message with no forward-channel pixel
+    // effect, so a present one is refused rather than parsed.
+    let first = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    field_bits += 1;
+    if first {
+        return Err(Error::BadBackChannelMessage);
+    }
+    let second = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    field_bits += 1;
+    if !second {
+        // "00" is not a defined BCI codeword (§N.4.1.5).
+        return Err(Error::BadBackChannelMessage);
+    }
+
+    Ok(GobNewpredFields {
+        tr,
+        trpi,
+        trp,
+        field_bits,
+    })
+}
 
 /// A single stored reference picture: its decoded samples plus the
 /// 10-bit Temporal Reference under which it was coded.
@@ -172,6 +316,135 @@ pub fn compose_tr(tr: u8, etr: Option<u8>) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxideav_core::bits::BitWriter;
+
+    /// §N.4.1 — write a NEWPRED field group (TRI/TR/TRPI/TRP + BCI = "01")
+    /// onto a fresh writer and return the bytes plus the count of bits
+    /// written, so the parser's `field_bits` can be cross-checked.
+    fn write_newpred(
+        tr: Option<u16>,
+        trp: Option<u16>,
+        custom_pcf: bool,
+        bci: &[bool],
+    ) -> (Vec<u8>, u32) {
+        let mut w = BitWriter::new();
+        let mut bits = 0u32;
+        w.write_bit(tr.is_some()); // TRI
+        bits += 1;
+        if let Some(t) = tr {
+            let width = if custom_pcf { 10 } else { 8 };
+            w.write_u32(u32::from(t), width);
+            bits += width;
+        }
+        w.write_bit(trp.is_some()); // TRPI
+        bits += 1;
+        if let Some(p) = trp {
+            w.write_u32(u32::from(p), NEWPRED_TRP_BITS);
+            bits += NEWPRED_TRP_BITS;
+        }
+        for &b in bci {
+            w.write_bit(b);
+            bits += 1;
+        }
+        // Trailing sentinel bits so the reader never runs dry on a
+        // legal field group.
+        w.write_u32(0, 8);
+        (w.finish(), bits)
+    }
+
+    #[test]
+    fn newpred_no_tr_no_trp_consumes_three_bits() {
+        // TRI = 0, TRPI = 0, BCI = "01" → 1 + 1 + 2 = 4 bits.
+        let (bytes, bits) = write_newpred(None, None, false, &[false, true]);
+        let mut r = BitReader::new(&bytes);
+        let f = parse_gob_newpred_fields(&mut r, false, false).unwrap();
+        assert_eq!(f.tr, None);
+        assert!(!f.trpi);
+        assert_eq!(f.trp, None);
+        assert_eq!(f.field_bits, bits);
+        assert_eq!(f.field_bits, 4);
+        assert_eq!(f.segment_trp(), None);
+        assert_eq!(r.bit_position(), u64::from(bits));
+    }
+
+    #[test]
+    fn newpred_tr_present_8bit_without_custom_pcf() {
+        let (bytes, bits) = write_newpred(Some(42), None, false, &[false, true]);
+        let mut r = BitReader::new(&bytes);
+        let f = parse_gob_newpred_fields(&mut r, false, false).unwrap();
+        assert_eq!(f.tr, Some(42));
+        assert_eq!(f.field_bits, bits); // 1 + 8 + 1 + 2 = 12
+        assert_eq!(f.field_bits, 12);
+    }
+
+    #[test]
+    fn newpred_tr_present_10bit_with_custom_pcf() {
+        // A 10-bit TR value only representable with the custom-PCF width.
+        let (bytes, bits) = write_newpred(Some(0x2A5), None, true, &[false, true]);
+        let mut r = BitReader::new(&bytes);
+        let f = parse_gob_newpred_fields(&mut r, true, false).unwrap();
+        assert_eq!(f.tr, Some(0x2A5));
+        assert_eq!(f.field_bits, bits); // 1 + 10 + 1 + 2 = 14
+        assert_eq!(f.field_bits, 14);
+    }
+
+    #[test]
+    fn newpred_trp_present_selects_segment_reference() {
+        // TRI = 0, TRPI = 1, TRP = 17, BCI = "01".
+        let (bytes, bits) = write_newpred(None, Some(17), false, &[false, true]);
+        let mut r = BitReader::new(&bytes);
+        let f = parse_gob_newpred_fields(&mut r, false, false).unwrap();
+        assert!(f.trpi);
+        assert_eq!(f.trp, Some(17));
+        assert_eq!(f.segment_trp(), Some(17));
+        assert_eq!(f.field_bits, bits); // 1 + 1 + 10 + 2 = 14
+        assert_eq!(f.field_bits, 14);
+    }
+
+    #[test]
+    fn newpred_trpi_on_intra_is_rejected() {
+        // §N.4.1.3 — TRPI must be 0 for an I/EI picture.
+        let (bytes, _) = write_newpred(None, Some(5), false, &[false, true]);
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_gob_newpred_fields(&mut r, false, true),
+            Err(Error::PlusPtypeReservedField)
+        );
+    }
+
+    #[test]
+    fn newpred_bci_one_refuses_back_channel_message() {
+        // BCI = "1" signals a present BCM (§N.4.1.6) — refused.
+        let (bytes, _) = write_newpred(None, None, false, &[true]);
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_gob_newpred_fields(&mut r, false, false),
+            Err(Error::BadBackChannelMessage)
+        );
+    }
+
+    #[test]
+    fn newpred_bci_double_zero_is_rejected() {
+        // BCI = "00" is not a defined codeword (§N.4.1.5).
+        let (bytes, _) = write_newpred(None, None, false, &[false, false]);
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_gob_newpred_fields(&mut r, false, false),
+            Err(Error::BadBackChannelMessage)
+        );
+    }
+
+    #[test]
+    fn newpred_truncated_buffer_returns_eof() {
+        // Only the TRI bit present, then the buffer ends.
+        let bytes = [0b1000_0000u8]; // TRI = 1, then nothing usable for an 8-bit TR
+        let mut r = BitReader::new(&bytes[..1]);
+        // TRI=1 wants an 8-bit TR but only 7 bits remain → EOF.
+        assert_eq!(
+            parse_gob_newpred_fields(&mut r, false, false),
+            Err(Error::UnexpectedEof)
+        );
+    }
 
     fn flat(value: u8) -> YuvFrame {
         let mut f = YuvFrame::grey(16, 16);

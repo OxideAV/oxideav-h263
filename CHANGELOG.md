@@ -8,6 +8,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex N §N.4.1 GOB/slice-layer NEWPRED field parser** (round 366):
+  new `annex_n::parse_gob_newpred_fields` decodes the per-segment
+  Reference Picture Selection fields appended to a GOB or slice header
+  when Annex N is in use (Figure N.2 / N.3): §N.4.1.1 TRI + §N.4.1.2 TR
+  (8 bits, or 10 with a custom picture clock frequency), §N.4.1.3 TRPI +
+  §N.4.1.4 TRP (10 bits), and the §N.4.1.5 BCI codeword (`"01"` accepted;
+  a present `"1"` back-channel message or the undefined `"00"` shape
+  surfaces the new `Error::BadBackChannelMessage`). The §N.4.1.3 rule
+  that TRPI must be `0` on an I/EI picture is enforced. New public
+  `GobNewpredFields` struct (with `segment_trp()`) + `NEWPRED_TRP_BITS`
+  constant. Nine unit tests cover the field-presence matrix, the
+  custom-PCF 10-bit TR width, the TRPI-on-INTRA / BCI-`"1"` / BCI-`"00"`
+  rejections, and a truncated-buffer EOF.
+
 - **Annex T Modified Quantization + Annex S Alternative INTER VLC now
   thread through the Annex K Slice-Structured driver** (round 362): the
   slice macroblock walker passes `options.modified_quant` into its

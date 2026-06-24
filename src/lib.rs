@@ -440,6 +440,13 @@ pub enum Error {
     /// the §O.6 spatial-scalability upsample path is a separate,
     /// not-yet-staged step).
     BadScalabilityReferenceGeometry,
+    /// An Annex N §N.4.1.5 / §N.4.1.6 GOB- or slice-layer Back-Channel
+    /// message Indication (BCI) codeword signalled a present Back-Channel
+    /// Message (`BCI == "1"`), or carried the undefined `"00"` shape.
+    /// The §N.4.2 BCM is a decoder → encoder message whose
+    /// videomux-dependent layout is not staged on the forward-channel
+    /// decode path (a forward-channel BCI is always `"01"`).
+    BadBackChannelMessage,
 }
 
 impl core::fmt::Display for Error {
@@ -562,6 +569,10 @@ impl core::fmt::Display for Error {
             Error::BadScalabilityReferenceGeometry => write!(
                 f,
                 "oxideav-h263: Annex O enhancement-layer reference geometry incompatible (SNR-scalability path needs identical reference-layer dimensions)"
+            ),
+            Error::BadBackChannelMessage => write!(
+                f,
+                "oxideav-h263: Annex N GOB/slice-layer BCI signalled a present back-channel message (forward-channel BCI must be \"01\")"
             ),
         }
     }
