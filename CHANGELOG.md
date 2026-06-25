@@ -8,6 +8,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Multi-picture PB-frame reference-threading test** (round 371): an
+  I + PB + P stream decodes to four frames [I, B, P, P2], asserting the
+  PB-frame's P-part (not its display-only B-part) becomes the prediction
+  reference for the following P-picture and `prev_tr` advances to the
+  P-part's TR. Added an all-skipped baseline-INTER real-wire picture
+  builder for the test.
+
 - **Deblocking-Filter-mode four motion vectors per macroblock** (round
   371): per §5.3.8 / Table J.1, Annex J Deblocking Filter mode "includes
   the ability to use four motion vectors per macroblock" without the §F.3

@@ -12003,6 +12003,79 @@ mod tests {
         }
     }
 
+    /// Build an all-skipped QCIF baseline INTER (P) picture in the
+    /// real elementary-stream wire layout (PQUANT + CPM = "0" + PEI =
+    /// "0", GOB-0 header elided): every macroblock is COD = 1, so the
+    /// whole picture reproduces the reference. `tr` is the §5.1.2
+    /// Temporal Reference.
+    fn build_qcif_inter_skipped_picture_real_wire(tr: u8, pquant: u8) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(tr as u32, 8);
+        w.write_bit(true); // PTYPE bit1
+        w.write_bit(false); // PTYPE bit2
+        w.write_bit(false); // split-screen
+        w.write_bit(false); // doc-camera
+        w.write_bit(false); // freeze
+        w.write_u32(0b010, 3); // QCIF
+        w.write_bit(true); // INTER
+        w.write_bit(false); // umv
+        w.write_bit(false); // sac
+        w.write_bit(false); // ap
+        w.write_bit(false); // pb
+        w.write_u32(pquant as u32, 5); // §5.1.19 PQUANT
+        w.write_bit(false); // §5.1.20 CPM = "0"
+        w.write_bit(false); // §5.1.24 PEI = "0"
+                            // GOB 0: no header; GOBs 1..8: full headers.
+        for mb in 0..11 {
+            let _ = mb;
+            write_skipped_mb(&mut w);
+        }
+        for _gob in 1..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(pquant as u32, GQUANT_BITS);
+            for _mb in 0..11 {
+                write_skipped_mb(&mut w);
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// An I + PB + P stream decodes to four frames [I, B, P, P2]: the
+    /// PB-frame's P-part (not its display-only B-part) becomes the
+    /// prediction reference for the following P-picture, and `prev_tr`
+    /// advances to the P-part's TR. With every part all-skipped, all
+    /// four frames reproduce the I-frame — and crucially the final
+    /// P-picture decodes without error, proving the reference threaded
+    /// through the PB P-part rather than the B-part.
+    #[test]
+    fn decode_sequence_threads_pb_p_part_as_next_reference() {
+        let i_frame = build_qcif_intra_dc_picture_gob0_elided(0x10, 8);
+        let pb = build_qcif_pb_picture_real_wire(2, 8, 1, 0b00, |w, _, _| write_skipped_mb(w));
+        // Following P-picture (TR = 3): all-skipped → reproduces the PB
+        // P-part (= the I-frame).
+        let p2 = build_qcif_inter_skipped_picture_real_wire(3, 8);
+        let stream: Vec<u8> = i_frame
+            .iter()
+            .chain(pb.iter())
+            .chain(p2.iter())
+            .copied()
+            .collect();
+        let frames = decode_sequence(&stream, DecodeOptions::default()).expect("sequence");
+        assert_eq!(frames.len(), 4, "expected [I, B, P, P2]");
+        for (idx, f) in frames.iter().enumerate() {
+            assert!(
+                f.y.iter().all(|&p| p == 16),
+                "frame {idx} luma not uniform 16"
+            );
+        }
+    }
+
     /// `decode_sequence` routes an extended (PLUSPTYPE) Improved
     /// PB-frame (MPPTYPE picture-type `"010"`) through the (P, BPB) pair
     /// driver, splicing the BPB-picture in *before* the P-picture in
