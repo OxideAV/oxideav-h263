@@ -175,6 +175,22 @@ planar 4:2:0 `YuvFrame`:
   §P.2 **explicit** RPRP field (WDA + eight Table-D.3 warping parameters
   + fill mode, parsed for INTER / B / Improved-PB pictures). The
   EP-picture explicit-RPR lower-layer-refinement case is not yet staged.
+* **Annex G §G.1–§G.5** — PB-frames decode end-to-end, both through the
+  per-layer `decode_pb_picture` driver (test-convention wire layout) and —
+  new this round — through the headline `decode_sequence` streaming entry
+  point: a baseline-PTYPE INTER picture that signals PB-frames mode
+  (PTYPE bit 13) is routed to `decode_pb_picture_no_gob0_header`, which
+  reads the spec-conformant baseline picture-header tail a real encoder
+  emits (§5.1.19 PQUANT, §5.1.20 CPM, §5.1.22 TRB, §5.1.23 DBQUANT,
+  §5.1.24/§5.1.25 PEI/PSUPP), elides the group-number-0 GOB header (§5.2.2)
+  and tolerates the §5.2 optional later GOB headers. The decoded (B, P)
+  pair is spliced into the frame sequence in display order (B before P);
+  only the P-part advances the prediction reference and the §G.4 TR the
+  next PB-frame scales against. Per macroblock the §5.3 / Figure 10 / Table
+  10 PB-frame layer (COD, MCBPC, MODB, CBPB, CBPY, DQUANT, MVD, MVDB) drives
+  the six P-blocks then the six §G.4 / §G.5 bidirectionally-predicted
+  B-blocks with the Table-6 BQUANT dequant. SAC / Advanced Prediction / AIC
+  combinations are refused (§G.1 bars the PLUSPTYPE-gated modes).
 * **Annex O §O.4 / §O.5** — temporal-scalability **B-pictures** decode
   end-to-end (`decode_b_picture` / `decode_b_picture_layer`): the Table
   O.1 MBTYPE layer drives Forward / Backward / Bi-dir / INTRA
@@ -292,8 +308,12 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   §N.4.1 per-segment TRP re-selection now decodes to pixels on both the
   GOB-layer and the Annex K slice-layer paths (see the supported list).
 * Slice-boundary / Independent-Segment-Decoding deblock skip rules.
-* PB-frames and Improved PB-frames (Annex G / M) end-to-end
-  reconstruction.
+* Improved PB-frames (Annex M) through `decode_sequence` (the per-layer
+  `decode_improved_pb_picture` driver decodes the (P, BPB) pair, but the
+  extended-PTYPE streaming dispatch in `decode_sequence` still yields only
+  the P-part of an Improved-PB picture, not the BPB-part). Annex G
+  PB-frames now decode end-to-end through `decode_sequence` (see the
+  supported list).
 * Annex K Rectangular Slice submode, Annex K with Advanced Prediction /
   CPM, and Arbitrary Slice Ordering.
 * Annex O CPM-multiplexed / Advanced-Prediction / SAC / Annex-K-slice

@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex G PB-frames decode through `decode_sequence`** (round 371): the
+  headline multi-picture streaming entry point now routes a baseline-PTYPE
+  INTER picture that signals PB-frames mode (PTYPE bit 13) through a new
+  real-elementary-stream PB driver and splices the decoded (B, P) pair into
+  the output in display order — the B-picture *before* the P-picture, with
+  only the P-part advancing the prediction reference and the §G.4 TR.
+  `decode_pb_picture_no_gob0_header` consumes the spec-conformant baseline
+  picture-header tail a real encoder emits for a PB-frame — §5.1.19 PQUANT,
+  §5.1.20 CPM (the "1" Annex-C branch refused), §5.1.22 TRB, §5.1.23
+  DBQUANT, §5.1.24/§5.1.25 PEI/PSUPP — then elides the group-number-0 GOB
+  header (§5.2.2) and treats every later GOB header as optional (§5.2),
+  exactly the framing the baseline non-PB streaming path uses (where the
+  existing `decode_pb_picture` instead used the per-layer test convention:
+  no PQUANT/CPM in the header and a mandatory header on every GOB). The TR
+  of every decoded reference (baseline I/P, extended P, or the PB P-part)
+  is tracked across the sequence loop so a following PB-frame scales its
+  §G.4 B-vectors against the correct anchor. New tests: the real-wire PB
+  driver reproduces the reference in both parts for an all-skipped frame,
+  rejects a zero PQUANT, and `decode_sequence` of an I-frame + all-skipped
+  PB-frame yields three display-order frames `[I, B, P]`.
+
 - **Annex N §N.4.1 per-slice Reference Picture Selection through the
   Annex K Slice-Structured driver** (round 366): the slice driver now
   parses the §N.4.1 slice-layer NEWPRED fields (Figure N.3) after each

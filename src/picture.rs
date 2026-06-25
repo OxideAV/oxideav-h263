@@ -830,12 +830,19 @@ fn find_next_psc(data: &[u8], from: usize) -> Option<usize> {
 /// * [`Error::BadPictureStartCode`] if `data` does not begin with a PSC
 ///   (after any leading bytes — the first PSC is located the same way as
 ///   the subsequent ones).
-/// * The union of [`decode_picture_no_gob0_header`]'s errors for any
-///   picture in the stream.
+/// * The union of [`decode_picture_no_gob0_header`]'s,
+///   [`decode_pb_picture_no_gob0_header`]'s, and
+///   [`decode_picture_layer_with_inherited`]'s errors for any picture in
+///   the stream.
 ///
-/// PB / Improved-PB / scalability (EI/EP/B) and CPM streams are refused
-/// by the per-picture driver and therefore by this entry point; they have
-/// their own dedicated drivers.
+/// A baseline-PTYPE INTER picture that signals Annex G PB-frames mode
+/// (PTYPE bit 13) is routed to [`decode_pb_picture_no_gob0_header`]; the
+/// decoded (B, P) pair is appended in display order (the B-picture
+/// *before* the P-picture, §5.1.22), and only the P-part advances the
+/// prediction reference / §G.4 TR. Improved-PB (Annex M), scalability
+/// (EI/EP/B), and CPM streams still take their dedicated drivers — the
+/// extended-PTYPE dispatch here yields only the P-part of an Improved-PB
+/// picture.
 pub fn decode_sequence(data: &[u8], options: DecodeOptions) -> Result<Vec<YuvFrame>> {
     let first = find_next_psc(data, 0).ok_or(Error::BadPictureStartCode)?;
     let mut frames: Vec<YuvFrame> = Vec::new();
@@ -845,6 +852,12 @@ pub fn decode_sequence(data: &[u8], options: DecodeOptions) -> Result<Vec<YuvFra
     // picture. A baseline-PTYPE picture resets this to the spec default
     // (rule 3), which the extended driver already returns on its outcome.
     let mut inherited = InheritedExtendedState::default();
+    // §5.1.2 / §G.4 — the Temporal Reference of the most recent decoded
+    // *reference* picture (an I- or P-picture, or the P-part of a
+    // PB-frame). A PB-frame's §G.4 TRD scales its B-vectors against this
+    // value, so it tracks the prediction-reference picture (never a
+    // display-only B-frame). `None` until the first picture decodes.
+    let mut prev_tr: Option<u8> = None;
     let mut start = first;
     loop {
         // The picture spans from its PSC to the next PSC (exclusive), or
@@ -859,18 +872,48 @@ pub fn decode_sequence(data: &[u8], options: DecodeOptions) -> Result<Vec<YuvFra
         // driver (which handles the H.263+ Annex modes, slice-structured
         // layout, and reference resampling) and thread the §5.1.4.4
         // inherited-state snapshot forward.
-        let frame = if picture_header_is_extended(picture)? {
+        if picture_header_is_extended(picture)? {
+            // The §5.1.2 prefix TR (8 bits after the PSC) records this
+            // picture as a potential §G.4 reference for a following
+            // baseline PB-frame (peeked before the borrow-conflicting
+            // push below).
+            let ext_tr = {
+                let mut r = BitReader::new(picture);
+                r.skip(PSC_BITS).map_err(|_| Error::UnexpectedEof)?;
+                r.read_u32(8).map_err(|_| Error::UnexpectedEof)? as u8
+            };
             let outcome =
                 decode_picture_layer_with_inherited(picture, reference, options, inherited)?;
             inherited = outcome.inherited;
-            outcome.frame
+            prev_tr = Some(ext_tr);
+            frames.push(outcome.frame);
         } else {
             // A non-PLUSPTYPE picture clears the inherited mode state
             // (§5.1.4.5 rule 3) for any following UFEP="000" picture.
             inherited = InheritedExtendedState::default();
-            decode_picture_no_gob0_header(picture, reference, options)?
-        };
-        frames.push(frame);
+            let (tr, pb_frames) = baseline_tr_and_pb(picture)?;
+            if pb_frames {
+                // §G.1 / Annex G PB-frame: decode the (B, P) pair. The
+                // B-picture is displayed *before* the P-picture (it sits
+                // temporally between the reference and the P-part,
+                // §5.1.22) but is never a prediction source, so only the
+                // P-part advances `prev_tr` / becomes the next reference.
+                let prev = prev_tr.ok_or(Error::BadPbTemporalReference)?;
+                let anchor = reference.ok_or(Error::BadPbTemporalReference)?;
+                let pair = decode_pb_picture_no_gob0_header(picture, anchor, prev, options)?;
+                let PbFramePair { p_frame, b_frame } = pair;
+                // Splice the B-frame in *before* the P-frame in display
+                // order. `reference` borrowed `frames`; it is dropped
+                // above, so the push is sound.
+                frames.push(b_frame);
+                prev_tr = Some(tr);
+                frames.push(p_frame);
+            } else {
+                let frame = decode_picture_no_gob0_header(picture, reference, options)?;
+                prev_tr = Some(tr);
+                frames.push(frame);
+            }
+        }
         match next {
             Some(n) => start = n,
             None => break,
@@ -907,6 +950,38 @@ fn picture_header_is_extended(data: &[u8]) -> Result<bool> {
     reader.skip(8 + 5).map_err(|_| Error::UnexpectedEof)?;
     let source_format = reader.read_u32(3).map_err(|_| Error::UnexpectedEof)?;
     Ok(source_format == 0b111)
+}
+
+/// Peek the §5.1.2 Temporal Reference (8 bits, immediately after the
+/// PSC) and the §5.1.3 PTYPE PB-frames bit (PTYPE bit 9) of a baseline
+/// (non-extended) picture without consuming the picture-header parser.
+///
+/// Used by [`decode_sequence`] to route a baseline INTER picture that
+/// signals PB-frames mode to [`decode_pb_picture_no_gob0_header`] (which
+/// needs the reference picture's TR for the §G.4 TRD), and to record the
+/// TR of every decoded reference for the next picture's §G.4 scaling.
+///
+/// Returns `(temporal_reference, pb_frames)`. The caller must only invoke
+/// this on a picture known to be baseline-PTYPE (PTYPE bits 6-8 are not
+/// `"111"`); the PB-frames bit it reads is otherwise the first bit of the
+/// extended PLUSPTYPE escape.
+fn baseline_tr_and_pb(data: &[u8]) -> Result<(u8, bool)> {
+    let mut reader = BitReader::new(data);
+    let psc = reader
+        .read_u32(PSC_BITS)
+        .map_err(|_| Error::UnexpectedEof)?;
+    if psc != PSC_VALUE {
+        return Err(Error::BadPictureStartCode);
+    }
+    let tr = reader.read_u32(8).map_err(|_| Error::UnexpectedEof)? as u8;
+    // PTYPE bit1 + bit2 + split-screen + doc-camera + freeze-release (5)
+    // + source format (3) + coding type (1) + UMV (1) + SAC (1) +
+    // Advanced Prediction (1) precede the PB-frames bit.
+    reader
+        .skip(5 + 3 + 1 + 1 + 1 + 1)
+        .map_err(|_| Error::UnexpectedEof)?;
+    let pb_frames = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    Ok((tr, pb_frames))
 }
 
 /// Decode a single H.263 picture from `data`, dispatching on the
@@ -1518,6 +1593,119 @@ pub fn decode_pb_picture(
             b_frame: &mut b_frame,
         }),
         None,
+    )?;
+    Ok(PbFramePair { p_frame, b_frame })
+}
+
+/// Decode one Annex G PB-frame from a **real elementary-stream** wire
+/// layout, producing both the P-picture and the B-picture.
+///
+/// This is the [`decode_sequence`]-facing counterpart to
+/// [`decode_pb_picture`]. Where `decode_pb_picture` uses the per-layer
+/// test convention (no PQUANT/CPM/PEI in the header, a mandatory header
+/// on every GOB), this driver consumes the spec-conformant baseline
+/// picture-header tail a real encoder emits for a PB-frame:
+///
+/// 1. §5.1.19 PQUANT (5 bits) — primes QUANT for the header-less GOB 0.
+/// 2. §5.1.20 CPM (1 bit) — the "1" branch (Annex C sub-bitstreams) is
+///    refused, matching [`decode_picture_no_gob0_header`].
+/// 3. §5.1.22 TRB (3 bits, standard CIF picture clock frequency) and
+///    §5.1.23 DBQUANT (2 bits) — present because PTYPE signals PB-frames.
+/// 4. §5.1.24 / §5.1.25 PEI / PSUPP extension loop — consumed and
+///    discarded.
+///
+/// The reconstruction then runs through [`decode_after_picture_header`]
+/// with `gob0_pquant = Some(pquant)`, so the topmost group-number-0 GOB
+/// header is elided (§5.2.2) and every later GOB header is **optional**
+/// (§5.2) — exactly the framing the baseline non-PB streaming path uses.
+///
+/// `prev_tr` is the §5.1.2 Temporal Reference of the `reference` picture;
+/// §G.4 derives TRD as the TR increment from it (adding 256 on wrap).
+///
+/// # Errors
+///
+/// The union of [`decode_pb_picture`]'s errors, plus
+/// [`Error::InvalidQuantiser`] for an out-of-range PQUANT and
+/// [`Error::NotImplemented`] for CPM = "1".
+pub fn decode_pb_picture_no_gob0_header(
+    data: &[u8],
+    reference: &YuvFrame,
+    prev_tr: u8,
+    options: DecodeOptions,
+) -> Result<PbFramePair> {
+    let mut reader = BitReader::new(data);
+    let header = parse_picture_header(&mut reader)?;
+    if !header.pb_frames {
+        return Err(Error::NotImplemented);
+    }
+    if !matches!(header.coding_type, H263PictureCodingType::Inter) {
+        return Err(Error::NotImplemented);
+    }
+    if header.advanced_prediction || header.sac_mode || options.aic {
+        return Err(Error::NotImplemented);
+    }
+
+    // §5.1.19 — PQUANT (5 bits). In the baseline picture header it
+    // follows PTYPE directly and primes the header-less GOB 0.
+    let pquant = reader.read_u32(5).map_err(|_| Error::UnexpectedEof)? as u8;
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+
+    // §5.1.20 — CPM (1 bit). The "1" branch pulls in PSBI + per-GOB
+    // GSBI (Annex C) this driver does not frame; refuse it.
+    let cpm = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    if cpm {
+        return Err(Error::NotImplemented);
+    }
+
+    // §5.1.22 — TRB (3 bits at the standard CIF picture clock frequency;
+    // the 5-bit custom-PCF form is a PLUSPTYPE-only feature §G.1 bars
+    // from Annex G). §5.1.23 — DBQUANT (2 bits).
+    let trb = reader.read_u32(3).map_err(|_| Error::UnexpectedEof)? as i32;
+    if trb == 0 {
+        return Err(Error::BadPbTemporalReference);
+    }
+    let dbquant = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)? as u8;
+    // §G.4 — TRD.
+    let mut trd = i32::from(header.temporal_reference) - i32::from(prev_tr);
+    if trd < 0 {
+        trd += 256;
+    }
+    if trd == 0 {
+        return Err(Error::BadPbTemporalReference);
+    }
+
+    // §5.1.24 / §5.1.25 — PEI / PSUPP loop (discarded), leaving the
+    // reader on the first bit of GOB-0 macroblock data.
+    skip_pei_psupp(&mut reader)?;
+
+    let layout =
+        PictureLayout::for_source_format(header.source_format).ok_or(Error::NotImplemented)?;
+    let luma_w = layout.luma_width as usize;
+    let luma_h = layout.luma_height as usize;
+    let mut b_frame = YuvFrame {
+        y: vec![0u8; luma_w * luma_h],
+        cb: vec![0u8; (luma_w / 2) * (luma_h / 2)],
+        cr: vec![0u8; (luma_w / 2) * (luma_h / 2)],
+        luma_width: luma_w,
+        luma_height: luma_h,
+    };
+    let p_frame = decode_after_picture_header(
+        &mut reader,
+        &header,
+        &layout,
+        Some(reference),
+        options,
+        Some(PbPictureCtx {
+            trb,
+            trd,
+            dbquant,
+            annex_m: false,
+            left_bpb_forward_mv: None,
+            b_frame: &mut b_frame,
+        }),
+        Some(pquant),
     )?;
     Ok(PbFramePair { p_frame, b_frame })
 }
@@ -11521,6 +11709,117 @@ mod tests {
                 assert_eq!(pair.b_frame.cb[j * 88 + i], expected.cb[j][i]);
                 assert_eq!(pair.b_frame.cr[j * 88 + i], expected.cr[j][i]);
             }
+        }
+    }
+
+    // ---- Annex G PB-frame real-stream wire layout ------------------
+
+    /// Build a QCIF Annex G PB-frame in the **real elementary-stream**
+    /// wire layout consumed by [`decode_pb_picture_no_gob0_header`] /
+    /// [`decode_sequence`]: PSC, TR, PTYPE (PB on), §5.1.19 PQUANT (5),
+    /// §5.1.20 CPM = "0", §5.1.22 TRB (3), §5.1.23 DBQUANT (2), then
+    /// §5.1.24 PEI = "0", then the header-less GOB 0 (§5.2.2) and
+    /// GOBs 1..8 with full headers, every macroblock written by the
+    /// `write_mb(w, gob, mb)` closure.
+    fn build_qcif_pb_picture_real_wire<F: FnMut(&mut BitWriter, usize, usize)>(
+        tr: u8,
+        pquant: u8,
+        trb: u32,
+        dbquant: u32,
+        mut write_mb: F,
+    ) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(tr as u32, 8);
+        w.write_bit(true); // PTYPE bit1
+        w.write_bit(false); // PTYPE bit2
+        w.write_bit(false); // split-screen
+        w.write_bit(false); // doc-camera
+        w.write_bit(false); // freeze
+        w.write_u32(0b010, 3); // QCIF
+        w.write_bit(true); // INTER
+        w.write_bit(false); // umv
+        w.write_bit(false); // sac
+        w.write_bit(false); // ap
+        w.write_bit(true); // pb = ON
+        w.write_u32(pquant as u32, 5); // §5.1.19 PQUANT
+        w.write_bit(false); // §5.1.20 CPM = "0"
+        w.write_u32(trb, 3); // §5.1.22 TRB
+        w.write_u32(dbquant, 2); // §5.1.23 DBQUANT
+        w.write_bit(false); // §5.1.24 PEI = "0"
+                            // GOB 0: NO header (§5.2.2).
+        for mb in 0..11 {
+            write_mb(&mut w, 0, mb);
+        }
+        // GOBs 1..8: full headers at QUANT = PQUANT.
+        for gob in 1..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(pquant as u32, GQUANT_BITS);
+            for mb in 0..11 {
+                write_mb(&mut w, gob, mb);
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// The real-wire PB driver reproduces the reference in both parts
+    /// for an all-skipped PB-frame, exactly as the per-layer
+    /// [`decode_pb_picture`] does — confirming the §5.1.19 PQUANT /
+    /// §5.1.20 CPM / §5.1.24 PEI header tail is framed correctly and
+    /// the GOB-0 header elision (§5.2.2) lands the reader on the first
+    /// macroblock.
+    #[test]
+    fn decode_pb_picture_no_gob0_header_all_skipped_reproduces_reference() {
+        let reference = ramp_reference(176, 144);
+        let data = build_qcif_pb_picture_real_wire(2, 8, 1, 0b00, |w, _, _| write_skipped_mb(w));
+        let pair = decode_pb_picture_no_gob0_header(&data, &reference, 0, DecodeOptions::default())
+            .expect("decode");
+        assert_eq!(pair.p_frame, reference);
+        assert_eq!(pair.b_frame, reference);
+    }
+
+    /// A bad PQUANT (0) in the real-wire PB header is rejected before
+    /// any GOB data is consumed.
+    #[test]
+    fn decode_pb_picture_no_gob0_header_rejects_zero_pquant() {
+        let reference = YuvFrame::grey(176, 144);
+        let data = build_qcif_pb_picture_real_wire(2, 0, 1, 0b00, |w, _, _| write_skipped_mb(w));
+        assert_eq!(
+            decode_pb_picture_no_gob0_header(&data, &reference, 0, DecodeOptions::default())
+                .unwrap_err(),
+            Error::InvalidQuantiser
+        );
+    }
+
+    /// `decode_sequence` routes a baseline INTER picture that signals
+    /// PB-frames mode through the (B, P) pair driver, splicing the
+    /// B-picture in *before* the P-picture in display order and
+    /// advancing the prediction reference / §G.4 TR only on the
+    /// P-part. An I-frame followed by an all-skipped PB-frame
+    /// therefore yields three frames [I, B, P] all equal to the I.
+    #[test]
+    fn decode_sequence_routes_pb_frame_pair_in_display_order() {
+        // I-frame (TR = 0): uniform luma/chroma = 16.
+        let i_frame = build_qcif_intra_dc_picture_gob0_elided(0x10, 8);
+        // PB-frame (TR = 2, TRB = 1 -> TRD = 2): all-skipped, so both
+        // parts reproduce the I-frame.
+        let pb = build_qcif_pb_picture_real_wire(2, 8, 1, 0b00, |w, _, _| write_skipped_mb(w));
+        let stream: Vec<u8> = i_frame.iter().chain(pb.iter()).copied().collect();
+        let frames = decode_sequence(&stream, DecodeOptions::default()).expect("sequence");
+        assert_eq!(frames.len(), 3, "expected [I, B, P]");
+        // All three frames reproduce the flat I-frame.
+        for (idx, f) in frames.iter().enumerate() {
+            assert!(
+                f.y.iter().all(|&p| p == 16),
+                "frame {idx} luma not uniform 16"
+            );
+            assert!(f.cb.iter().all(|&p| p == 16), "frame {idx} cb not uniform");
+            assert!(f.cr.iter().all(|&p| p == 16), "frame {idx} cr not uniform");
         }
     }
 
