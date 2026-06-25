@@ -277,9 +277,10 @@ pub use pb_layer::{
 };
 pub use picture::{
     decode_b_picture, decode_b_picture_layer, decode_ep_picture_layer, decode_improved_pb_picture,
-    decode_pb_picture, decode_pb_picture_no_gob0_header, decode_picture, decode_picture_layer,
-    decode_picture_layer_with_inherited, decode_picture_no_gob0_header, decode_sequence,
-    BPictureTemporal, DecodeOptions, DecodePictureOutcome, PbFramePair, PictureLayout, YuvFrame,
+    decode_improved_pb_picture_with_inherited, decode_pb_picture, decode_pb_picture_no_gob0_header,
+    decode_picture, decode_picture_layer, decode_picture_layer_with_inherited,
+    decode_picture_no_gob0_header, decode_sequence, BPictureTemporal, DecodeOptions,
+    DecodePictureOutcome, PbFramePair, PictureLayout, YuvFrame,
 };
 pub use picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,

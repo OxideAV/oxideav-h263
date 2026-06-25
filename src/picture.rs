@@ -836,13 +836,13 @@ fn find_next_psc(data: &[u8], from: usize) -> Option<usize> {
 ///   the stream.
 ///
 /// A baseline-PTYPE INTER picture that signals Annex G PB-frames mode
-/// (PTYPE bit 13) is routed to [`decode_pb_picture_no_gob0_header`]; the
-/// decoded (B, P) pair is appended in display order (the B-picture
-/// *before* the P-picture, §5.1.22), and only the P-part advances the
-/// prediction reference / §G.4 TR. Improved-PB (Annex M), scalability
-/// (EI/EP/B), and CPM streams still take their dedicated drivers — the
-/// extended-PTYPE dispatch here yields only the P-part of an Improved-PB
-/// picture.
+/// (PTYPE bit 13) is routed to [`decode_pb_picture_no_gob0_header`], and
+/// an extended-PTYPE Improved PB-frame (Annex M, §5.1.4.3 MPPTYPE
+/// picture-type `"010"`) to [`decode_improved_pb_picture_with_inherited`];
+/// in both cases the decoded (B/BPB, P) pair is appended in display order
+/// (the B/BPB-picture *before* the P-picture, §5.1.22), and only the
+/// P-part advances the prediction reference / §G.4 TR. Scalability
+/// (EI/EP/B) and CPM streams still take their dedicated drivers.
 pub fn decode_sequence(data: &[u8], options: DecodeOptions) -> Result<Vec<YuvFrame>> {
     let first = find_next_psc(data, 0).ok_or(Error::BadPictureStartCode)?;
     let mut frames: Vec<YuvFrame> = Vec::new();
@@ -875,18 +875,37 @@ pub fn decode_sequence(data: &[u8], options: DecodeOptions) -> Result<Vec<YuvFra
         if picture_header_is_extended(picture)? {
             // The §5.1.2 prefix TR (8 bits after the PSC) records this
             // picture as a potential §G.4 reference for a following
-            // baseline PB-frame (peeked before the borrow-conflicting
+            // PB / Improved-PB frame (peeked before the borrow-conflicting
             // push below).
             let ext_tr = {
                 let mut r = BitReader::new(picture);
                 r.skip(PSC_BITS).map_err(|_| Error::UnexpectedEof)?;
                 r.read_u32(8).map_err(|_| Error::UnexpectedEof)? as u8
             };
-            let outcome =
-                decode_picture_layer_with_inherited(picture, reference, options, inherited)?;
-            inherited = outcome.inherited;
-            prev_tr = Some(ext_tr);
-            frames.push(outcome.frame);
+            // §5.1.4.3 MPPTYPE picture-type = "010" selects an Annex M
+            // Improved PB-frame, which decodes into a (P, BPB) pair the
+            // single-frame `decode_picture_layer_with_inherited` refuses.
+            // Route it to the dedicated pair driver instead, splicing the
+            // BPB-picture in *before* the P-picture in display order
+            // (§5.1.22) — only the P-part advances the reference / §G.4 TR.
+            if extended_is_improved_pb(picture, inherited)? {
+                let prev = prev_tr.ok_or(Error::BadPbTemporalReference)?;
+                let anchor = reference.ok_or(Error::BadPbTemporalReference)?;
+                let (pair, next_inherited) = decode_improved_pb_picture_with_inherited(
+                    picture, anchor, prev, options, inherited,
+                )?;
+                let PbFramePair { p_frame, b_frame } = pair;
+                inherited = next_inherited;
+                frames.push(b_frame);
+                prev_tr = Some(ext_tr);
+                frames.push(p_frame);
+            } else {
+                let outcome =
+                    decode_picture_layer_with_inherited(picture, reference, options, inherited)?;
+                inherited = outcome.inherited;
+                prev_tr = Some(ext_tr);
+                frames.push(outcome.frame);
+            }
         } else {
             // A non-PLUSPTYPE picture clears the inherited mode state
             // (§5.1.4.5 rule 3) for any following UFEP="000" picture.
@@ -950,6 +969,33 @@ fn picture_header_is_extended(data: &[u8]) -> Result<bool> {
     reader.skip(8 + 5).map_err(|_| Error::UnexpectedEof)?;
     let source_format = reader.read_u32(3).map_err(|_| Error::UnexpectedEof)?;
     Ok(source_format == 0b111)
+}
+
+/// Determine whether an extended (PLUSPTYPE) picture is an Annex M
+/// Improved PB-frame — §5.1.4.3 MPPTYPE picture-type = `"010"`.
+///
+/// The MPPTYPE picture-type is variable-position in the PLUSPTYPE header
+/// (it depends on UFEP and the OPPTYPE field widths), so rather than
+/// bit-peek it this parses the picture layer with the supplied
+/// `inherited` state — the same parse [`decode_picture_layer_with_inherited`]
+/// performs — and inspects the picture type. Used by [`decode_sequence`]
+/// to route an Improved-PB picture to the (P, BPB) pair driver before the
+/// single-frame driver refuses it.
+///
+/// # Errors
+///
+/// The parse errors of [`parse_picture_layer`] (a malformed PLUSPTYPE
+/// header). A baseline picture (which this is only called on after
+/// [`picture_header_is_extended`] returned `true`) yields `false`.
+fn extended_is_improved_pb(data: &[u8], inherited: InheritedExtendedState) -> Result<bool> {
+    let mut reader = BitReader::new(data);
+    match parse_picture_layer(&mut reader, inherited)? {
+        H263PictureLayer::Extended(e) => Ok(matches!(
+            e.plus.mpptype.picture_type,
+            PlusPictureType::ImprovedPb
+        )),
+        H263PictureLayer::Baseline(_) => Ok(false),
+    }
 }
 
 /// Peek the §5.1.2 Temporal Reference (8 bits, immediately after the
@@ -1763,12 +1809,52 @@ pub fn decode_improved_pb_picture(
     prev_tr: u8,
     options: DecodeOptions,
 ) -> Result<PbFramePair> {
+    let (pair, _next) = decode_improved_pb_picture_with_inherited(
+        data,
+        reference,
+        prev_tr,
+        options,
+        InheritedExtendedState::default(),
+    )?;
+    Ok(pair)
+}
+
+/// Decode one Annex M Improved PB-frame, threading caller-supplied
+/// §5.1.4.4 inherited-state and returning the next-inherited snapshot —
+/// the [`decode_sequence`] counterpart to [`decode_improved_pb_picture`].
+///
+/// Behaves exactly like [`decode_improved_pb_picture`] (same wire layout,
+/// same §M.2 / §G.4 reconstruction, same refusals) except that:
+///
+/// * the supplied `inherited` is used to decode a `UFEP = "000"` Improved
+///   PB-frame whose source-format / mode bits come from a prior
+///   `UFEP = "001"` picture in the same bitstream (§5.1.4.4), and
+/// * it returns the next-picture inherited snapshot alongside the decoded
+///   `(P, BPB)` pair, so a streaming caller can thread it forward.
+///
+/// # Errors
+///
+/// The same set as [`decode_improved_pb_picture`].
+pub fn decode_improved_pb_picture_with_inherited(
+    data: &[u8],
+    reference: &YuvFrame,
+    prev_tr: u8,
+    options: DecodeOptions,
+    inherited: InheritedExtendedState,
+) -> Result<(PbFramePair, InheritedExtendedState)> {
     let mut reader = BitReader::new(data);
-    let layer = parse_picture_layer(&mut reader, InheritedExtendedState::default())?;
+    let layer = parse_picture_layer(&mut reader, inherited)?;
     let extended = match layer {
         H263PictureLayer::Extended(e) => e,
         // §M.1 — Improved PB-frames is PLUSPTYPE-only.
         H263PictureLayer::Baseline(_) => return Err(Error::NotImplemented),
+    };
+    // §5.1.4.4 — a UFEP=001 picture establishes the inherited snapshot for
+    // the next picture; a UFEP=000 picture passes the incoming state
+    // through unchanged.
+    let next_inherited = match extended.plus.opptype {
+        Some(o) => InheritedExtendedState::from_opptype_with_cpfmt(o, extended.plus.cpfmt),
+        None => inherited,
     };
     let PlusShimOutcome {
         header,
@@ -1776,12 +1862,7 @@ pub fn decode_improved_pb_picture(
         options: shim_options,
         slice_structured,
         improved_pb,
-    } = plus_ptype_to_baseline_shim(
-        &extended,
-        options,
-        InheritedExtendedState::default(),
-        /* allow_rps */ false,
-    )?;
+    } = plus_ptype_to_baseline_shim(&extended, options, inherited, /* allow_rps */ false)?;
     if !improved_pb {
         // Not an Improved PB-frame — the caller should use
         // [`decode_picture_layer`] for a plain INTRA / INTER picture.
@@ -1851,7 +1932,7 @@ pub fn decode_improved_pb_picture(
         }),
         None,
     )?;
-    Ok(PbFramePair { p_frame, b_frame })
+    Ok((PbFramePair { p_frame, b_frame }, next_inherited))
 }
 
 /// §M.2.2 — forward prediction for one Improved-PB BPB-macroblock.
@@ -11821,6 +11902,54 @@ mod tests {
             assert!(f.cb.iter().all(|&p| p == 16), "frame {idx} cb not uniform");
             assert!(f.cr.iter().all(|&p| p == 16), "frame {idx} cr not uniform");
         }
+    }
+
+    /// `decode_sequence` routes an extended (PLUSPTYPE) Improved
+    /// PB-frame (MPPTYPE picture-type `"010"`) through the (P, BPB) pair
+    /// driver, splicing the BPB-picture in *before* the P-picture in
+    /// display order. An I-frame followed by an all-skipped Improved-PB
+    /// frame yields three frames [I, BPB, P] all equal to the I-frame.
+    #[test]
+    fn decode_sequence_routes_improved_pb_pair_in_display_order() {
+        // I-frame (TR = 0): uniform luma/chroma = 16.
+        let i_frame = build_qcif_intra_dc_picture_gob0_elided(0x10, 8);
+        // Improved-PB frame (TR = 2, TRB = 1 -> TRD = 2): all-skipped, so
+        // both parts reproduce the I-frame.
+        let ipb = build_qcif_improved_pb_picture(2, 1, 0b00, |w, _, _| write_skipped_mb(w));
+        let stream: Vec<u8> = i_frame.iter().chain(ipb.iter()).copied().collect();
+        let frames = decode_sequence(&stream, DecodeOptions::default()).expect("sequence");
+        assert_eq!(frames.len(), 3, "expected [I, BPB, P]");
+        for (idx, f) in frames.iter().enumerate() {
+            assert!(
+                f.y.iter().all(|&p| p == 16),
+                "frame {idx} luma not uniform 16"
+            );
+            assert!(f.cb.iter().all(|&p| p == 16), "frame {idx} cb not uniform");
+            assert!(f.cr.iter().all(|&p| p == 16), "frame {idx} cr not uniform");
+        }
+    }
+
+    /// `decode_improved_pb_picture_with_inherited` returns the same
+    /// (P, BPB) pair as the non-inherited entry for a self-contained
+    /// UFEP=001 Improved-PB picture, and surfaces the OPPTYPE snapshot
+    /// for the next picture.
+    #[test]
+    fn decode_improved_pb_with_inherited_matches_plain_entry() {
+        let reference = ramp_reference(176, 144);
+        let data = build_qcif_improved_pb_picture(2, 1, 0b00, |w, _, _| write_skipped_mb(w));
+        let plain = decode_improved_pb_picture(&data, &reference, 0, DecodeOptions::default())
+            .expect("plain");
+        let (pair, snap) = decode_improved_pb_picture_with_inherited(
+            &data,
+            &reference,
+            0,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+        )
+        .expect("inherited");
+        assert_eq!(pair, plain);
+        // UFEP=001 establishes a non-default snapshot (QCIF source format).
+        assert_eq!(snap.source_format, Some(PlusSourceFormat::Qcif));
     }
 
     // ---- Annex M Improved PB-frames (§M) --------------------------

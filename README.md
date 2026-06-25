@@ -191,6 +191,18 @@ planar 4:2:0 `YuvFrame`:
   the six P-blocks then the six §G.4 / §G.5 bidirectionally-predicted
   B-blocks with the Table-6 BQUANT dequant. SAC / Advanced Prediction / AIC
   combinations are refused (§G.1 bars the PLUSPTYPE-gated modes).
+* **Annex M §M.1–§M.4** — Improved PB-frames decode end-to-end, both
+  through the per-layer `decode_improved_pb_picture` driver and — new this
+  round — through `decode_sequence`: an extended-PTYPE picture whose
+  §5.1.4.3 MPPTYPE picture-type is `"010"` is detected before dispatch and
+  routed to `decode_improved_pb_picture_with_inherited`, which threads the
+  §5.1.4.4 inherited-state and returns the decoded (P, BPB) pair plus the
+  next-picture OPPTYPE snapshot. The pair is spliced into the sequence in
+  display order (BPB before P); only the P-part advances the reference and
+  §G.4 TR. Per macroblock the §M.4 / Table M.1 MODB form drives the §M.2
+  coding modes (bidirectional / forward with the §M.2.2 left-neighbour MVDB
+  predictor / backward). Annex K + Improved-PB, Advanced Prediction, UMV
+  and AIC combinations are refused (unstaged §M sub-cases).
 * **Annex O §O.4 / §O.5** — temporal-scalability **B-pictures** decode
   end-to-end (`decode_b_picture` / `decode_b_picture_layer`): the Table
   O.1 MBTYPE layer drives Forward / Backward / Bi-dir / INTRA
@@ -308,12 +320,11 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   §N.4.1 per-segment TRP re-selection now decodes to pixels on both the
   GOB-layer and the Annex K slice-layer paths (see the supported list).
 * Slice-boundary / Independent-Segment-Decoding deblock skip rules.
-* Improved PB-frames (Annex M) through `decode_sequence` (the per-layer
-  `decode_improved_pb_picture` driver decodes the (P, BPB) pair, but the
-  extended-PTYPE streaming dispatch in `decode_sequence` still yields only
-  the P-part of an Improved-PB picture, not the BPB-part). Annex G
-  PB-frames now decode end-to-end through `decode_sequence` (see the
-  supported list).
+* Annex G PB-frames and Annex M Improved PB-frames now both decode
+  end-to-end through `decode_sequence` (see the supported list). Still
+  unstaged within those modes: Advanced Prediction / INTER4V B-blocks, UMV
+  over-boundary forward vectors (Annex M), AIC, SAC, and the Annex K
+  Slice-Structured + Improved-PB combination.
 * Annex K Rectangular Slice submode, Annex K with Advanced Prediction /
   CPM, and Arbitrary Slice Ordering.
 * Annex O CPM-multiplexed / Advanced-Prediction / SAC / Annex-K-slice

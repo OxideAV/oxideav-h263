@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex M Improved PB-frames decode through `decode_sequence`** (round
+  371): the extended-PTYPE streaming dispatch now detects an Improved-PB
+  picture (§5.1.4.3 MPPTYPE picture-type "010") via `extended_is_improved_pb`
+  before the single-frame `decode_picture_layer_with_inherited` driver
+  (which refuses it) runs, and routes it to a new
+  `decode_improved_pb_picture_with_inherited` that threads §5.1.4.4
+  inherited-state and returns the decoded (P, BPB) pair plus the next
+  picture's OPPTYPE snapshot. The pair is spliced into the output in
+  display order (the BPB-picture before the P-picture); only the P-part
+  advances the reference and the §G.4 TR. The existing
+  `decode_improved_pb_picture` now delegates to the inherited-aware entry
+  with the default snapshot (no behaviour change). New tests:
+  `decode_sequence` of an I-frame + all-skipped Improved-PB frame yields
+  three display-order frames [I, BPB, P]; the inherited-aware entry matches
+  the plain entry and surfaces the UFEP=001 QCIF source-format snapshot.
+
 - **Annex G PB-frames decode through `decode_sequence`** (round 371): the
   headline multi-picture streaming entry point now routes a baseline-PTYPE
   INTER picture that signals PB-frames mode (PTYPE bit 13) through a new
