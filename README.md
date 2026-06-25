@@ -92,6 +92,15 @@ planar 4:2:0 `YuvFrame`:
 * **Annex J §J.3** — in-loop deblocking edge filter (four-tap formula
   + full Table J.2 STRENGTH lookup + horizontal-before-vertical
   ordering + picture-edge skip), opt-in via `DecodeOptions::deblock`.
+  Deblocking-Filter mode also turns on the §5.3.8 / Table J.1 **four
+  motion vectors per macroblock** element *without* the §F.3 OBMC
+  element: when `deblock` is set, an INTER4V / INTER4V+Q macroblock
+  carries MVD2-4 (gated by the new `MbContext::deblocking_filter`) and
+  each 8×8 luma block is predicted with plain half-pel motion
+  compensation by its own §F.2 four-vector-derived vector (the
+  median-predictor / §D.1 edge replication / Table F.1 chroma derivation
+  are shared with the Advanced-Prediction path; only the OBMC blend is
+  skipped).
 * **Annex K §K.2** — Slice Structured mode: the slice-layer header
   parse (SSC + SEPB1/2/3 + optional SSBI + MBA + SQUANT + optional
   SWI + GFID, plus the first-slice reduced form) and the free-running
@@ -302,8 +311,6 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 
 ## Not yet implemented
 
-* INTER4V macroblocks outside Advanced Prediction mode (the PLUSPTYPE
-  Deblocking-Filter mode INTER4V+Q row).
 * GOB-0-header elision in the *legacy* `decode_picture` /
   `decode_picture_layer` / PB / Annex-K-slice drivers (those still expect
   every GOB, including the topmost, to carry a header on the wire). The

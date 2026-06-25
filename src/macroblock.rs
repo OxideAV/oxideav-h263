@@ -112,6 +112,15 @@ pub struct MbContext {
     /// `true`, INTER4V macroblocks (MB type 2) carry MVD2-4 after
     /// the primary MVD (§5.3.8).
     pub advanced_prediction: bool,
+    /// PLUSPTYPE OPPTYPE bit 11 — Deblocking Filter mode (Annex J).
+    /// Per §5.3.8 / Table J.1, Deblocking Filter mode "includes the
+    /// ability to use four motion vectors per macroblock" without the
+    /// OBMC element, so MVD2-4 follow the primary MVD for INTER4V
+    /// macroblocks under DF mode just as they do under Advanced
+    /// Prediction. Independent of [`MbContext::advanced_prediction`]
+    /// (Table J.1 lists DF-only and AP-only rows that both enable four
+    /// vectors).
+    pub deblocking_filter: bool,
     /// Annex I §I.2 — Advanced INTRA Coding mode. When `true`, an
     /// `INTRA_MODE` VLC (Table I.1) is read between MCBPC and CBPY
     /// for every INTRA macroblock (MB type 3 or 4). The decoded
@@ -204,11 +213,16 @@ impl MbType {
     }
 
     /// Whether MVD2-4 (§5.3.8) follows the primary MVD, given the
-    /// picture-level Advanced Prediction flag. Per Table 9: types
-    /// 2 and 5 in Advanced Prediction mode (or in Deblocking
-    /// Filter mode under PLUSPTYPE, which round 3 doesn't handle).
-    pub fn has_mvd2_4(self, advanced_prediction: bool) -> bool {
-        advanced_prediction && matches!(self, MbType::Inter4V | MbType::Inter4VQ)
+    /// picture-level Advanced Prediction and Deblocking Filter flags.
+    /// Per §5.3.8 / Table J.1: the four-vector elements (and therefore
+    /// MVD2-4) are present for INTER4V types (2 / 5) when **either**
+    /// Advanced Prediction mode (Annex F) **or** Deblocking Filter mode
+    /// (Annex J, PLUSPTYPE OPPTYPE bit 11) is active — DF mode "includes
+    /// the ability to use four motion vectors per macroblock" without the
+    /// OBMC element.
+    pub fn has_mvd2_4(self, advanced_prediction: bool, deblocking_filter: bool) -> bool {
+        (advanced_prediction || deblocking_filter)
+            && matches!(self, MbType::Inter4V | MbType::Inter4VQ)
     }
 
     /// Whether the macroblock is "INTRA-coded" for CBPY-complement
@@ -457,7 +471,7 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
     // are never used for INTRA" (§G.2) — has_mvd2_4 is false for
     // INTRA types, so no PB-mode adjustment is needed here.
     let mut mvd234 = [None; 3];
-    if mb_type.has_mvd2_4(ctx.advanced_prediction) {
+    if mb_type.has_mvd2_4(ctx.advanced_prediction, ctx.deblocking_filter) {
         for slot in mvd234.iter_mut() {
             *slot = Some(Mvd {
                 dx_half: decode_mvd_component(reader)?,
@@ -914,6 +928,7 @@ mod tests {
         MbContext {
             picture_coding_type: H263PictureCodingType::Intra,
             advanced_prediction: false,
+            deblocking_filter: false,
             aic_intra_mode: false,
             pb_frames: false,
             pb_annex_m: false,
@@ -926,6 +941,7 @@ mod tests {
         MbContext {
             picture_coding_type: H263PictureCodingType::Inter,
             advanced_prediction: advanced,
+            deblocking_filter: false,
             aic_intra_mode: false,
             pb_frames: false,
             pb_annex_m: false,
@@ -1617,6 +1633,7 @@ mod tests {
             MbContext {
                 picture_coding_type: pic.coding_type,
                 advanced_prediction: pic.advanced_prediction,
+                deblocking_filter: false,
                 aic_intra_mode: false,
                 pb_frames: false,
                 pb_annex_m: false,
@@ -1636,6 +1653,7 @@ mod tests {
         MbContext {
             picture_coding_type: H263PictureCodingType::Inter,
             advanced_prediction: false,
+            deblocking_filter: false,
             aic_intra_mode: false,
             pb_frames: true,
             pb_annex_m: false,
@@ -1650,6 +1668,7 @@ mod tests {
         MbContext {
             picture_coding_type: H263PictureCodingType::Inter,
             advanced_prediction: false,
+            deblocking_filter: false,
             aic_intra_mode: false,
             pb_frames: true,
             pb_annex_m: true,

@@ -2922,6 +2922,7 @@ fn decode_after_picture_header_inner(
                         MbContext {
                             picture_coding_type: header.coding_type,
                             advanced_prediction: header.advanced_prediction,
+                            deblocking_filter: options.deblock,
                             aic_intra_mode: options.aic,
                             pb_frames: header.pb_frames,
                             pb_annex_m: pb.as_ref().is_some_and(|p| p.annex_m),
@@ -5031,6 +5032,7 @@ fn decode_slice_structured_after_header_inner(
                     MbContext {
                         picture_coding_type: header.coding_type,
                         advanced_prediction: header.advanced_prediction,
+                        deblocking_filter: options.deblock,
                         aic_intra_mode: options.aic,
                         pb_frames: header.pb_frames,
                         // The slice-structured driver does not support
@@ -5797,13 +5799,14 @@ fn decode_inter4v_macroblock(
     aic_state: &mut AicState,
     aic_segment: u32,
 ) -> Result<(MotionVector, Mb4Mv)> {
-    // The macroblock parser only emits MVD2-4 when AP is set, so
-    // INTER4V outside AP would mean PLUSPTYPE Deblocking-Filter mode —
-    // a path the baseline driver does not decode. Refuse defensively.
-    if !advanced_prediction {
-        return Err(Error::NotImplemented);
-    }
-
+    // §5.3.8 / Table J.1 — the macroblock parser emits MVD2-4 (four
+    // vectors) when **either** Advanced Prediction (Annex F) **or**
+    // Deblocking Filter mode (Annex J) is active. Under AP the luma
+    // prediction is the §F.3 overlapped block motion compensation
+    // (OBMC); under DF-only mode the OBMC element is OFF (Table J.1),
+    // so each 8×8 luma block is predicted with plain half-pel motion
+    // compensation by its own vector. `advanced_prediction` selects
+    // between the two below.
     let reference = reference.ok_or(Error::NotImplemented)?;
     let luma_stride = frame.luma_width;
     let chroma_stride = frame.chroma_width();
@@ -5923,29 +5926,36 @@ fn decode_inter4v_macroblock(
         let (bx, by) = luma_block_origin(mb_x, mb_y, blk_i);
         let q_mv = mvs4[blk_i];
 
-        let (r_top, r_bot, s_left, s_right) = classify_remote_mvs(
-            blk,
-            &mvs4,
-            nb_above,
-            nb_left,
-            nb_right,
-            mb_above_outside,
-            mb_left_outside,
-            mb_right_outside,
-            mb_below_outside,
-        );
-
-        let prediction = obmc_predict_block(
-            &y_ref,
-            bx,
-            by,
-            q_mv,
-            r_top,
-            r_bot,
-            s_left,
-            s_right,
-            RCONTROL_DEFAULT,
-        );
+        let prediction = if advanced_prediction {
+            // §F.3 OBMC: blend the current vector with the per-pixel
+            // top / bottom / left / right remote vectors.
+            let (r_top, r_bot, s_left, s_right) = classify_remote_mvs(
+                blk,
+                &mvs4,
+                nb_above,
+                nb_left,
+                nb_right,
+                mb_above_outside,
+                mb_left_outside,
+                mb_right_outside,
+                mb_below_outside,
+            );
+            obmc_predict_block(
+                &y_ref,
+                bx,
+                by,
+                q_mv,
+                r_top,
+                r_bot,
+                s_left,
+                s_right,
+                RCONTROL_DEFAULT,
+            )
+        } else {
+            // Deblocking-Filter-mode four vectors (Table J.1: OBMC OFF):
+            // plain half-pel block motion compensation per vector.
+            motion_compensate_block(&y_ref, bx, by, q_mv, RCONTROL_DEFAULT)
+        };
 
         let has_coef = (inter_cbpy >> (3 - blk_i)) & 1 == 1;
         let samples = if has_coef {
@@ -7239,6 +7249,95 @@ mod tests {
         w.write_u32(0b11, 2); // CBPY idx 15
         w.write_bit(true); // dx = 0
         w.write_bit(true); // dy = 0
+    }
+
+    /// Write a QCIF INTER picture header with **AP off** (so the §F.3
+    /// OBMC element is not active). Deblocking-Filter mode is a
+    /// PLUSPTYPE-only annex with no baseline-PTYPE wire bit, so the
+    /// caller signals it through `DecodeOptions::deblock`; with that flag
+    /// set the macroblock parser reads MVD2-4 for INTER4V macroblocks
+    /// (Table J.1: DF mode enables four vectors) and the reconstruction
+    /// uses plain per-block motion compensation.
+    fn write_qcif_inter_no_ap_picture_header(w: &mut BitWriter) {
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true); // PTYPE bit1
+        w.write_bit(false); // PTYPE bit2
+        w.write_bit(false); // split-screen
+        w.write_bit(false); // doc-camera
+        w.write_bit(false); // freeze
+        w.write_u32(0b010, 3); // QCIF
+        w.write_bit(true); // INTER
+        w.write_bit(false); // umv
+        w.write_bit(false); // sac
+        w.write_bit(false); // ap = OFF
+        w.write_bit(false); // pb
+    }
+
+    /// Drive a QCIF INTER picture (AP off) whose GOB-0 first macroblock
+    /// is an INTER4V with all-zero MVDs and no residual; remaining
+    /// macroblocks are skipped. Decoded with `deblock = true` this
+    /// exercises the §J.3 Deblocking-Filter-mode four-vector path
+    /// (Table J.1: four vectors ON, OBMC OFF).
+    fn build_qcif_df_inter4v_zero_mv_first_mb_picture() -> Vec<u8> {
+        let mut w = BitWriter::new();
+        write_qcif_inter_no_ap_picture_header(&mut w);
+        for gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for mb in 0..11 {
+                if gob == 0 && mb == 0 {
+                    write_inter4v_mb_zero_mvds(&mut w);
+                } else {
+                    write_skipped_mb(&mut w);
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.finish()
+    }
+
+    /// A Deblocking-Filter-mode INTER4V macroblock with all four MVDs =
+    /// (0, 0) reproduces the reference at the top-left macroblock: every
+    /// per-block vector is zero, so plain motion compensation copies the
+    /// reference verbatim. Crucially this also confirms the parser reads
+    /// the four MVDs (Table J.1 four-vector element) under DF mode even
+    /// though Advanced Prediction is off — without the `deblocking_filter`
+    /// gate the parser would read only the primary MVD and mis-frame the
+    /// rest of the GOB.
+    #[test]
+    fn decode_df_mode_inter4v_zero_mvds_reproduces_reference_at_top_left() {
+        let reference = ramp_reference(176, 144);
+        let data = build_qcif_df_inter4v_zero_mv_first_mb_picture();
+        // deblock = true selects the §J.3 Deblocking-Filter mode.
+        let opts = DecodeOptions {
+            deblock: true,
+            ..DecodeOptions::default()
+        };
+        let frame = decode_picture(&data, Some(&reference), opts).expect("decode");
+        // MB(0,0) luma (0..16, 0..16) reproduces the reference. (Block
+        // edges of the macroblock interior are left unfiltered because
+        // every neighbouring block carries identical pixels, so the §J.3
+        // filter is a no-op here; picture-edge rows are skipped.)
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    frame.y[y * 176 + x],
+                    reference.y[y * 176 + x],
+                    "DF INTER4V zero-MV luma mismatch at ({x}, {y})"
+                );
+            }
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(frame.cb[y * 88 + x], reference.cb[y * 88 + x]);
+                assert_eq!(frame.cr[y * 88 + x], reference.cr[y * 88 + x]);
+            }
+        }
     }
 
     /// Drive a QCIF INTER picture with AP on whose first GOB-0 first

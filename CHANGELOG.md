@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Deblocking-Filter-mode four motion vectors per macroblock** (round
+  371): per §5.3.8 / Table J.1, Annex J Deblocking Filter mode "includes
+  the ability to use four motion vectors per macroblock" without the §F.3
+  OBMC element. `MbContext` gained a `deblocking_filter` field and
+  `MbType::has_mvd2_4` now takes both the AP and DF flags, so an INTER4V /
+  INTER4V+Q macroblock carries MVD2-4 when **either** Advanced Prediction
+  **or** Deblocking Filter mode is active. The picture / slice-structured
+  drivers set `deblocking_filter: options.deblock`, and
+  `decode_inter4v_macroblock` selects between the §F.3 OBMC prediction
+  (AP on) and plain per-block half-pel motion compensation (DF-only); the
+  §F.2 four-vector median-predictor derivation, §D.1 edge replication and
+  Table F.1 chroma vector are shared. **API change:** `MbContext` literals
+  must now set `deblocking_filter`. New test: a DF-mode INTER4V macroblock
+  with all-zero MVDs reproduces the reference at the top-left macroblock
+  (and confirms the parser reads four MVDs under DF mode without AP).
+
 - **Annex M Improved PB-frames decode through `decode_sequence`** (round
   371): the extended-PTYPE streaming dispatch now detects an Improved-PB
   picture (§5.1.4.3 MPPTYPE picture-type "010") via `extended_is_improved_pb`

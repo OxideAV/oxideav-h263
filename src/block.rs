@@ -1323,6 +1323,7 @@ mod tests {
             MbContext {
                 picture_coding_type: pic.coding_type,
                 advanced_prediction: pic.advanced_prediction,
+                deblocking_filter: false,
                 aic_intra_mode: false,
                 pb_frames: false,
                 pb_annex_m: false,
