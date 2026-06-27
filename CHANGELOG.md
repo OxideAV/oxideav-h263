@@ -8,6 +8,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Baseline INTRA-picture encoder** (round 376): `encoder::encode_intra_picture`
+  turns a planar 4:2:0 `YuvFrame` into a complete byte-aligned baseline
+  H.263 I-picture — §5.1 header (PSC, TR, PTYPE all-baseline, PQUANT,
+  CPM=0, PEI=0) + §5.2.2 GOB-0-elided single-segment macroblock stream +
+  §5.1.28 PSTUF byte alignment. The output decodes end-to-end through the
+  crate's own `decode_picture_no_gob0_header`; a flat-grey QCIF frame
+  reconstructs bit-exactly (128→DC 1024→128), and a gradient QCIF frame at
+  QUANT=4 reconstructs with luma MAE < 8 and max error ≤ 40. sub-QCIF /
+  QCIF / CIF dimensions verified; non-standard dimensions and
+  out-of-range QUANT are rejected. Composes the `encoder_mb` (§5.3),
+  `encoder_block` (§5.4), `fdct` and `encoder_vlc` layers.
+
+- **Macroblock-layer encoder** (round 376): `encoder_mb` —
+  `encode_intra_macroblock` / `encode_inter_macroblock` /
+  `encode_skipped_macroblock` assemble the §5.3 header (COD, MCBPC, CBPY
+  with INTER complement, MVD) + §5.4 six-block payload in the decoder's
+  exact block order (Y1..Y4, Cb, Cr) and CBP-bit gating. Header
+  round-trips through `parse_macroblock`.
+
+- **Block-layer encoder** (round 376): `encoder_block` —
+  `encode_intra_block` / `encode_inter_block` plus the §5.4.2 TCOEF
+  run-length coder (`tcoef_events`, bit-exact inverse of the decoder's
+  RUN/LEVEL loop) and the INTRADC + TCOEF emitters
+  (`write_intra_block` / `write_inter_block_coeffs`).
+
+- **Forward DCT + forward quantisation** (round 376): `fdct` — the
+  orthonormal forward DCT that inverts the decoder's IDCT (±1 LSB on an
+  unquantised round-trip), the conventional dead-zone forward quantiser
+  `|L| = floor(|F| / (2·QUANT))`, and `quantise_intradc` (nearest legal
+  Table 15 reconstruction level). Round-trips through §6.2.1 dequant to
+  within ~2·QUANT.
+
 - **Encoder VLC primitives** (round 376): new `encoder_vlc` module with
   the emit-direction inverse of every baseline decode table — `write_mcbpc_i`
   / `write_mcbpc_p` (§5.3.2 Tables 7/8), `write_cbpy` (§5.3.5 Table 12),

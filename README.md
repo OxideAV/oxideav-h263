@@ -1,21 +1,34 @@
 # oxideav-h263
 
-A pure-Rust ITU-T H.263 baseline video decoder for the
+A pure-Rust ITU-T H.263 baseline video **codec** for the
 [oxideav](https://github.com/OxideAV/oxideav) framework, built
 clean-room against [ITU-T Recommendation H.263 (01/2005)][spec].
 
 ## Status
 
-Decode-only. The crate implements the H.263 baseline picture / GOB /
-macroblock / block layers and reconstructs INTRA and INTER pictures
-end-to-end, plus a growing set of optional Annexes (D, F, I, J, K, M,
-N, O, P, Q, S, T).
-There is no encoder, and `register()` is currently a no-op pending a
-frame-yielding `oxideav_core::Decoder` adapter — callers drive the
-decoder through the free `decode_picture` entry point.
+Full baseline **decoder**, plus a growing **encoder**. The decoder
+implements the H.263 baseline picture / GOB / macroblock / block layers
+and reconstructs INTRA and INTER pictures end-to-end, plus a wide set of
+optional Annexes (D, F, I, J, K, M, N, O, P, Q, S, T).
 
-Any decode path that is not yet wired returns `Error::NotImplemented`
-rather than silently guessing.
+The encoder (round 376 onward) produces baseline **INTRA (I-)
+pictures**: `encoder::encode_intra_picture` forward-transforms,
+quantises and entropy-codes a planar 4:2:0 `YuvFrame` into a complete
+byte-aligned H.263 picture that decodes back through this crate's own
+decoder. It is built bottom-up from reusable layers —
+`encoder_vlc` (MCBPC / CBPY / MVD / INTRADC / TCOEF emitters),
+`fdct` (forward DCT + dead-zone quantiser), `encoder_block` (§5.4 block
+layer + run-length coder) and `encoder_mb` (§5.3 macroblock layer) —
+each round-trip-verified against the decoder. INTER (P-) picture
+encoding (motion estimation + residual coding) is the next milestone.
+
+`register()` is currently a no-op pending a frame-yielding
+`oxideav_core::Decoder` adapter — callers drive the decoder through the
+free `decode_picture` entry point and the encoder through
+`encode_intra_picture`.
+
+Any path that is not yet wired returns `Error::NotImplemented` rather
+than silently guessing.
 
 ## What works
 
