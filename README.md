@@ -11,16 +11,20 @@ implements the H.263 baseline picture / GOB / macroblock / block layers
 and reconstructs INTRA and INTER pictures end-to-end, plus a wide set of
 optional Annexes (D, F, I, J, K, M, N, O, P, Q, S, T).
 
-The encoder (round 376 onward) produces baseline **INTRA (I-)
-pictures**: `encoder::encode_intra_picture` forward-transforms,
-quantises and entropy-codes a planar 4:2:0 `YuvFrame` into a complete
-byte-aligned H.263 picture that decodes back through this crate's own
-decoder. It is built bottom-up from reusable layers —
+The encoder (round 376 onward) produces baseline **INTRA (I-)** and
+**INTER (P-)** pictures: `encoder::encode_intra_picture` /
+`encode_inter_picture` forward-transform, quantise and entropy-code a
+planar 4:2:0 `YuvFrame` into a complete byte-aligned H.263 picture that
+decodes back through this crate's own decoder. The P-picture path
+predicts from the previous reconstructed frame with zero motion vectors
+(a static frame reconstructs bit-exactly via skipped macroblocks). The
+encoder is built bottom-up from reusable layers —
 `encoder_vlc` (MCBPC / CBPY / MVD / INTRADC / TCOEF emitters),
 `fdct` (forward DCT + dead-zone quantiser), `encoder_block` (§5.4 block
-layer + run-length coder) and `encoder_mb` (§5.3 macroblock layer) —
-each round-trip-verified against the decoder. INTER (P-) picture
-encoding (motion estimation + residual coding) is the next milestone.
+layer + run-length coder), `encoder_mb` (§5.3 macroblock layer) and
+`encoder` (§5.1 / §5.2 picture layer) — each round-trip-verified
+against the decoder. Motion estimation (non-zero MVs, Annex D/F) is the
+next milestone.
 
 `register()` is currently a no-op pending a frame-yielding
 `oxideav_core::Decoder` adapter — callers drive the decoder through the

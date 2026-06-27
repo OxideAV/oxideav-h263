@@ -93,6 +93,42 @@ fn extract_macroblock(frame: &YuvFrame, mb_col: usize, mb_row: usize) -> Macrobl
     mb
 }
 
+/// Write the §5.1 baseline picture header (PSC, TR, PTYPE all-baseline,
+/// PQUANT, CPM=0, PEI=0). `is_inter` selects the §5.1.3 picture
+/// coding-type bit (INTRA = 0, INTER = 1); all optional-mode flags are
+/// emitted as 0.
+fn write_picture_header(
+    w: &mut BitWriter,
+    fmt: H263SourceFormat,
+    quant: u8,
+    tr: u8,
+    is_inter: bool,
+) {
+    // §5.1.1 — Picture Start Code (22 bits, 0x000020).
+    w.write_bits(PSC_VALUE, 22);
+    // §5.1.2 — Temporal Reference (8 bits).
+    w.write_bits(tr as u32, 8);
+    // §5.1.3 — PTYPE. bit1 = 1, bit2 = 0, then split/doc/freeze = 0,
+    // source-format (3), coding-type, then UMV/SAC/AP/PB = 0.
+    w.write_bit(true); // bit 1
+    w.write_bit(false); // bit 2
+    w.write_bit(false); // split-screen
+    w.write_bit(false); // document-camera
+    w.write_bit(false); // freeze-release
+    w.write_bits(source_format_bits(fmt), 3);
+    w.write_bit(is_inter); // coding-type: 0 INTRA / 1 INTER
+    w.write_bit(false); // UMV (Annex D)
+    w.write_bit(false); // SAC (Annex E)
+    w.write_bit(false); // AP  (Annex F)
+    w.write_bit(false); // PB  (Annex G)
+                        // §5.1.19 — PQUANT (5 bits).
+    w.write_bits(quant as u32, 5);
+    // §5.1.20 — CPM (1 bit, 0 = single bitstream).
+    w.write_bit(false);
+    // §5.1.24 — PEI (1 bit, 0 = no PSUPP extension).
+    w.write_bit(false);
+}
+
 /// Encode a planar 4:2:0 [`YuvFrame`] as a baseline H.263 **INTRA**
 /// (I-) picture at the given `quant` and 8-bit temporal reference `tr`.
 ///
@@ -111,30 +147,7 @@ pub fn encode_intra_picture(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u
         source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
 
     let mut w = BitWriter::new();
-
-    // §5.1.1 — Picture Start Code (22 bits, 0x000020).
-    w.write_bits(PSC_VALUE, 22);
-    // §5.1.2 — Temporal Reference (8 bits).
-    w.write_bits(tr as u32, 8);
-    // §5.1.3 — PTYPE. bit1 = 1, bit2 = 0, then split/doc/freeze = 0,
-    // source-format (3), coding-type = 0 (INTRA), then UMV/SAC/AP/PB = 0.
-    w.write_bit(true); // bit 1
-    w.write_bit(false); // bit 2
-    w.write_bit(false); // split-screen
-    w.write_bit(false); // document-camera
-    w.write_bit(false); // freeze-release
-    w.write_bits(source_format_bits(fmt), 3);
-    w.write_bit(false); // coding-type: INTRA
-    w.write_bit(false); // UMV (Annex D)
-    w.write_bit(false); // SAC (Annex E)
-    w.write_bit(false); // AP  (Annex F)
-    w.write_bit(false); // PB  (Annex G)
-                        // §5.1.19 — PQUANT (5 bits).
-    w.write_bits(quant as u32, 5);
-    // §5.1.20 — CPM (1 bit, 0 = single bitstream).
-    w.write_bit(false);
-    // §5.1.24 — PEI (1 bit, 0 = no PSUPP extension).
-    w.write_bit(false);
+    write_picture_header(&mut w, fmt, quant, tr, /* is_inter */ false);
 
     // §5.2.2 — macroblock stream, no GOB headers (single segment, GOB-0
     // elided, every later GOB header omitted). The macroblocks run
@@ -153,6 +166,108 @@ pub fn encode_intra_picture(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u
 
     // §5.1.28 — PSTUF: pad to the next byte boundary with zero bits so
     // the picture (and any following PSC) is byte-aligned.
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+/// Per-element signed residual `source − prediction` of two 8×8 sample
+/// blocks (range roughly `[-255, 255]`).
+fn residual_of(
+    source: &[i16; COEFFS_PER_BLOCK],
+    prediction: &[i16; COEFFS_PER_BLOCK],
+) -> [i16; COEFFS_PER_BLOCK] {
+    let mut out = [0i16; COEFFS_PER_BLOCK];
+    for ((o, &s), &p) in out.iter_mut().zip(source.iter()).zip(prediction.iter()) {
+        *o = s - p;
+    }
+    out
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as a baseline H.263 **INTER**
+/// (P-) picture predicted from `reference` (the previous reconstructed
+/// frame) with **zero motion vectors**.
+///
+/// Every macroblock is INTER-coded with `MVD = 0`: because the encoder
+/// emits a single video-picture segment and the §6.1.1 median predictor
+/// over an all-zero-MV neighbourhood is zero, the decoder reconstructs
+/// `MV = predictor + MVD = 0` for every macroblock, so the prediction is
+/// the co-located reference block. The residual (`source − reference`)
+/// is forward-transformed, quantised and coded per block; macroblocks
+/// whose residual quantises away entirely (and whose chroma is also
+/// zero) are emitted as **skipped** (COD = 1) for compactness.
+///
+/// Zero-MV P-pictures are exact for static content and a correct (if
+/// not rate-optimal) encoding for moving content; true motion estimation
+/// is a later milestone. `reference` must share the frame's dimensions.
+pub fn encode_inter_picture(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+) -> Result<Vec<u8>> {
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if frame.luma_width != reference.luma_width || frame.luma_height != reference.luma_height {
+        return Err(Error::NotImplemented);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+
+    let mut w = BitWriter::new();
+    write_picture_header(&mut w, fmt, quant, tr, /* is_inter */ true);
+
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let src = extract_macroblock(frame, mb_col, mb_row);
+            let refmb = extract_macroblock(reference, mb_col, mb_row);
+
+            // Residual = source − prediction (zero-MV prediction is the
+            // co-located reference block).
+            let luma_enc: Vec<crate::encoder_block::EncodedInterBlock> = (0..4)
+                .map(|blk| {
+                    let residual = residual_of(&src.luma[blk], &refmb.luma[blk]);
+                    crate::encoder_block::encode_inter_block(&residual, quant)
+                })
+                .collect();
+            let cb_enc =
+                crate::encoder_block::encode_inter_block(&residual_of(&src.cb, &refmb.cb), quant);
+            let cr_enc =
+                crate::encoder_block::encode_inter_block(&residual_of(&src.cr, &refmb.cr), quant);
+
+            let any_coeffs =
+                luma_enc.iter().any(|e| e.has_coeffs) || cb_enc.has_coeffs || cr_enc.has_coeffs;
+
+            if !any_coeffs {
+                // No residual survives quantisation — emit a skipped MB
+                // (COD = 1). The decoder copies the co-located reference
+                // block with a zero MV, which is exactly our prediction.
+                crate::encoder_mb::encode_skipped_macroblock(&mut w);
+                continue;
+            }
+
+            let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
+                luma_enc[0].clone(),
+                luma_enc[1].clone(),
+                luma_enc[2].clone(),
+                luma_enc[3].clone(),
+            ];
+            crate::encoder_mb::encode_inter_macroblock(
+                &mut w,
+                &luma_arr,
+                &cb_enc,
+                &cr_enc,
+                crate::macroblock::Mvd {
+                    dx_half: 0,
+                    dy_half: 0,
+                },
+            )?;
+        }
+    }
+
     w.align_to_byte_zero();
     Ok(w.finish())
 }
@@ -303,6 +418,67 @@ mod tests {
         assert_eq!(bytes[0], 0x00);
         assert_eq!(bytes[1], 0x00);
         assert_eq!(bytes[2] & 0b1100_0000, 0b1000_0000);
+    }
+
+    /// A static P-picture (identical to its reference) encodes to an
+    /// all-skipped frame and reconstructs to the reference exactly.
+    #[test]
+    fn static_inter_picture_is_lossless() {
+        // Reference is the *decoded* I-picture, so the P-frame predicts
+        // from exactly what the decoder will hold.
+        let src = gradient_frame(176, 144);
+        let i_bytes = encode_intra_picture(&src, 6, 0).unwrap();
+        let recon_ref =
+            decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+
+        // P-frame whose source equals the reference -> zero residual.
+        let p_bytes = encode_inter_picture(&recon_ref, &recon_ref, 6, 1).unwrap();
+        let decoded =
+            decode_picture_no_gob0_header(&p_bytes, Some(&recon_ref), DecodeOptions::default())
+                .unwrap();
+        assert_eq!(decoded.y, recon_ref.y, "static P luma must equal reference");
+        assert_eq!(decoded.cb, recon_ref.cb);
+        assert_eq!(decoded.cr, recon_ref.cr);
+    }
+
+    /// A moving P-picture round-trips against its reconstructed
+    /// reference with bounded error.
+    #[test]
+    fn moving_inter_picture_round_trips_within_tolerance() {
+        let frame0 = gradient_frame(176, 144);
+        let i_bytes = encode_intra_picture(&frame0, 5, 0).unwrap();
+        let recon_ref =
+            decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+
+        // frame1 = frame0 brightened by a small constant (a residual the
+        // INTER path must carry).
+        let mut frame1 = frame0.clone();
+        for p in frame1.y.iter_mut() {
+            *p = (*p as i32 + 20).min(255) as u8;
+        }
+
+        let p_bytes = encode_inter_picture(&frame1, &recon_ref, 5, 1).unwrap();
+        let decoded =
+            decode_picture_no_gob0_header(&p_bytes, Some(&recon_ref), DecodeOptions::default())
+                .unwrap();
+
+        let mut sum = 0u64;
+        for (a, b) in frame1.y.iter().zip(decoded.y.iter()) {
+            sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+        }
+        let mae = sum as f64 / frame1.y.len() as f64;
+        assert!(mae < 10.0, "INTER luma MAE too high: {}", mae);
+    }
+
+    /// A mismatched reference is rejected.
+    #[test]
+    fn inter_mismatched_reference_rejected() {
+        let frame = YuvFrame::grey(176, 144);
+        let bad_ref = YuvFrame::grey(128, 96);
+        assert!(matches!(
+            encode_inter_picture(&frame, &bad_ref, 8, 1),
+            Err(Error::NotImplemented)
+        ));
     }
 
     /// An all-INTRA sequence of three frames decodes back to three

@@ -8,6 +8,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Baseline INTER (P-) picture encoder, zero motion** (round 376):
+  `encoder::encode_inter_picture` predicts from the previous
+  reconstructed frame with `MVD = 0`. Because the encoder emits a single
+  video-picture segment, the §6.1.1 median predictor over an all-zero-MV
+  neighbourhood is zero, so the decoder reconstructs `MV = 0` and the
+  prediction is the co-located reference block. The residual is forward
+  DCT'd, dead-zone-quantised and coded per block; macroblocks whose
+  residual quantises away are emitted as skipped (COD = 1). A static
+  P-frame (source == reconstructed reference) reconstructs **bit-exactly**
+  (all-skipped); a brightened frame round-trips with luma MAE < 10. True
+  motion estimation is the next milestone.
+
 - **Baseline INTRA-picture encoder** (round 376): `encoder::encode_intra_picture`
   turns a planar 4:2:0 `YuvFrame` into a complete byte-aligned baseline
   H.263 I-picture — §5.1 header (PSC, TR, PTYPE all-baseline, PQUANT,

@@ -259,7 +259,7 @@ pub use deblock::{
     up_down_ramp, EdgeCondition, STRENGTH_RRU_INFINITE,
 };
 pub use dequant::{dequantise_ac, scatter_into_block, AC_REC_MAX, AC_REC_MIN};
-pub use encoder::{encode_intra_picture, encode_intra_sequence};
+pub use encoder::{encode_inter_picture, encode_intra_picture, encode_intra_sequence};
 pub use encoder_block::{
     block_has_ac, encode_inter_block, encode_intra_block, tcoef_events, write_inter_block_coeffs,
     write_intra_block, EncodedInterBlock, EncodedIntraBlock,
