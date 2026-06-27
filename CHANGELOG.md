@@ -8,6 +8,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Encoder VLC primitives** (round 376): new `encoder_vlc` module with
+  the emit-direction inverse of every baseline decode table — `write_mcbpc_i`
+  / `write_mcbpc_p` (§5.3.2 Tables 7/8), `write_cbpy` (§5.3.5 Table 12),
+  `write_mvd_component` (§5.3.7 Table 14), `write_intradc` (§5.4.1 Table 15)
+  and `write_tcoef` (§5.4.2 Table 16, dedicated VLC + ESCAPE form). Each is
+  round-trip verified against the existing decoder over its full symbol
+  range (all 24 P-picture MCBPC code-points, all 16 CBPY patterns, the full
+  −32..+31 MVD range, every legal INTRADC reconstruction level, and
+  representative TCOEF VLC / ESCAPE / multi-event blocks). The first
+  encoder building block in this decode-only crate.
+
 - **Multi-picture PB-frame reference-threading test** (round 371): an
   I + PB + P stream decodes to four frames [I, B, P, P2], asserting the
   PB-frame's P-part (not its display-only B-part) becomes the prediction

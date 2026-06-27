@@ -517,6 +517,17 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
 /// `1` + optional fixed-length suffix. We use [`BitReader::read_unary`]
 /// to consume the run + the `1`, then dispatch on the zero-count
 /// and read any suffix bits per the per-table layout below.
+/// Test-only re-export of the private MCBPC decoder so the encoder's
+/// VLC round-trip tests can verify `write_mcbpc_*` against the decode
+/// side directly (without fabricating a whole macroblock layer).
+#[cfg(test)]
+pub(crate) fn decode_mcbpc_for_test(
+    reader: &mut BitReader<'_>,
+    picture: H263PictureCodingType,
+) -> Result<(MbType, u8)> {
+    decode_mcbpc(reader, picture)
+}
+
 fn decode_mcbpc(
     reader: &mut BitReader<'_>,
     picture: H263PictureCodingType,

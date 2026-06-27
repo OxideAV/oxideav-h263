@@ -219,6 +219,7 @@ pub mod block;
 pub mod block_aic;
 pub mod deblock;
 pub mod dequant;
+pub mod encoder_vlc;
 pub mod gob_header;
 pub mod idct;
 pub mod intra_tcoef;
