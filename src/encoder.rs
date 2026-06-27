@@ -157,6 +157,28 @@ pub fn encode_intra_picture(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u
     Ok(w.finish())
 }
 
+/// Encode a sequence of frames as an all-INTRA H.263 elementary stream.
+///
+/// Each frame is encoded as a baseline I-picture (via
+/// [`encode_intra_picture`]) at the same `quant`, byte-aligned and
+/// concatenated; the §5.1.2 Temporal Reference is assigned modulo 256
+/// in presentation order starting from `tr0`. Every frame must share the
+/// same standard source-format dimensions.
+///
+/// The resulting stream decodes through
+/// [`crate::picture::decode_sequence`] into the same number of frames.
+/// All-INTRA is the simplest valid stream (no inter-frame prediction);
+/// P-picture encoding will let later frames reference their predecessor.
+pub fn encode_intra_sequence(frames: &[YuvFrame], quant: u8, tr0: u8) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        let tr = tr0.wrapping_add(i as u8);
+        let pic = encode_intra_picture(frame, quant, tr)?;
+        out.extend_from_slice(&pic);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +303,25 @@ mod tests {
         assert_eq!(bytes[0], 0x00);
         assert_eq!(bytes[1], 0x00);
         assert_eq!(bytes[2] & 0b1100_0000, 0b1000_0000);
+    }
+
+    /// An all-INTRA sequence of three frames decodes back to three
+    /// frames through `decode_sequence`, each TR incrementing.
+    #[test]
+    fn intra_sequence_round_trips_to_n_frames() {
+        use crate::picture::decode_sequence;
+        let frames = vec![
+            gradient_frame(176, 144),
+            YuvFrame::grey(176, 144),
+            gradient_frame(176, 144),
+        ];
+        let stream = encode_intra_sequence(&frames, 5, 0).unwrap();
+        let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.len(), 3, "expected 3 decoded frames");
+        for d in &decoded {
+            assert_eq!((d.luma_width, d.luma_height), (176, 144));
+        }
+        // The flat-grey middle frame reconstructs to flat 128.
+        assert!(decoded[1].y.iter().all(|&p| p == 128));
     }
 }

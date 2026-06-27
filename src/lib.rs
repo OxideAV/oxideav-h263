@@ -259,6 +259,20 @@ pub use deblock::{
     up_down_ramp, EdgeCondition, STRENGTH_RRU_INFINITE,
 };
 pub use dequant::{dequantise_ac, scatter_into_block, AC_REC_MAX, AC_REC_MIN};
+pub use encoder::{encode_intra_picture, encode_intra_sequence};
+pub use encoder_block::{
+    block_has_ac, encode_inter_block, encode_intra_block, tcoef_events, write_inter_block_coeffs,
+    write_intra_block, EncodedInterBlock, EncodedIntraBlock,
+};
+pub use encoder_mb::{
+    encode_inter_macroblock, encode_intra_macroblock, encode_skipped_macroblock,
+    macroblock_samples_from_u8, MacroblockSamples,
+};
+pub use encoder_vlc::{
+    write_cbpy, write_intradc, write_mcbpc_i, write_mcbpc_p, write_mvd_component, write_tcoef,
+    TcoefEvent,
+};
+pub use fdct::{fdct_8x8, forward_quantise_block, quantise_ac_coefficient, quantise_intradc};
 pub use gob_header::{
     gob_header_present, parse_gob_layer, parse_gob_layer_from_bytes, GobLayer, GBSC_BITS,
     GBSC_VALUE, GFID_BITS, GN_BITS, GOB_HEADER_BITS_NO_CPM, GQUANT_BITS,
