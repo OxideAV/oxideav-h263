@@ -8,6 +8,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **INTRA/INTER mode decision in P-pictures (intra refresh)** (round 376):
+  `encode_inter_picture_motion` now compares the motion-compensated INTER
+  residual SAD against the macroblock's own intra AC energy (variance about
+  the per-block mean) and codes the macroblock INTRA (Table 8 INTRA MCBPC,
+  with COD) when intra is cheaper — the classic H.263 intra-refresh
+  heuristic. A P-picture whose source is unrelated to the reference falls
+  back to INTRA and reconstructs the source (not the reference) within the
+  INTRA tolerance, exercising the INTRA-in-P bitstream path end-to-end.
+
 - **Motion estimation + motion-compensated INTER encoder** (round 376):
   new `encoder_motion` module with `estimate_motion` (SAD over an integer
   window + half-pel refinement, biased toward the median predictor),

@@ -393,6 +393,51 @@ pub fn encode_inter_picture_motion(
                 continue;
             }
 
+            // §5.3.2 INTRA/INTER mode decision. When the motion-compensated
+            // residual energy exceeds the macroblock's own AC energy
+            // (variance about the per-block mean), an INTRA macroblock
+            // costs fewer bits and reconstructs more faithfully than a
+            // large INTER residual — the classic H.263 intra-refresh
+            // heuristic. The INTRA candidate is recorded as a zero
+            // predictor candidate (§6.1.1 rule 1, outside PB-frames mode).
+            let inter_sad: u32 = {
+                let mut s = 0u32;
+                for blk in 0..4 {
+                    let bx = mb_x + (blk % 2) * 8;
+                    let by = mb_y + (blk / 2) * 8;
+                    let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
+                    for row in 0..8 {
+                        for col in 0..8 {
+                            let sv = frame.y[(by + row) * lw + (bx + col)] as i32;
+                            let pv = pred[row * 8 + col] as i32;
+                            s += (sv - pv).unsigned_abs();
+                        }
+                    }
+                }
+                s
+            };
+            let intra_sad: u32 = src
+                .luma
+                .iter()
+                .map(|blk| {
+                    let mean = blk.iter().map(|&v| v as i32).sum::<i32>() / 64;
+                    blk.iter()
+                        .map(|&v| (v as i32 - mean).unsigned_abs())
+                        .sum::<u32>()
+                })
+                .sum();
+
+            if intra_sad + 256 < inter_sad {
+                // Code as an INTRA macroblock in the P-picture (Table 8
+                // INTRA MCBPC, with COD). No motion vector is carried.
+                encode_intra_macroblock(
+                    &mut w, &src, quant, /* write_cod */ true,
+                    /* picture_is_inter */ true,
+                )?;
+                grid.set_zero_candidate(mb_col, mb_row);
+                continue;
+            }
+
             let mvd = crate::encoder_motion::mvd_for(mv, predictor);
             let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
                 luma_enc[0].clone(),
@@ -655,6 +700,45 @@ mod tests {
             "MC stream ({}) not smaller than zero-motion ({})",
             mc_bytes.len(),
             zm_bytes.len()
+        );
+    }
+
+    /// When the reference is unrelated to the source, the P-picture
+    /// mode decision picks INTRA macroblocks (Table 8 INTRA), and the
+    /// result reconstructs the *source* (not the reference) within the
+    /// INTRA tolerance.
+    #[test]
+    fn unrelated_inter_picture_falls_back_to_intra() {
+        // Reference is a mid-grey field; source is a bright gradient
+        // with nothing in common — INTER prediction is useless.
+        let reference = YuvFrame::grey(176, 144);
+        let source = gradient_frame(176, 144);
+
+        let p_bytes = encode_inter_picture_motion(&source, &reference, 5, 1, 2).unwrap();
+        let decoded =
+            decode_picture_no_gob0_header(&p_bytes, Some(&reference), DecodeOptions::default())
+                .unwrap();
+
+        // The decoded frame should track the SOURCE (via INTRA refresh),
+        // not the grey reference.
+        let mut src_sum = 0u64;
+        let mut ref_sum = 0u64;
+        for i in 0..source.y.len() {
+            src_sum += (source.y[i] as i32 - decoded.y[i] as i32).unsigned_abs() as u64;
+            ref_sum += (reference.y[i] as i32 - decoded.y[i] as i32).unsigned_abs() as u64;
+        }
+        let src_mae = src_sum as f64 / source.y.len() as f64;
+        let ref_mae = ref_sum as f64 / source.y.len() as f64;
+        assert!(
+            src_mae < 8.0,
+            "decoded should track source, MAE {}",
+            src_mae
+        );
+        assert!(
+            src_mae < ref_mae,
+            "decoded closer to reference ({}) than source ({})",
+            ref_mae,
+            src_mae
         );
     }
 
