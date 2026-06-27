@@ -272,6 +272,143 @@ pub fn encode_inter_picture(
     Ok(w.finish())
 }
 
+/// Fetch the 8×8 block at pixel origin `(x0, y0)` from a plane with the
+/// given row stride into a flat `[u8; 64]`.
+fn motion_compensated_block(
+    plane: &[u8],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    mv: crate::motion::MotionVector,
+) -> [u8; COEFFS_PER_BLOCK] {
+    let rp = crate::motion::RefPlane::new(plane, width, height);
+    crate::motion::motion_compensate_block(&rp, x0, y0, mv, crate::motion::RCONTROL_DEFAULT)
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as a baseline H.263 **INTER**
+/// (P-) picture with **motion estimation** against `reference`.
+///
+/// Each macroblock's luma motion vector is estimated by
+/// [`crate::encoder_motion::estimate_motion`] (SAD over a `search_half`
+/// integer window + half-pel refinement, biased toward the §6.1.1
+/// median predictor so static regions keep `MVD = 0`). The encoder
+/// replicates the decoder's predictor bookkeeping via
+/// [`crate::encoder_motion::MvGrid`], so the emitted `MVD` reconstructs
+/// to exactly the chosen MV. The residual is computed against the
+/// **motion-compensated** prediction (bit-identical to the decoder's),
+/// forward-transformed, quantised and coded; a macroblock with a zero
+/// MV and no surviving residual is skipped.
+///
+/// `reference` must share the frame's dimensions. The chroma vector is
+/// derived from the luma MV by the decoder (Table 18), so the encoder
+/// computes the chroma residual against the same Table-18 chroma
+/// prediction.
+pub fn encode_inter_picture_motion(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+) -> Result<Vec<u8>> {
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if frame.luma_width != reference.luma_width || frame.luma_height != reference.luma_height {
+        return Err(Error::NotImplemented);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+
+    let mut w = BitWriter::new();
+    write_picture_header(&mut w, fmt, quant, tr, /* is_inter */ true);
+
+    let lw = frame.luma_width;
+    let lh = frame.luma_height;
+    let cw = frame.chroma_width();
+    let ch = frame.chroma_height();
+    let mb_cols = lw / 16;
+    let mb_rows = lh / 16;
+    let mut grid = crate::encoder_motion::MvGrid::new(mb_cols, mb_rows);
+    // λ in SAD units per half-pel of MVD; a small bias keeps static
+    // regions on MVD = 0 without over-penalising real motion.
+    let lambda = 2 * quant as u32;
+
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let predictor = grid.predict(mb_col, mb_row);
+            let mv = crate::encoder_motion::estimate_motion(
+                frame,
+                reference,
+                mb_col,
+                mb_row,
+                predictor,
+                search_half,
+                lambda,
+            );
+
+            let mb_x = mb_col * 16;
+            let mb_y = mb_row * 16;
+            let c_x = mb_col * 8;
+            let c_y = mb_row * 8;
+            let chroma_mv = crate::motion::chroma_mv(mv);
+
+            // Build the motion-compensated prediction + residual per block.
+            let src = extract_macroblock(frame, mb_col, mb_row);
+            let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(4);
+            for blk in 0..4 {
+                let bx = mb_x + (blk % 2) * 8;
+                let by = mb_y + (blk / 2) * 8;
+                let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
+                let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
+                for (d, &p) in pred_i16.iter_mut().zip(pred.iter()) {
+                    *d = p as i16;
+                }
+                let residual = residual_of(&src.luma[blk], &pred_i16);
+                luma_enc.push(crate::encoder_block::encode_inter_block(&residual, quant));
+            }
+            let cb_pred = motion_compensated_block(&reference.cb, cw, ch, c_x, c_y, chroma_mv);
+            let cr_pred = motion_compensated_block(&reference.cr, cw, ch, c_x, c_y, chroma_mv);
+            let mut cb_pred_i = [0i16; COEFFS_PER_BLOCK];
+            let mut cr_pred_i = [0i16; COEFFS_PER_BLOCK];
+            for i in 0..COEFFS_PER_BLOCK {
+                cb_pred_i[i] = cb_pred[i] as i16;
+                cr_pred_i[i] = cr_pred[i] as i16;
+            }
+            let cb_enc =
+                crate::encoder_block::encode_inter_block(&residual_of(&src.cb, &cb_pred_i), quant);
+            let cr_enc =
+                crate::encoder_block::encode_inter_block(&residual_of(&src.cr, &cr_pred_i), quant);
+
+            let any_coeffs =
+                luma_enc.iter().any(|e| e.has_coeffs) || cb_enc.has_coeffs || cr_enc.has_coeffs;
+            let is_zero_mv = mv.dx_half == 0 && mv.dy_half == 0;
+
+            if !any_coeffs && is_zero_mv {
+                // Skipped MB: COD = 1. The decoder copies the co-located
+                // reference block with a zero MV (= our prediction). The
+                // grid records a zero candidate (skipped MB).
+                crate::encoder_mb::encode_skipped_macroblock(&mut w);
+                grid.set_zero_candidate(mb_col, mb_row);
+                continue;
+            }
+
+            let mvd = crate::encoder_motion::mvd_for(mv, predictor);
+            let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
+                luma_enc[0].clone(),
+                luma_enc[1].clone(),
+                luma_enc[2].clone(),
+                luma_enc[3].clone(),
+            ];
+            crate::encoder_mb::encode_inter_macroblock(&mut w, &luma_arr, &cb_enc, &cr_enc, mvd)?;
+            grid.set_inter(mb_col, mb_row, mv);
+        }
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
 /// Encode a sequence of frames as an all-INTRA H.263 elementary stream.
 ///
 /// Each frame is encoded as a baseline I-picture (via
@@ -468,6 +605,57 @@ mod tests {
         }
         let mae = sum as f64 / frame1.y.len() as f64;
         assert!(mae < 10.0, "INTER luma MAE too high: {}", mae);
+    }
+
+    /// A horizontally-translated frame: motion-compensated INTER
+    /// encoding round-trips with bounded error and beats zero-motion
+    /// encoding on the same translated content.
+    #[test]
+    fn motion_compensated_inter_round_trips_and_beats_zero_motion() {
+        // Reference = decoded I-picture of frame0.
+        let frame0 = gradient_frame(176, 144);
+        let i_bytes = encode_intra_picture(&frame0, 5, 0).unwrap();
+        let recon_ref =
+            decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+
+        // frame1 = frame0 translated left by 2 px (content moves), built
+        // from the *reconstructed* reference so the only error source is
+        // the residual quantiser.
+        let lw = 176;
+        let lh = 144;
+        let mut frame1 = recon_ref.clone();
+        for row in 0..lh {
+            for col in 0..lw {
+                let srccol = (col + 2).min(lw - 1);
+                frame1.y[row * lw + col] = recon_ref.y[row * lw + srccol];
+            }
+        }
+
+        // Motion-compensated encode.
+        let mc_bytes = encode_inter_picture_motion(&frame1, &recon_ref, 5, 1, 4).unwrap();
+        let mc_decoded =
+            decode_picture_no_gob0_header(&mc_bytes, Some(&recon_ref), DecodeOptions::default())
+                .unwrap();
+        let mut mc_sum = 0u64;
+        for (a, b) in frame1.y.iter().zip(mc_decoded.y.iter()) {
+            mc_sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+        }
+        let mc_mae = mc_sum as f64 / frame1.y.len() as f64;
+
+        // Zero-motion encode of the same content.
+        let zm_bytes = encode_inter_picture(&frame1, &recon_ref, 5, 1).unwrap();
+
+        // Motion compensation should reconstruct accurately (the shifted
+        // content is exactly available in the reference).
+        assert!(mc_mae < 6.0, "MC luma MAE too high: {}", mc_mae);
+        // And it should be more compact than zero-motion (fewer residual
+        // bits for translational motion).
+        assert!(
+            mc_bytes.len() <= zm_bytes.len(),
+            "MC stream ({}) not smaller than zero-motion ({})",
+            mc_bytes.len(),
+            zm_bytes.len()
+        );
     }
 
     /// A mismatched reference is rejected.

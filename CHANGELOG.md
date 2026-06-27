@@ -8,6 +8,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Motion estimation + motion-compensated INTER encoder** (round 376):
+  new `encoder_motion` module with `estimate_motion` (SAD over an integer
+  window + half-pel refinement, biased toward the median predictor),
+  `MvGrid` (replays the decoder's §6.1.1 median-predictor border rules for
+  the single-segment stream so the emitted MVD reconstructs to exactly the
+  chosen MV), and `mvd_for` (inverts the §6.1.1 wrap; round-trip verified
+  through `reconstruct_mv` over the full predictor × MV grid).
+  `encoder::encode_inter_picture_motion` wires these in: each macroblock's
+  luma MV is estimated, the residual is taken against the
+  motion-compensated prediction (bit-identical to the decoder's, chroma via
+  Table 18), coded, and the MV grid updated. A translated frame
+  reconstructs with luma MAE < 6 and produces a **smaller** stream than the
+  zero-motion encoder on the same content.
+
 - **Baseline INTER (P-) picture encoder, zero motion** (round 376):
   `encoder::encode_inter_picture` predicts from the previous
   reconstructed frame with `MVD = 0`. Because the encoder emits a single
