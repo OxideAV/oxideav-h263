@@ -219,6 +219,7 @@ pub mod block;
 pub mod block_aic;
 pub mod deblock;
 pub mod dequant;
+pub mod encoder_block;
 pub mod encoder_vlc;
 pub mod fdct;
 pub mod gob_header;
