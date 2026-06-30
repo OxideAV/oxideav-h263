@@ -170,6 +170,77 @@ pub fn encode_intra_picture(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u
     Ok(w.finish())
 }
 
+/// Clamp a desired per-macroblock target quantiser into a §5.3.6
+/// reachable step given the running QUANT: DQUANT can only move QUANT by
+/// `{-2, -1, +1, +2}` per macroblock (and stays in `1..=31`). Returns the
+/// reachable `(new_quant, dquant)` closest to `target` (no change yields
+/// `dquant = None`).
+fn reach_quant(current: u8, target: u8) -> (u8, Option<i8>) {
+    let target = target.clamp(1, 31);
+    if target == current {
+        return (current, None);
+    }
+    let diff = (target as i16 - current as i16).clamp(-2, 2) as i8;
+    let next = (current as i16 + diff as i16).clamp(1, 31) as u8;
+    if next == current {
+        (current, None)
+    } else {
+        (next, Some(next as i8 - current as i8))
+    }
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as a baseline H.263 **INTRA**
+/// (I-) picture with a **per-macroblock quantiser map** driven through
+/// §5.3.6 DQUANT (the INTRA+Q macroblock type).
+///
+/// `pquant` is the picture-header PQUANT (the QUANT GOB 0 / the first
+/// macroblock runs at). `target_quant(mb_col, mb_row)` returns the
+/// desired quantiser for each macroblock; the encoder walks the
+/// macroblocks in raster order tracking the running QUANT and emits a
+/// DQUANT differential whenever the target differs and is reachable in
+/// one `{-2,-1,+1,+2}` step (the §5.3.6 constraint), quantising that
+/// macroblock at the reached QUANT. This is the foundation of rate
+/// control: coarser quantisation where the eye is less sensitive, finer
+/// where detail matters, all within the single video-picture segment.
+///
+/// The output decodes through [`crate::picture::decode_picture_no_gob0_header`].
+pub fn encode_intra_picture_dquant<F>(
+    frame: &YuvFrame,
+    pquant: u8,
+    tr: u8,
+    mut target_quant: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(usize, usize) -> u8,
+{
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+
+    let mut w = BitWriter::new();
+    write_picture_header(&mut w, fmt, pquant, tr, /* is_inter */ false);
+
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+    let mut current = pquant;
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let mb = extract_macroblock(frame, mb_col, mb_row);
+            let (next, dquant) = reach_quant(current, target_quant(mb_col, mb_row));
+            crate::encoder_mb::encode_intra_macroblock_dq(
+                &mut w, &mb, next, /* write_cod */ false, /* picture_is_inter */ false,
+                dquant,
+            )?;
+            current = next;
+        }
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
 /// Per-element signed residual `source − prediction` of two 8×8 sample
 /// blocks (range roughly `[-255, 255]`).
 fn residual_of(
@@ -545,6 +616,56 @@ mod tests {
         let mae = sum as f64 / frame.y.len() as f64;
         assert!(mae < 8.0, "luma MAE too high: {}", mae);
         assert!(max <= 40, "luma max error too high: {}", max);
+    }
+
+    /// A per-macroblock quantiser map driven through DQUANT decodes
+    /// end-to-end and stays within INTRA tolerance. The left half of the
+    /// picture is coded fine (low QUANT), the right half coarse (high
+    /// QUANT); the encoder ramps QUANT in {-2,-1,+1,+2} steps via DQUANT.
+    #[test]
+    fn intra_picture_dquant_round_trips() {
+        let frame = gradient_frame(176, 144);
+        let pquant = 4;
+        let mb_cols = 176 / 16;
+        let bytes =
+            encode_intra_picture_dquant(
+                &frame,
+                pquant,
+                0,
+                |col, _row| {
+                    if col < mb_cols / 2 {
+                        4
+                    } else {
+                        16
+                    }
+                },
+            )
+            .unwrap();
+        let decoded =
+            decode_picture_no_gob0_header(&bytes, None, DecodeOptions::default()).unwrap();
+        assert_eq!((decoded.luma_width, decoded.luma_height), (176, 144));
+        // Whole-frame mean error stays bounded even with the coarse half.
+        let mut sum = 0u64;
+        for (a, b) in frame.y.iter().zip(decoded.y.iter()) {
+            sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+        }
+        let mae = sum as f64 / frame.y.len() as f64;
+        assert!(mae < 16.0, "DQUANT-mapped INTRA luma MAE too high: {}", mae);
+    }
+
+    /// `reach_quant` only moves QUANT by a legal §5.3.6 step and clamps
+    /// to 1..=31.
+    #[test]
+    fn reach_quant_respects_step_and_clamp() {
+        assert_eq!(reach_quant(10, 10), (10, None));
+        assert_eq!(reach_quant(10, 12), (12, Some(2)));
+        assert_eq!(reach_quant(10, 11), (11, Some(1)));
+        assert_eq!(reach_quant(10, 8), (8, Some(-2)));
+        // Target far above: only +2 reachable in one step.
+        assert_eq!(reach_quant(10, 31), (12, Some(2)));
+        // At the ceiling: +1 would exceed 31, so clamp keeps movement legal.
+        assert_eq!(reach_quant(31, 31), (31, None));
+        assert_eq!(reach_quant(1, 1), (1, None));
     }
 
     /// sub-QCIF dimensions are accepted.

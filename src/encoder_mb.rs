@@ -19,7 +19,9 @@ use crate::block::COEFFS_PER_BLOCK;
 use crate::encoder_block::{
     encode_intra_block, write_inter_block_coeffs, write_intra_block, EncodedInterBlock,
 };
-use crate::encoder_vlc::{write_cbpy, write_mcbpc_i, write_mcbpc_p, write_mvd_component};
+use crate::encoder_vlc::{
+    write_cbpy, write_dquant, write_mcbpc_i, write_mcbpc_p, write_mvd_component,
+};
 use crate::macroblock::{MbType, Mvd};
 use crate::Result;
 use oxideav_core::bits::BitWriter;
@@ -49,15 +51,34 @@ pub struct MacroblockSamples {
 /// "coded"). `picture_is_inter` selects the MCBPC table (Table 7 vs
 /// Table 8).
 ///
-/// The macroblock type is INTRA (no DQUANT here — the +Q variants are a
-/// later milestone). Returns [`crate::Error::BadMcbpcCode`] / [`crate::Error::BadTcoefCode`]
-/// if any field is unrepresentable.
+/// The macroblock type is INTRA, or — when `dquant` is `Some(diff)` with
+/// `diff ∈ {-2,-1,+1,+2}` — INTRA+Q (§5.3.6 Table 13 differential carried
+/// after CBPY). The six blocks are forward-transformed and quantised at
+/// `quant`, which the caller must have already advanced by `diff` when
+/// `dquant` is set (the decoder applies the differential then dequantises
+/// at the new QUANT). Returns [`crate::Error::BadMcbpcCode`] /
+/// [`crate::Error::BadTcoefCode`] / [`crate::Error::BadDquant`] if any
+/// field is unrepresentable.
 pub fn encode_intra_macroblock(
     w: &mut BitWriter,
     mb: &MacroblockSamples,
     quant: u8,
     write_cod: bool,
     picture_is_inter: bool,
+) -> Result<()> {
+    encode_intra_macroblock_dq(w, mb, quant, write_cod, picture_is_inter, None)
+}
+
+/// As [`encode_intra_macroblock`], but carrying an optional §5.3.6 DQUANT
+/// differential `dquant` (selecting the INTRA+Q macroblock type). `quant`
+/// is the **post-differential** quantiser the six blocks are quantised at.
+pub fn encode_intra_macroblock_dq(
+    w: &mut BitWriter,
+    mb: &MacroblockSamples,
+    quant: u8,
+    write_cod: bool,
+    picture_is_inter: bool,
+    dquant: Option<i8>,
 ) -> Result<()> {
     // §5.3.1 — COD (P-pictures only): 0 = coded.
     if write_cod {
@@ -82,10 +103,15 @@ pub fn encode_intra_macroblock(
     if cr_enc.has_ac {
         cbpc |= 0b01;
     }
-    if picture_is_inter {
-        write_mcbpc_p(w, MbType::Intra, cbpc)?;
+    let mb_type = if dquant.is_some() {
+        MbType::IntraQ
     } else {
-        write_mcbpc_i(w, MbType::Intra, cbpc)?;
+        MbType::Intra
+    };
+    if picture_is_inter {
+        write_mcbpc_p(w, mb_type, cbpc)?;
+    } else {
+        write_mcbpc_i(w, mb_type, cbpc)?;
     }
 
     // §5.3.5 — CBPY (INTRA orientation): bit (3 - blk) set when luma
@@ -97,6 +123,12 @@ pub fn encode_intra_macroblock(
         }
     }
     write_cbpy(w, cbpy)?;
+
+    // §5.3.6 — DQUANT (INTRA+Q only): the baseline 2-bit Table 13
+    // differential, after CBPY.
+    if let Some(diff) = dquant {
+        write_dquant(w, diff)?;
+    }
 
     // §5.4 — six blocks in order Y1..Y4, Cb, Cr.
     for e in &y_enc {
@@ -126,11 +158,27 @@ pub fn encode_inter_macroblock(
     cr: &EncodedInterBlock,
     mvd: Mvd,
 ) -> Result<()> {
+    encode_inter_macroblock_dq(w, luma, cb, cr, mvd, None)
+}
+
+/// As [`encode_inter_macroblock`], but carrying an optional §5.3.6 DQUANT
+/// differential `dquant` (selecting the INTER+Q macroblock type). The
+/// DQUANT field is emitted after CBPY and before MVD per Figure 9; the
+/// caller must have forward-quantised the residual blocks at the
+/// post-differential quantiser.
+pub fn encode_inter_macroblock_dq(
+    w: &mut BitWriter,
+    luma: &[EncodedInterBlock; 4],
+    cb: &EncodedInterBlock,
+    cr: &EncodedInterBlock,
+    mvd: Mvd,
+    dquant: Option<i8>,
+) -> Result<()> {
     // §5.3.1 — COD = 0 (coded). INTER macroblocks always appear in
     // P-pictures, which carry COD.
     w.write_bit(false);
 
-    // §5.3.2 — MCBPC for an INTER (type 0) macroblock.
+    // §5.3.2 — MCBPC for an INTER (type 0) / INTER+Q (type 1) macroblock.
     let mut cbpc = 0u8;
     if cb.has_coeffs {
         cbpc |= 0b10;
@@ -138,7 +186,12 @@ pub fn encode_inter_macroblock(
     if cr.has_coeffs {
         cbpc |= 0b01;
     }
-    write_mcbpc_p(w, MbType::Inter, cbpc)?;
+    let mb_type = if dquant.is_some() {
+        MbType::InterQ
+    } else {
+        MbType::Inter
+    };
+    write_mcbpc_p(w, mb_type, cbpc)?;
 
     // §5.3.5 — CBPY. The natural (INTRA-orientation) pattern has bit
     // (3 - blk) set when luma block blk has coefficients; INTER
@@ -150,6 +203,12 @@ pub fn encode_inter_macroblock(
         }
     }
     write_cbpy(w, cbpy_intra ^ 0b1111)?;
+
+    // §5.3.6 — DQUANT (INTER+Q only): baseline 2-bit Table 13
+    // differential, after CBPY and before MVD.
+    if let Some(diff) = dquant {
+        write_dquant(w, diff)?;
+    }
 
     // §5.3.7 — MVD (horizontal then vertical).
     write_mvd_component(w, mvd.dx_half)?;
@@ -294,6 +353,98 @@ mod tests {
         // Cb has AC -> CBPC bit 0b10 set.
         assert_eq!(parsed.cbpc.unwrap() & 0b10, 0b10);
         assert!(bit_len > 0);
+    }
+
+    /// An INTRA+Q macroblock: DQUANT differential is read back and the
+    /// decoder advances QUANT by the differential (clamped to 1..=31).
+    #[test]
+    fn intra_q_mb_dquant_round_trips() {
+        let mb = flat_mb(100);
+        // quantiser_before = 10, diff = +2 -> quantiser_after = 12.
+        let mut w = BitWriter::new();
+        encode_intra_macroblock_dq(
+            &mut w,
+            &mb,
+            12,
+            /* write_cod */ false,
+            /* inter */ false,
+            /* dquant */ Some(2),
+        )
+        .unwrap();
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let parsed = parse_macroblock(
+            &mut r,
+            MbContext {
+                picture_coding_type: H263PictureCodingType::Intra,
+                advanced_prediction: false,
+                deblocking_filter: false,
+                aic_intra_mode: false,
+                pb_frames: false,
+                pb_annex_m: false,
+                quantiser_before: 10,
+                modified_quant: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(parsed.mb_type, Some(MbType::IntraQ));
+        assert_eq!(parsed.dquant, Some(2));
+        assert_eq!(parsed.quantiser_after, 12);
+    }
+
+    /// An INTER+Q macroblock in a P-picture: COD=0, INTER+Q MCBPC,
+    /// DQUANT differential after CBPY, then MVD. The decoder reads the
+    /// differential and advances QUANT.
+    #[test]
+    fn inter_q_mb_dquant_round_trips() {
+        use crate::encoder_block::{encode_inter_block, EncodedInterBlock};
+        // A residual that survives quantisation so the MB is coded.
+        let mut residual = [0i16; COEFFS_PER_BLOCK];
+        for (i, r) in residual.iter_mut().enumerate() {
+            *r = ((i as i16 % 7) - 3) * 12;
+        }
+        let q_after = 6u8;
+        let luma: [EncodedInterBlock; 4] = [
+            encode_inter_block(&residual, q_after),
+            encode_inter_block(&residual, q_after),
+            encode_inter_block(&residual, q_after),
+            encode_inter_block(&residual, q_after),
+        ];
+        let zero = [0i16; COEFFS_PER_BLOCK];
+        let cb = encode_inter_block(&zero, q_after);
+        let cr = encode_inter_block(&zero, q_after);
+        let mut w = BitWriter::new();
+        encode_inter_macroblock_dq(
+            &mut w,
+            &luma,
+            &cb,
+            &cr,
+            Mvd {
+                dx_half: 0,
+                dy_half: 0,
+            },
+            /* dquant */ Some(-1),
+        )
+        .unwrap();
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let parsed = parse_macroblock(
+            &mut r,
+            MbContext {
+                picture_coding_type: H263PictureCodingType::Inter,
+                advanced_prediction: false,
+                deblocking_filter: false,
+                aic_intra_mode: false,
+                pb_frames: false,
+                pb_annex_m: false,
+                quantiser_before: 7,
+                modified_quant: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(parsed.mb_type, Some(MbType::InterQ));
+        assert_eq!(parsed.dquant, Some(-1));
+        assert_eq!(parsed.quantiser_after, 6);
     }
 
     /// Skipped MB: COD = 1, then the decoder reports not-coded.

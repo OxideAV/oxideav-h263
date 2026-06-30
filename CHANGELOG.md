@@ -8,6 +8,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **DQUANT (+Q) macroblock encoding** (round 381): the §5.3.6 Table 13
+  baseline 2-bit DQUANT differential is now emitted by the encoder.
+  `encoder_vlc::write_dquant` writes the `{-2,-1,+1,+2}` differential;
+  `encode_intra_macroblock_dq` / `encode_inter_macroblock_dq` select the
+  INTRA+Q / INTER+Q macroblock types and place the DQUANT field after
+  CBPY (before MVD for INTER) per Figure 9. The new picture-layer entry
+  `encode_intra_picture_dquant` drives a per-macroblock quantiser map
+  through DQUANT (the foundation of rate control: it ramps QUANT in legal
+  one-step increments across the raster), round-trip-verified through the
+  decoder. New `Error::BadDquant` for out-of-range differentials.
+
 - **INTRA/INTER mode decision in P-pictures (intra refresh)** (round 376):
   `encode_inter_picture_motion` now compares the motion-compensated INTER
   residual SAD against the macroblock's own intra AC energy (variance about

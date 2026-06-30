@@ -261,20 +261,22 @@ pub use deblock::{
 };
 pub use dequant::{dequantise_ac, scatter_into_block, AC_REC_MAX, AC_REC_MIN};
 pub use encoder::{
-    encode_inter_picture, encode_inter_picture_motion, encode_intra_picture, encode_intra_sequence,
+    encode_inter_picture, encode_inter_picture_motion, encode_intra_picture,
+    encode_intra_picture_dquant, encode_intra_sequence,
 };
 pub use encoder_block::{
     block_has_ac, encode_inter_block, encode_intra_block, tcoef_events, write_inter_block_coeffs,
     write_intra_block, EncodedInterBlock, EncodedIntraBlock,
 };
 pub use encoder_mb::{
-    encode_inter_macroblock, encode_intra_macroblock, encode_skipped_macroblock,
-    macroblock_samples_from_u8, MacroblockSamples,
+    encode_inter_macroblock, encode_inter_macroblock_dq, encode_intra_macroblock,
+    encode_intra_macroblock_dq, encode_skipped_macroblock, macroblock_samples_from_u8,
+    MacroblockSamples,
 };
 pub use encoder_motion::{estimate_motion, mvd_for, MvGrid};
 pub use encoder_vlc::{
-    write_cbpy, write_intradc, write_mcbpc_i, write_mcbpc_p, write_mvd_component, write_tcoef,
-    TcoefEvent,
+    write_cbpy, write_dquant, write_intradc, write_mcbpc_i, write_mcbpc_p, write_mvd_component,
+    write_tcoef, TcoefEvent,
 };
 pub use fdct::{fdct_8x8, forward_quantise_block, quantise_ac_coefficient, quantise_intradc};
 pub use gob_header::{
@@ -388,6 +390,9 @@ pub enum Error {
     BadMcbpcCode,
     /// The CBPY codeword (§5.3.5) was not present in Table 12.
     BadCbpyCode,
+    /// A DQUANT differential (§5.3.6, Table 13) the encoder was asked
+    /// to emit was outside the legal `{-2, -1, +1, +2}` set.
+    BadDquant,
     /// A motion-vector difference component (§5.3.7, Table 14) was
     /// not present in the spec table — the prefix consumed 13 bits
     /// without matching any of the 64 entries.
@@ -525,6 +530,10 @@ impl core::fmt::Display for Error {
             Error::BadCbpyCode => write!(
                 f,
                 "oxideav-h263: CBPY variable-length code not found in Table 12"
+            ),
+            Error::BadDquant => write!(
+                f,
+                "oxideav-h263: DQUANT differential outside the legal {{-2,-1,+1,+2}} set"
             ),
             Error::BadMvdCode => write!(
                 f,

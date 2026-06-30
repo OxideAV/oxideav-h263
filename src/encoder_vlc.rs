@@ -123,6 +123,25 @@ pub fn write_cbpy(w: &mut BitWriter, cbpy: u8) -> Result<()> {
     Ok(())
 }
 
+/// §5.3.6 / Table 13 — emit the baseline 2-bit DQUANT differential for a
+/// signed change `diff` in `{-2, -1, +1, +2}` (the per-macroblock
+/// quantiser update carried by the `+Q` macroblock types).
+///
+/// The wire mapping is the inverse of the decoder's 2-bit read:
+/// `-1 → 00`, `-2 → 01`, `+1 → 10`, `+2 → 11`. Any other `diff` is
+/// rejected with [`Error::BadDquant`].
+pub fn write_dquant(w: &mut BitWriter, diff: i8) -> Result<()> {
+    let code: u32 = match diff {
+        -1 => 0b00,
+        -2 => 0b01,
+        1 => 0b10,
+        2 => 0b11,
+        _ => return Err(Error::BadDquant),
+    };
+    w.write_bits(code, 2);
+    Ok(())
+}
+
 /// §5.4.1 / Table 15 — emit the 8-bit INTRADC FLC for a DC reconstruction
 /// level `rec` (the value the decoder reconstructs into block slot 0).
 ///
