@@ -8,6 +8,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **§F.2 intra-macroblock candidate predictors, decoder** (round 384):
+  the four-vector predictor derivation now threads each
+  just-reconstructed vector back into the Figure-F.1 neighbourhood, so
+  B2's MV1 reads B1's actual vector, B3's MV2/MV3 read B1's/B2's, and
+  B4's MV1/MV2 read B3's/B2's — previously those intra-macroblock
+  candidate cells stayed zero, mis-reconstructing every INTER4V
+  macroblock whose first blocks carry non-zero vectors. Regression: an
+  INTER4V MB with MVD1 = (+4,0) and MVD2-4 = 0 reconstructs all four
+  vectors as (+4,0) via the propagated medians.
+
 - **§F.3 OBMC conformance, decoder** (round 384) — two deviations
   in the Advanced-Prediction reconstruction corrected. (1) The OBMC
   right-half remote vectors of blocks B2 / B4 now use the **actual

@@ -6010,8 +6010,12 @@ fn decode_inter4v_macroblock(
 
     // Build the §F.2 / Figure-F.1 four-MV neighbourhood from the grid.
     // The §6.1.1 INTRA / not-coded → zero collapse is folded into the
-    // None decision per the [`Mb4MvNeighbourhood`] contract.
-    let neighbourhood = build_4mv_neighbourhood(grid, mb_cols, col, row);
+    // None decision per the [`Mb4MvNeighbourhood`] contract. The
+    // `current` cells are filled progressively below: §F.2 / Figure F.1
+    // reads the **already-reconstructed** vectors of this macroblock as
+    // candidates for its later blocks (B2's MV1 is B1's vector, B3's
+    // MV2/MV3 are B1's/B2's, B4's MV1/MV2 are B3's/B2's).
+    let mut neighbourhood = build_4mv_neighbourhood(grid, mb_cols, col, row);
 
     // Reconstruct each per-block luma MV from its (MV1, MV2, MV3)
     // candidates, with the §6.1.1 rule-3 "above unavailable → MV2 =
@@ -6049,6 +6053,9 @@ fn decode_inter4v_macroblock(
             reconstruct_mv(predictor, mvd)
         };
         mvs4[blk.index()] = mv;
+        // §F.2 — later blocks of this macroblock use the reconstructed
+        // vector as an intra-macroblock candidate predictor.
+        neighbourhood.current[blk.index()] = mv;
     }
 
     // Chroma vector per §F.2 / Table F.1: sum of the four luma vectors
@@ -7767,6 +7774,80 @@ mod tests {
                 assert_eq!(frame.y[y * 176 + x], 16);
             }
         }
+    }
+
+    /// §F.2 / Figure F.1 intra-macroblock candidate threading: the
+    /// candidate predictors of blocks B2 / B3 / B4 read the
+    /// **already-reconstructed** vectors of this macroblock (B2's MV1
+    /// is B1's vector, B3's MV2/MV3 are B1's/B2's, B4's MV1/MV2 are
+    /// B3's/B2's). An INTER4V macroblock at the picture's top-left
+    /// with MVD1 = (+4, 0) and MVD2-4 = (0, 0) therefore reconstructs
+    /// **all four** vectors as (+4, 0): each later block's median
+    /// collapses onto the propagated +4 candidate, and the zero MVDs
+    /// keep it. (A driver that leaves the current cells zeroed decodes
+    /// B2..B4 as zero vectors instead.)
+    #[test]
+    fn decode_inter4v_intra_mb_candidates_propagate() {
+        let reference = ramp_reference(176, 144);
+        let mut w = BitWriter::new();
+        write_qcif_inter_ap_picture_header(&mut w, false);
+        for gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for mb in 0..11 {
+                if gob == 0 && mb == 0 {
+                    // INTER4V, cbpc 00, CBPY INTER 0000, MVDs:
+                    // B1 = (+4, 0); B2..B4 = (0, 0).
+                    w.write_bit(false); // COD = 0
+                    w.write_u32(0b010, 3); // MCBPC idx 8: INTER4V cbpc 00
+                    w.write_u32(0b11, 2); // CBPY idx 15
+                    crate::encoder_vlc::write_mvd_component(&mut w, 4).unwrap();
+                    crate::encoder_vlc::write_mvd_component(&mut w, 0).unwrap();
+                    for _ in 0..3 {
+                        crate::encoder_vlc::write_mvd_component(&mut w, 0).unwrap();
+                        crate::encoder_vlc::write_mvd_component(&mut w, 0).unwrap();
+                    }
+                } else {
+                    write_skipped_mb(&mut w);
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let frame =
+            decode_picture(&data, Some(&reference), DecodeOptions::default()).expect("decode");
+
+        // With all four vectors equal to (+4, 0), block B3 (origin
+        // (0, 8)) has every §F.3 remote resolve to (+4, 0) as well
+        // (top = current B1, bottom-of-MB rule → current, left =
+        // off-picture → current, right = current B4), so its OBMC
+        // blend degenerates to a plain +2-pixel motion-compensated
+        // copy.
+        let y_ref = RefPlane::new(&reference.y, 176, 144);
+        let mv = MotionVector::new(4, 0);
+        let expect_b3 = motion_compensate_block(&y_ref, 0, 8, mv, RCONTROL_DEFAULT);
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(
+                    frame.y[(8 + j) * 176 + i],
+                    expect_b3[j * 8 + i],
+                    "B3 did not inherit the propagated +4 vector at ({i}, {j})"
+                );
+            }
+        }
+        // Power check: a zero vector on B3 (the pre-fix behaviour)
+        // would have produced the plain co-located copy instead.
+        let plain =
+            motion_compensate_block(&y_ref, 0, 8, MotionVector::new(0, 0), RCONTROL_DEFAULT);
+        assert_ne!(
+            expect_b3.to_vec(),
+            plain.to_vec(),
+            "oracle degenerated — ramp reference no longer distinguishes the vectors"
+        );
     }
 
     /// §F.3 right-remote regression: the OBMC blend of a macroblock's
