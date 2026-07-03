@@ -236,6 +236,64 @@ pub fn encode_skipped_macroblock(w: &mut BitWriter) {
     w.write_bit(true);
 }
 
+/// Encode an Annex F **INTER4V** macroblock (four motion vectors,
+/// §5.3.8): COD = 0, the Table 8 INTER4V MCBPC, the complemented CBPY,
+/// then the four MVD pairs (§5.3.7 MVD + §5.3.8 MVD2-4, horizontal then
+/// vertical each) and the coefficient payload. `mvds` are the four
+/// per-block motion vector differences in Figure-5 order, each
+/// reconstructing to its block's vector through the decoder's §F.2
+/// per-block median predictor.
+pub fn encode_inter4v_macroblock(
+    w: &mut BitWriter,
+    luma: &[EncodedInterBlock; 4],
+    cb: &EncodedInterBlock,
+    cr: &EncodedInterBlock,
+    mvds: &[Mvd; 4],
+) -> Result<()> {
+    // §5.3.1 — COD = 0 (coded).
+    w.write_bit(false);
+
+    // §5.3.2 — MCBPC for an INTER4V (type 2) macroblock.
+    let mut cbpc = 0u8;
+    if cb.has_coeffs {
+        cbpc |= 0b10;
+    }
+    if cr.has_coeffs {
+        cbpc |= 0b01;
+    }
+    write_mcbpc_p(w, MbType::Inter4V, cbpc)?;
+
+    // §5.3.5 — CBPY, INTER complement.
+    let mut cbpy_intra = 0u8;
+    for (blk, e) in luma.iter().enumerate() {
+        if e.has_coeffs {
+            cbpy_intra |= 1 << (3 - blk);
+        }
+    }
+    write_cbpy(w, cbpy_intra ^ 0b1111)?;
+
+    // §5.3.7 / §5.3.8 — MVD then MVD2-4, horizontal before vertical.
+    for mvd in mvds {
+        write_mvd_component(w, mvd.dx_half)?;
+        write_mvd_component(w, mvd.dy_half)?;
+    }
+
+    // §5.4 — six blocks; only those with coefficients emit TCOEFs.
+    for e in luma.iter() {
+        if e.has_coeffs {
+            write_inter_block_coeffs(w, &e.scan)?;
+        }
+    }
+    if cb.has_coeffs {
+        write_inter_block_coeffs(w, &cb.scan)?;
+    }
+    if cr.has_coeffs {
+        write_inter_block_coeffs(w, &cr.scan)?;
+    }
+
+    Ok(())
+}
+
 /// Convenience: clamp an `i16` sample-difference array's source samples
 /// (`u8` promoted) is the caller's job; this helper builds a
 /// [`MacroblockSamples`] from raw `u8` luma/chroma blocks.

@@ -261,21 +261,22 @@ pub use deblock::{
 };
 pub use dequant::{dequantise_ac, scatter_into_block, AC_REC_MAX, AC_REC_MIN};
 pub use encoder::{
-    encode_inter_picture, encode_inter_picture_gobs, encode_inter_picture_motion,
-    encode_inter_picture_umv, encode_intra_picture, encode_intra_picture_dquant,
-    encode_intra_picture_gobs, encode_intra_sequence,
+    encode_inter_picture, encode_inter_picture_ap, encode_inter_picture_gobs,
+    encode_inter_picture_motion, encode_inter_picture_umv, encode_intra_picture,
+    encode_intra_picture_dquant, encode_intra_picture_gobs, encode_intra_sequence,
 };
 pub use encoder_block::{
     block_has_ac, encode_inter_block, encode_intra_block, tcoef_events, write_inter_block_coeffs,
     write_intra_block, EncodedInterBlock, EncodedIntraBlock,
 };
 pub use encoder_mb::{
-    encode_inter_macroblock, encode_inter_macroblock_dq, encode_intra_macroblock,
-    encode_intra_macroblock_dq, encode_skipped_macroblock, macroblock_samples_from_u8,
-    MacroblockSamples,
+    encode_inter4v_macroblock, encode_inter_macroblock, encode_inter_macroblock_dq,
+    encode_intra_macroblock, encode_intra_macroblock_dq, encode_skipped_macroblock,
+    macroblock_samples_from_u8, MacroblockSamples,
 };
 pub use encoder_motion::{
-    estimate_motion, estimate_motion_umv, mvd_for, umv_mvd_component_for, umv_mvd_for, MvGrid,
+    estimate_block_motion, estimate_motion, estimate_motion_umv, mvd_for, umv_mvd_component_for,
+    umv_mvd_for, Mv4Grid, MvGrid,
 };
 pub use encoder_vlc::{
     write_cbpy, write_dquant, write_intradc, write_mcbpc_i, write_mcbpc_p, write_mvd_component,

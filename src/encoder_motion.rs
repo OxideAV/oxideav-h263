@@ -34,7 +34,8 @@
 //! search scores is bit-identical to what the decoder will reconstruct.
 
 use crate::motion::{
-    median3, motion_compensate_block, reconstruct_mv_component_umv, MotionVector, RefPlane,
+    median3, motion_compensate_block, predict_mv_median, reconstruct_mv_component_umv,
+    select_4mv_candidates, LumaBlockIndex, Mb4Mv, Mb4MvNeighbourhood, MotionVector, RefPlane,
     MV_HALF_MAX, MV_HALF_MIN, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN, RCONTROL_DEFAULT,
 };
 use crate::picture::YuvFrame;
@@ -168,6 +169,173 @@ impl MvGrid {
     pub fn set_zero_candidate(&mut self, col: usize, row: usize) {
         self.entries[row * self.cols + col] = MvGridEntry::ZERO;
     }
+}
+
+/// The encoder's running **four-vector** grid for Annex F Advanced
+/// Prediction pictures, replaying the decoder's §F.2 / Figure-F.1
+/// per-block candidate-predictor derivation for the single-segment
+/// stream the encoder emits (no GOB headers after GOB 0).
+///
+/// Every macroblock the encoder emits on this path is either a coded
+/// INTER4V macroblock or (for a static region) a skipped macroblock
+/// whose four vectors are zero — and a skipped neighbour's contribution
+/// to both the §6.1.1/§F.2 candidates and the §F.3 remote vectors is
+/// exactly a zero vector, so the grid stores plain `Mb4Mv` cells
+/// (zeros for skipped) without a coded flag.
+#[derive(Debug, Clone)]
+pub struct Mv4Grid {
+    entries: Vec<Mb4Mv>,
+    cols: usize,
+}
+
+impl Mv4Grid {
+    /// A fresh grid for a picture `mb_cols × mb_rows` macroblocks.
+    pub fn new(mb_cols: usize, mb_rows: usize) -> Self {
+        Mv4Grid {
+            entries: vec![[MotionVector::new(0, 0); 4]; mb_cols * mb_rows],
+            cols: mb_cols,
+        }
+    }
+
+    /// Record a macroblock's four reconstructed vectors (Figure-5
+    /// order). Skipped macroblocks keep their zero cells.
+    pub fn set(&mut self, col: usize, row: usize, mvs4: Mb4Mv) {
+        self.entries[row * self.cols + col] = mvs4;
+    }
+
+    /// The four vectors of the macroblock at `(col, row)`.
+    pub fn get(&self, col: usize, row: usize) -> Mb4Mv {
+        self.entries[row * self.cols + col]
+    }
+
+    /// The §F.2 / Figure-F.1 median predictor for luminance block
+    /// `blk` of the macroblock at `(col, row)`, given the vectors of
+    /// this macroblock's **already-estimated** earlier blocks in
+    /// `current` (B2 reads B1, B3 reads B1/B2, B4 reads B3/B2 — §F.2
+    /// threads reconstructed vectors as candidates). Matches the
+    /// decoder's derivation for the single-segment stream: the §6.1.1
+    /// rule-3 top border applies only at the picture's top row, and
+    /// rule 4 zeroes MV3 for B2/B4 at the right picture edge.
+    pub fn predict_block(
+        &self,
+        col: usize,
+        row: usize,
+        blk: LumaBlockIndex,
+        current: &Mb4Mv,
+    ) -> MotionVector {
+        let n = Mb4MvNeighbourhood {
+            current: *current,
+            left: (col > 0).then(|| self.get(col - 1, row)),
+            above: (row > 0).then(|| self.get(col, row - 1)),
+            above_right: (row > 0 && col + 1 < self.cols).then(|| self.get(col + 1, row - 1)),
+            // MB-right is later in raster order — never a candidate.
+            right: None,
+        };
+        let (mv1, mut mv2, mut mv3) = select_4mv_candidates(blk, &n);
+        // §6.1.1 rule 3 at the picture top row (single segment: no
+        // GOB-header borders).
+        if matches!(blk, LumaBlockIndex::B1 | LumaBlockIndex::B2) && row == 0 {
+            mv2 = mv1;
+            mv3 = mv1;
+        }
+        // §6.1.1 rule 4 at the right picture edge.
+        if col + 1 >= self.cols && matches!(blk, LumaBlockIndex::B2 | LumaBlockIndex::B4) {
+            mv3 = MotionVector::new(0, 0);
+        }
+        predict_mv_median(mv1, mv2, mv3)
+    }
+}
+
+/// Sum of absolute differences of one **8×8 luminance block** of
+/// `source` at pixel origin `(bx, by)` against the motion-compensated
+/// prediction from `reference_plane` under `mv` (half-pel).
+fn block_sad(
+    source: &YuvFrame,
+    reference_plane: &RefPlane<'_>,
+    bx: usize,
+    by: usize,
+    mv: MotionVector,
+) -> u32 {
+    let lw = source.luma_width;
+    let pred = motion_compensate_block(reference_plane, bx, by, mv, RCONTROL_DEFAULT);
+    let mut sad = 0u32;
+    for row in 0..8 {
+        for col in 0..8 {
+            let s = source.y[(by + row) * lw + (bx + col)] as i32;
+            let p = pred[row * 8 + col] as i32;
+            sad += (s - p).unsigned_abs();
+        }
+    }
+    sad
+}
+
+/// Estimate the best motion vector (half-pel, baseline `[-32, 31]`
+/// range) for the **8×8 luminance block** at pixel origin `(bx, by)`,
+/// biased toward `predictor` — the per-block counterpart of
+/// [`estimate_motion`] used by the Annex F four-vector encoder.
+pub fn estimate_block_motion(
+    source: &YuvFrame,
+    reference: &YuvFrame,
+    bx: usize,
+    by: usize,
+    predictor: MotionVector,
+    search_half: i32,
+    lambda: u32,
+) -> MotionVector {
+    let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
+    let clamp = |mv: MotionVector| -> MotionVector {
+        MotionVector {
+            dx_half: mv.dx_half.clamp(MV_HALF_MIN, MV_HALF_MAX),
+            dy_half: mv.dy_half.clamp(MV_HALF_MIN, MV_HALF_MAX),
+        }
+    };
+    let cost = |mv: MotionVector| -> u32 {
+        let sad = block_sad(source, &y_ref, bx, by, mv);
+        let mvbits = (mv.dx_half - predictor.dx_half).unsigned_abs()
+            + (mv.dy_half - predictor.dy_half).unsigned_abs();
+        sad + lambda * mvbits
+    };
+
+    let mut best = clamp(predictor);
+    let mut best_cost = cost(best);
+    let zero = MotionVector::new(0, 0);
+    let zc = cost(zero);
+    if zc < best_cost {
+        best = zero;
+        best_cost = zc;
+    }
+    let pdx_int = predictor.dx_half / 2;
+    let pdy_int = predictor.dy_half / 2;
+    for dy in -search_half..=search_half {
+        for dx in -search_half..=search_half {
+            let mv = clamp(MotionVector {
+                dx_half: (pdx_int + dx) * 2,
+                dy_half: (pdy_int + dy) * 2,
+            });
+            let c = cost(mv);
+            if c < best_cost {
+                best_cost = c;
+                best = mv;
+            }
+        }
+    }
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let mv = clamp(MotionVector {
+                dx_half: best.dx_half + dx,
+                dy_half: best.dy_half + dy,
+            });
+            let c = cost(mv);
+            if c < best_cost {
+                best_cost = c;
+                best = mv;
+            }
+        }
+    }
+    best
 }
 
 /// Annex D §D.2 — the Table-14 MVD component the encoder must emit so

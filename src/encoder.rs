@@ -569,6 +569,214 @@ pub fn encode_inter_picture_umv(
     )
 }
 
+/// Encode a planar 4:2:0 [`YuvFrame`] as an H.263 **INTER** (P-)
+/// picture in the **Annex F Advanced Prediction mode**: the PTYPE
+/// bit-12 AP flag is raised and every macroblock is coded **INTER4V**
+/// with four per-8×8-block motion vectors (§5.3.8 / §F.2), predicted
+/// through the §F.3 **overlapped block motion compensation** blend the
+/// decoder reconstructs with.
+///
+/// The encoder runs two passes:
+///
+/// 1. **Estimation** (raster order): each luminance block's vector is
+///    searched around its §F.2 / Figure-F.1 median predictor
+///    ([`crate::encoder_motion::Mv4Grid`] replays the decoder's
+///    derivation, including the intra-macroblock candidate threading),
+///    and the four MVDs are recorded.
+/// 2. **Reconstruction + coding**: with the full motion field known,
+///    each block's §F.3 OBMC prediction is computed exactly as the
+///    decoder will (the right-half remote vectors read the macroblock
+///    to the right — available now), the residual is transformed,
+///    quantised and coded, and the macroblock is emitted.
+///
+/// Every macroblock is coded (no skip): a skipped macroblock would be
+/// reconstructed by the decoder as a plain zero-vector copy rather
+/// than the OBMC blend, which only coincides for all-zero
+/// neighbourhoods — the always-coded form keeps encoder and decoder
+/// predictions bit-identical everywhere at a small COD/MCBPC/MVD
+/// overhead. Chrominance is predicted with the §F.2 / Table-F.1
+/// sum-of-four vector (no OBMC). `reference` must share the frame's
+/// dimensions.
+pub fn encode_inter_picture_ap(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+) -> Result<Vec<u8>> {
+    use crate::encoder_motion::{estimate_block_motion, mvd_for, Mv4Grid};
+    use crate::motion::{chroma_mv_4mv, LumaBlockIndex, Mb4Mv, MotionVector, RemoteMv};
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if frame.luma_width != reference.luma_width || frame.luma_height != reference.luma_height {
+        return Err(Error::NotImplemented);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+
+    let lw = frame.luma_width;
+    let lh = frame.luma_height;
+    let mb_cols = lw / 16;
+    let mb_rows = lh / 16;
+    let lambda = 2 * quant as u32;
+
+    // ---- Pass 1: per-block motion estimation with §F.2 predictor
+    // replay. --------------------------------------------------------
+    let mut grid4 = Mv4Grid::new(mb_cols, mb_rows);
+    let mut field: Vec<Mb4Mv> = Vec::with_capacity(mb_cols * mb_rows);
+    let mut mvds_field: Vec<[crate::macroblock::Mvd; 4]> = Vec::with_capacity(mb_cols * mb_rows);
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let mut cur: Mb4Mv = [MotionVector::new(0, 0); 4];
+            let mut mvds = [crate::macroblock::Mvd {
+                dx_half: 0,
+                dy_half: 0,
+            }; 4];
+            for &blk in &LumaBlockIndex::ALL {
+                let blk_i = blk.index();
+                let bx = mb_col * 16 + (blk_i % 2) * 8;
+                let by = mb_row * 16 + (blk_i / 2) * 8;
+                let predictor = grid4.predict_block(mb_col, mb_row, blk, &cur);
+                let mv =
+                    estimate_block_motion(frame, reference, bx, by, predictor, search_half, lambda);
+                cur[blk_i] = mv;
+                mvds[blk_i] = mvd_for(mv, predictor);
+            }
+            grid4.set(mb_col, mb_row, cur);
+            field.push(cur);
+            mvds_field.push(mvds);
+        }
+    }
+
+    // ---- Pass 2: §F.3 OBMC prediction + residual coding. -------------
+    let mut w = BitWriter::new();
+    write_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ true,
+        PtypeFlags {
+            advanced_prediction: true,
+            ..PtypeFlags::default()
+        },
+    );
+
+    let y_ref = crate::motion::RefPlane::new(&reference.y, lw, lh);
+    let cw = frame.chroma_width();
+    let ch = frame.chroma_height();
+
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let idx = mb_row * mb_cols + mb_col;
+            let cur = field[idx];
+            let mvds = mvds_field[idx];
+            let above = (mb_row > 0).then(|| field[idx - mb_cols]);
+            let left = (mb_col > 0).then(|| field[idx - 1]);
+            let right = (mb_col + 1 < mb_cols).then(|| field[idx + 1]);
+
+            // §F.3 remote-vector tags per block. Every macroblock in
+            // this stream is coded INTER, so a present neighbour
+            // contributes its actual vector; an off-picture neighbour
+            // is replaced by the current vector, and the bottom
+            // remotes of B3/B4 are always the current vector.
+            let remote = |nb: Option<Mb4Mv>, cell: LumaBlockIndex| -> RemoteMv {
+                match nb {
+                    Some(m) => RemoteMv::Vector(m[cell.index()]),
+                    None => RemoteMv::Current,
+                }
+            };
+            let tags = |blk: LumaBlockIndex| -> (RemoteMv, RemoteMv, RemoteMv, RemoteMv) {
+                match blk {
+                    LumaBlockIndex::B1 => (
+                        remote(above, LumaBlockIndex::B3),
+                        RemoteMv::Vector(cur[LumaBlockIndex::B3.index()]),
+                        remote(left, LumaBlockIndex::B2),
+                        RemoteMv::Vector(cur[LumaBlockIndex::B2.index()]),
+                    ),
+                    LumaBlockIndex::B2 => (
+                        remote(above, LumaBlockIndex::B4),
+                        RemoteMv::Vector(cur[LumaBlockIndex::B4.index()]),
+                        RemoteMv::Vector(cur[LumaBlockIndex::B1.index()]),
+                        remote(right, LumaBlockIndex::B1),
+                    ),
+                    LumaBlockIndex::B3 => (
+                        RemoteMv::Vector(cur[LumaBlockIndex::B1.index()]),
+                        RemoteMv::Current,
+                        remote(left, LumaBlockIndex::B4),
+                        RemoteMv::Vector(cur[LumaBlockIndex::B4.index()]),
+                    ),
+                    LumaBlockIndex::B4 => (
+                        RemoteMv::Vector(cur[LumaBlockIndex::B2.index()]),
+                        RemoteMv::Current,
+                        RemoteMv::Vector(cur[LumaBlockIndex::B3.index()]),
+                        remote(right, LumaBlockIndex::B3),
+                    ),
+                }
+            };
+
+            let src = extract_macroblock(frame, mb_col, mb_row);
+            let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(4);
+            for &blk in &LumaBlockIndex::ALL {
+                let blk_i = blk.index();
+                let bx = mb_col * 16 + (blk_i % 2) * 8;
+                let by = mb_row * 16 + (blk_i / 2) * 8;
+                let (r_top, r_bot, s_left, s_right) = tags(blk);
+                let pred = crate::motion::obmc_predict_block(
+                    &y_ref,
+                    bx,
+                    by,
+                    cur[blk_i],
+                    r_top,
+                    r_bot,
+                    s_left,
+                    s_right,
+                    crate::motion::RCONTROL_DEFAULT,
+                );
+                let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
+                for (d, &p) in pred_i16.iter_mut().zip(pred.iter()) {
+                    *d = p as i16;
+                }
+                let residual = residual_of(&src.luma[blk_i], &pred_i16);
+                luma_enc.push(crate::encoder_block::encode_inter_block(&residual, quant));
+            }
+
+            // §F.2 chroma: sum-of-four / Table F.1 vector, plain
+            // half-pel motion compensation (no OBMC).
+            let chroma_vec = chroma_mv_4mv(&cur);
+            let c_x = mb_col * 8;
+            let c_y = mb_row * 8;
+            let cb_pred = motion_compensated_block(&reference.cb, cw, ch, c_x, c_y, chroma_vec);
+            let cr_pred = motion_compensated_block(&reference.cr, cw, ch, c_x, c_y, chroma_vec);
+            let mut cb_pred_i = [0i16; COEFFS_PER_BLOCK];
+            let mut cr_pred_i = [0i16; COEFFS_PER_BLOCK];
+            for i in 0..COEFFS_PER_BLOCK {
+                cb_pred_i[i] = cb_pred[i] as i16;
+                cr_pred_i[i] = cr_pred[i] as i16;
+            }
+            let cb_enc =
+                crate::encoder_block::encode_inter_block(&residual_of(&src.cb, &cb_pred_i), quant);
+            let cr_enc =
+                crate::encoder_block::encode_inter_block(&residual_of(&src.cr, &cr_pred_i), quant);
+
+            let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
+                luma_enc[0].clone(),
+                luma_enc[1].clone(),
+                luma_enc[2].clone(),
+                luma_enc[3].clone(),
+            ];
+            crate::encoder_mb::encode_inter4v_macroblock(
+                &mut w, &luma_arr, &cb_enc, &cr_enc, &mvds,
+            )?;
+        }
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
 /// Shared motion-estimated INTER picture encode: the default-mode
 /// (§6.1.1 wrap, `umv = false`) and Annex D UMV (`umv = true`) paths
 /// differ only in the PTYPE bit-10 flag, the estimator range and the
@@ -1157,6 +1365,106 @@ mod tests {
         }
         let mae = sum as f64 / frame1.y.len() as f64;
         assert!(mae < 6.0, "GOB-header INTER luma MAE too high: {}", mae);
+    }
+
+    /// A static Advanced-Prediction P-picture is lossless: every
+    /// macroblock is coded INTER4V with zero vectors, the §F.3 OBMC
+    /// blend of all-zero vectors is the plain co-located copy, and the
+    /// residual quantises to zero — so the decoder reproduces the
+    /// reference exactly. The PTYPE AP flag is on the wire.
+    #[test]
+    fn ap_static_picture_is_lossless() {
+        use crate::picture_header::parse_picture_header;
+        use oxideav_core::bits::BitReader;
+
+        let src = gradient_frame(176, 144);
+        let i_bytes = encode_intra_picture(&src, 6, 0).unwrap();
+        let recon_ref =
+            decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+
+        let p_bytes = encode_inter_picture_ap(&recon_ref, &recon_ref, 6, 1, 2).unwrap();
+        let mut r = BitReader::new(&p_bytes);
+        let header = parse_picture_header(&mut r).unwrap();
+        assert!(header.advanced_prediction, "PTYPE AP flag not set");
+        assert!(!header.umv_mode);
+
+        let decoded =
+            decode_picture_no_gob0_header(&p_bytes, Some(&recon_ref), DecodeOptions::default())
+                .unwrap();
+        assert_eq!(decoded.y, recon_ref.y, "static AP luma must be lossless");
+        assert_eq!(decoded.cb, recon_ref.cb);
+        assert_eq!(decoded.cr, recon_ref.cr);
+    }
+
+    /// Divergent intra-macroblock motion (the right 8-pixel half of
+    /// every macroblock shifts, the left half stays) — exactly what
+    /// four vectors per macroblock exist for. The AP encode
+    /// round-trips within tolerance and spends far fewer bits than the
+    /// zero-motion encoder on the same content.
+    #[test]
+    fn ap_shear_content_round_trips_and_beats_zero_motion() {
+        let frame0 = gradient_frame(176, 144);
+        let i_bytes = encode_intra_picture(&frame0, 5, 0).unwrap();
+        let recon_ref =
+            decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+
+        // Right half of every macroblock samples 3 px to the right;
+        // left half is static. Per-8×8-block vectors capture this,
+        // a single MV per macroblock cannot.
+        let lw = 176;
+        let lh = 144;
+        let mut frame1 = recon_ref.clone();
+        for row in 0..lh {
+            for col in 0..lw {
+                let shift = if col % 16 >= 8 { 3 } else { 0 };
+                let src = (col + shift).min(lw - 1);
+                frame1.y[row * lw + col] = recon_ref.y[row * lw + src];
+            }
+        }
+
+        let ap_bytes = encode_inter_picture_ap(&frame1, &recon_ref, 5, 1, 4).unwrap();
+        let decoded =
+            decode_picture_no_gob0_header(&ap_bytes, Some(&recon_ref), DecodeOptions::default())
+                .unwrap();
+        let mut sum = 0u64;
+        for (a, b) in frame1.y.iter().zip(decoded.y.iter()) {
+            sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+        }
+        let mae = sum as f64 / frame1.y.len() as f64;
+        assert!(mae < 8.0, "AP shear luma MAE too high: {}", mae);
+
+        // Zero-motion coding of the same content has to carry the
+        // whole divergence as residual.
+        let zm_bytes = encode_inter_picture(&frame1, &recon_ref, 5, 1).unwrap();
+        assert!(
+            ap_bytes.len() < zm_bytes.len(),
+            "AP stream ({}) not smaller than zero-motion ({})",
+            ap_bytes.len(),
+            zm_bytes.len()
+        );
+    }
+
+    /// A translated frame round-trips through the AP encoder (uniform
+    /// motion — all four vectors of each macroblock converge, OBMC
+    /// remotes agree across macroblocks).
+    #[test]
+    fn ap_translated_frame_round_trips() {
+        let frame0 = gradient_frame(176, 144);
+        let i_bytes = encode_intra_picture(&frame0, 5, 0).unwrap();
+        let recon_ref =
+            decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+        let frame1 = translate_left(&recon_ref, 2);
+
+        let ap_bytes = encode_inter_picture_ap(&frame1, &recon_ref, 5, 1, 4).unwrap();
+        let decoded =
+            decode_picture_no_gob0_header(&ap_bytes, Some(&recon_ref), DecodeOptions::default())
+                .unwrap();
+        let mut sum = 0u64;
+        for (a, b) in frame1.y.iter().zip(decoded.y.iter()) {
+            sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+        }
+        let mae = sum as f64 / frame1.y.len() as f64;
+        assert!(mae < 6.0, "AP translated luma MAE too high: {}", mae);
     }
 
     /// Translate a frame's content left by `shift` luma pixels with

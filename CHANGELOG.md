@@ -39,6 +39,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex F Advanced-Prediction (INTER4V + OBMC) encoder** (round
+  384): `encoder::encode_inter_picture_ap` encodes a P-picture with the
+  PTYPE bit-12 AP flag and **four motion vectors per macroblock**
+  (§5.3.8 / §F.2), predicted through the §F.3 overlapped block motion
+  compensation blend the decoder reconstructs with. Two passes:
+  per-block estimation with §F.2 / Figure-F.1 predictor replay
+  (`encoder_motion::Mv4Grid`, including the intra-macroblock candidate
+  threading, + the 8×8 `estimate_block_motion` search), then — with
+  the full motion field known — the exact decoder-side OBMC prediction
+  per block (right-half remotes read the macroblock to the right) and
+  residual coding. Chroma uses the §F.2 / Table-F.1 sum-of-four
+  vector. `encoder_mb::encode_inter4v_macroblock` emits the Table-8
+  INTER4V form with four MVD pairs. A static AP picture round-trips
+  **losslessly**; divergent intra-macroblock motion (sheared halves)
+  round-trips within tolerance at a fraction of the zero-motion bits.
+
 - **§5.2 GOB-header emission (resync-friendly streams + per-GOB
   GQUANT)** (round 384): `encoder::encode_intra_picture_gobs` encodes
   an I-picture with a GOB header (GSTUF byte alignment + GBSC + GN +
