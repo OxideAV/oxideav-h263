@@ -8,6 +8,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D §D.2 UMV motion-vector coding, encoder side** (round 384):
+  `encoder_motion::umv_mvd_component_for` / `umv_mvd_for` compute the
+  Table-14 MVD the encoder must emit so the decoder's §D.2
+  predictor-dependent pair selection reconstructs exactly the chosen
+  extended-range vector — verified exhaustively against
+  `reconstruct_mv_component_umv` over the full `[-63, 63]²`
+  predictor × vector space (reachable pairs round-trip, unreachable
+  ones are refused). `estimate_motion_umv` runs the SAD search over
+  the extended `[-31.5, 31.5]`-pixel window with a per-candidate §D.2
+  reachability filter, so every returned vector is codable; the
+  default-mode `estimate_motion` is now a thin wrapper over the shared
+  search core.
+
 - **DQUANT (+Q) macroblock encoding** (round 381): the §5.3.6 Table 13
   baseline 2-bit DQUANT differential is now emitted by the encoder.
   `encoder_vlc::write_dquant` writes the `{-2,-1,+1,+2}` differential;

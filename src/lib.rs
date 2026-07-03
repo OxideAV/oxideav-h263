@@ -273,7 +273,9 @@ pub use encoder_mb::{
     encode_intra_macroblock_dq, encode_skipped_macroblock, macroblock_samples_from_u8,
     MacroblockSamples,
 };
-pub use encoder_motion::{estimate_motion, mvd_for, MvGrid};
+pub use encoder_motion::{
+    estimate_motion, estimate_motion_umv, mvd_for, umv_mvd_component_for, umv_mvd_for, MvGrid,
+};
 pub use encoder_vlc::{
     write_cbpy, write_dquant, write_intradc, write_mcbpc_i, write_mcbpc_p, write_mvd_component,
     write_tcoef, TcoefEvent,

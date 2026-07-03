@@ -34,8 +34,8 @@
 //! search scores is bit-identical to what the decoder will reconstruct.
 
 use crate::motion::{
-    median3, motion_compensate_block, MotionVector, RefPlane, MV_HALF_MAX, MV_HALF_MIN,
-    RCONTROL_DEFAULT,
+    median3, motion_compensate_block, reconstruct_mv_component_umv, MotionVector, RefPlane,
+    MV_HALF_MAX, MV_HALF_MIN, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN, RCONTROL_DEFAULT,
 };
 use crate::picture::YuvFrame;
 
@@ -144,6 +144,65 @@ impl MvGrid {
     }
 }
 
+/// Annex D §D.2 — the Table-14 MVD component the encoder must emit so
+/// the decoder's [`reconstruct_mv_component_umv`] recovers `mv` from
+/// `predictor`, or `None` when `mv` is **not reachable** from that
+/// predictor in the Unrestricted Motion Vector mode (PLUSPTYPE absent).
+///
+/// §D.2 restricts the reachable set per component (half-pel units):
+///
+/// * predictor `Pc ∈ [-31, 32]` — only `MVc ∈ [Pc − 32, Pc + 31]`
+///   ("only values that are within a range of `[-16, 15.5]` around the
+///   predictor ... can be reached if the predictor is in the range
+///   `[-15.5, 16]`"),
+/// * `Pc ∈ [-63, -32]` — `MVc ∈ [-63, 0]`,
+/// * `Pc ∈ [33, 63]` — `MVc ∈ [0, 63]`.
+///
+/// The emitted difference is a plain Table-14 codeword in `[-32, 31]`;
+/// the decoder's §D.2 pair-selection maps it back to `mv`. The inverse
+/// is found by scanning the 64 possible Table-14 values and checking
+/// them against the decoder's own reconstruction, so the round-trip is
+/// exact by construction (`reconstruct_mv_component_umv(predictor, d)
+/// == mv` for the returned `d`).
+pub fn umv_mvd_component_for(mv: i32, predictor: i32) -> Option<i8> {
+    if !(MV_UMV_HALF_MIN..=MV_UMV_HALF_MAX).contains(&mv) {
+        return None;
+    }
+    // Fast path: the direct difference, when Table-14-representable.
+    let direct = mv - predictor;
+    if (MV_HALF_MIN..=MV_HALF_MAX).contains(&direct)
+        && reconstruct_mv_component_umv(predictor, direct) == mv
+    {
+        return Some(direct as i8);
+    }
+    // Otherwise the codeword denotes the pair {d, d ± 64}; try the
+    // member of the pair that lands in the Table-14 window.
+    let paired = if direct > MV_HALF_MAX {
+        direct - crate::motion::MV_HALF_SPAN
+    } else {
+        direct + crate::motion::MV_HALF_SPAN
+    };
+    if (MV_HALF_MIN..=MV_HALF_MAX).contains(&paired)
+        && reconstruct_mv_component_umv(predictor, paired) == mv
+    {
+        return Some(paired as i8);
+    }
+    None
+}
+
+/// Annex D §D.2 — the full [`crate::macroblock::Mvd`] for a motion
+/// vector under the Unrestricted Motion Vector mode, or `None` when
+/// either component is unreachable from its predictor (see
+/// [`umv_mvd_component_for`]).
+pub fn umv_mvd_for(mv: MotionVector, predictor: MotionVector) -> Option<crate::macroblock::Mvd> {
+    let dx = umv_mvd_component_for(mv.dx_half, predictor.dx_half)?;
+    let dy = umv_mvd_component_for(mv.dy_half, predictor.dy_half)?;
+    Some(crate::macroblock::Mvd {
+        dx_half: dx,
+        dy_half: dy,
+    })
+}
+
 /// Sum of absolute differences between a 16×16 macroblock of `source`
 /// (luma) at pixel origin `(mb_x, mb_y)` and the motion-compensated
 /// prediction from `reference` under motion vector `mv` (half-pel).
@@ -195,6 +254,88 @@ pub fn estimate_motion(
     search_half: i32,
     lambda: u32,
 ) -> MotionVector {
+    let clamp = |mv: MotionVector| -> MotionVector {
+        MotionVector {
+            dx_half: mv.dx_half.clamp(MV_HALF_MIN, MV_HALF_MAX),
+            dy_half: mv.dy_half.clamp(MV_HALF_MIN, MV_HALF_MAX),
+        }
+    };
+    // In the default prediction mode every MV in [-32, 31] half-pel is
+    // reachable from any predictor (the §6.1.1 wrap), so the candidate
+    // filter is a plain range clamp.
+    search_best(
+        source,
+        reference,
+        mb_col,
+        mb_row,
+        predictor,
+        search_half,
+        lambda,
+        &clamp,
+        &|_| true,
+    )
+}
+
+/// Annex D §D.2 variant of [`estimate_motion`] for the **Unrestricted
+/// Motion Vector mode** (PLUSPTYPE absent).
+///
+/// The candidate window is the extended `[-63, 63]` half-pel range, but
+/// a candidate is admitted only when **both** components are reachable
+/// from `predictor` under the §D.2 rules (see
+/// [`umv_mvd_component_for`]) — so the returned MV is always exactly
+/// codable with a Table-14 MVD pair. With a zero predictor the
+/// reachable window matches the default mode; as neighbouring
+/// macroblocks accumulate large vectors the predictor grows and the
+/// window slides out to ±31.5 pixels, which is how §D.2 reaches the
+/// extended range in practice.
+pub fn estimate_motion_umv(
+    source: &YuvFrame,
+    reference: &YuvFrame,
+    mb_col: usize,
+    mb_row: usize,
+    predictor: MotionVector,
+    search_half: i32,
+    lambda: u32,
+) -> MotionVector {
+    let clamp = |mv: MotionVector| -> MotionVector {
+        MotionVector {
+            dx_half: mv.dx_half.clamp(MV_UMV_HALF_MIN, MV_UMV_HALF_MAX),
+            dy_half: mv.dy_half.clamp(MV_UMV_HALF_MIN, MV_UMV_HALF_MAX),
+        }
+    };
+    let representable = |mv: MotionVector| -> bool {
+        umv_mvd_component_for(mv.dx_half, predictor.dx_half).is_some()
+            && umv_mvd_component_for(mv.dy_half, predictor.dy_half).is_some()
+    };
+    search_best(
+        source,
+        reference,
+        mb_col,
+        mb_row,
+        predictor,
+        search_half,
+        lambda,
+        &clamp,
+        &representable,
+    )
+}
+
+/// Shared integer-then-half-pel SAD search. `clamp` folds a raw
+/// candidate into the mode's component range; `admit` rejects
+/// candidates whose MVD is not representable from `predictor` (always
+/// true in the default mode, the §D.2 reachability test in UMV mode).
+#[allow(clippy::too_many_arguments)]
+fn search_best(
+    source: &YuvFrame,
+    reference: &YuvFrame,
+    mb_col: usize,
+    mb_row: usize,
+    predictor: MotionVector,
+    search_half: i32,
+    lambda: u32,
+    clamp: &dyn Fn(MotionVector) -> MotionVector,
+    admit: &dyn Fn(MotionVector) -> bool,
+) -> MotionVector {
     let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
     let mb_x = mb_col * 16;
     let mb_y = mb_row * 16;
@@ -206,21 +347,17 @@ pub fn estimate_motion(
         sad + lambda * mvbits
     };
 
-    let clamp = |mv: MotionVector| -> MotionVector {
-        MotionVector {
-            dx_half: mv.dx_half.clamp(MV_HALF_MIN, MV_HALF_MAX),
-            dy_half: mv.dy_half.clamp(MV_HALF_MIN, MV_HALF_MAX),
-        }
-    };
-
-    // Start from the predictor and the zero vector; pick the cheaper.
+    // Start from the predictor (always reachable: MVD = 0) and the zero
+    // vector; pick the cheaper.
     let mut best = clamp(predictor);
     let mut best_cost = cost(best);
     let zero = MotionVector::new(0, 0);
-    let zc = cost(zero);
-    if zc < best_cost {
-        best = zero;
-        best_cost = zc;
+    if admit(zero) {
+        let zc = cost(zero);
+        if zc < best_cost {
+            best = zero;
+            best_cost = zc;
+        }
     }
 
     // Integer-pel full search around the integer part of the predictor.
@@ -232,6 +369,9 @@ pub fn estimate_motion(
                 dx_half: (pdx_int + dx) * 2,
                 dy_half: (pdy_int + dy) * 2,
             });
+            if !admit(mv) {
+                continue;
+            }
             let c = cost(mv);
             if c < best_cost {
                 best_cost = c;
@@ -250,6 +390,9 @@ pub fn estimate_motion(
                 dx_half: best.dx_half + dx,
                 dy_half: best.dy_half + dy,
             });
+            if !admit(mv) {
+                continue;
+            }
             let c = cost(mv);
             if c < best_cost {
                 best_cost = c;
@@ -364,6 +507,98 @@ mod tests {
         // content sits at `col + 2` in the (unshifted) reference — the
         // best vector points right by 2 px (+4 half-pel).
         assert_eq!(mv.dx_half, 4, "expected dx ≈ +4 half-pel, got {:?}", mv);
+    }
+
+    // ---- Annex D §D.2 UMV MVD inverse -----------------------------
+
+    /// For every predictor, every §D.2-reachable component round-trips
+    /// through the decoder's reconstruction, and every unreachable one
+    /// is refused.
+    #[test]
+    fn umv_mvd_component_inverts_reconstruction_exhaustively() {
+        use crate::motion::{reconstruct_mv_component_umv, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN};
+        for pred in MV_UMV_HALF_MIN..=MV_UMV_HALF_MAX {
+            // §D.2 reachable set for this predictor.
+            let reachable = |mv: i32| -> bool {
+                if (-31..=32).contains(&pred) {
+                    (pred - 32..=pred + 31).contains(&mv)
+                } else if pred > 32 {
+                    (0..=MV_UMV_HALF_MAX).contains(&mv)
+                } else {
+                    (MV_UMV_HALF_MIN..=0).contains(&mv)
+                }
+            };
+            for mv in MV_UMV_HALF_MIN..=MV_UMV_HALF_MAX {
+                match umv_mvd_component_for(mv, pred) {
+                    Some(d) => {
+                        assert!(
+                            reachable(mv),
+                            "pred={pred} mv={mv}: not reachable but coded"
+                        );
+                        assert_eq!(
+                            reconstruct_mv_component_umv(pred, d as i32),
+                            mv,
+                            "pred={pred} mv={mv} d={d}: decoder disagrees"
+                        );
+                    }
+                    None => {
+                        assert!(!reachable(mv), "pred={pred} mv={mv}: reachable but refused");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The full-vector inverse composes the per-component rule; a
+    /// mixed reachable/unreachable pair is refused as a whole.
+    #[test]
+    fn umv_mvd_full_vector() {
+        use crate::motion::reconstruct_mv_umv;
+        let pred = MotionVector::new(40, -2);
+        let mv = MotionVector::new(56, 20);
+        let mvd = umv_mvd_for(mv, pred).expect("reachable pair");
+        assert_eq!(reconstruct_mv_umv(pred, mvd), mv);
+        // dy = 40 is outside [-34, 29] around pred.dy = -2 → refused.
+        assert!(umv_mvd_for(MotionVector::new(56, 40), pred).is_none());
+    }
+
+    /// With a large predictor the UMV estimator reaches a vector beyond
+    /// the default ±31-half window (the §D.2 extension), while the
+    /// default-mode estimator clamps to [-32, 31].
+    #[test]
+    fn umv_estimator_reaches_extended_range() {
+        // Reference: gradient. Source: the same pattern shifted right
+        // by 20 px, so the matching content sits 20 px right in the
+        // reference (best MV = +40 half-pel).
+        let reference = gradient_frame(176, 144, 0);
+        let source = gradient_frame(176, 144, 20);
+        let predictor = MotionVector::new(40, 0); // grown via neighbours
+        let mv = estimate_motion_umv(&source, &reference, 4, 4, predictor, 4, 1);
+        assert_eq!(mv.dx_half, 40, "UMV search missed the +40 optimum: {mv:?}");
+        assert_eq!(mv.dy_half, 0);
+        // The default-mode estimator cannot represent +40: it stays
+        // within the baseline window.
+        let base = estimate_motion(&source, &reference, 4, 4, predictor, 4, 1);
+        assert!(
+            base.dx_half <= MV_HALF_MAX,
+            "default mode exceeded its range: {base:?}"
+        );
+    }
+
+    /// Every vector the UMV estimator returns is exactly codable: the
+    /// MVD exists and reconstructs to the returned vector.
+    #[test]
+    fn umv_estimator_returns_codable_vectors() {
+        use crate::motion::reconstruct_mv_umv;
+        let reference = gradient_frame(176, 144, 0);
+        let source = gradient_frame(176, 144, 7);
+        for (pdx, pdy) in [(0, 0), (31, 0), (-40, 6), (50, -50)] {
+            let predictor = MotionVector::new(pdx, pdy);
+            let mv = estimate_motion_umv(&source, &reference, 2, 3, predictor, 3, 2);
+            let mvd = umv_mvd_for(mv, predictor)
+                .unwrap_or_else(|| panic!("uncodable MV {mv:?} from predictor {predictor:?}"));
+            assert_eq!(reconstruct_mv_umv(predictor, mvd), mv);
+        }
     }
 
     /// The predictor grid matches the decoder's reduced border rules:
