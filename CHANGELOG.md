@@ -39,6 +39,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex G PB-frames encoder** (round 384):
+  `encoder::encode_pb_picture` encodes a P-picture and a B-picture as
+  one Annex G PB-frame unit (`PbConfig`: quant / TRB / DBQUANT /
+  search window). The P-part is motion-estimated and coded like the
+  baseline P-path; the encoder then reconstructs PREC (§G.5) exactly
+  as the decoder will (dequantising its own coefficients through the
+  shared reconstruction), forms the §G.4 TRB/TRD-scaled bidirectional
+  B-prediction with `MVDB = 0` via the decoder's own
+  `pb_b_predict_macroblock`, and codes surviving B-residuals at the
+  Table-6 BQUANT (MODB `"11"` + CBPB; MODB `"0"` otherwise; fully
+  static macroblocks skip). A static PB-frame is lossless on both
+  parts; a translating (ref, B, P) triple round-trips within tolerance
+  and an I + PB stream decodes through `decode_sequence` into display
+  order [I, B, P]. The picture-header writer emits the §5.1.22 TRB +
+  §5.1.23 DBQUANT fields when the PTYPE bit-13 PB flag is raised.
+
 - **Closed-loop GOP sequence encoder + §5.1.27 EOS** (round 384):
   `encoder::encode_sequence` encodes a frame sequence with a classic
   I + P GOP structure (`GopConfig`: quantiser, intra period, search

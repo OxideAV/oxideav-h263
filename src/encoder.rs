@@ -106,7 +106,9 @@ struct PtypeFlags {
 /// Write the §5.1 baseline picture header (PSC, TR, PTYPE, PQUANT,
 /// CPM=0, PEI=0). `is_inter` selects the §5.1.3 picture coding-type bit
 /// (INTRA = 0, INTER = 1); `flags` raises the optional-mode PTYPE bits
-/// (SAC and PB stay 0 on this path).
+/// (SAC stays 0 on this path). `pb_fields` — `Some((trb, dbquant))` —
+/// raises the PTYPE bit-13 PB-frames flag and emits the §5.1.22 TRB +
+/// §5.1.23 DBQUANT fields between CPM and PEI.
 fn write_picture_header(
     w: &mut BitWriter,
     fmt: H263SourceFormat,
@@ -114,6 +116,7 @@ fn write_picture_header(
     tr: u8,
     is_inter: bool,
     flags: PtypeFlags,
+    pb_fields: Option<(u8, u8)>,
 ) {
     // §5.1.1 — Picture Start Code (22 bits, 0x000020).
     w.write_bits(PSC_VALUE, 22);
@@ -131,11 +134,16 @@ fn write_picture_header(
     w.write_bit(flags.umv); // UMV (Annex D)
     w.write_bit(false); // SAC (Annex E)
     w.write_bit(flags.advanced_prediction); // AP (Annex F)
-    w.write_bit(false); // PB  (Annex G)
-                        // §5.1.19 — PQUANT (5 bits).
+    w.write_bit(pb_fields.is_some()); // PB (Annex G)
+                                      // §5.1.19 — PQUANT (5 bits).
     w.write_bits(quant as u32, 5);
     // §5.1.20 — CPM (1 bit, 0 = single bitstream).
     w.write_bit(false);
+    // §5.1.22 TRB (3 bits) + §5.1.23 DBQUANT (2 bits) — PB-frames only.
+    if let Some((trb, dbquant)) = pb_fields {
+        w.write_bits(trb as u32, 3);
+        w.write_bits(dbquant as u32, 2);
+    }
     // §5.1.24 — PEI (1 bit, 0 = no PSUPP extension).
     w.write_bit(false);
 }
@@ -192,6 +200,7 @@ where
         tr,
         /* is_inter */ false,
         PtypeFlags::default(),
+        None,
     );
 
     let gfid = tr & 0b11;
@@ -244,6 +253,7 @@ pub fn encode_intra_picture(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u
         tr,
         /* is_inter */ false,
         PtypeFlags::default(),
+        None,
     );
 
     // §5.2.2 — macroblock stream, no GOB headers (single segment, GOB-0
@@ -324,6 +334,7 @@ where
         tr,
         /* is_inter */ false,
         PtypeFlags::default(),
+        None,
     );
 
     let mb_cols = frame.luma_width / 16;
@@ -397,6 +408,7 @@ pub fn encode_inter_picture(
         tr,
         /* is_inter */ true,
         PtypeFlags::default(),
+        None,
     );
 
     let mb_cols = frame.luma_width / 16;
@@ -662,6 +674,7 @@ pub fn encode_inter_picture_ap(
             advanced_prediction: true,
             ..PtypeFlags::default()
         },
+        None,
     );
 
     let y_ref = crate::motion::RefPlane::new(&reference.y, lw, lh);
@@ -811,6 +824,7 @@ fn encode_inter_picture_motion_impl(
             umv,
             ..PtypeFlags::default()
         },
+        None,
     );
 
     let lw = frame.luma_width;
@@ -969,6 +983,332 @@ fn encode_inter_picture_motion_impl(
                 luma_enc[3].clone(),
             ];
             crate::encoder_mb::encode_inter_macroblock(&mut w, &luma_arr, &cb_enc, &cr_enc, mvd)?;
+            grid.set_inter(mb_col, mb_row, mv);
+        }
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+/// Configuration for [`encode_pb_picture`].
+#[derive(Debug, Clone, Copy)]
+pub struct PbConfig {
+    /// Quantiser for the P-blocks (`1..=31`); the B-blocks run at the
+    /// §5.1.23 / Table-6 BQUANT derived from it and `dbquant`.
+    pub quant: u8,
+    /// §5.1.22 TRB (3-bit form, `1..=7`): the number of
+    /// non-transmitted pictures between the previous anchor and the
+    /// B-picture, plus one.
+    pub trb: u8,
+    /// §5.1.23 DBQUANT (`0..=3`): selects the Table-6 QUANT → BQUANT
+    /// relation.
+    pub dbquant: u8,
+    /// Motion-search window for the P-part (±whole pixels).
+    pub search_half: i32,
+}
+
+impl Default for PbConfig {
+    fn default() -> Self {
+        PbConfig {
+            quant: 8,
+            trb: 1,
+            dbquant: 0,
+            search_half: 8,
+        }
+    }
+}
+
+/// Encode an Annex G **PB-frame**: one picture unit carrying a
+/// P-picture (`p_source`, predicted from `reference`) and a B-picture
+/// (`b_source`, temporally between `reference` and `p_source`,
+/// predicted bidirectionally per §G.4 / §G.5).
+///
+/// Per macroblock the P-part is motion-estimated and coded exactly
+/// like [`encode_inter_picture_motion`]; the encoder then
+/// reconstructs the P-macroblock (PREC, §G.5) the way the decoder
+/// will, forms the §G.4 bidirectional B-prediction with the
+/// TRB/TRD-scaled vectors (`MVDB = 0`), and codes the B-residual at
+/// the Table-6 BQUANT wherever it survives quantisation (MODB `"11"`
+/// with a zero MVDB + CBPB; MODB `"0"` when no B-block is lit). A
+/// macroblock with a zero vector, no P-residual and no B-residual is
+/// skipped (COD = 1).
+///
+/// `tr_p` is the §5.1.2 Temporal Reference of the P-part; `prev_tr`
+/// is the reference picture's TR (their difference mod 256 is the
+/// §G.4 TRD, which must be non-zero and greater than
+/// [`PbConfig::trb`]). The output decodes through
+/// [`crate::picture::decode_pb_picture_no_gob0_header`] and — inside
+/// an elementary stream — [`crate::picture::decode_sequence`], which
+/// splices the decoded pair in display order (B before P).
+pub fn encode_pb_picture(
+    p_source: &YuvFrame,
+    b_source: &YuvFrame,
+    reference: &YuvFrame,
+    tr_p: u8,
+    prev_tr: u8,
+    cfg: &PbConfig,
+) -> Result<Vec<u8>> {
+    use crate::pb_layer::{pb_b_predict_macroblock, pb_bquant, PbBReferencePlanes};
+
+    if cfg.quant == 0 || cfg.quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if cfg.trb == 0 || cfg.trb > 7 || cfg.dbquant > 3 {
+        return Err(Error::BadPbTemporalReference);
+    }
+    let trd = i32::from(tr_p.wrapping_sub(prev_tr));
+    if trd == 0 || i32::from(cfg.trb) >= trd {
+        return Err(Error::BadPbTemporalReference);
+    }
+    if p_source.luma_width != reference.luma_width
+        || p_source.luma_height != reference.luma_height
+        || b_source.luma_width != reference.luma_width
+        || b_source.luma_height != reference.luma_height
+    {
+        return Err(Error::NotImplemented);
+    }
+    let fmt = source_format_for(p_source.luma_width, p_source.luma_height)
+        .ok_or(Error::NotImplemented)?;
+
+    let quant = cfg.quant;
+    let bquant = pb_bquant(cfg.dbquant, quant);
+    let trb = i32::from(cfg.trb);
+
+    let mut w = BitWriter::new();
+    write_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr_p,
+        /* is_inter */ true,
+        PtypeFlags::default(),
+        Some((cfg.trb, cfg.dbquant)),
+    );
+
+    let lw = p_source.luma_width;
+    let lh = p_source.luma_height;
+    let cw = p_source.chroma_width();
+    let ch = p_source.chroma_height();
+    let mb_cols = lw / 16;
+    let mb_rows = lh / 16;
+    let mut grid = crate::encoder_motion::MvGrid::new(mb_cols, mb_rows);
+    let lambda = 2 * quant as u32;
+
+    let prev_y = crate::motion::RefPlane::new(&reference.y, lw, lh);
+    let prev_cb = crate::motion::RefPlane::new(&reference.cb, cw, ch);
+    let prev_cr = crate::motion::RefPlane::new(&reference.cr, cw, ch);
+
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let mb_x = mb_col * 16;
+            let mb_y = mb_row * 16;
+            let c_x = mb_col * 8;
+            let c_y = mb_row * 8;
+
+            // ---- P-part: motion estimation + residual coding. -------
+            let predictor = grid.predict(mb_col, mb_row);
+            let mv = crate::encoder_motion::estimate_motion(
+                p_source,
+                reference,
+                mb_col,
+                mb_row,
+                predictor,
+                cfg.search_half,
+                lambda,
+            );
+            let chroma_mv = crate::motion::chroma_mv(mv);
+            let src = extract_macroblock(p_source, mb_col, mb_row);
+
+            let mut luma_pred: Vec<[u8; COEFFS_PER_BLOCK]> = Vec::with_capacity(4);
+            let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(4);
+            for blk in 0..4 {
+                let bx = mb_x + (blk % 2) * 8;
+                let by = mb_y + (blk / 2) * 8;
+                let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
+                let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
+                for (d, &pv) in pred_i16.iter_mut().zip(pred.iter()) {
+                    *d = pv as i16;
+                }
+                luma_enc.push(crate::encoder_block::encode_inter_block(
+                    &residual_of(&src.luma[blk], &pred_i16),
+                    quant,
+                ));
+                luma_pred.push(pred);
+            }
+            let cb_pred = motion_compensated_block(&reference.cb, cw, ch, c_x, c_y, chroma_mv);
+            let cr_pred = motion_compensated_block(&reference.cr, cw, ch, c_x, c_y, chroma_mv);
+            let mut cb_pred_i = [0i16; COEFFS_PER_BLOCK];
+            let mut cr_pred_i = [0i16; COEFFS_PER_BLOCK];
+            for i in 0..COEFFS_PER_BLOCK {
+                cb_pred_i[i] = cb_pred[i] as i16;
+                cr_pred_i[i] = cr_pred[i] as i16;
+            }
+            let cb_enc =
+                crate::encoder_block::encode_inter_block(&residual_of(&src.cb, &cb_pred_i), quant);
+            let cr_enc =
+                crate::encoder_block::encode_inter_block(&residual_of(&src.cr, &cr_pred_i), quant);
+
+            let any_p =
+                luma_enc.iter().any(|e| e.has_coeffs) || cb_enc.has_coeffs || cr_enc.has_coeffs;
+            let is_zero_mv = mv.dx_half == 0 && mv.dy_half == 0;
+
+            // ---- PREC (§G.5): the decoder-reconstructed P-macroblock.
+            let recon_block = |enc: &crate::encoder_block::EncodedInterBlock,
+                               pred: &[u8; COEFFS_PER_BLOCK],
+                               q: u8|
+             -> [u8; COEFFS_PER_BLOCK] {
+                if enc.has_coeffs {
+                    let block = crate::block::H263Block {
+                        coefficients: enc.scan,
+                        tcoef_event_count: 0,
+                        had_intradc: false,
+                    };
+                    crate::reconstruct_inter_block_with_prediction(&block, q, pred)
+                } else {
+                    *pred
+                }
+            };
+            let mut prec_y = [0u8; 256];
+            for blk in 0..4 {
+                let samples = recon_block(&luma_enc[blk], &luma_pred[blk], quant);
+                let ox = (blk % 2) * 8;
+                let oy = (blk / 2) * 8;
+                for j in 0..8 {
+                    prec_y[(oy + j) * 16 + ox..(oy + j) * 16 + ox + 8]
+                        .copy_from_slice(&samples[j * 8..j * 8 + 8]);
+                }
+            }
+            let prec_cb = recon_block(&cb_enc, &cb_pred, quant);
+            let prec_cr = recon_block(&cr_enc, &cr_pred, quant);
+
+            // ---- B-part: §G.4 + §G.5 bidirectional prediction with
+            // MVDB = 0, residual at BQUANT. ---------------------------
+            let planes = PbBReferencePlanes {
+                prev_y,
+                prev_cb,
+                prev_cr,
+                prec_y: crate::motion::RefPlane::new(&prec_y, 16, 16),
+                prec_cb: crate::motion::RefPlane::new(&prec_cb, 8, 8),
+                prec_cr: crate::motion::RefPlane::new(&prec_cr, 8, 8),
+            };
+            let b_pred = pb_b_predict_macroblock(
+                &planes,
+                mb_x,
+                mb_y,
+                &[mv; 4],
+                None,
+                trb,
+                trd,
+                crate::motion::RCONTROL_DEFAULT,
+            );
+
+            let b_src = extract_macroblock(b_source, mb_col, mb_row);
+            let mut b_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(6);
+            for blk in 0..4 {
+                let ox = (blk % 2) * 8;
+                let oy = (blk / 2) * 8;
+                let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
+                for j in 0..8 {
+                    for i in 0..8 {
+                        pred_i16[j * 8 + i] = b_pred.luma[oy + j][ox + i] as i16;
+                    }
+                }
+                b_enc.push(crate::encoder_block::encode_inter_block(
+                    &residual_of(&b_src.luma[blk], &pred_i16),
+                    bquant,
+                ));
+            }
+            let mut b_cb_pred = [0i16; COEFFS_PER_BLOCK];
+            let mut b_cr_pred = [0i16; COEFFS_PER_BLOCK];
+            for j in 0..8 {
+                for i in 0..8 {
+                    b_cb_pred[j * 8 + i] = b_pred.cb[j][i] as i16;
+                    b_cr_pred[j * 8 + i] = b_pred.cr[j][i] as i16;
+                }
+            }
+            b_enc.push(crate::encoder_block::encode_inter_block(
+                &residual_of(&b_src.cb, &b_cb_pred),
+                bquant,
+            ));
+            b_enc.push(crate::encoder_block::encode_inter_block(
+                &residual_of(&b_src.cr, &b_cr_pred),
+                bquant,
+            ));
+            let any_b = b_enc.iter().any(|e| e.has_coeffs);
+
+            // ---- Skip / emit. ---------------------------------------
+            if !any_p && !any_b && is_zero_mv {
+                crate::encoder_mb::encode_skipped_macroblock(&mut w);
+                grid.set_zero_candidate(mb_col, mb_row);
+                continue;
+            }
+
+            // COD = 0; MCBPC (Table 8, INTER type 0).
+            w.write_bit(false);
+            let mut cbpc = 0u8;
+            if cb_enc.has_coeffs {
+                cbpc |= 0b10;
+            }
+            if cr_enc.has_coeffs {
+                cbpc |= 0b01;
+            }
+            crate::encoder_vlc::write_mcbpc_p(&mut w, crate::macroblock::MbType::Inter, cbpc)?;
+
+            // §5.3.3 MODB (Table 11): "0" = no CBPB/MVDB; "11" = both.
+            if any_b {
+                w.write_bit(true);
+                w.write_bit(true);
+                // §5.3.4 CBPB — block N lights bit (6 − N).
+                let mut cbpb = 0u8;
+                for (blk, e) in b_enc.iter().enumerate() {
+                    if e.has_coeffs {
+                        cbpb |= 1 << (6 - (blk + 1));
+                    }
+                }
+                w.write_bits(cbpb as u32, 6);
+            } else {
+                w.write_bit(false);
+            }
+
+            // §5.3.5 CBPY (INTER complement).
+            let mut cbpy_intra = 0u8;
+            for (blk, e) in luma_enc.iter().enumerate() {
+                if e.has_coeffs {
+                    cbpy_intra |= 1 << (3 - blk);
+                }
+            }
+            crate::encoder_vlc::write_cbpy(&mut w, cbpy_intra ^ 0b1111)?;
+
+            // §5.3.7 MVD.
+            let mvd = crate::encoder_motion::mvd_for(mv, predictor);
+            crate::encoder_vlc::write_mvd_component(&mut w, mvd.dx_half)?;
+            crate::encoder_vlc::write_mvd_component(&mut w, mvd.dy_half)?;
+
+            // §5.3.9 MVDB = (0, 0) when MODB carries it.
+            if any_b {
+                crate::encoder_vlc::write_mvd_component(&mut w, 0)?;
+                crate::encoder_vlc::write_mvd_component(&mut w, 0)?;
+            }
+
+            // §G.3 — six P-blocks, then six B-blocks.
+            for e in luma_enc.iter() {
+                if e.has_coeffs {
+                    crate::encoder_block::write_inter_block_coeffs(&mut w, &e.scan)?;
+                }
+            }
+            if cb_enc.has_coeffs {
+                crate::encoder_block::write_inter_block_coeffs(&mut w, &cb_enc.scan)?;
+            }
+            if cr_enc.has_coeffs {
+                crate::encoder_block::write_inter_block_coeffs(&mut w, &cr_enc.scan)?;
+            }
+            for e in b_enc.iter() {
+                if e.has_coeffs {
+                    crate::encoder_block::write_inter_block_coeffs(&mut w, &e.scan)?;
+                }
+            }
+
             grid.set_inter(mb_col, mb_row, mv);
         }
     }
@@ -1700,6 +2040,145 @@ mod tests {
         assert!(matches!(
             encode_inter_picture(&frame, &bad_ref, 8, 1),
             Err(Error::NotImplemented)
+        ));
+    }
+
+    /// A static PB-frame (B == P == reference) is all-skipped and both
+    /// parts reconstruct the reference exactly.
+    #[test]
+    fn pb_static_pair_is_lossless() {
+        use crate::picture::decode_pb_picture_no_gob0_header;
+        let src = gradient_frame(176, 144);
+        let i_bytes = encode_intra_picture(&src, 6, 0).unwrap();
+        let recon_ref =
+            decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+
+        let cfg = PbConfig {
+            quant: 6,
+            trb: 1,
+            dbquant: 0,
+            search_half: 2,
+        };
+        let pb_bytes = encode_pb_picture(&recon_ref, &recon_ref, &recon_ref, 2, 0, &cfg).unwrap();
+        let pair =
+            decode_pb_picture_no_gob0_header(&pb_bytes, &recon_ref, 0, DecodeOptions::default())
+                .unwrap();
+        assert_eq!(
+            pair.p_frame.y, recon_ref.y,
+            "static P-part must be lossless"
+        );
+        assert_eq!(
+            pair.b_frame.y, recon_ref.y,
+            "static B-part must be lossless"
+        );
+        assert_eq!(pair.p_frame.cb, recon_ref.cb);
+        assert_eq!(pair.b_frame.cr, recon_ref.cr);
+    }
+
+    /// A translating three-frame set (reference, B at the midpoint, P):
+    /// the PB-frame round-trips with both parts tracking their sources
+    /// — the B-part via the §G.4 scaled vectors plus coded B-residual.
+    #[test]
+    fn pb_translating_pair_round_trips() {
+        use crate::picture::decode_pb_picture_no_gob0_header;
+        let frame0 = gradient_frame(176, 144);
+        let i_bytes = encode_intra_picture(&frame0, 5, 0).unwrap();
+        let recon_ref =
+            decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+        // B halfway (1 px), P at 2 px: linear motion, TRB/TRD = 1/2.
+        let b_src = translate_left(&recon_ref, 1);
+        let p_src = translate_left(&recon_ref, 2);
+
+        let cfg = PbConfig {
+            quant: 5,
+            trb: 1,
+            dbquant: 0,
+            search_half: 3,
+        };
+        let pb_bytes = encode_pb_picture(&p_src, &b_src, &recon_ref, 2, 0, &cfg).unwrap();
+        let pair =
+            decode_pb_picture_no_gob0_header(&pb_bytes, &recon_ref, 0, DecodeOptions::default())
+                .unwrap();
+
+        let mae = |a: &YuvFrame, b: &YuvFrame| -> f64 {
+            let mut sum = 0u64;
+            for (x, y) in a.y.iter().zip(b.y.iter()) {
+                sum += (*x as i32 - *y as i32).unsigned_abs() as u64;
+            }
+            sum as f64 / a.y.len() as f64
+        };
+        let p_mae = mae(&p_src, &pair.p_frame);
+        let b_mae = mae(&b_src, &pair.b_frame);
+        assert!(p_mae < 6.0, "P-part luma MAE too high: {p_mae}");
+        assert!(b_mae < 8.0, "B-part luma MAE too high: {b_mae}");
+    }
+
+    /// An I + PB elementary stream decodes through `decode_sequence`
+    /// into three frames in display order [I, B, P].
+    #[test]
+    fn pb_stream_decodes_in_display_order() {
+        use crate::picture::decode_sequence;
+        let frame0 = gradient_frame(176, 144);
+        let i_bytes = encode_intra_picture(&frame0, 5, 0).unwrap();
+        let recon_ref =
+            decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+        let b_src = translate_left(&recon_ref, 1);
+        let p_src = translate_left(&recon_ref, 2);
+
+        let cfg = PbConfig {
+            quant: 5,
+            trb: 1,
+            dbquant: 0,
+            search_half: 3,
+        };
+        let pb_bytes = encode_pb_picture(&p_src, &b_src, &recon_ref, 2, 0, &cfg).unwrap();
+        let mut stream = i_bytes.clone();
+        stream.extend_from_slice(&pb_bytes);
+
+        let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.len(), 3, "expected [I, B, P]");
+        // Display order: the middle frame is the B-part (closest to
+        // b_src), the last is the P-part.
+        let mae = |a: &YuvFrame, b: &YuvFrame| -> f64 {
+            let mut sum = 0u64;
+            for (x, y) in a.y.iter().zip(b.y.iter()) {
+                sum += (*x as i32 - *y as i32).unsigned_abs() as u64;
+            }
+            sum as f64 / a.y.len() as f64
+        };
+        assert!(mae(&b_src, &decoded[1]) < 8.0, "middle frame should be B");
+        assert!(mae(&p_src, &decoded[2]) < 6.0, "last frame should be P");
+        assert!(
+            mae(&b_src, &decoded[1]) < mae(&p_src, &decoded[1]),
+            "middle decoded frame closer to P than to B — order wrong"
+        );
+    }
+
+    /// PB parameter validation: TRB and TRD constraints.
+    #[test]
+    fn pb_bad_parameters_rejected() {
+        let f = YuvFrame::grey(176, 144);
+        let bad_trb = PbConfig {
+            trb: 0,
+            ..PbConfig::default()
+        };
+        assert!(matches!(
+            encode_pb_picture(&f, &f, &f, 2, 0, &bad_trb),
+            Err(Error::BadPbTemporalReference)
+        ));
+        // TRD = 0 (same TR).
+        assert!(matches!(
+            encode_pb_picture(&f, &f, &f, 5, 5, &PbConfig::default()),
+            Err(Error::BadPbTemporalReference)
+        ));
+        // TRB >= TRD.
+        let cfg = PbConfig {
+            trb: 2,
+            ..PbConfig::default()
+        };
+        assert!(matches!(
+            encode_pb_picture(&f, &f, &f, 2, 0, &cfg),
+            Err(Error::BadPbTemporalReference)
         ));
     }
 
