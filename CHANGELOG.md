@@ -8,6 +8,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§5.2 GOB-header emission (resync-friendly streams + per-GOB
+  GQUANT)** (round 384): `encoder::encode_intra_picture_gobs` encodes
+  an I-picture with a GOB header (GSTUF byte alignment + GBSC + GN +
+  GFID + GQUANT) on every GOB after the first, driving a **per-GOB
+  quantiser map** — unlike §5.3.6 DQUANT, GQUANT may jump anywhere in
+  `1..=31` between GOBs (coarse rate control with resynchronisation
+  points). `encoder::encode_inter_picture_gobs` does the same for
+  motion-compensated P-pictures; `MvGrid::with_gob_headers` replays
+  the decoder's §6.1.1 rule-3 per-GOB predictor segmentation (MV2/MV3
+  collapse onto MV1 at every GOB top row) so each MVD still
+  reconstructs exactly. A same-quant GOB-header I-picture reconstructs
+  **identically** to the single-segment encode.
+
 - **Annex D UMV INTER-picture encoder** (round 384):
   `encoder::encode_inter_picture_umv` encodes a P-picture in the
   Unrestricted Motion Vector mode (PLUSPTYPE absent): the PTYPE bit-10

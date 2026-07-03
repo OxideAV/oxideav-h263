@@ -140,6 +140,85 @@ fn write_picture_header(
     w.write_bit(false);
 }
 
+/// Write a §5.2 GOB header for GOB `gn` (CPM = 0 stream): §5.2.1 GSTUF
+/// zero-stuffing to the next byte boundary, the 17-bit GBSC, the 5-bit
+/// Group Number, the 2-bit GOB Frame ID and the 5-bit GQUANT.
+fn write_gob_header(w: &mut BitWriter, gn: u32, gfid: u8, gquant: u8) {
+    use crate::gob_header::{GBSC_BITS, GBSC_VALUE, GFID_BITS, GN_BITS, GQUANT_BITS};
+    // §5.2.1 — GSTUF: zero bits until the GBSC is byte aligned.
+    w.align_to_byte_zero();
+    w.write_bits(GBSC_VALUE, GBSC_BITS);
+    w.write_bits(gn, GN_BITS);
+    w.write_bits(gfid as u32 & 0b11, GFID_BITS);
+    w.write_bits(gquant as u32, GQUANT_BITS);
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as a baseline H.263 **INTRA**
+/// (I-) picture with a §5.2 **GOB header on every GOB after the
+/// first**, carrying a per-GOB quantiser.
+///
+/// `gob_quant(gn)` supplies the quantiser for GOB `gn` (each must be in
+/// `1..=31`): GOB 0 runs at `gob_quant(0)`, which doubles as the
+/// picture-header PQUANT (§5.2.2 — GOB 0 never carries a header), and
+/// every later GOB opens with GSTUF + GBSC + GN + GFID + GQUANT
+/// priming its own quantiser (§5.2.6). Unlike the §5.3.6 DQUANT path,
+/// GQUANT can jump anywhere in `1..=31` between GOBs — coarse-grained
+/// rate control with resynchronisation points.
+///
+/// The output decodes through
+/// [`crate::picture::decode_picture_no_gob0_header`] (whose
+/// `gob_header_present` probe accepts the §5.2 optional headers) and
+/// [`crate::picture::decode_sequence`].
+pub fn encode_intra_picture_gobs<F>(frame: &YuvFrame, tr: u8, mut gob_quant: F) -> Result<Vec<u8>>
+where
+    F: FnMut(usize) -> u8,
+{
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let rows_per_gob = crate::picture::PictureLayout::for_source_format(fmt)
+        .ok_or(Error::NotImplemented)?
+        .mb_rows_per_gob as usize;
+
+    let pquant = gob_quant(0);
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+
+    let mut w = BitWriter::new();
+    write_picture_header(
+        &mut w,
+        fmt,
+        pquant,
+        tr,
+        /* is_inter */ false,
+        PtypeFlags::default(),
+    );
+
+    let gfid = tr & 0b11;
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+    let mut quant = pquant;
+    for mb_row in 0..mb_rows {
+        if mb_row > 0 && mb_row % rows_per_gob == 0 {
+            let gn = mb_row / rows_per_gob;
+            quant = gob_quant(gn);
+            if quant == 0 || quant > 31 {
+                return Err(Error::InvalidQuantiser);
+            }
+            write_gob_header(&mut w, gn as u32, gfid, quant);
+        }
+        for mb_col in 0..mb_cols {
+            let mb = extract_macroblock(frame, mb_col, mb_row);
+            encode_intra_macroblock(
+                &mut w, &mb, quant, /* write_cod */ false, /* picture_is_inter */ false,
+            )?;
+        }
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
 /// Encode a planar 4:2:0 [`YuvFrame`] as a baseline H.263 **INTRA**
 /// (I-) picture at the given `quant` and 8-bit temporal reference `tr`.
 ///
@@ -421,6 +500,32 @@ pub fn encode_inter_picture_motion(
         tr,
         search_half,
         /* umv */ false,
+        /* gob_headers */ false,
+    )
+}
+
+/// As [`encode_inter_picture_motion`], but emitting a §5.2 **GOB
+/// header** (GSTUF byte alignment + GBSC + GN + GFID + GQUANT) for
+/// every GOB after the first — the resync-friendly stream shape. Each
+/// GOB is then its own §6.1.1 video picture segment: the encoder
+/// applies the rule-3 top-border predictor treatment at every GOB's
+/// first macroblock row, exactly as the decoder does when
+/// `gob_header_present` holds.
+pub fn encode_inter_picture_gobs(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+) -> Result<Vec<u8>> {
+    encode_inter_picture_motion_impl(
+        frame,
+        reference,
+        quant,
+        tr,
+        search_half,
+        /* umv */ false,
+        /* gob_headers */ true,
     )
 }
 
@@ -460,13 +565,15 @@ pub fn encode_inter_picture_umv(
         tr,
         search_half,
         /* umv */ true,
+        /* gob_headers */ false,
     )
 }
 
 /// Shared motion-estimated INTER picture encode: the default-mode
 /// (§6.1.1 wrap, `umv = false`) and Annex D UMV (`umv = true`) paths
 /// differ only in the PTYPE bit-10 flag, the estimator range and the
-/// MVD derivation.
+/// MVD derivation; `gob_headers` selects the §5.2 every-GOB-header
+/// stream shape (with the per-GOB predictor segmentation).
 fn encode_inter_picture_motion_impl(
     frame: &YuvFrame,
     reference: &YuvFrame,
@@ -474,6 +581,7 @@ fn encode_inter_picture_motion_impl(
     tr: u8,
     search_half: i32,
     umv: bool,
+    gob_headers: bool,
 ) -> Result<Vec<u8>> {
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -503,12 +611,27 @@ fn encode_inter_picture_motion_impl(
     let ch = frame.chroma_height();
     let mb_cols = lw / 16;
     let mb_rows = lh / 16;
-    let mut grid = crate::encoder_motion::MvGrid::new(mb_cols, mb_rows);
+    // §4.2.1 — macroblock rows per GOB for the standard source formats
+    // (1 for sub-QCIF..CIF, 2 for 4CIF, 4 for 16CIF).
+    let rows_per_gob = crate::picture::PictureLayout::for_source_format(fmt)
+        .ok_or(Error::NotImplemented)?
+        .mb_rows_per_gob as usize;
+    let mut grid = if gob_headers {
+        crate::encoder_motion::MvGrid::with_gob_headers(mb_cols, mb_rows, rows_per_gob)
+    } else {
+        crate::encoder_motion::MvGrid::new(mb_cols, mb_rows)
+    };
+    let gfid = tr & 0b11;
     // λ in SAD units per half-pel of MVD; a small bias keeps static
     // regions on MVD = 0 without over-penalising real motion.
     let lambda = 2 * quant as u32;
 
     for mb_row in 0..mb_rows {
+        // §5.2 — a GOB header before the first macroblock row of every
+        // GOB after GOB 0 (which is always header-less, §5.2.2).
+        if gob_headers && mb_row > 0 && mb_row % rows_per_gob == 0 {
+            write_gob_header(&mut w, (mb_row / rows_per_gob) as u32, gfid, quant);
+        }
         for mb_col in 0..mb_cols {
             let predictor = grid.predict(mb_col, mb_row);
             let mv = if umv {
@@ -943,6 +1066,97 @@ mod tests {
             mc_bytes.len(),
             zm_bytes.len()
         );
+    }
+
+    /// An INTRA picture with a header on every GOB reconstructs
+    /// **identically** to the header-less single-segment encode at the
+    /// same quantiser (the headers change framing, not coefficients),
+    /// and the stream is longer by the header bits.
+    #[test]
+    fn intra_gob_headers_reconstruct_identically() {
+        let frame = gradient_frame(176, 144);
+        let plain = encode_intra_picture(&frame, 6, 3).unwrap();
+        let gobs = encode_intra_picture_gobs(&frame, 3, |_| 6).unwrap();
+        assert!(
+            gobs.len() > plain.len(),
+            "GOB headers should add bytes ({} vs {})",
+            gobs.len(),
+            plain.len()
+        );
+        let d_plain =
+            decode_picture_no_gob0_header(&plain, None, DecodeOptions::default()).unwrap();
+        let d_gobs = decode_picture_no_gob0_header(&gobs, None, DecodeOptions::default()).unwrap();
+        assert_eq!(d_plain.y, d_gobs.y);
+        assert_eq!(d_plain.cb, d_gobs.cb);
+        assert_eq!(d_plain.cr, d_gobs.cr);
+    }
+
+    /// A per-GOB quantiser map (fine top half, coarse bottom half)
+    /// primes each GOB's QUANT from its GQUANT and decodes end-to-end
+    /// within tolerance — unlike DQUANT, GQUANT may jump arbitrarily.
+    #[test]
+    fn intra_gob_quant_map_round_trips() {
+        let frame = gradient_frame(176, 144);
+        // QCIF: 9 GOBs of one MB row each. Top 4 fine, bottom 5 coarse
+        // (a jump 4 -> 20 that DQUANT could not express in one step).
+        let bytes = encode_intra_picture_gobs(&frame, 0, |gn| if gn < 4 { 4 } else { 20 }).unwrap();
+        let decoded =
+            decode_picture_no_gob0_header(&bytes, None, DecodeOptions::default()).unwrap();
+        let lw = 176;
+        // The fine half is tight; the whole frame stays bounded.
+        let mut top_sum = 0u64;
+        for row in 0..64 {
+            for col in 0..lw {
+                top_sum += (frame.y[row * lw + col] as i32 - decoded.y[row * lw + col] as i32)
+                    .unsigned_abs() as u64;
+            }
+        }
+        let top_mae = top_sum as f64 / (64 * lw) as f64;
+        assert!(top_mae < 8.0, "fine-GOB luma MAE too high: {}", top_mae);
+        let mut sum = 0u64;
+        for (a, b) in frame.y.iter().zip(decoded.y.iter()) {
+            sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+        }
+        let mae = sum as f64 / frame.y.len() as f64;
+        assert!(mae < 20.0, "whole-frame luma MAE too high: {}", mae);
+    }
+
+    /// An out-of-range per-GOB quantiser is rejected.
+    #[test]
+    fn intra_gob_bad_quant_rejected() {
+        let frame = YuvFrame::grey(176, 144);
+        assert!(matches!(
+            encode_intra_picture_gobs(&frame, 0, |_| 0),
+            Err(Error::InvalidQuantiser)
+        ));
+        assert!(matches!(
+            encode_intra_picture_gobs(&frame, 0, |gn| if gn == 3 { 32 } else { 8 }),
+            Err(Error::InvalidQuantiser)
+        ));
+    }
+
+    /// A motion-compensated P-picture with per-GOB headers round-trips:
+    /// the encoder's per-GOB predictor segmentation matches the
+    /// decoder's rule-3 treatment of header-carrying GOBs, so every
+    /// MVD reconstructs to the searched vector.
+    #[test]
+    fn inter_gob_headers_round_trip() {
+        let frame0 = gradient_frame(176, 144);
+        let i_bytes = encode_intra_picture(&frame0, 5, 0).unwrap();
+        let recon_ref =
+            decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+        let frame1 = translate_left(&recon_ref, 3);
+
+        let p_bytes = encode_inter_picture_gobs(&frame1, &recon_ref, 5, 1, 4).unwrap();
+        let decoded =
+            decode_picture_no_gob0_header(&p_bytes, Some(&recon_ref), DecodeOptions::default())
+                .unwrap();
+        let mut sum = 0u64;
+        for (a, b) in frame1.y.iter().zip(decoded.y.iter()) {
+            sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+        }
+        let mae = sum as f64 / frame1.y.len() as f64;
+        assert!(mae < 6.0, "GOB-header INTER luma MAE too high: {}", mae);
     }
 
     /// Translate a frame's content left by `shift` luma pixels with

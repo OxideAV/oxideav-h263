@@ -66,15 +66,38 @@ pub struct MvGrid {
     entries: Vec<MvGridEntry>,
     cols: usize,
     rows: usize,
+    /// When the encoder emits a GOB header for **every** GOB after the
+    /// first (the §5.2 non-empty-header stream shape), each GOB is its
+    /// own §6.1.1 video picture segment: the top macroblock row of
+    /// every GOB gets the rule-3 "MV2 = MV3 = MV1" border treatment.
+    /// `Some(k)` records the §4.2.1 `mb_rows_per_gob`; `None` keeps the
+    /// single-segment behaviour (no headers after GOB 0).
+    rows_per_gob: Option<usize>,
 }
 
 impl MvGrid {
-    /// A fresh grid for a picture `mb_cols × mb_rows` macroblocks.
+    /// A fresh grid for a picture `mb_cols × mb_rows` macroblocks
+    /// encoded as a **single segment** (no GOB headers after GOB 0).
     pub fn new(mb_cols: usize, mb_rows: usize) -> Self {
         MvGrid {
             entries: vec![MvGridEntry::ZERO; mb_cols * mb_rows],
             cols: mb_cols,
             rows: mb_rows,
+            rows_per_gob: None,
+        }
+    }
+
+    /// A fresh grid for a picture whose encoder emits a GOB header for
+    /// every GOB after the first, each GOB covering `mb_rows_per_gob`
+    /// macroblock rows (§4.2.1: 1 for sub-QCIF..CIF, 2 for 4CIF, 4 for
+    /// 16CIF). Matches the decoder's `predict_mv` when
+    /// `gob_header_present` holds for every non-zero GOB.
+    pub fn with_gob_headers(mb_cols: usize, mb_rows: usize, mb_rows_per_gob: usize) -> Self {
+        MvGrid {
+            entries: vec![MvGridEntry::ZERO; mb_cols * mb_rows],
+            cols: mb_cols,
+            rows: mb_rows,
+            rows_per_gob: Some(mb_rows_per_gob.max(1)),
         }
     }
 
@@ -104,8 +127,11 @@ impl MvGrid {
             cand(self.get(col as isize - 1, row as isize))
         };
 
-        // Top-border test (no GOB headers -> only the picture top edge).
-        let top_border = row == 0;
+        // Top-border test: the picture top edge, plus — when every GOB
+        // carries a header — the top macroblock row of each GOB (the
+        // §6.1.1 rule-3 "outside the GOB at the top" case the decoder
+        // applies whenever `gob_header_present` held for that GOB).
+        let top_border = row == 0 || self.rows_per_gob.is_some_and(|k| row % k == 0);
 
         // MV2 — above neighbour; = MV1 at the top border.
         let mv2 = if top_border {
@@ -612,5 +638,33 @@ mod tests {
         // the top row MV2 = MV3 = MV1, so the median is MV1.
         grid.set_inter(0, 0, MotionVector::new(6, -4));
         assert_eq!(grid.predict(1, 0), MotionVector::new(6, -4));
+    }
+
+    /// With a header on every GOB, each GOB top row is a §6.1.1 rule-3
+    /// border: MV2/MV3 collapse onto MV1 and the above row's vectors do
+    /// not leak across the boundary.
+    #[test]
+    fn predictor_grid_gob_segments() {
+        // k = 1 (QCIF-like): every row is a GOB top.
+        let mut grid = MvGrid::with_gob_headers(11, 9, 1);
+        grid.set_inter(4, 0, MotionVector::new(10, 10));
+        // (4,1): MV1 = left (unset -> zero); above (4,0) must NOT
+        // contribute (different GOB): MV2 = MV3 = MV1 = 0.
+        assert_eq!(grid.predict(4, 1), MotionVector::new(0, 0));
+        // Left neighbour still propagates within the row.
+        grid.set_inter(3, 1, MotionVector::new(-8, 2));
+        assert_eq!(grid.predict(4, 1), MotionVector::new(-8, 2));
+
+        // k = 2 (4CIF-like): row 1 is inside GOB 0, row 2 opens GOB 1.
+        let mut grid2 = MvGrid::with_gob_headers(11, 8, 2);
+        grid2.set_inter(4, 0, MotionVector::new(10, 10));
+        grid2.set_inter(5, 0, MotionVector::new(10, 10));
+        // (4,1): above row is the same GOB -> MV2/MV3 contribute, and
+        // the median of (0, 10, 10) is 10.
+        assert_eq!(grid2.predict(4, 1), MotionVector::new(10, 10));
+        // (4,2): GOB boundary -> above row must not leak.
+        grid2.set_inter(4, 1, MotionVector::new(10, 10));
+        grid2.set_inter(5, 1, MotionVector::new(10, 10));
+        assert_eq!(grid2.predict(4, 2), MotionVector::new(0, 0));
     }
 }
