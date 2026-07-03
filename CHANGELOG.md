@@ -39,6 +39,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Closed-loop GOP sequence encoder + §5.1.27 EOS** (round 384):
+  `encoder::encode_sequence` encodes a frame sequence with a classic
+  I + P GOP structure (`GopConfig`: quantiser, intra period, search
+  window, optional Annex D UMV P-pictures, optional EOS): every
+  P-picture predicts from the **decoded reconstruction** of the
+  previous picture (the encoder decodes its own output picture by
+  picture), so the prediction reference is bit-identical to a
+  conformant decoder's and long sequences accumulate no drift — a
+  six-frame translating GOP shows the last P-frame no worse than the
+  first. `GopConfig::eos` appends the byte-aligned §5.1.27 End Of
+  Sequence codeword (`EOS_BYTES`), transparent to `decode_sequence`.
+
 - **Annex F Advanced-Prediction (INTER4V + OBMC) encoder** (round
   384): `encoder::encode_inter_picture_ap` encodes a P-picture with the
   PTYPE bit-12 AP flag and **four motion vectors per macroblock**

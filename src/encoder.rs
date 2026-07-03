@@ -977,6 +977,102 @@ fn encode_inter_picture_motion_impl(
     Ok(w.finish())
 }
 
+/// §5.1.27 — the byte-aligned End Of Sequence marker: the 22-bit
+/// codeword `0000 0000 0000 0000 1 11111` followed by two ESTUF-style
+/// zero bits completing the byte. Appending it to a byte-aligned
+/// elementary stream (every picture ends PSTUF-padded, §5.1.28) keeps
+/// the alignment invariant.
+pub const EOS_BYTES: [u8; 3] = [0x00, 0x00, 0xFC];
+
+/// Configuration for [`encode_sequence`] — the closed-loop GOP encoder.
+#[derive(Debug, Clone, Copy)]
+pub struct GopConfig {
+    /// Quantiser for every picture (`1..=31`).
+    pub quant: u8,
+    /// An INTRA picture every `intra_period` frames (frame 0 is always
+    /// INTRA). `0` means "only the first frame is INTRA" (an infinite
+    /// GOP); `1` means all-INTRA.
+    pub intra_period: usize,
+    /// Motion-search window for P-pictures (±whole pixels around the
+    /// predictor).
+    pub search_half: i32,
+    /// Encode P-pictures in the Annex D Unrestricted Motion Vector
+    /// mode (extended §D.2 range + §D.1 over-boundary vectors).
+    pub umv: bool,
+    /// Append the §5.1.27 End Of Sequence marker after the last
+    /// picture.
+    pub eos: bool,
+}
+
+impl Default for GopConfig {
+    fn default() -> Self {
+        GopConfig {
+            quant: 8,
+            intra_period: 12,
+            search_half: 8,
+            umv: false,
+            eos: false,
+        }
+    }
+}
+
+/// Encode a sequence of frames as an H.263 elementary stream with a
+/// classic **I + P GOP structure**, closed-loop.
+///
+/// Frame 0 (and every `intra_period`-th frame after it) is coded as a
+/// baseline INTRA picture; every other frame is a motion-estimated
+/// INTER picture predicted from the **decoder's reconstruction** of
+/// the previous picture — the encoder decodes its own output picture
+/// by picture (via [`crate::picture::decode_picture_no_gob0_header`])
+/// so its prediction reference is bit-identical to what any conformant
+/// decoder holds, eliminating encoder–decoder drift over arbitrarily
+/// long sequences. The §5.1.2 Temporal Reference increments modulo 256
+/// from `tr0`.
+///
+/// The resulting stream decodes through
+/// [`crate::picture::decode_sequence`] into `frames.len()` pictures;
+/// with [`GopConfig::eos`] set, the §5.1.27 End Of Sequence codeword
+/// (byte-aligned, [`EOS_BYTES`]) terminates the stream — decoders
+/// ignore it (it is not a Picture Start Code).
+pub fn encode_sequence(frames: &[YuvFrame], cfg: &GopConfig, tr0: u8) -> Result<Vec<u8>> {
+    use crate::picture::{decode_picture_no_gob0_header, DecodeOptions};
+
+    if cfg.quant == 0 || cfg.quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let mut out = Vec::new();
+    let mut recon: Option<YuvFrame> = None;
+    for (i, frame) in frames.iter().enumerate() {
+        let tr = tr0.wrapping_add(i as u8);
+        let force_intra = recon.is_none() || (cfg.intra_period != 0 && i % cfg.intra_period == 0);
+        let bytes = if force_intra {
+            encode_intra_picture(frame, cfg.quant, tr)?
+        } else {
+            let reference = recon.as_ref().expect("recon present for P-picture");
+            if cfg.umv {
+                encode_inter_picture_umv(frame, reference, cfg.quant, tr, cfg.search_half)?
+            } else {
+                encode_inter_picture_motion(frame, reference, cfg.quant, tr, cfg.search_half)?
+            }
+        };
+        // Closed loop: the next picture predicts from the *decoded*
+        // reconstruction of this one, exactly like the decoder will.
+        let decoded = decode_picture_no_gob0_header(
+            &bytes,
+            if force_intra { None } else { recon.as_ref() },
+            DecodeOptions::default(),
+        )?;
+        out.extend_from_slice(&bytes);
+        recon = Some(decoded);
+    }
+    if cfg.eos {
+        // §5.1.27 — EOS, byte-aligned (the stream is already a
+        // multiple of 8 bits after each picture's PSTUF).
+        out.extend_from_slice(&EOS_BYTES);
+    }
+    Ok(out)
+}
+
 /// Encode a sequence of frames as an all-INTRA H.263 elementary stream.
 ///
 /// Each frame is encoded as a baseline I-picture (via
@@ -1605,6 +1701,119 @@ mod tests {
             encode_inter_picture(&frame, &bad_ref, 8, 1),
             Err(Error::NotImplemented)
         ));
+    }
+
+    /// A six-frame I+P GOP (intra_period = 3) round-trips: the stream
+    /// holds six pictures, each decoded frame tracks its source within
+    /// tolerance, and the closed loop keeps late P-frames as accurate
+    /// as early ones (no drift).
+    #[test]
+    fn gop_sequence_round_trips_without_drift() {
+        use crate::picture::decode_sequence;
+        // Six frames translating 1 px per frame.
+        let base = gradient_frame(176, 144);
+        let frames: Vec<YuvFrame> = (0..6)
+            .map(|k| {
+                let lw = 176;
+                let mut f = base.clone();
+                for row in 0..144 {
+                    for col in 0..lw {
+                        let src = (col + k).min(lw - 1);
+                        f.y[row * lw + col] = base.y[row * lw + src];
+                    }
+                }
+                f
+            })
+            .collect();
+
+        let cfg = GopConfig {
+            quant: 5,
+            intra_period: 3,
+            search_half: 3,
+            ..GopConfig::default()
+        };
+        let stream = encode_sequence(&frames, &cfg, 0).unwrap();
+        let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.len(), 6, "expected 6 decoded frames");
+        let mut maes = Vec::new();
+        for (src, dec) in frames.iter().zip(decoded.iter()) {
+            let mut sum = 0u64;
+            for (a, b) in src.y.iter().zip(dec.y.iter()) {
+                sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+            }
+            maes.push(sum as f64 / src.y.len() as f64);
+        }
+        for (i, mae) in maes.iter().enumerate() {
+            assert!(*mae < 8.0, "frame {i} luma MAE too high: {mae}");
+        }
+        // Closed loop: the last P-frame is not meaningfully worse than
+        // the first (drift would grow the error monotonically).
+        assert!(
+            maes[5] < maes[1] + 4.0,
+            "drift suspected: MAE grew from {} to {}",
+            maes[1],
+            maes[5]
+        );
+    }
+
+    /// The §5.1.27 EOS marker terminates the stream byte-aligned and
+    /// is transparent to the sequence decoder.
+    #[test]
+    fn gop_sequence_eos_appended_and_transparent() {
+        use crate::picture::decode_sequence;
+        let frames = vec![gradient_frame(176, 144), YuvFrame::grey(176, 144)];
+        let cfg = GopConfig {
+            quant: 6,
+            intra_period: 1, // all-INTRA
+            eos: true,
+            ..GopConfig::default()
+        };
+        let stream = encode_sequence(&frames, &cfg, 0).unwrap();
+        assert!(
+            stream.ends_with(&EOS_BYTES),
+            "stream must end with the byte-aligned EOS codeword"
+        );
+        let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded[1].y.iter().all(|&p| p == 128));
+    }
+
+    /// The UMV P-picture path threads through the GOP driver.
+    #[test]
+    fn gop_sequence_umv_path_round_trips() {
+        use crate::picture::decode_sequence;
+        let base = gradient_frame(176, 144);
+        let frames: Vec<YuvFrame> = (0..3)
+            .map(|k| {
+                let lw = 176;
+                let mut f = base.clone();
+                for row in 0..144 {
+                    for col in 0..lw {
+                        let src = (col + 4 * k).min(lw - 1);
+                        f.y[row * lw + col] = base.y[row * lw + src];
+                    }
+                }
+                f
+            })
+            .collect();
+        let cfg = GopConfig {
+            quant: 5,
+            intra_period: 0, // I then P, P
+            search_half: 5,
+            umv: true,
+            ..GopConfig::default()
+        };
+        let stream = encode_sequence(&frames, &cfg, 0).unwrap();
+        let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.len(), 3);
+        for (i, (src, dec)) in frames.iter().zip(decoded.iter()).enumerate() {
+            let mut sum = 0u64;
+            for (a, b) in src.y.iter().zip(dec.y.iter()) {
+                sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+            }
+            let mae = sum as f64 / src.y.len() as f64;
+            assert!(mae < 8.0, "UMV GOP frame {i} MAE too high: {mae}");
+        }
     }
 
     /// An all-INTRA sequence of three frames decodes back to three
