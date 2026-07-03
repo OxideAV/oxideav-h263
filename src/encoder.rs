@@ -93,23 +93,34 @@ fn extract_macroblock(frame: &YuvFrame, mb_col: usize, mb_row: usize) -> Macrobl
     mb
 }
 
-/// Write the §5.1 baseline picture header (PSC, TR, PTYPE all-baseline,
-/// PQUANT, CPM=0, PEI=0). `is_inter` selects the §5.1.3 picture
-/// coding-type bit (INTRA = 0, INTER = 1); all optional-mode flags are
-/// emitted as 0.
+/// The §5.1.3 PTYPE optional-mode flags the encoder can raise (bits
+/// 10–13). Baseline pictures leave every flag `false`.
+#[derive(Debug, Clone, Copy, Default)]
+struct PtypeFlags {
+    /// Bit 10 — Annex D Unrestricted Motion Vector mode.
+    umv: bool,
+    /// Bit 12 — Annex F Advanced Prediction mode.
+    advanced_prediction: bool,
+}
+
+/// Write the §5.1 baseline picture header (PSC, TR, PTYPE, PQUANT,
+/// CPM=0, PEI=0). `is_inter` selects the §5.1.3 picture coding-type bit
+/// (INTRA = 0, INTER = 1); `flags` raises the optional-mode PTYPE bits
+/// (SAC and PB stay 0 on this path).
 fn write_picture_header(
     w: &mut BitWriter,
     fmt: H263SourceFormat,
     quant: u8,
     tr: u8,
     is_inter: bool,
+    flags: PtypeFlags,
 ) {
     // §5.1.1 — Picture Start Code (22 bits, 0x000020).
     w.write_bits(PSC_VALUE, 22);
     // §5.1.2 — Temporal Reference (8 bits).
     w.write_bits(tr as u32, 8);
     // §5.1.3 — PTYPE. bit1 = 1, bit2 = 0, then split/doc/freeze = 0,
-    // source-format (3), coding-type, then UMV/SAC/AP/PB = 0.
+    // source-format (3), coding-type, then the UMV/SAC/AP/PB flags.
     w.write_bit(true); // bit 1
     w.write_bit(false); // bit 2
     w.write_bit(false); // split-screen
@@ -117,9 +128,9 @@ fn write_picture_header(
     w.write_bit(false); // freeze-release
     w.write_bits(source_format_bits(fmt), 3);
     w.write_bit(is_inter); // coding-type: 0 INTRA / 1 INTER
-    w.write_bit(false); // UMV (Annex D)
+    w.write_bit(flags.umv); // UMV (Annex D)
     w.write_bit(false); // SAC (Annex E)
-    w.write_bit(false); // AP  (Annex F)
+    w.write_bit(flags.advanced_prediction); // AP (Annex F)
     w.write_bit(false); // PB  (Annex G)
                         // §5.1.19 — PQUANT (5 bits).
     w.write_bits(quant as u32, 5);
@@ -147,7 +158,14 @@ pub fn encode_intra_picture(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u
         source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
 
     let mut w = BitWriter::new();
-    write_picture_header(&mut w, fmt, quant, tr, /* is_inter */ false);
+    write_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ false,
+        PtypeFlags::default(),
+    );
 
     // §5.2.2 — macroblock stream, no GOB headers (single segment, GOB-0
     // elided, every later GOB header omitted). The macroblocks run
@@ -220,7 +238,14 @@ where
         source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
 
     let mut w = BitWriter::new();
-    write_picture_header(&mut w, fmt, pquant, tr, /* is_inter */ false);
+    write_picture_header(
+        &mut w,
+        fmt,
+        pquant,
+        tr,
+        /* is_inter */ false,
+        PtypeFlags::default(),
+    );
 
     let mb_cols = frame.luma_width / 16;
     let mb_rows = frame.luma_height / 16;
@@ -286,7 +311,14 @@ pub fn encode_inter_picture(
         source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
 
     let mut w = BitWriter::new();
-    write_picture_header(&mut w, fmt, quant, tr, /* is_inter */ true);
+    write_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ true,
+        PtypeFlags::default(),
+    );
 
     let mb_cols = frame.luma_width / 16;
     let mb_rows = frame.luma_height / 16;
@@ -382,6 +414,67 @@ pub fn encode_inter_picture_motion(
     tr: u8,
     search_half: i32,
 ) -> Result<Vec<u8>> {
+    encode_inter_picture_motion_impl(
+        frame,
+        reference,
+        quant,
+        tr,
+        search_half,
+        /* umv */ false,
+    )
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an H.263 **INTER** (P-)
+/// picture in the **Annex D Unrestricted Motion Vector mode**
+/// (PLUSPTYPE absent): the PTYPE bit-10 UMV flag is raised and each
+/// macroblock's motion vector is estimated over the extended §D.2
+/// `[-31.5, 31.5]`-pixel range via
+/// [`crate::encoder_motion::estimate_motion_umv`].
+///
+/// Two Annex D effects apply relative to the default mode:
+///
+/// * **§D.2 range extension** — a vector component beyond ±16 pixels is
+///   reachable once the median predictor has grown past the first
+///   column of Table 14 (the encoder's per-candidate reachability
+///   filter guarantees every emitted MVD reconstructs to exactly the
+///   searched vector through the decoder's §D.2 pair selection);
+/// * **§D.1 motion vectors over picture boundaries** — vectors may
+///   reference pixels outside the coded picture area; both the
+///   encoder's prediction and the decoder's use the same edge-replicated
+///   sampling, so the round-trip stays consistent.
+///
+/// Fast-moving content (beyond ±16 pixels/frame) reconstructs with far
+/// less residual than the default mode can manage. `reference` must
+/// share the frame's dimensions.
+pub fn encode_inter_picture_umv(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+) -> Result<Vec<u8>> {
+    encode_inter_picture_motion_impl(
+        frame,
+        reference,
+        quant,
+        tr,
+        search_half,
+        /* umv */ true,
+    )
+}
+
+/// Shared motion-estimated INTER picture encode: the default-mode
+/// (§6.1.1 wrap, `umv = false`) and Annex D UMV (`umv = true`) paths
+/// differ only in the PTYPE bit-10 flag, the estimator range and the
+/// MVD derivation.
+fn encode_inter_picture_motion_impl(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+    umv: bool,
+) -> Result<Vec<u8>> {
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
     }
@@ -392,7 +485,17 @@ pub fn encode_inter_picture_motion(
         source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
 
     let mut w = BitWriter::new();
-    write_picture_header(&mut w, fmt, quant, tr, /* is_inter */ true);
+    write_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ true,
+        PtypeFlags {
+            umv,
+            ..PtypeFlags::default()
+        },
+    );
 
     let lw = frame.luma_width;
     let lh = frame.luma_height;
@@ -408,15 +511,27 @@ pub fn encode_inter_picture_motion(
     for mb_row in 0..mb_rows {
         for mb_col in 0..mb_cols {
             let predictor = grid.predict(mb_col, mb_row);
-            let mv = crate::encoder_motion::estimate_motion(
-                frame,
-                reference,
-                mb_col,
-                mb_row,
-                predictor,
-                search_half,
-                lambda,
-            );
+            let mv = if umv {
+                crate::encoder_motion::estimate_motion_umv(
+                    frame,
+                    reference,
+                    mb_col,
+                    mb_row,
+                    predictor,
+                    search_half,
+                    lambda,
+                )
+            } else {
+                crate::encoder_motion::estimate_motion(
+                    frame,
+                    reference,
+                    mb_col,
+                    mb_row,
+                    predictor,
+                    search_half,
+                    lambda,
+                )
+            };
 
             let mb_x = mb_col * 16;
             let mb_y = mb_row * 16;
@@ -509,7 +624,13 @@ pub fn encode_inter_picture_motion(
                 continue;
             }
 
-            let mvd = crate::encoder_motion::mvd_for(mv, predictor);
+            let mvd = if umv {
+                // The UMV estimator only returns §D.2-reachable vectors,
+                // so the inverse always exists.
+                crate::encoder_motion::umv_mvd_for(mv, predictor).ok_or(Error::BadMvdCode)?
+            } else {
+                crate::encoder_motion::mvd_for(mv, predictor)
+            };
             let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
                 luma_enc[0].clone(),
                 luma_enc[1].clone(),
@@ -822,6 +943,96 @@ mod tests {
             mc_bytes.len(),
             zm_bytes.len()
         );
+    }
+
+    /// Translate a frame's content left by `shift` luma pixels with
+    /// edge replication (the rightmost column repeats), on all planes.
+    fn translate_left(frame: &YuvFrame, shift: usize) -> YuvFrame {
+        let lw = frame.luma_width;
+        let lh = frame.luma_height;
+        let cw = frame.chroma_width();
+        let ch = frame.chroma_height();
+        let mut out = frame.clone();
+        for row in 0..lh {
+            for col in 0..lw {
+                let src = (col + shift).min(lw - 1);
+                out.y[row * lw + col] = frame.y[row * lw + src];
+            }
+        }
+        let cshift = shift / 2;
+        for row in 0..ch {
+            for col in 0..cw {
+                let src = (col + cshift).min(cw - 1);
+                out.cb[row * cw + col] = frame.cb[row * cw + src];
+                out.cr[row * cw + col] = frame.cr[row * cw + src];
+            }
+        }
+        out
+    }
+
+    /// A 20-pixel translation — beyond the default ±16-pixel MV range —
+    /// round-trips through the Annex D UMV encoder with low error and
+    /// fewer bits than the default-mode encoder needs for the same
+    /// content, and the stream carries the PTYPE UMV flag.
+    #[test]
+    fn umv_inter_large_shift_round_trips_and_beats_default() {
+        use crate::picture_header::parse_picture_header;
+        use oxideav_core::bits::BitReader;
+
+        let frame0 = gradient_frame(176, 144);
+        let i_bytes = encode_intra_picture(&frame0, 5, 0).unwrap();
+        let recon_ref =
+            decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+
+        // Content moves 20 px — matching pixels sit 20 px to the right
+        // in the reference (best MV = +40 half-pel, outside [-32, 31]).
+        let frame1 = translate_left(&recon_ref, 20);
+
+        let umv_bytes = encode_inter_picture_umv(&frame1, &recon_ref, 5, 1, 22).unwrap();
+        let base_bytes = encode_inter_picture_motion(&frame1, &recon_ref, 5, 1, 22).unwrap();
+
+        // The UMV stream signals Annex D in PTYPE.
+        let mut r = BitReader::new(&umv_bytes);
+        let header = parse_picture_header(&mut r).unwrap();
+        assert!(header.umv_mode, "PTYPE UMV flag not set");
+        assert!(!header.advanced_prediction);
+
+        let decoded =
+            decode_picture_no_gob0_header(&umv_bytes, Some(&recon_ref), DecodeOptions::default())
+                .unwrap();
+        let mut sum = 0u64;
+        for (a, b) in frame1.y.iter().zip(decoded.y.iter()) {
+            sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+        }
+        let mae = sum as f64 / frame1.y.len() as f64;
+        assert!(mae < 8.0, "UMV luma MAE too high: {}", mae);
+
+        // Beyond-range motion costs the default mode much more bits
+        // (large residuals / intra refresh); UMV codes it as motion.
+        assert!(
+            umv_bytes.len() < base_bytes.len(),
+            "UMV stream ({}) not smaller than default-mode stream ({})",
+            umv_bytes.len(),
+            base_bytes.len()
+        );
+    }
+
+    /// A static UMV P-picture is all-skipped and lossless, exactly like
+    /// the default mode (the UMV flag changes only MV interpretation).
+    #[test]
+    fn umv_static_inter_picture_is_lossless() {
+        let src = gradient_frame(176, 144);
+        let i_bytes = encode_intra_picture(&src, 6, 0).unwrap();
+        let recon_ref =
+            decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+
+        let p_bytes = encode_inter_picture_umv(&recon_ref, &recon_ref, 6, 1, 4).unwrap();
+        let decoded =
+            decode_picture_no_gob0_header(&p_bytes, Some(&recon_ref), DecodeOptions::default())
+                .unwrap();
+        assert_eq!(decoded.y, recon_ref.y);
+        assert_eq!(decoded.cb, recon_ref.cb);
+        assert_eq!(decoded.cr, recon_ref.cr);
     }
 
     /// When the reference is unrelated to the source, the P-picture

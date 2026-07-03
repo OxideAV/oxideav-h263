@@ -8,6 +8,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D UMV INTER-picture encoder** (round 384):
+  `encoder::encode_inter_picture_umv` encodes a P-picture in the
+  Unrestricted Motion Vector mode (PLUSPTYPE absent): the PTYPE bit-10
+  flag is raised and each macroblock's vector is estimated over the
+  extended §D.2 `[-31.5, 31.5]`-pixel range (with §D.1 over-boundary
+  referencing — encoder prediction and decoder reconstruction share
+  the same edge-replicated sampling). A 20-pixel translation — beyond
+  the default ±16-pixel range — round-trips with luma MAE < 8 and a
+  smaller stream than the default-mode encoder needs for the same
+  content; a static UMV P-picture stays all-skipped and lossless. The
+  picture header writer gained a `PtypeFlags` carrier for the
+  optional-mode PTYPE bits.
+
 - **Annex D §D.2 UMV motion-vector coding, encoder side** (round 384):
   `encoder_motion::umv_mvd_component_for` / `umv_mvd_for` compute the
   Table-14 MVD the encoder must emit so the decoder's §D.2
