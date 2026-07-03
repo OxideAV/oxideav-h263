@@ -6,6 +6,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **§F.3 OBMC conformance, decoder** (round 384) — two deviations
+  in the Advanced-Prediction reconstruction corrected. (1) The OBMC
+  right-half remote vectors of blocks B2 / B4 now use the **actual
+  motion vector of the macroblock to the right**: since that
+  macroblock is parsed later in the bitstream, the luminance
+  reconstruction of every coded AP INTER macroblock is deferred one
+  macroblock (`PendingApLuma` + `reconstruct_pending_ap_luma`, flushed
+  once the right neighbour's grid entry is recorded or at the end of
+  the macroblock row); previously the right remote silently resolved
+  to a zero vector. (2) **Single-MV** coded INTER macroblocks in AP
+  pictures are now OBMC-predicted too (§F.2: "defined as four vectors
+  with the same value"); previously only INTER4V macroblocks were
+  blended. Regression tests pin both against the pure
+  `obmc_predict_block` oracle, and a full-range sweep shows the §F.2
+  sum-of-four chroma derivation equals the Table-18 single-MV rule for
+  equal vectors (so chroma is unchanged). Chrominance (no OBMC, §F.2)
+  and Deblocking-Filter-only four-vector prediction (Table J.1: OBMC
+  off) keep reconstructing immediately.
+
 ### Added
 
 - **§5.2 GOB-header emission (resync-friendly streams + per-GOB

@@ -79,7 +79,7 @@ use oxideav_core::bits::BitReader;
 use crate::aic_predict::{
     aic_intra_reconstruct_coefficients, aic_intra_reconstruct_samples, Neighbour,
 };
-use crate::block::{parse_block, BlockContext, COEFFS_PER_BLOCK};
+use crate::block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK};
 use crate::block_aic::parse_intra_block_aic;
 use crate::deblock::{deblock_plane, strength_for_quant, EdgeCondition};
 use crate::gob_header::parse_gob_layer;
@@ -2836,6 +2836,12 @@ fn decode_after_picture_header_inner(
     // a different stored reference. A header-less GOB keeps the previous
     // segment's reference ("TRP is valid until the next PSC, GSC or SSC").
     let mut active_reference: Option<&YuvFrame> = reference;
+    // §F.3 — Advanced-Prediction INTER macroblock whose luminance OBMC
+    // is deferred until its right neighbour's motion vectors are known
+    // (flushed after the next macroblock's grid entry is recorded, or
+    // at the end of the macroblock row). At most one macroblock is
+    // ever pending.
+    let mut pending_ap: Option<PendingApLuma> = None;
     for gob_index in 0..num_gobs as usize {
         // Resolve this GOB's QUANT, segment id, and whether the §6.1.1
         // rule-3 "outside the GOB at the top" border applies.
@@ -2936,14 +2942,13 @@ fn decode_after_picture_header_inner(
                     break mb;
                 };
 
-                let (mv, mvs4) = decode_one_macroblock(
+                let (mv, mvs4, pending_new) = decode_one_macroblock(
                     reader,
                     &mb,
                     active_reference,
                     &mut frame,
                     &grid,
                     mb_cols,
-                    mb_rows_total,
                     col,
                     row,
                     gob_top_row,
@@ -2992,6 +2997,23 @@ fn decode_after_picture_header_inner(
                     mvs4,
                     aic_segment,
                 );
+                // §F.3 — the previous macroblock's OBMC right remote is
+                // resolved now that this macroblock's grid entry is
+                // recorded; flush its deferred luminance.
+                if let Some(p) = pending_ap.take() {
+                    let r = active_reference.ok_or(Error::NotImplemented)?;
+                    reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total);
+                }
+                pending_ap = pending_new;
+            }
+            // §F.3 — at the end of the macroblock row, a still-pending
+            // macroblock is the row's last: its right neighbour is
+            // outside the picture (the §F.3 current-vector
+            // substitution), so it can be reconstructed before any GOB
+            // header / reference re-selection applies to the next row.
+            if let Some(p) = pending_ap.take() {
+                let r = active_reference.ok_or(Error::NotImplemented)?;
+                reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total);
             }
             // §5.2 carry-over: a header-less GOB inherits the QUANT in
             // force at the end of the previous GOB (the last macroblock's
@@ -5062,14 +5084,13 @@ fn decode_slice_structured_after_header_inner(
             // above neighbour inside the slice is still consulted and
             // `gob_header_present = false` to leave the border decision
             // entirely to the segment id.
-            let (mv, mvs4) = decode_one_macroblock(
+            let (mv, mvs4, pending_ap) = decode_one_macroblock(
                 reader,
                 &mb,
                 active_reference,
                 &mut frame,
                 &grid,
                 mb_cols,
-                mb_rows_total,
                 col,
                 row,
                 row,
@@ -5082,6 +5103,12 @@ fn decode_slice_structured_after_header_inner(
                 &mut aic_state,
                 segment,
             )?;
+            // The slice-structured driver refuses Advanced Prediction
+            // upstream, so a deferred-OBMC macroblock cannot appear
+            // here; refuse defensively rather than drop luminance.
+            if pending_ap.is_some() {
+                return Err(Error::NotImplemented);
+            }
             record_grid(
                 &mut grid,
                 &mut mb_quant,
@@ -5209,7 +5236,6 @@ fn decode_one_macroblock(
     frame: &mut YuvFrame,
     grid: &[MbGridEntry],
     mb_cols: usize,
-    mb_rows_total: usize,
     col: usize,
     row: usize,
     gob_top_row: usize,
@@ -5221,7 +5247,7 @@ fn decode_one_macroblock(
     options: DecodeOptions,
     aic_state: &mut AicState,
     aic_segment: u32,
-) -> Result<(MotionVector, Mb4Mv)> {
+) -> Result<(MotionVector, Mb4Mv, Option<PendingApLuma>)> {
     let luma_stride = frame.luma_width;
     let chroma_stride = frame.chroma_width();
 
@@ -5248,7 +5274,7 @@ fn decode_one_macroblock(
             aic_state.record_non_intra_macroblock(col, row, aic_segment);
         }
         let zero = MotionVector::new(0, 0);
-        return Ok((zero, [zero; 4]));
+        return Ok((zero, [zero; 4], None));
     }
 
     let mb_type = mb.mb_type.ok_or(Error::NotImplemented)?;
@@ -5265,7 +5291,6 @@ fn decode_one_macroblock(
             frame,
             grid,
             mb_cols,
-            mb_rows_total,
             col,
             row,
             gob_top_row,
@@ -5314,7 +5339,8 @@ fn decode_one_macroblock(
                 cbpc,
                 aic_state,
                 aic_segment,
-            );
+            )
+            .map(|(mv, mvs4)| (mv, mvs4, None));
         }
         // INTRA / INTRA+Q: every block has INTRADC; CBPY/CBPC govern AC.
         // CBPY is in CBPY(INTRA) orientation: bit 3 (0b1000) = block 1,
@@ -5386,7 +5412,7 @@ fn decode_one_macroblock(
         } else {
             MotionVector::new(0, 0)
         };
-        return Ok((mv, [mv; 4]));
+        return Ok((mv, [mv; 4], None));
     }
 
     // INTER / INTER+Q (single MV).
@@ -5425,30 +5451,75 @@ fn decode_one_macroblock(
     let alt_cbpy = options.alt_inter_vlc && (cbpc & 0b11) == 0b11;
     let inter_cbpy = if alt_cbpy { cbpy } else { cbpy ^ 0b1111 };
 
-    let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
-    for blk in 0..4 {
-        let has_coef = (inter_cbpy >> (3 - blk)) & 1 == 1;
-        let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
-        let prediction = motion_compensate_block(&y_ref, bx, by, luma_mv, RCONTROL_DEFAULT);
-        let samples = if has_coef {
-            // §S.2 — Alternative INTER VLC for coefficients.
-            let block = if options.alt_inter_vlc {
-                crate::block::parse_inter_block_alt_inter_vlc(reader, mq)?
+    let mut pending: Option<PendingApLuma> = None;
+    if advanced_prediction {
+        // §F.2 / §F.3 — in Advanced Prediction mode the luminance
+        // prediction of **every** coded INTER macroblock is the OBMC
+        // blend (a one-vector macroblock "is defined as four vectors
+        // with the same value"). The right-half remote vectors come
+        // from the macroblock to the right, parsed later — so the
+        // luminance reconstruction is deferred exactly like the
+        // INTER4V case: parse the coefficient blocks now, reconstruct
+        // once the right neighbour's grid entry is recorded.
+        if pb_mode {
+            // §G.1 bars the Advanced Prediction combination for
+            // PB-frames on this driver (refused upstream); the B-part
+            // would read the P-part's pixels before the deferred OBMC
+            // lands, so refuse defensively.
+            return Err(Error::NotImplemented);
+        }
+        let mut blocks: [Option<H263Block>; 4] = [None, None, None, None];
+        for (blk_i, slot) in blocks.iter_mut().enumerate() {
+            let has_coef = (inter_cbpy >> (3 - blk_i)) & 1 == 1;
+            if has_coef {
+                let block = if options.alt_inter_vlc {
+                    crate::block::parse_inter_block_alt_inter_vlc(reader, mq)?
+                } else {
+                    parse_block(
+                        reader,
+                        BlockContext {
+                            has_intradc: false,
+                            has_coefficients: true,
+                            modified_quant: mq,
+                        },
+                    )?
+                };
+                *slot = Some(block);
+            }
+        }
+        pending = Some(PendingApLuma {
+            col,
+            row,
+            quant,
+            mvs4: [luma_mv; 4],
+            blocks,
+        });
+    } else {
+        let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
+        for blk in 0..4 {
+            let has_coef = (inter_cbpy >> (3 - blk)) & 1 == 1;
+            let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+            let prediction = motion_compensate_block(&y_ref, bx, by, luma_mv, RCONTROL_DEFAULT);
+            let samples = if has_coef {
+                // §S.2 — Alternative INTER VLC for coefficients.
+                let block = if options.alt_inter_vlc {
+                    crate::block::parse_inter_block_alt_inter_vlc(reader, mq)?
+                } else {
+                    parse_block(
+                        reader,
+                        BlockContext {
+                            has_intradc: false,
+                            has_coefficients: true,
+                            modified_quant: mq,
+                        },
+                    )?
+                };
+                reconstruct_inter_block_with_prediction(&block, quant, &prediction)
             } else {
-                parse_block(
-                    reader,
-                    BlockContext {
-                        has_intradc: false,
-                        has_coefficients: true,
-                        modified_quant: mq,
-                    },
-                )?
+                prediction
             };
-            reconstruct_inter_block_with_prediction(&block, quant, &prediction)
-        } else {
-            prediction
-        };
-        blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+            blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+        }
     }
 
     // §T.3 — chrominance dequant uses QUANT_C when MQ is in use.
@@ -5513,7 +5584,7 @@ fn decode_one_macroblock(
     // §F.2 last paragraph: a single-MV macroblock is "defined as four
     // vectors with the same value" for the purpose of neighbour-grid
     // predictor lookups by adjacent INTER4V macroblocks.
-    Ok((luma_mv, [luma_mv; 4]))
+    Ok((luma_mv, [luma_mv; 4], pending))
 }
 
 /// Decode and reconstruct one Annex I §I.2 / §I.3 INTRA macroblock —
@@ -5769,6 +5840,113 @@ fn aic_chroma_neighbour_left<'a>(
     }
 }
 
+/// A coded INTER macroblock of an Advanced-Prediction picture whose
+/// **luminance** reconstruction has been deferred (§F.3): the OBMC
+/// right-half remote vectors of blocks B2 / B4 come from the macroblock
+/// to the right, whose motion vectors are parsed later in the
+/// bitstream. The driver flushes the pending macroblock through
+/// [`reconstruct_pending_ap_luma`] as soon as the next macroblock's
+/// grid entry has been recorded (or at the end of the macroblock row,
+/// where the right neighbour is outside the picture and §F.3 replaces
+/// its remote vector with the current one). Chrominance has no OBMC
+/// (§F.2) and is reconstructed immediately.
+struct PendingApLuma {
+    /// Macroblock grid position.
+    col: usize,
+    /// Macroblock grid position.
+    row: usize,
+    /// QUANT in force for this macroblock's coefficients.
+    quant: u8,
+    /// The four per-block luma motion vectors (a one-vector macroblock
+    /// carries four copies of its vector, §F.2 last paragraph).
+    mvs4: Mb4Mv,
+    /// Parsed coefficient blocks in Figure-5 order; `None` = the CBPY
+    /// bit was clear (prediction only).
+    blocks: [Option<H263Block>; 4],
+}
+
+/// Reconstruct the luminance of a deferred Advanced-Prediction INTER
+/// macroblock (§F.3 OBMC) once every remote motion vector is known.
+///
+/// `grid` must already contain the final entry for the macroblock to
+/// the right of `pending` (or `pending` must be the last macroblock of
+/// its row, in which case §F.3 substitutes the current vector for the
+/// off-picture right remote). The §F.3 substitution rules are applied
+/// by [`classify_remote_mvs`]; the not-coded → zero / INTRA → current
+/// classifications for the left and above neighbours read the same
+/// final grid entries the parse-time pass saw.
+fn reconstruct_pending_ap_luma(
+    pending: &PendingApLuma,
+    reference: &YuvFrame,
+    frame: &mut YuvFrame,
+    grid: &[MbGridEntry],
+    mb_cols: usize,
+    mb_rows_total: usize,
+) {
+    let col = pending.col;
+    let row = pending.row;
+    let mb_x = col * 16;
+    let mb_y = row * 16;
+    let luma_stride = frame.luma_width;
+    let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
+
+    let mb_below_outside = row + 1 >= mb_rows_total;
+    let mb_above_outside = row == 0;
+    let mb_left_outside = col == 0;
+    let mb_right_outside = col + 1 >= mb_cols;
+
+    let nb_above = if mb_above_outside {
+        None
+    } else {
+        Some(grid[(row - 1) * mb_cols + col])
+    };
+    let nb_left = if mb_left_outside {
+        None
+    } else {
+        Some(grid[row * mb_cols + (col - 1)])
+    };
+    let nb_right = if mb_right_outside {
+        None
+    } else {
+        Some(grid[row * mb_cols + (col + 1)])
+    };
+
+    for &blk in &LumaBlockIndex::ALL {
+        let blk_i = blk.index();
+        let (bx, by) = luma_block_origin(mb_x, mb_y, blk_i);
+        let q_mv = pending.mvs4[blk_i];
+        let (r_top, r_bot, s_left, s_right) = classify_remote_mvs(
+            blk,
+            &pending.mvs4,
+            nb_above,
+            nb_left,
+            nb_right,
+            mb_above_outside,
+            mb_left_outside,
+            mb_right_outside,
+            mb_below_outside,
+        );
+        let prediction = obmc_predict_block(
+            &y_ref,
+            bx,
+            by,
+            q_mv,
+            r_top,
+            r_bot,
+            s_left,
+            s_right,
+            RCONTROL_DEFAULT,
+        );
+        let samples = match &pending.blocks[blk_i] {
+            Some(block) => {
+                reconstruct_inter_block_with_prediction(block, pending.quant, &prediction)
+            }
+            None => prediction,
+        };
+        blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+    }
+}
+
 /// Decode and reconstruct one Annex F §F.2 INTER4V / INTER4V+Q
 /// macroblock (four 8×8 luminance motion vectors + Annex F §F.3
 /// overlapped block motion compensation for luma + Table-F.1
@@ -5787,7 +5965,6 @@ fn decode_inter4v_macroblock(
     frame: &mut YuvFrame,
     grid: &[MbGridEntry],
     mb_cols: usize,
-    mb_rows_total: usize,
     col: usize,
     row: usize,
     gob_top_row: usize,
@@ -5798,7 +5975,7 @@ fn decode_inter4v_macroblock(
     options: DecodeOptions,
     aic_state: &mut AicState,
     aic_segment: u32,
-) -> Result<(MotionVector, Mb4Mv)> {
+) -> Result<(MotionVector, Mb4Mv, Option<PendingApLuma>)> {
     // §5.3.8 / Table J.1 — the macroblock parser emits MVD2-4 (four
     // vectors) when **either** Advanced Prediction (Annex F) **or**
     // Deblocking Filter mode (Annex J) is active. Under AP the luma
@@ -5878,100 +6055,64 @@ fn decode_inter4v_macroblock(
     // divided by 8 with sixteenth → half snap.
     let chroma_vec = chroma_mv_4mv(&mvs4);
 
-    // §F.3 OBMC luma prediction: classify each block's four remote MVs
-    // (top, bottom, left, right) per the §F.3 substitution rules:
-    //
-    //   * not-coded neighbour MB → `RemoteMv::Zero`
-    //   * INTRA neighbour / off-picture neighbour → `RemoteMv::Current`
-    //   * for blocks at the bottom of the MB (B3 / B4), the bottom
-    //     remote is **always** the current vector (§F.3 last sentence:
-    //     "if the current block is at the bottom of the macroblock,
-    //     the remote motion vector ... in the macroblock below ... is
-    //     replaced by the motion vector for the current block").
     let inter_cbpy = cbpy ^ 0b1111;
-    let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
 
-    let mb_below_outside = row + 1 >= mb_rows_total;
-    let mb_above_outside = row == 0;
-    let mb_left_outside = col == 0;
-    let mb_right_outside = col + 1 >= mb_cols;
-
-    // Look up the neighbour MB grid entries once (used for §F.3 INTRA /
-    // not-coded classification of the remote-MV slot per block).
-    let nb_above = if mb_above_outside {
-        None
+    let mut pending: Option<PendingApLuma> = None;
+    if advanced_prediction {
+        // §F.3 OBMC luma. The right-half remote vectors of blocks B2 /
+        // B4 come from the macroblock to the **right**, whose motion
+        // vectors are parsed later in the bitstream — so the luminance
+        // reconstruction is *deferred*: the coefficient blocks are
+        // parsed now (bitstream order) and the OBMC blend + residual
+        // add run once the driver has recorded the right neighbour's
+        // grid entry (see `reconstruct_pending_ap_luma`).
+        let mut blocks: [Option<H263Block>; 4] = [None, None, None, None];
+        for (blk_i, slot) in blocks.iter_mut().enumerate() {
+            let has_coef = (inter_cbpy >> (3 - blk_i)) & 1 == 1;
+            if has_coef {
+                *slot = Some(parse_block(
+                    reader,
+                    BlockContext {
+                        has_intradc: false,
+                        has_coefficients: true,
+                        ..Default::default()
+                    },
+                )?);
+            }
+        }
+        pending = Some(PendingApLuma {
+            col,
+            row,
+            quant,
+            mvs4,
+            blocks,
+        });
     } else {
-        Some(grid[(row - 1) * mb_cols + col])
-    };
-    let nb_left = if mb_left_outside {
-        None
-    } else {
-        Some(grid[row * mb_cols + (col - 1)])
-    };
-    let nb_right = if mb_right_outside {
-        None
-    } else {
-        Some(grid[row * mb_cols + (col + 1)])
-    };
-    // MB-below has not been decoded yet at this point; an §F.3
-    // "INTRA-below" classification would need a second pass. Per the
-    // §F.3 second-to-last sentence, B3/B4 unconditionally use the
-    // current vector for their bottom remote, which sidesteps the
-    // question for those blocks. For B1/B2 the bottom remote reads
-    // **inside the current macroblock** (block B3 / B4 of the *current*
-    // MB), which is always present and coded by definition.
-
-    for &blk in &LumaBlockIndex::ALL {
-        let blk_i = blk.index();
-        let (bx, by) = luma_block_origin(mb_x, mb_y, blk_i);
-        let q_mv = mvs4[blk_i];
-
-        let prediction = if advanced_prediction {
-            // §F.3 OBMC: blend the current vector with the per-pixel
-            // top / bottom / left / right remote vectors.
-            let (r_top, r_bot, s_left, s_right) = classify_remote_mvs(
-                blk,
-                &mvs4,
-                nb_above,
-                nb_left,
-                nb_right,
-                mb_above_outside,
-                mb_left_outside,
-                mb_right_outside,
-                mb_below_outside,
-            );
-            obmc_predict_block(
-                &y_ref,
-                bx,
-                by,
-                q_mv,
-                r_top,
-                r_bot,
-                s_left,
-                s_right,
-                RCONTROL_DEFAULT,
-            )
-        } else {
-            // Deblocking-Filter-mode four vectors (Table J.1: OBMC OFF):
-            // plain half-pel block motion compensation per vector.
-            motion_compensate_block(&y_ref, bx, by, q_mv, RCONTROL_DEFAULT)
-        };
-
-        let has_coef = (inter_cbpy >> (3 - blk_i)) & 1 == 1;
-        let samples = if has_coef {
-            let block = parse_block(
-                reader,
-                BlockContext {
-                    has_intradc: false,
-                    has_coefficients: true,
-                    ..Default::default()
-                },
-            )?;
-            reconstruct_inter_block_with_prediction(&block, quant, &prediction)
-        } else {
-            prediction
-        };
-        blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+        // Deblocking-Filter-mode four vectors (Table J.1: OBMC OFF):
+        // plain half-pel block motion compensation per vector,
+        // reconstructed immediately (no remote vectors involved).
+        let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
+        for &blk in &LumaBlockIndex::ALL {
+            let blk_i = blk.index();
+            let (bx, by) = luma_block_origin(mb_x, mb_y, blk_i);
+            let q_mv = mvs4[blk_i];
+            let prediction = motion_compensate_block(&y_ref, bx, by, q_mv, RCONTROL_DEFAULT);
+            let has_coef = (inter_cbpy >> (3 - blk_i)) & 1 == 1;
+            let samples = if has_coef {
+                let block = parse_block(
+                    reader,
+                    BlockContext {
+                        has_intradc: false,
+                        has_coefficients: true,
+                        ..Default::default()
+                    },
+                )?;
+                reconstruct_inter_block_with_prediction(&block, quant, &prediction)
+            } else {
+                prediction
+            };
+            blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+        }
     }
 
     // Chroma: no OBMC per §F.2 ("the prediction for chrominance is
@@ -6025,7 +6166,7 @@ fn decode_inter4v_macroblock(
         aic_state.record_non_intra_macroblock(col, row, aic_segment);
     }
 
-    Ok((mvs4[LumaBlockIndex::B1.index()], mvs4))
+    Ok((mvs4[LumaBlockIndex::B1.index()], mvs4, pending))
 }
 
 /// Build the §F.2 / Figure-F.1 four-MV neighbourhood for a macroblock
@@ -7626,6 +7767,217 @@ mod tests {
                 assert_eq!(frame.y[y * 176 + x], 16);
             }
         }
+    }
+
+    /// §F.3 right-remote regression: the OBMC blend of a macroblock's
+    /// B2 / B4 right halves uses the **actual motion vector of the
+    /// macroblock to its right** (parsed later in the bitstream — the
+    /// driver defers the luminance reconstruction one macroblock).
+    ///
+    /// MB(0,0) is a coded single-MV INTER MB with MV = (0,0) in an AP
+    /// picture; MB(1,0) carries MV = (+4,0) half-pel (predictor zero at
+    /// the top-left, so MVD = +4). Every remote of MB(0,0) is zero /
+    /// Current except the right remote of B2 / B4, which must resolve
+    /// to (+4,0). The expected samples are computed with the pure §F.3
+    /// primitive [`obmc_predict_block`] as the oracle.
+    #[test]
+    fn decode_ap_right_remote_uses_right_neighbours_vector() {
+        let reference = ramp_reference(176, 144);
+        let mut w = BitWriter::new();
+        write_qcif_inter_ap_picture_header(&mut w, false);
+        for gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for mb in 0..11 {
+                if gob == 0 && mb == 0 {
+                    write_inter_single_mv_zero(&mut w);
+                } else if gob == 0 && mb == 1 {
+                    // Coded single-MV INTER MB, MVD = (+4, 0).
+                    w.write_bit(false); // COD = 0
+                    w.write_bit(true); // MCBPC type 0 (INTER), cbpc 00
+                    w.write_u32(0b11, 2); // CBPY idx 15 -> INTER 0000
+                    crate::encoder_vlc::write_mvd_component(&mut w, 4).unwrap();
+                    crate::encoder_vlc::write_mvd_component(&mut w, 0).unwrap();
+                } else {
+                    write_skipped_mb(&mut w);
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let frame =
+            decode_picture(&data, Some(&reference), DecodeOptions::default()).expect("decode");
+
+        let y_ref = RefPlane::new(&reference.y, 176, 144);
+        let zero = MotionVector::new(0, 0);
+        let right_mv = MotionVector::new(4, 0);
+
+        // Oracle for MB(0,0) B2 (block origin (8,0)): top outside →
+        // Current; bottom = current B4 (zero); left = current B1
+        // (zero); right = MB(1,0)'s B1 vector.
+        let expect_b2 = obmc_predict_block(
+            &y_ref,
+            8,
+            0,
+            zero,
+            RemoteMv::Current,
+            RemoteMv::Vector(zero),
+            RemoteMv::Vector(zero),
+            RemoteMv::Vector(right_mv),
+            RCONTROL_DEFAULT,
+        );
+        // Oracle for MB(0,0) B4 (block origin (8,8)): top = current B2
+        // (zero); bottom-of-MB rule → Current; left = current B3
+        // (zero); right = MB(1,0)'s B3 vector.
+        let expect_b4 = obmc_predict_block(
+            &y_ref,
+            8,
+            8,
+            zero,
+            RemoteMv::Vector(zero),
+            RemoteMv::Current,
+            RemoteMv::Vector(zero),
+            RemoteMv::Vector(right_mv),
+            RCONTROL_DEFAULT,
+        );
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(
+                    frame.y[j * 176 + 8 + i],
+                    expect_b2[j * 8 + i],
+                    "B2 OBMC mismatch at ({i}, {j})"
+                );
+                assert_eq!(
+                    frame.y[(8 + j) * 176 + 8 + i],
+                    expect_b4[j * 8 + i],
+                    "B4 OBMC mismatch at ({i}, {j})"
+                );
+            }
+        }
+        // And the blend genuinely differs from a plain zero-MV copy in
+        // the right half (the pre-§F.3-fix behaviour), so this test
+        // fails on a driver that feeds a zero right remote.
+        let mut plain = Vec::with_capacity(64);
+        for j in 0..8 {
+            for i in 0..8 {
+                plain.push(reference.y[j * 176 + 8 + i]);
+            }
+        }
+        assert_ne!(
+            (0..64).map(|k| expect_b2[k]).collect::<Vec<u8>>(),
+            plain,
+            "oracle degenerated to the plain copy — test lost its power"
+        );
+    }
+
+    /// §F.2 / §F.3: in Advanced Prediction mode a **single-MV** coded
+    /// INTER macroblock is also OBMC-predicted ("defined as four
+    /// vectors with the same value"). An isolated moving macroblock
+    /// surrounded by skipped macroblocks blends its own vector with the
+    /// not-coded neighbours' zero remotes — which differs from plain
+    /// motion compensation.
+    #[test]
+    fn decode_ap_single_mv_macroblock_is_obmc_predicted() {
+        let reference = ramp_reference(176, 144);
+        let mut w = BitWriter::new();
+        write_qcif_inter_ap_picture_header(&mut w, false);
+        for gob in 0..9 {
+            w.write_u32(GBSC_VALUE, GBSC_BITS);
+            w.write_u32(1, GN_BITS);
+            w.write_u32(0, GFID_BITS);
+            w.write_u32(8, GQUANT_BITS);
+            for mb in 0..11 {
+                if gob == 1 && mb == 1 {
+                    // Coded single-MV INTER MB(1,1), MVD = (+4, 0)
+                    // (all neighbours skipped → predictor zero).
+                    w.write_bit(false);
+                    w.write_bit(true);
+                    w.write_u32(0b11, 2);
+                    crate::encoder_vlc::write_mvd_component(&mut w, 4).unwrap();
+                    crate::encoder_vlc::write_mvd_component(&mut w, 0).unwrap();
+                } else {
+                    write_skipped_mb(&mut w);
+                }
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let frame =
+            decode_picture(&data, Some(&reference), DecodeOptions::default()).expect("decode");
+
+        let y_ref = RefPlane::new(&reference.y, 176, 144);
+        let mv = MotionVector::new(4, 0);
+        // All four blocks of MB(1,1) (origin (16,16)): every external
+        // neighbour MB is skipped → not-coded → Zero remote; internal
+        // remotes are the current vector; B3/B4 bottom → Current.
+        let tags = [
+            // (block origin, r_top, r_bot, s_left, s_right)
+            (
+                (16usize, 16usize),
+                RemoteMv::Zero,
+                RemoteMv::Vector(mv),
+                RemoteMv::Zero,
+                RemoteMv::Vector(mv),
+            ),
+            (
+                (24, 16),
+                RemoteMv::Zero,
+                RemoteMv::Vector(mv),
+                RemoteMv::Vector(mv),
+                RemoteMv::Zero,
+            ),
+            (
+                (16, 24),
+                RemoteMv::Vector(mv),
+                RemoteMv::Current,
+                RemoteMv::Zero,
+                RemoteMv::Vector(mv),
+            ),
+            (
+                (24, 24),
+                RemoteMv::Vector(mv),
+                RemoteMv::Current,
+                RemoteMv::Vector(mv),
+                RemoteMv::Zero,
+            ),
+        ];
+        let mut any_differs_from_plain_mc = false;
+        for ((bx, by), r_top, r_bot, s_left, s_right) in tags {
+            let expect = obmc_predict_block(
+                &y_ref,
+                bx,
+                by,
+                mv,
+                r_top,
+                r_bot,
+                s_left,
+                s_right,
+                RCONTROL_DEFAULT,
+            );
+            let plain = motion_compensate_block(&y_ref, bx, by, mv, RCONTROL_DEFAULT);
+            if expect != plain {
+                any_differs_from_plain_mc = true;
+            }
+            for j in 0..8 {
+                for i in 0..8 {
+                    assert_eq!(
+                        frame.y[(by + j) * 176 + bx + i],
+                        expect[j * 8 + i],
+                        "OBMC mismatch at block ({bx},{by}) pixel ({i},{j})"
+                    );
+                }
+            }
+        }
+        assert!(
+            any_differs_from_plain_mc,
+            "OBMC oracle equals plain MC everywhere — test lost its power"
+        );
     }
 
     /// `classify_remote_mvs` returns the §F.3 substitution tags. For

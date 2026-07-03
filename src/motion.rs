@@ -1607,6 +1607,25 @@ mod tests {
         }
     }
 
+    /// §F.2 chroma-vector consistency over the **full** component
+    /// range, half-pel positions included: for a one-vector macroblock
+    /// ("four vectors with the same value") the Table-F.1 sum-of-four
+    /// derivation equals the §6.1.1 Table-18 single-MV chroma
+    /// derivation everywhere in the extended `[-63, 63]` range — so an
+    /// Advanced-Prediction driver may reconstruct single-MV chroma with
+    /// either rule.
+    #[test]
+    fn chroma_4mv_equals_table_18_for_all_equal_vectors() {
+        for l in MV_UMV_HALF_MIN..=MV_UMV_HALF_MAX {
+            let mv = MotionVector::new(l, -l);
+            assert_eq!(
+                chroma_mv_4mv(&[mv; 4]),
+                chroma_mv(mv),
+                "component {l}: §F.2 sum-of-four disagrees with Table 18"
+            );
+        }
+    }
+
     /// A four-vector sum of `+4` luma half-pel (each MV +1 half-pel)
     /// gives sixteenth position 4 → Table F.1 → half-position 1
     /// (one chroma half-pel step). Sign is preserved on the negative
