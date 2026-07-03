@@ -1,5 +1,7 @@
 # oxideav-h263
 
+[![CI](https://github.com/OxideAV/oxideav-h263/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-h263/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-h263.svg)](https://crates.io/crates/oxideav-h263) [![docs.rs](https://docs.rs/oxideav-h263/badge.svg)](https://docs.rs/oxideav-h263) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A pure-Rust ITU-T H.263 baseline video **codec** for the
 [oxideav](https://github.com/OxideAV/oxideav) framework, built
 clean-room against [ITU-T Recommendation H.263 (01/2005)][spec].
