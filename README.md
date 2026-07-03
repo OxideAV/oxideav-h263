@@ -12,23 +12,27 @@ and reconstructs INTRA and INTER pictures end-to-end, plus a wide set of
 optional Annexes (D, F, I, J, K, M, N, O, P, Q, S, T).
 
 The encoder (round 376 onward) produces baseline **INTRA (I-)** and
-**INTER (P-)** pictures: `encoder::encode_intra_picture` /
-`encode_inter_picture` forward-transform, quantise and entropy-code a
-planar 4:2:0 `YuvFrame` into a complete byte-aligned H.263 picture that
-decodes back through this crate's own decoder. The P-picture path
-predicts from the previous reconstructed frame either with zero motion
-vectors (`encode_inter_picture`; a static frame reconstructs bit-exactly
-via skipped macroblocks) or with **motion estimation**
-(`encode_inter_picture_motion`: SAD search + half-pel refinement,
-predictor-replay so the emitted MVD reconstructs to exactly the chosen
-MV). The encoder is built bottom-up from reusable layers —
-`encoder_vlc` (MCBPC / CBPY / MVD / INTRADC / TCOEF emitters),
-`fdct` (forward DCT + dead-zone quantiser), `encoder_block` (§5.4 block
-layer + run-length coder), `encoder_mb` (§5.3 macroblock layer),
-`encoder_motion` (§6.1.1 motion estimation + predictor replay) and
+**INTER (P-)** pictures plus a growing set of optional modes:
+`encoder::encode_intra_picture` / `encode_inter_picture` /
+`encode_inter_picture_motion` (SAD search + half-pel refinement with
+§6.1.1 predictor replay), `encode_inter_picture_umv` (**Annex D**
+extended-range motion with the exact §D.2 pair-selection inverse),
+`encode_inter_picture_ap` (**Annex F** INTER4V four vectors per
+macroblock with §F.3 OBMC-exact prediction, two-pass),
+`encode_pb_picture` (**Annex G** PB-frames: P-part + §G.4/§G.5
+bidirectionally-predicted B-part with BQUANT residuals),
+`encode_intra_picture_dquant` (§5.3.6 per-macroblock DQUANT),
+`encode_intra_picture_gobs` / `encode_inter_picture_gobs` (§5.2 GOB
+headers with per-GOB GQUANT + segmented MV prediction), and the
+closed-loop GOP driver `encode_sequence` (I + P GOPs predicting from
+the encoder's own decoded reconstruction — no drift; optional §5.1.27
+EOS). Everything is built bottom-up from reusable layers —
+`encoder_vlc`, `fdct`, `encoder_block` (§5.4), `encoder_mb` (§5.3),
+`encoder_motion` (§6.1.1/§F.2/§D.2 estimation + predictor replay) and
 `encoder` (§5.1 / §5.2 picture layer) — each round-trip-verified
-against the decoder. INTER4V / OBMC (Annex F) and Annex D unrestricted
-MV encoding are the next milestones.
+against the decoder, including a mixed-mode I + P + UMV-P + AP-P + PB
+elementary stream decoded end-to-end by `decode_sequence`. Annex I
+AIC / Annex T MQ / Annex K slice encoding are the next milestones.
 
 `register()` is currently a no-op pending a frame-yielding
 `oxideav_core::Decoder` adapter — callers drive the decoder through the
@@ -99,12 +103,18 @@ planar 4:2:0 `YuvFrame`:
   extended `[-63, 63]` half-pel range with predictor-dependent
   difference-pair selection).
 * **Annex F §F.2 / §F.3** — Advanced Prediction: four-motion-vector
-  candidate-predictor redefinition (Figure F.1), Table F.1
-  sixteenth-pixel chroma derivation, and overlapped block motion
-  compensation (OBMC) over the Figures F.2 / F.3 / F.4 weight
+  candidate-predictor redefinition (Figure F.1, threading each
+  just-reconstructed vector back in as an intra-macroblock candidate),
+  Table F.1 sixteenth-pixel chroma derivation, and overlapped block
+  motion compensation (OBMC) over the Figures F.2 / F.3 / F.4 weight
   matrices with the `Zero` / `Current` / `Vector` remote-MV
-  substitution rules. INTER4V / INTER4V+Q macroblocks reconstruct
-  end-to-end when Advanced Prediction is signalled.
+  substitution rules. OBMC covers **every** coded INTER macroblock of
+  an AP picture (a one-vector macroblock is "four vectors with the
+  same value"), and the B2/B4 right-half remotes read the **actual**
+  vector of the macroblock to the right — the luminance reconstruction
+  is deferred one macroblock so the later-parsed right neighbour is
+  known. INTER4V / INTER4V+Q macroblocks reconstruct end-to-end when
+  Advanced Prediction is signalled.
 * **Annex I §I.2 / §I.3** — Advanced INTRA Coding: the INTRA_MODE VLC
   (Table I.1), the two alternate DCT scans (Figure I.2) and scan
   selection, the separate INTRA-coefficient VLC (Table I.2), the
@@ -366,9 +376,12 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   §Q.4 pseudo-MV reconstruction, §Q.5 enlarged OBMC and §Q.3 reference
   extension are not yet wired, so the §Q.7 driver is not yet invoked from
   an end-to-end RRU reconstruction).
-* GSTUF stuffing auto-detection and GSBI (CPM = "1").
-* End-of-sequence markers (EOS / EOSBS).
-* Encoder. The crate is decode-only.
+* GSBI (CPM = "1"); the EOSBS end marker (the §5.1.27 EOS is emitted
+  by the encoder and transparently skipped by `decode_sequence`).
+* Encoder: Annex I AIC / Annex T MQ / Annex K slice-structured
+  encoding; UMV + AP combined mode; PB-frames with non-zero MVDB /
+  Annex M Improved-PB; INTRA-refresh inside the AP and PB paths; rate
+  control beyond the per-MB DQUANT / per-GOB GQUANT primitives.
 * `oxideav_core::Decoder` registration; `register()` is a no-op
   pending a frame-yielding decoder adapter.
 

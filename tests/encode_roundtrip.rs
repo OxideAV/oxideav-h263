@@ -11,7 +11,9 @@
 //! exactly as a real H.263 codec round-trips.
 
 use oxideav_h263::encoder::{
-    encode_inter_picture, encode_inter_picture_motion, encode_intra_picture, encode_intra_sequence,
+    encode_inter_picture, encode_inter_picture_ap, encode_inter_picture_motion,
+    encode_inter_picture_umv, encode_intra_picture, encode_intra_sequence, encode_pb_picture,
+    encode_sequence, GopConfig, PbConfig, EOS_BYTES,
 };
 use oxideav_h263::picture::{
     decode_picture_no_gob0_header, decode_sequence, DecodeOptions, YuvFrame,
@@ -180,4 +182,104 @@ fn i_then_p_gop_decodes_as_sequence() {
     // Frame 1 reconstructs the translated content within tolerance.
     let mae = luma_mae(&frame1, &decoded[1]);
     assert!(mae < 6.0, "P-frame luma MAE {}", mae);
+}
+
+/// Translate a frame's luma content left by `shift` pixels (edge
+/// replication), chroma by `shift / 2`.
+fn translated(frame: &YuvFrame, shift: usize) -> YuvFrame {
+    let lw = frame.luma_width;
+    let lh = frame.luma_height;
+    let cw = lw / 2;
+    let ch = lh / 2;
+    let mut out = frame.clone();
+    for row in 0..lh {
+        for col in 0..lw {
+            out.y[row * lw + col] = frame.y[row * lw + (col + shift).min(lw - 1)];
+        }
+    }
+    for row in 0..ch {
+        for col in 0..cw {
+            let src = (col + shift / 2).min(cw - 1);
+            out.cb[row * cw + col] = frame.cb[row * cw + src];
+            out.cr[row * cw + col] = frame.cr[row * cw + src];
+        }
+    }
+    out
+}
+
+/// A mixed-mode elementary stream assembled from the round-384 encoder
+/// entry points — I, then a baseline P, a UMV P, an Advanced-Prediction
+/// (INTER4V + OBMC) P and an Annex G PB pair — decodes end-to-end
+/// through `decode_sequence` with every frame tracking its source.
+#[test]
+fn mixed_mode_stream_decodes_end_to_end() {
+    let f0 = gradient(176, 144, 0);
+    let i_bytes = encode_intra_picture(&f0, 5, 0).unwrap();
+    let r0 = decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+
+    // Baseline motion P (1 px).
+    let f1 = translated(&r0, 1);
+    let p1 = encode_inter_picture_motion(&f1, &r0, 5, 1, 3).unwrap();
+    let r1 = decode_picture_no_gob0_header(&p1, Some(&r0), DecodeOptions::default()).unwrap();
+
+    // Annex D UMV P (2 px more).
+    let f2 = translated(&r0, 3);
+    let p2 = encode_inter_picture_umv(&f2, &r1, 5, 2, 4).unwrap();
+    let r2 = decode_picture_no_gob0_header(&p2, Some(&r1), DecodeOptions::default()).unwrap();
+
+    // Annex F AP / INTER4V P (1 px more).
+    let f3 = translated(&r0, 4);
+    let p3 = encode_inter_picture_ap(&f3, &r2, 5, 3, 3).unwrap();
+    let r3 = decode_picture_no_gob0_header(&p3, Some(&r2), DecodeOptions::default()).unwrap();
+
+    // Annex G PB pair: B at 5 px, P at 6 px (TR 3 -> 5, TRB 1).
+    let fb = translated(&r0, 5);
+    let fp = translated(&r0, 6);
+    let cfg = PbConfig {
+        quant: 5,
+        trb: 1,
+        dbquant: 0,
+        search_half: 3,
+    };
+    let pb = encode_pb_picture(&fp, &fb, &r3, 5, 3, &cfg).unwrap();
+
+    let mut stream = Vec::new();
+    for part in [&i_bytes, &p1, &p2, &p3, &pb] {
+        stream.extend_from_slice(part);
+    }
+    stream.extend_from_slice(&EOS_BYTES);
+
+    let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.len(), 6, "expected I, P, P(UMV), P(AP), B, P");
+    for (i, (src, dec)) in [&f0, &f1, &f2, &f3, &fb, &fp]
+        .iter()
+        .zip(decoded.iter())
+        .enumerate()
+    {
+        let mae = luma_mae(src, dec);
+        assert!(mae < 8.0, "frame {i} luma MAE too high: {mae}");
+    }
+}
+
+/// The closed-loop GOP driver round-trips through the public API with
+/// an EOS-terminated stream.
+#[test]
+fn gop_driver_public_api_round_trips() {
+    let base = gradient(176, 144, 10);
+    let frames: Vec<YuvFrame> = (0..5).map(|k| translated(&base, k)).collect();
+    let cfg = GopConfig {
+        quant: 6,
+        intra_period: 4,
+        search_half: 2,
+        umv: false,
+        eos: true,
+    };
+    let stream = encode_sequence(&frames, &cfg, 0).unwrap();
+    assert!(stream.ends_with(&EOS_BYTES));
+    let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.len(), 5);
+    for (i, (src, dec)) in frames.iter().zip(decoded.iter()).enumerate() {
+        let mae = luma_mae(src, dec);
+        assert!(mae < 8.0, "GOP frame {i} luma MAE too high: {mae}");
+    }
 }
