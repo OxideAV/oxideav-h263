@@ -395,6 +395,100 @@ pub fn decode_intra_tcoef_event(
 /// inventory per §I.3.
 pub const INTRA_TCOEF_REGULAR_ENTRIES: usize = 102;
 
+/// Look up the Table-I.2 dedicated `(prefix_bits, code)` codeword (the
+/// trailing sign bit excluded) for a regular `(last, run, |level|)`
+/// event, or `None` when the triple has no dedicated row and must take
+/// the ESCAPE form.
+///
+/// The inventory searched is [`INTRA_TCOEF_TABLE`] itself — the same
+/// data the decoder ([`decode_intra_tcoef_event`]) consumes — so the
+/// encoder and decoder can never drift: any triple this returns a code
+/// for round-trips back to the identical triple, and the returned
+/// `prefix_bits` is the row's spec "Bits" length minus one (the sign).
+fn intra_tcoef_vlc_codeword(last: bool, run: u8, abs_level: u8) -> Option<(u32, u32)> {
+    for r in INTRA_TCOEF_TABLE.iter() {
+        if r.is_escape {
+            continue;
+        }
+        if r.last == last && r.run == run && r.abs_level == abs_level {
+            return Some((r.code as u32, (r.bits - 1) as u32));
+        }
+    }
+    None
+}
+
+/// Emit one Table-I.2 INTRA-coefficient `(LAST, RUN, LEVEL)` event —
+/// the §I.3 encoder counterpart of [`decode_intra_tcoef_event`].
+///
+/// A `(last, run, |level|)` triple that has a dedicated Table-I.2 row
+/// uses that row's VLC code followed by the sign bit; anything else
+/// takes the ESCAPE form (the 7-bit prefix `0000 011`, then 1-bit LAST,
+/// 6-bit RUN, 8-bit two's-complement LEVEL — the §5.4.2 layout Table I.2
+/// shares per §I.3).
+///
+/// `level` must be non-zero. Within the ESCAPE form the 8-bit LEVEL
+/// field is two's complement with `0x00` and `0x80` forbidden (§5.4.2),
+/// so an ESCAPE magnitude is restricted to `1..=127` unless
+/// `modified_quant` is set: with Modified Quantization mode in use the
+/// §T.4 / §T.5-rule-2 EXTENDED-ESCAPE marker `1000 0000` introduces an
+/// 11-bit EXTENDED-LEVEL field ([`crate::block::extended_level_to_wire`])
+/// carrying a magnitude up to the §T.4 range. `run` must be `0..=63`.
+///
+/// Errors ([`Error::BadTcoefCode`]) when `level` is zero, `run` exceeds
+/// 63, or the magnitude cannot be represented (out of the ESCAPE 8-bit
+/// range with `modified_quant` clear, or out of the EXTENDED-LEVEL range
+/// with it set).
+pub fn write_intra_tcoef_event(
+    w: &mut oxideav_core::bits::BitWriter,
+    ev: IntraTcoefEvent,
+    modified_quant: bool,
+) -> Result<()> {
+    if ev.level == 0 {
+        return Err(Error::BadTcoefCode);
+    }
+    let abs_level = ev.level.unsigned_abs();
+    let sign = ev.level < 0;
+
+    // Dedicated Table-I.2 code-point first (magnitudes 1..=some small
+    // bound have rows; the escape covers the rest).
+    if abs_level <= u8::MAX as u16 {
+        if let Some((code, bits)) = intra_tcoef_vlc_codeword(ev.last, ev.run, abs_level as u8) {
+            w.write_bits(code, bits);
+            w.write_bit(sign);
+            return Ok(());
+        }
+    }
+
+    if ev.run > 0x3F {
+        return Err(Error::BadTcoefCode);
+    }
+
+    // ESCAPE form. §I.3 shares the §5.4.2 layout.
+    w.write_bits(0b0000_011, 7);
+    w.write_bit(ev.last);
+    w.write_bits(ev.run as u32, 6);
+
+    if (1..=127).contains(&abs_level) {
+        // Regular 8-bit two's-complement LEVEL.
+        let level_byte = (ev.level as i8) as u8;
+        w.write_bits(level_byte as u32, 8);
+        return Ok(());
+    }
+
+    // Magnitude > 127: only representable under Modified Quantization
+    // mode via the §T.4 EXTENDED-ESCAPE mechanism (§T.5 rule 2 extends
+    // it to Table I.2).
+    if !modified_quant {
+        return Err(Error::BadTcoefCode);
+    }
+    // EXTENDED-ESCAPE marker `1000 0000`, then the 11-bit EXTENDED-LEVEL
+    // field carrying the magnitude via the Figure-T.1 wire transform.
+    w.write_bits(0x80, 8);
+    let wire = crate::block::extended_level_to_wire(ev.level);
+    w.write_bits(wire as u32, 11);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,5 +905,148 @@ mod tests {
                 idx, row.code, row.bits, row.run, expected_last
             );
         }
+    }
+
+    // ---- write_intra_tcoef_event (§I.3 encoder VLC) round-trips ----
+
+    /// Encode one event with [`write_intra_tcoef_event`], then decode it
+    /// back with [`decode_intra_tcoef_event`]; assert equality.
+    fn encode_then_decode(ev: IntraTcoefEvent, modified_quant: bool) -> IntraTcoefEvent {
+        let mut w = BitWriter::new();
+        write_intra_tcoef_event(&mut w, ev, modified_quant).expect("encode");
+        let bytes = finish_aligned(w);
+        let mut r = BitReader::new(&bytes);
+        decode_intra_tcoef_event(&mut r, modified_quant).expect("decode")
+    }
+
+    /// Every regular Table-I.2 row round-trips through the encoder VLC
+    /// for both sign polarities: the decoded event equals the row's
+    /// (LAST, RUN, ±|LEVEL|). This proves the encoder emits the exact
+    /// dedicated code-point the decoder recognises (never a needless
+    /// ESCAPE) for every representable triple.
+    #[test]
+    fn encoder_round_trips_full_regular_table() {
+        for row in INTRA_TCOEF_TABLE.iter() {
+            if row.is_escape || row.abs_level == 0 {
+                continue;
+            }
+            for sign in [false, true] {
+                let level = if sign {
+                    -(row.abs_level as i16)
+                } else {
+                    row.abs_level as i16
+                };
+                let ev = IntraTcoefEvent {
+                    last: row.last,
+                    run: row.run,
+                    level,
+                };
+                assert_eq!(encode_then_decode(ev, false), ev, "row code={:b}", row.code);
+            }
+        }
+    }
+
+    /// A regular row must use its dedicated VLC, not the ESCAPE form:
+    /// the encoded length equals the row's spec `bits` (prefix + sign),
+    /// which is always shorter than the 22-bit ESCAPE event.
+    #[test]
+    fn encoder_prefers_dedicated_codeword_over_escape() {
+        // Index 0: `10s` → 3 bits total. ESCAPE would be 7+1+6+8 = 22.
+        let ev = IntraTcoefEvent {
+            last: false,
+            run: 0,
+            level: 1,
+        };
+        let mut w = BitWriter::new();
+        write_intra_tcoef_event(&mut w, ev, false).unwrap();
+        assert_eq!(w.bit_position(), 3);
+    }
+
+    /// A `(last, run, |level|)` triple with no dedicated Table-I.2 row
+    /// takes the ESCAPE form and round-trips. RUN=40 with |LEVEL|=1 has
+    /// no dedicated entry, so it must escape.
+    #[test]
+    fn encoder_escape_round_trips() {
+        for &level in &[1i16, -1, 60, -127, 127] {
+            let ev = IntraTcoefEvent {
+                last: false,
+                run: 40,
+                level,
+            };
+            let mut w = BitWriter::new();
+            write_intra_tcoef_event(&mut w, ev, false).unwrap();
+            // ESCAPE = 7 (prefix) + 1 (LAST) + 6 (RUN) + 8 (LEVEL) = 22.
+            assert_eq!(w.bit_position(), 22, "level={level}");
+            assert_eq!(encode_then_decode(ev, false), ev, "level={level}");
+        }
+    }
+
+    /// The last-event escape (LAST=1) round-trips too.
+    #[test]
+    fn encoder_escape_last_round_trips() {
+        let ev = IntraTcoefEvent {
+            last: true,
+            run: 50,
+            level: -33,
+        };
+        assert_eq!(encode_then_decode(ev, false), ev);
+    }
+
+    /// A magnitude > 127 is rejected without Modified Quantization mode
+    /// (the 8-bit ESCAPE LEVEL field cannot represent it) and accepted
+    /// via the §T.4 / §T.5-rule-2 EXTENDED-ESCAPE path with it set.
+    #[test]
+    fn encoder_extended_escape_gated_on_modified_quant() {
+        let ev = IntraTcoefEvent {
+            last: false,
+            run: 5,
+            level: 300,
+        };
+        let mut w = BitWriter::new();
+        assert_eq!(
+            write_intra_tcoef_event(&mut w, ev, false),
+            Err(Error::BadTcoefCode)
+        );
+        // With MQ set the EXTENDED-ESCAPE round-trips over a wide range.
+        for &level in &[128i16, -128, 300, -300, 1023, -1024] {
+            let ev = IntraTcoefEvent {
+                last: false,
+                run: 5,
+                level,
+            };
+            assert_eq!(encode_then_decode(ev, true), ev, "level={level}");
+        }
+    }
+
+    /// Zero level and out-of-range RUN are rejected.
+    #[test]
+    fn encoder_rejects_zero_level_and_bad_run() {
+        let mut w = BitWriter::new();
+        assert_eq!(
+            write_intra_tcoef_event(
+                &mut w,
+                IntraTcoefEvent {
+                    last: false,
+                    run: 0,
+                    level: 0
+                },
+                false
+            ),
+            Err(Error::BadTcoefCode)
+        );
+        // RUN 64 exceeds the 6-bit ESCAPE field (a run with no dedicated
+        // row so it would need the escape form).
+        assert_eq!(
+            write_intra_tcoef_event(
+                &mut w,
+                IntraTcoefEvent {
+                    last: false,
+                    run: 64,
+                    level: 1
+                },
+                false
+            ),
+            Err(Error::BadTcoefCode)
+        );
     }
 }

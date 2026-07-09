@@ -525,6 +525,20 @@ pub(crate) fn extended_level_from_wire(wire: u16) -> i16 {
     }
 }
 
+/// Encode a signed `LEVEL` into the §T.4 EXTENDED-LEVEL 11-bit wire
+/// value — the exact inverse of [`extended_level_from_wire`].
+///
+/// Per §T.4 / Figure T.1 the encoder takes the least-significant 11
+/// bits of the two's-complement representation of LEVEL and cyclically
+/// rotates them **right** by 5 positions to form the wire value. Only
+/// the low 11 bits of the result are significant; the caller emits them
+/// MSB-first. `LEVEL` must fit the signed 11-bit range `[-1024, 1023]`
+/// (the §T.4 EXTENDED-LEVEL range); values outside it alias modulo 2^11.
+pub(crate) fn extended_level_to_wire(level: i16) -> u16 {
+    let v = (level as u16) & 0x07FF;
+    ((v >> 5) | (v << (11 - 5))) & 0x07FF
+}
+
 /// One row of Table 16/H.263 (TCOEF VLC). `is_escape` flags the
 /// single ESCAPE entry (index 102, code `0000 011`); for that row
 /// the `last` / `run` / `abs_level` fields are unused.
@@ -754,14 +768,6 @@ mod tests {
             has_coefficients: true,
             modified_quant: true,
         }
-    }
-
-    /// Test-side encoder for the §T.4 EXTENDED-LEVEL wire field:
-    /// take the low 11 bits of LEVEL's two's-complement form and
-    /// cyclically rotate them **right** by 5 (Figure T.1).
-    fn extended_level_to_wire(level: i16) -> u16 {
-        let v = (level as u16) & 0x07FF;
-        ((v >> 5) | (v << (11 - 5))) & 0x07FF
     }
 
     fn finish_aligned(mut w: BitWriter) -> Vec<u8> {

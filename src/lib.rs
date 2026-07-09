@@ -289,7 +289,9 @@ pub use gob_header::{
     GBSC_VALUE, GFID_BITS, GN_BITS, GOB_HEADER_BITS_NO_CPM, GQUANT_BITS,
 };
 pub use idct::{idct_8x8, reconstruct_intra_samples, BLOCK_DIM, IDCT_OUT_MAX, IDCT_OUT_MIN};
-pub use intra_tcoef::{decode_intra_tcoef_event, IntraTcoefEvent, INTRA_TCOEF_REGULAR_ENTRIES};
+pub use intra_tcoef::{
+    decode_intra_tcoef_event, write_intra_tcoef_event, IntraTcoefEvent, INTRA_TCOEF_REGULAR_ENTRIES,
+};
 pub use macroblock::{parse_macroblock, H263Macroblock, MbContext, MbType, Mvd};
 pub use motion::{
     chroma_mv, chroma_mv_4mv, chroma_mv_component, chroma_mv_component_4mv, median3,
