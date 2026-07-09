@@ -220,6 +220,7 @@ pub mod block_aic;
 pub mod deblock;
 pub mod dequant;
 pub mod encoder;
+pub mod encoder_aic;
 pub mod encoder_block;
 pub mod encoder_mb;
 pub mod encoder_motion;
@@ -241,8 +242,8 @@ pub mod scalability;
 pub mod slice_header;
 
 pub use aic::{
-    decode_intra_mode, scan_for_intra_mode, IntraMode, ALT_HORIZONTAL_TO_BLOCK_POS,
-    ALT_VERTICAL_TO_BLOCK_POS,
+    decode_intra_mode, scan_for_intra_mode, write_intra_mode, IntraMode,
+    ALT_HORIZONTAL_TO_BLOCK_POS, ALT_VERTICAL_TO_BLOCK_POS,
 };
 pub use aic_dequant::{
     aic_dequant_coefficient, clip_ac, oddify_clip_dc, AIC_AC_REC_MAX, AIC_AC_REC_MIN,
@@ -266,6 +267,7 @@ pub use encoder::{
     encode_intra_picture_dquant, encode_intra_picture_gobs, encode_intra_sequence,
     encode_pb_picture, encode_sequence, GopConfig, PbConfig, EOS_BYTES,
 };
+pub use encoder_aic::{plan_intra_block_aic, write_intra_block_aic, AicBlockPlan};
 pub use encoder_block::{
     block_has_ac, encode_inter_block, encode_intra_block, tcoef_events, write_inter_block_coeffs,
     write_intra_block, EncodedInterBlock, EncodedIntraBlock,

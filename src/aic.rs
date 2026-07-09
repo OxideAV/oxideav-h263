@@ -110,6 +110,28 @@ pub fn decode_intra_mode(reader: &mut BitReader<'_>) -> Result<IntraMode> {
     }
 }
 
+/// Emit the §I.2 INTRA_MODE field per Table I.1 — the encoder
+/// counterpart of [`decode_intra_mode`].
+///
+/// | Mode               | VLC  |
+/// |--------------------|------|
+/// | DC Only            | `0`  |
+/// | Vertical DC & AC   | `10` |
+/// | Horizontal DC & AC | `11` |
+pub fn write_intra_mode(w: &mut oxideav_core::bits::BitWriter, mode: IntraMode) {
+    match mode {
+        IntraMode::DcOnly => w.write_bit(false),
+        IntraMode::VerticalDcAc => {
+            w.write_bit(true);
+            w.write_bit(false);
+        }
+        IntraMode::HorizontalDcAc => {
+            w.write_bit(true);
+            w.write_bit(true);
+        }
+    }
+}
+
 /// Alternate-Horizontal scan → block-position lookup (§I.3,
 /// Figure I.2-a).
 ///
@@ -280,6 +302,25 @@ mod tests {
         assert_eq!(IntraMode::DcOnly.index(), 0);
         assert_eq!(IntraMode::VerticalDcAc.index(), 1);
         assert_eq!(IntraMode::HorizontalDcAc.index(), 2);
+    }
+
+    /// Every mode written by [`write_intra_mode`] decodes back to the
+    /// same mode via [`decode_intra_mode`], and consumes exactly the
+    /// spec'd 1 / 2 bits.
+    #[test]
+    fn intra_mode_encoder_round_trips() {
+        for (mode, len) in [
+            (IntraMode::DcOnly, 1u64),
+            (IntraMode::VerticalDcAc, 2),
+            (IntraMode::HorizontalDcAc, 2),
+        ] {
+            let mut w = BitWriter::new();
+            write_intra_mode(&mut w, mode);
+            assert_eq!(w.bit_position(), len, "mode {mode:?}");
+            let bytes = w.into_bytes();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(decode_intra_mode(&mut r).unwrap(), mode);
+        }
     }
 
     /// Both alternate scans are permutations of 0..=63 (each block
