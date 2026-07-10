@@ -14,8 +14,8 @@ use oxideav_h263::aic::IntraMode;
 use oxideav_h263::encoder::{
     encode_inter_picture, encode_inter_picture_ap, encode_inter_picture_motion,
     encode_inter_picture_umv, encode_intra_picture, encode_intra_picture_aic,
-    encode_intra_picture_aic_auto, encode_intra_sequence, encode_pb_picture, encode_sequence,
-    GopConfig, PbConfig, EOS_BYTES,
+    encode_intra_picture_aic_auto, encode_intra_picture_aic_mq, encode_intra_sequence,
+    encode_pb_picture, encode_sequence, GopConfig, PbConfig, EOS_BYTES,
 };
 use oxideav_h263::picture::{
     decode_picture_no_gob0_header, decode_sequence, DecodeOptions, YuvFrame,
@@ -387,4 +387,24 @@ fn aic_auto_mode_round_trips_and_is_not_worse() {
         auto.len(),
         worst_fixed
     );
+}
+
+/// AIC + Annex T Modified Quantization encode → decode round-trip: the
+/// stream decodes with both `aic` and `modified_quant` set (§T.3 chroma
+/// QUANT_C + §T.4 EXTENDED-ESCAPE) within tolerance, across several
+/// quantisers including low ones where the widened LEVEL range matters.
+#[test]
+fn aic_mq_intra_picture_round_trips() {
+    let opts = DecodeOptions {
+        aic: true,
+        modified_quant: true,
+        ..DecodeOptions::default()
+    };
+    for &q in &[3u8, 8, 16, 25] {
+        let src = gradient(176, 144, 4);
+        let bytes = encode_intra_picture_aic_mq(&src, q, 0).expect("encode AIC+MQ");
+        let decoded = decode_picture_no_gob0_header(&bytes, None, opts).expect("decode AIC+MQ");
+        let mae = luma_mae(&src, &decoded);
+        assert!(mae < 10.0, "AIC+MQ q{q} luma MAE {mae}");
+    }
 }

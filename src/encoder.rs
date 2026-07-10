@@ -376,6 +376,19 @@ struct MbAicPlan {
     luma: [AicBlockPlan; 4],
     cb: AicBlockPlan,
     cr: AicBlockPlan,
+    /// Whether the block streams are emitted under Annex T Modified
+    /// Quantization mode (§T.4 EXTENDED-ESCAPE enabled on the wire).
+    modified_quant: bool,
+}
+
+/// The picture-constant §I / §T parameters threaded into every AIC
+/// macroblock plan: the luma QUANT, the §T.3 chroma `QUANT_C` (equal to
+/// QUANT outside Modified Quantization mode), and the MQ flag.
+#[derive(Debug, Clone, Copy)]
+struct AicParams {
+    quant: u8,
+    chroma_quant: u8,
+    modified_quant: bool,
 }
 
 /// Plan one AIC INTRA macroblock with a fixed INTRA_MODE, reading the
@@ -385,15 +398,21 @@ struct MbAicPlan {
 /// left is Y2, Y4's above/left are Y1/Y3 — those reconstructions come
 /// from a local scratch (not yet in the grid), while the top row / left
 /// column of the macroblock read the already-committed neighbours from
-/// `grid` (Figure-5 order, matching the decoder).
+/// `grid` (Figure-5 order, matching the decoder). Chroma dequantises at
+/// the §T.3 `QUANT_C` under Modified Quantization mode.
 fn plan_macroblock_aic(
     grid: &AicEncodeGrid,
     mb: &MacroblockSamples,
-    quant: u8,
+    params: AicParams,
     mode: IntraMode,
     mb_col: usize,
     mb_row: usize,
 ) -> MbAicPlan {
+    let AicParams {
+        quant,
+        chroma_quant,
+        modified_quant,
+    } = params;
     // Local reconstructions of this macroblock's four luma blocks, filled
     // as we plan them so later blocks see earlier ones as neighbours.
     let mut local: [Option<[i32; COEFFS_PER_BLOCK]>; 4] = [None; 4];
@@ -422,7 +441,7 @@ fn plan_macroblock_aic(
             quant,
             neigh(&above),
             neigh(&left),
-            false,
+            modified_quant,
         );
         local[blk] = Some(plan.rec);
         luma[blk] = Some(plan);
@@ -433,10 +452,10 @@ fn plan_macroblock_aic(
     let cb = plan_intra_block_aic(
         &mb.cb,
         mode,
-        quant,
+        chroma_quant,
         neigh(&cb_above),
         neigh(&cb_left),
-        false,
+        modified_quant,
     );
 
     let (cr_above, cr_left) =
@@ -444,10 +463,10 @@ fn plan_macroblock_aic(
     let cr = plan_intra_block_aic(
         &mb.cr,
         mode,
-        quant,
+        chroma_quant,
         neigh(&cr_above),
         neigh(&cr_left),
-        false,
+        modified_quant,
     );
 
     MbAicPlan {
@@ -455,6 +474,7 @@ fn plan_macroblock_aic(
         luma: luma.map(|p| p.unwrap()),
         cb,
         cr,
+        modified_quant,
     }
 }
 
@@ -488,11 +508,12 @@ fn write_macroblock_aic(w: &mut BitWriter, plan: &MbAicPlan) -> Result<()> {
     write_cbpy(w, cbpy)?;
 
     // §5.4 / §I.3 — six Table-I.2 block streams in order Y1..Y4, Cb, Cr.
+    let mq = plan.modified_quant;
     for p in &plan.luma {
-        write_intra_block_aic(w, p, false)?;
+        write_intra_block_aic(w, p, mq)?;
     }
-    write_intra_block_aic(w, &plan.cb, false)?;
-    write_intra_block_aic(w, &plan.cr, false)?;
+    write_intra_block_aic(w, &plan.cb, mq)?;
+    write_intra_block_aic(w, &plan.cr, mq)?;
     Ok(())
 }
 
@@ -529,14 +550,14 @@ fn macroblock_aic_bit_cost(plan: &MbAicPlan) -> u64 {
 fn encode_choose_macroblock_aic(
     w: &mut BitWriter,
     mb: &MacroblockSamples,
-    quant: u8,
+    params: AicParams,
     fixed_mode: Option<IntraMode>,
     mb_col: usize,
     mb_row: usize,
     grid: &mut AicEncodeGrid,
 ) -> Result<()> {
     let plan = match fixed_mode {
-        Some(mode) => plan_macroblock_aic(grid, mb, quant, mode, mb_col, mb_row),
+        Some(mode) => plan_macroblock_aic(grid, mb, params, mode, mb_col, mb_row),
         None => {
             let mut best: Option<(u64, MbAicPlan)> = None;
             for mode in [
@@ -544,7 +565,7 @@ fn encode_choose_macroblock_aic(
                 IntraMode::VerticalDcAc,
                 IntraMode::HorizontalDcAc,
             ] {
-                let candidate = plan_macroblock_aic(grid, mb, quant, mode, mb_col, mb_row);
+                let candidate = plan_macroblock_aic(grid, mb, params, mode, mb_col, mb_row);
                 let cost = macroblock_aic_bit_cost(&candidate);
                 let improves = match &best {
                     None => true,
@@ -590,11 +611,67 @@ pub fn encode_intra_picture_aic(
     tr: u8,
     mode: IntraMode,
 ) -> Result<Vec<u8>> {
+    encode_intra_picture_aic_core(frame, quant, tr, Some(mode), false)
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an Annex I **Advanced INTRA
+/// Coding** (§I) INTRA picture with a **per-macroblock INTRA_MODE
+/// decision**: each macroblock is planned under all three §I.2 modes
+/// (DC-only / vertical / horizontal) and the mode with the smallest exact
+/// wire cost is emitted, so §I.3 directional prediction is spent only
+/// where a macroblock's content has a dominant orientation.
+///
+/// Otherwise identical to [`encode_intra_picture_aic`] (single
+/// video-picture segment, closed-loop neighbour reconstruction, decode
+/// with `DecodeOptions { aic: true, .. }`).
+pub fn encode_intra_picture_aic_auto(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    encode_intra_picture_aic_core(frame, quant, tr, None, false)
+}
+
+/// Encode an Annex I **Advanced INTRA Coding** picture with Annex T
+/// **Modified Quantization** mode active: chrominance coefficients
+/// dequantise at the §T.3 `QUANT_C` step (Table T.2) and the §T.4 /
+/// §T.5-rule-2 EXTENDED-ESCAPE mechanism widens the Table-I.2 LEVEL range
+/// beyond ±127. Uses the per-macroblock INTRA_MODE decision.
+///
+/// The stream must be decoded with
+/// `DecodeOptions { aic: true, modified_quant: true, .. }` — neither §I
+/// nor §T is signalled on the baseline PTYPE wire (both are H.263+
+/// PLUSPTYPE-gated modes; PLUSPTYPE emission is future work).
+pub fn encode_intra_picture_aic_mq(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    encode_intra_picture_aic_core(frame, quant, tr, None, true)
+}
+
+/// Shared body of the AIC INTRA picture encoders: baseline INTRA header,
+/// then an all-INTRA macroblock stream (single video-picture segment).
+/// `fixed_mode` selects a picture-wide INTRA_MODE or the per-macroblock
+/// rate decision (`None`); `modified_quant` activates Annex T (§T.3
+/// chroma `QUANT_C`, §T.4 EXTENDED-ESCAPE).
+fn encode_intra_picture_aic_core(
+    frame: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    fixed_mode: Option<IntraMode>,
+    modified_quant: bool,
+) -> Result<Vec<u8>> {
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
     }
     let fmt =
         source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+
+    // §T.3 — chrominance QUANT_C (Table T.2) under Modified Quantization
+    // mode; identical to QUANT otherwise.
+    let chroma_quant = if modified_quant {
+        crate::annex_t::quant_c_from_quant(quant)?
+    } else {
+        quant
+    };
+    let params = AicParams {
+        quant,
+        chroma_quant,
+        modified_quant,
+    };
 
     let mut w = BitWriter::new();
     write_picture_header(
@@ -614,60 +691,12 @@ pub fn encode_intra_picture_aic(
         for mb_col in 0..mb_cols {
             let mb = extract_macroblock(frame, mb_col, mb_row);
             encode_choose_macroblock_aic(
-                &mut w,
-                &mb,
-                quant,
-                Some(mode),
-                mb_col,
-                mb_row,
-                &mut grid,
+                &mut w, &mb, params, fixed_mode, mb_col, mb_row, &mut grid,
             )?;
         }
     }
 
     // §5.1.28 — PSTUF.
-    w.align_to_byte_zero();
-    Ok(w.finish())
-}
-
-/// Encode a planar 4:2:0 [`YuvFrame`] as an Annex I **Advanced INTRA
-/// Coding** (§I) INTRA picture with a **per-macroblock INTRA_MODE
-/// decision**: each macroblock is planned under all three §I.2 modes
-/// (DC-only / vertical / horizontal) and the mode with the smallest exact
-/// wire cost is emitted, so §I.3 directional prediction is spent only
-/// where a macroblock's content has a dominant orientation.
-///
-/// Otherwise identical to [`encode_intra_picture_aic`] (single
-/// video-picture segment, closed-loop neighbour reconstruction, decode
-/// with `DecodeOptions { aic: true, .. }`).
-pub fn encode_intra_picture_aic_auto(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
-    if quant == 0 || quant > 31 {
-        return Err(Error::InvalidQuantiser);
-    }
-    let fmt =
-        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
-
-    let mut w = BitWriter::new();
-    write_picture_header(
-        &mut w,
-        fmt,
-        quant,
-        tr,
-        /* is_inter */ false,
-        PtypeFlags::default(),
-        None,
-    );
-
-    let mb_cols = frame.luma_width / 16;
-    let mb_rows = frame.luma_height / 16;
-    let mut grid = AicEncodeGrid::new(mb_cols, mb_rows);
-    for mb_row in 0..mb_rows {
-        for mb_col in 0..mb_cols {
-            let mb = extract_macroblock(frame, mb_col, mb_row);
-            encode_choose_macroblock_aic(&mut w, &mb, quant, None, mb_col, mb_row, &mut grid)?;
-        }
-    }
-
     w.align_to_byte_zero();
     Ok(w.finish())
 }
