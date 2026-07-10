@@ -15,7 +15,7 @@ use oxideav_h263::encoder::{
     encode_inter_picture, encode_inter_picture_ap, encode_inter_picture_motion,
     encode_inter_picture_umv, encode_intra_picture, encode_intra_picture_aic,
     encode_intra_picture_aic_auto, encode_intra_picture_aic_mq, encode_intra_sequence,
-    encode_pb_picture, encode_sequence, GopConfig, PbConfig, EOS_BYTES,
+    encode_intra_sequence_aic, encode_pb_picture, encode_sequence, GopConfig, PbConfig, EOS_BYTES,
 };
 use oxideav_h263::picture::{
     decode_picture_no_gob0_header, decode_sequence, DecodeOptions, YuvFrame,
@@ -406,5 +406,30 @@ fn aic_mq_intra_picture_round_trips() {
         let decoded = decode_picture_no_gob0_header(&bytes, None, opts).expect("decode AIC+MQ");
         let mae = luma_mae(&src, &decoded);
         assert!(mae < 10.0, "AIC+MQ q{q} luma MAE {mae}");
+    }
+}
+
+/// A multi-picture AIC elementary stream splits on Picture Start Codes
+/// and decodes through `decode_sequence` (with `aic` set) into all
+/// frames, each within the §I.3 round-trip tolerance.
+#[test]
+fn aic_intra_sequence_decodes_all_frames() {
+    let opts = DecodeOptions {
+        aic: true,
+        ..DecodeOptions::default()
+    };
+    let frames = vec![
+        gradient(176, 144, 0),
+        gradient(176, 144, 40),
+        YuvFrame::grey(176, 144),
+        gradient(176, 144, 90),
+    ];
+    let stream = encode_intra_sequence_aic(&frames, 9, 0).expect("encode AIC sequence");
+    let decoded = decode_sequence(&stream, opts).expect("decode AIC sequence");
+    assert_eq!(decoded.len(), frames.len());
+    for (i, (src, dec)) in frames.iter().zip(decoded.iter()).enumerate() {
+        assert_eq!((dec.luma_width, dec.luma_height), (176, 144));
+        let mae = luma_mae(src, dec);
+        assert!(mae < 10.0, "AIC sequence frame {i} luma MAE {mae}");
     }
 }

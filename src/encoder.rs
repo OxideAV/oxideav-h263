@@ -1859,6 +1859,29 @@ pub fn encode_intra_sequence(frames: &[YuvFrame], quant: u8, tr0: u8) -> Result<
     Ok(out)
 }
 
+/// Encode a sequence of frames as an all-INTRA Annex I **Advanced INTRA
+/// Coding** elementary stream.
+///
+/// Each frame is encoded as a §I AIC I-picture (via
+/// [`encode_intra_picture_aic_auto`], per-macroblock INTRA_MODE decision)
+/// at the same `quant`, byte-aligned and concatenated; the §5.1.2
+/// Temporal Reference is assigned modulo 256 in presentation order from
+/// `tr0`.
+///
+/// The stream decodes through [`crate::picture::decode_sequence`] when
+/// called with `DecodeOptions { aic: true, .. }` — each picture is a
+/// baseline-PTYPE INTRA picture whose §I mode is carried by the decode
+/// option (a baseline PTYPE cannot signal it on the wire).
+pub fn encode_intra_sequence_aic(frames: &[YuvFrame], quant: u8, tr0: u8) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        let tr = tr0.wrapping_add(i as u8);
+        let pic = encode_intra_picture_aic_auto(frame, quant, tr)?;
+        out.extend_from_slice(&pic);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

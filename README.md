@@ -25,16 +25,26 @@ macroblock with §F.3 OBMC-exact prediction, two-pass),
 bidirectionally-predicted B-part with BQUANT residuals),
 `encode_intra_picture_dquant` (§5.3.6 per-macroblock DQUANT),
 `encode_intra_picture_gobs` / `encode_inter_picture_gobs` (§5.2 GOB
-headers with per-GOB GQUANT + segmented MV prediction), and the
-closed-loop GOP driver `encode_sequence` (I + P GOPs predicting from
-the encoder's own decoded reconstruction — no drift; optional §5.1.27
+headers with per-GOB GQUANT + segmented MV prediction),
+`encode_intra_picture_aic` / `encode_intra_picture_aic_auto` /
+`encode_intra_picture_aic_mq` / `encode_intra_sequence_aic`
+(**Annex I** Advanced INTRA Coding: §I.2 per-macroblock INTRA_MODE
+with a rate-driven mode decision, §I.3 coefficient-domain DC/AC
+prediction from the encoder's own reconstructed neighbours, the
+Table I.2 separate INTRA VLC, and the optional **Annex T** §T.3
+chroma `QUANT_C` + §T.4 EXTENDED-ESCAPE range), and the closed-loop
+GOP driver `encode_sequence` (I + P GOPs predicting from the
+encoder's own decoded reconstruction — no drift; optional §5.1.27
 EOS). Everything is built bottom-up from reusable layers —
-`encoder_vlc`, `fdct`, `encoder_block` (§5.4), `encoder_mb` (§5.3),
-`encoder_motion` (§6.1.1/§F.2/§D.2 estimation + predictor replay) and
-`encoder` (§5.1 / §5.2 picture layer) — each round-trip-verified
-against the decoder, including a mixed-mode I + P + UMV-P + AP-P + PB
-elementary stream decoded end-to-end by `decode_sequence`. Annex I
-AIC / Annex T MQ / Annex K slice encoding are the next milestones.
+`encoder_vlc`, `fdct`, `encoder_block` (§5.4), `encoder_aic` (§I.3
+block plan + Table I.2 emit), `encoder_mb` (§5.3), `encoder_motion`
+(§6.1.1/§F.2/§D.2 estimation + predictor replay) and `encoder`
+(§5.1 / §5.2 picture layer) — each round-trip-verified against the
+decoder, including a mixed-mode I + P + UMV-P + AP-P + PB elementary
+stream decoded end-to-end by `decode_sequence`. The AIC closed loop
+reconstructs every block through the exact decoder primitive so
+encoder and decoder never drift (flat AIC pictures are byte-exact).
+Annex K slice-structured encoding is the next milestone.
 
 `register()` is currently a no-op pending a frame-yielding
 `oxideav_core::Decoder` adapter — callers drive the decoder through the
@@ -380,10 +390,14 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   an end-to-end RRU reconstruction).
 * GSBI (CPM = "1"); the EOSBS end marker (the §5.1.27 EOS is emitted
   by the encoder and transparently skipped by `decode_sequence`).
-* Encoder: Annex I AIC / Annex T MQ / Annex K slice-structured
-  encoding; UMV + AP combined mode; PB-frames with non-zero MVDB /
-  Annex M Improved-PB; INTRA-refresh inside the AP and PB paths; rate
-  control beyond the per-MB DQUANT / per-GOB GQUANT primitives.
+* Encoder: Annex K slice-structured encoding; UMV + AP combined mode;
+  PB-frames with non-zero MVDB / Annex M Improved-PB; INTRA-refresh
+  inside the AP and PB paths; AIC INTRA macroblocks inside a P-picture
+  (only whole AIC I-pictures encode so far); on-wire PLUSPTYPE
+  signalling of the §I / §T modes (they currently ride a baseline PTYPE
+  and require `DecodeOptions { aic / modified_quant }`); rate control
+  beyond the per-MB DQUANT / per-GOB GQUANT / per-MB INTRA_MODE
+  primitives.
 * `oxideav_core::Decoder` registration; `register()` is a no-op
   pending a frame-yielding decoder adapter.
 
@@ -394,8 +408,13 @@ built with the spec's bit layout (round-tripped via
 `oxideav_core::bits::BitWriter`), including full-table round-trips for
 Tables 7 / 8 / 12 / 14 / 16, the inverse-quantisation invariants, IDCT
 accuracy against the Annex A error budget, motion / OBMC / deblock /
-AIC / PLUSPTYPE / slice-header coverage, and end-to-end picture-decode
-tests.
+AIC / PLUSPTYPE / slice-header coverage, the full Table I.2 INTRA VLC
+encode round-trip, the §I.3 block-plan closed loop, and end-to-end
+picture-decode tests. `tests/encode_roundtrip.rs` additionally drives
+the public encode API back through the decoder, including the Annex I
+AIC I-picture / auto-mode / AIC+MQ / AIC-sequence encoders (flat AIC
+pictures byte-exact, AC-bearing content within the round-trip
+tolerance).
 
 `tests/fixture_decode.rs` adds end-to-end **conformance** tests against
 real H.263 elementary streams (the reference encoder) vendored under
