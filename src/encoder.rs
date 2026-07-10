@@ -22,8 +22,13 @@
 //! (sub-QCIF .. 16CIF) are supported. A frame whose dimensions do not
 //! match a standard source format is rejected.
 
+use crate::aic::{write_intra_mode, IntraMode};
+use crate::aic_predict::Neighbour;
 use crate::block::COEFFS_PER_BLOCK;
+use crate::encoder_aic::{plan_intra_block_aic, write_intra_block_aic, AicBlockPlan};
 use crate::encoder_mb::{encode_intra_macroblock, MacroblockSamples};
+use crate::encoder_vlc::{write_cbpy, write_mcbpc_i};
+use crate::macroblock::MbType;
 use crate::picture::YuvFrame;
 use crate::picture_header::{H263SourceFormat, PSC_VALUE};
 use crate::{Error, Result};
@@ -273,6 +278,249 @@ pub fn encode_intra_picture(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u
 
     // §5.1.28 — PSTUF: pad to the next byte boundary with zero bits so
     // the picture (and any following PSC) is byte-aligned.
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+/// Encoder-side mirror of the decoder's `AicState` §I.3 neighbour grid,
+/// for a **single video picture segment** (a header-less I-picture, so
+/// every already-encoded in-bounds block is an available `RecA'` /
+/// `RecB'` predictor — no segment-id bookkeeping is required).
+///
+/// Holds the reconstructed `RecC'(u,v)` block-position arrays keyed by
+/// the same grid coordinates the decoder uses (`luma_block_grid_pos`):
+/// luma at `2·mb_cols × 2·mb_rows`, chroma at `mb_cols × mb_rows`.
+struct AicEncodeGrid {
+    luma_block_cols: usize,
+    mb_cols: usize,
+    /// `RecC'` per luma block; `None` until the block has been encoded.
+    luma: Vec<Option<[i32; COEFFS_PER_BLOCK]>>,
+    cb: Vec<Option<[i32; COEFFS_PER_BLOCK]>>,
+    cr: Vec<Option<[i32; COEFFS_PER_BLOCK]>>,
+}
+
+impl AicEncodeGrid {
+    fn new(mb_cols: usize, mb_rows: usize) -> Self {
+        let luma_block_cols = 2 * mb_cols;
+        let luma_block_rows = 2 * mb_rows;
+        AicEncodeGrid {
+            luma_block_cols,
+            mb_cols,
+            luma: vec![None; luma_block_cols * luma_block_rows],
+            cb: vec![None; mb_cols * mb_rows],
+            cr: vec![None; mb_cols * mb_rows],
+        }
+    }
+
+    /// The `RecA'` (above) / `RecB'` (left) luma neighbour arrays at grid
+    /// position `(bx, by)`, copied out so the caller can build
+    /// [`Neighbour`] tags without borrowing the grid while it mutates.
+    fn luma_neighbours(
+        &self,
+        bx: usize,
+        by: usize,
+    ) -> (
+        Option<[i32; COEFFS_PER_BLOCK]>,
+        Option<[i32; COEFFS_PER_BLOCK]>,
+    ) {
+        let above = if by > 0 {
+            self.luma[(by - 1) * self.luma_block_cols + bx]
+        } else {
+            None
+        };
+        let left = if bx > 0 {
+            self.luma[by * self.luma_block_cols + (bx - 1)]
+        } else {
+            None
+        };
+        (above, left)
+    }
+
+    fn chroma_neighbours(
+        planes: &[Option<[i32; COEFFS_PER_BLOCK]>],
+        col: usize,
+        row: usize,
+        cols: usize,
+    ) -> (
+        Option<[i32; COEFFS_PER_BLOCK]>,
+        Option<[i32; COEFFS_PER_BLOCK]>,
+    ) {
+        let above = if row > 0 {
+            planes[(row - 1) * cols + col]
+        } else {
+            None
+        };
+        let left = if col > 0 {
+            planes[row * cols + (col - 1)]
+        } else {
+            None
+        };
+        (above, left)
+    }
+}
+
+/// Build a [`Neighbour`] tag borrowing `arr` when present.
+fn neigh(arr: &Option<[i32; COEFFS_PER_BLOCK]>) -> Neighbour<'_> {
+    match arr {
+        Some(a) => Neighbour::Available(a),
+        None => Neighbour::None,
+    }
+}
+
+/// Plan and emit one Annex I §I.3 AIC INTRA macroblock at grid position
+/// `(mb_col, mb_row)` with the given INTRA_MODE, threading the §I.3
+/// neighbour predictors through `grid`.
+///
+/// Wire order (the exact inverse of `decode_intra_macroblock_aic`):
+/// MCBPC(INTRA) → INTRA_MODE (Table I.1) → CBPY → six Table-I.2 block
+/// streams (Y1..Y4, Cb, Cr). The CBP bits carry each block's §I.3
+/// coded / not-coded state (a not-coded block reconstructs from the
+/// predictor alone — DC included).
+fn encode_intra_macroblock_aic(
+    w: &mut BitWriter,
+    mb: &MacroblockSamples,
+    quant: u8,
+    mode: IntraMode,
+    mb_col: usize,
+    mb_row: usize,
+    grid: &mut AicEncodeGrid,
+) -> Result<()> {
+    // Plan the four luma blocks in Figure-5 raster order, storing each
+    // reconstruction into the grid immediately so a later block of the
+    // same macroblock sees it as its own neighbour (Y3's above is Y1,
+    // Y4's left is Y3, etc.).
+    let mut luma_plans: [Option<AicBlockPlan>; 4] = [None, None, None, None];
+    for (blk, plan_slot) in luma_plans.iter_mut().enumerate() {
+        let bx = 2 * mb_col + (blk & 1);
+        let by = 2 * mb_row + (blk >> 1);
+        let (above, left) = grid.luma_neighbours(bx, by);
+        let plan = plan_intra_block_aic(
+            &mb.luma[blk],
+            mode,
+            quant,
+            neigh(&above),
+            neigh(&left),
+            false,
+        );
+        grid.luma[by * grid.luma_block_cols + bx] = Some(plan.rec);
+        *plan_slot = Some(plan);
+    }
+
+    // Chroma Cb then Cr, at macroblock-resolution grid positions.
+    let (cb_above, cb_left) =
+        AicEncodeGrid::chroma_neighbours(&grid.cb, mb_col, mb_row, grid.mb_cols);
+    let cb_plan = plan_intra_block_aic(
+        &mb.cb,
+        mode,
+        quant,
+        neigh(&cb_above),
+        neigh(&cb_left),
+        false,
+    );
+    grid.cb[mb_row * grid.mb_cols + mb_col] = Some(cb_plan.rec);
+
+    let (cr_above, cr_left) =
+        AicEncodeGrid::chroma_neighbours(&grid.cr, mb_col, mb_row, grid.mb_cols);
+    let cr_plan = plan_intra_block_aic(
+        &mb.cr,
+        mode,
+        quant,
+        neigh(&cr_above),
+        neigh(&cr_left),
+        false,
+    );
+    grid.cr[mb_row * grid.mb_cols + mb_col] = Some(cr_plan.rec);
+
+    // §5.3.2 — MCBPC(INTRA): CBPC bit 0b10 = Cb coded, 0b01 = Cr coded.
+    let mut cbpc = 0u8;
+    if cb_plan.coded {
+        cbpc |= 0b10;
+    }
+    if cr_plan.coded {
+        cbpc |= 0b01;
+    }
+    write_mcbpc_i(w, MbType::Intra, cbpc)?;
+
+    // §I.2 — INTRA_MODE (Table I.1), between MCBPC and CBPY.
+    write_intra_mode(w, mode);
+
+    // §5.3.5 — CBPY (INTRA orientation): bit (3 - blk) set when luma
+    // block blk is coded (in AIC the bit gates the whole block, DC
+    // included).
+    let mut cbpy = 0u8;
+    for (blk, plan) in luma_plans.iter().enumerate() {
+        if plan.as_ref().unwrap().coded {
+            cbpy |= 1 << (3 - blk);
+        }
+    }
+    write_cbpy(w, cbpy)?;
+
+    // §5.4 / §I.3 — six Table-I.2 block streams in order Y1..Y4, Cb, Cr.
+    for plan in &luma_plans {
+        write_intra_block_aic(w, plan.as_ref().unwrap(), false)?;
+    }
+    write_intra_block_aic(w, &cb_plan, false)?;
+    write_intra_block_aic(w, &cr_plan, false)?;
+
+    Ok(())
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an Annex I **Advanced INTRA
+/// Coding** (§I) INTRA picture: every macroblock is INTRA, coded with
+/// the §I.2 per-macroblock INTRA_MODE, the §I.3 coefficient-domain DC/AC
+/// prediction from reconstructed neighbours, the §I.3 modified
+/// quantisation and the Table I.2 separate INTRA-coefficient VLC.
+///
+/// `quant` is the picture quantiser (`1..=31`), `tr` the §5.1.2 Temporal
+/// Reference, and `mode` the INTRA_MODE applied to every macroblock (the
+/// §I.3 DC-only / vertical / horizontal prediction + scan selection).
+///
+/// The picture header is a plain baseline INTRA header — the §I mode is
+/// **not** signalled on the wire (a baseline PTYPE cannot carry it), so
+/// the stream must be decoded with `DecodeOptions { aic: true, .. }`
+/// (matching the crate's decoder convention). The output is a single
+/// video-picture segment (§5.2.2 GOB-0 elided, no later GOB headers), so
+/// every in-bounds neighbour is an available §I.3 predictor; the closed
+/// loop (each block reconstructed through the exact decoder primitive)
+/// keeps encoder and decoder bit-identical.
+///
+/// Decodes through
+/// [`crate::picture::decode_picture_no_gob0_header`] /
+/// [`crate::picture::decode_sequence`] with `aic` set.
+pub fn encode_intra_picture_aic(
+    frame: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    mode: IntraMode,
+) -> Result<Vec<u8>> {
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+
+    let mut w = BitWriter::new();
+    write_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ false,
+        PtypeFlags::default(),
+        None,
+    );
+
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+    let mut grid = AicEncodeGrid::new(mb_cols, mb_rows);
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let mb = extract_macroblock(frame, mb_col, mb_row);
+            encode_intra_macroblock_aic(&mut w, &mb, quant, mode, mb_col, mb_row, &mut grid)?;
+        }
+    }
+
+    // §5.1.28 — PSTUF.
     w.align_to_byte_zero();
     Ok(w.finish())
 }

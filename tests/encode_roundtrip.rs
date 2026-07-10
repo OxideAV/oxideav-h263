@@ -10,10 +10,11 @@
 //! "decodes through our decoder and reconstructs within tolerance",
 //! exactly as a real H.263 codec round-trips.
 
+use oxideav_h263::aic::IntraMode;
 use oxideav_h263::encoder::{
     encode_inter_picture, encode_inter_picture_ap, encode_inter_picture_motion,
-    encode_inter_picture_umv, encode_intra_picture, encode_intra_sequence, encode_pb_picture,
-    encode_sequence, GopConfig, PbConfig, EOS_BYTES,
+    encode_inter_picture_umv, encode_intra_picture, encode_intra_picture_aic,
+    encode_intra_sequence, encode_pb_picture, encode_sequence, GopConfig, PbConfig, EOS_BYTES,
 };
 use oxideav_h263::picture::{
     decode_picture_no_gob0_header, decode_sequence, DecodeOptions, YuvFrame,
@@ -281,5 +282,60 @@ fn gop_driver_public_api_round_trips() {
     for (i, (src, dec)) in frames.iter().zip(decoded.iter()).enumerate() {
         let mae = luma_mae(src, dec);
         assert!(mae < 8.0, "GOP frame {i} luma MAE too high: {mae}");
+    }
+}
+
+/// Annex I Advanced INTRA Coding encode → decode round-trip: the
+/// `encode_intra_picture_aic` output decodes (with `aic` set) within the
+/// lossy transform + §I.3 quantiser tolerance, for every INTRA_MODE and
+/// several standard picture sizes / quantisers.
+#[test]
+fn aic_intra_picture_round_trips_within_tolerance() {
+    let opts = DecodeOptions {
+        aic: true,
+        ..DecodeOptions::default()
+    };
+    for &mode in &[
+        IntraMode::DcOnly,
+        IntraMode::VerticalDcAc,
+        IntraMode::HorizontalDcAc,
+    ] {
+        for &(lw, lh) in &[(128usize, 96usize), (176, 144)] {
+            for &q in &[8u8, 13] {
+                let src = gradient(lw, lh, 3);
+                let bytes = encode_intra_picture_aic(&src, q, 0, mode).expect("encode AIC I");
+                let decoded =
+                    decode_picture_no_gob0_header(&bytes, None, opts).expect("decode AIC I");
+                assert_eq!((decoded.luma_width, decoded.luma_height), (lw, lh));
+                let mae = luma_mae(&src, &decoded);
+                assert!(mae < 10.0, "{lw}x{lh} q{q} {mode:?} AIC luma MAE {mae}");
+            }
+        }
+    }
+}
+
+/// A flat AIC INTRA picture reconstructs the exact grey field: with no
+/// AC energy every macroblock's DC prediction chains cleanly across the
+/// grid, so the round-trip is byte-exact on all three planes.
+#[test]
+fn aic_flat_picture_is_exact() {
+    let opts = DecodeOptions {
+        aic: true,
+        ..DecodeOptions::default()
+    };
+    let src = YuvFrame::grey(176, 144);
+    for &mode in &[
+        IntraMode::DcOnly,
+        IntraMode::VerticalDcAc,
+        IntraMode::HorizontalDcAc,
+    ] {
+        let bytes = encode_intra_picture_aic(&src, 10, 2, mode).expect("encode AIC flat");
+        let decoded = decode_picture_no_gob0_header(&bytes, None, opts).expect("decode AIC flat");
+        assert!(
+            decoded.y.iter().all(|&p| p == 128),
+            "{mode:?} luma not flat 128"
+        );
+        assert!(decoded.cb.iter().all(|&p| p == 128), "{mode:?} cb not flat");
+        assert!(decoded.cr.iter().all(|&p| p == 128), "{mode:?} cr not flat");
     }
 }
