@@ -264,8 +264,9 @@ pub use dequant::{dequantise_ac, scatter_into_block, AC_REC_MAX, AC_REC_MIN};
 pub use encoder::{
     encode_inter_picture, encode_inter_picture_ap, encode_inter_picture_gobs,
     encode_inter_picture_motion, encode_inter_picture_umv, encode_intra_picture,
-    encode_intra_picture_aic, encode_intra_picture_dquant, encode_intra_picture_gobs,
-    encode_intra_sequence, encode_pb_picture, encode_sequence, GopConfig, PbConfig, EOS_BYTES,
+    encode_intra_picture_aic, encode_intra_picture_aic_auto, encode_intra_picture_dquant,
+    encode_intra_picture_gobs, encode_intra_sequence, encode_pb_picture, encode_sequence,
+    GopConfig, PbConfig, EOS_BYTES,
 };
 pub use encoder_aic::{plan_intra_block_aic, write_intra_block_aic, AicBlockPlan};
 pub use encoder_block::{

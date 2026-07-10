@@ -14,7 +14,8 @@ use oxideav_h263::aic::IntraMode;
 use oxideav_h263::encoder::{
     encode_inter_picture, encode_inter_picture_ap, encode_inter_picture_motion,
     encode_inter_picture_umv, encode_intra_picture, encode_intra_picture_aic,
-    encode_intra_sequence, encode_pb_picture, encode_sequence, GopConfig, PbConfig, EOS_BYTES,
+    encode_intra_picture_aic_auto, encode_intra_sequence, encode_pb_picture, encode_sequence,
+    GopConfig, PbConfig, EOS_BYTES,
 };
 use oxideav_h263::picture::{
     decode_picture_no_gob0_header, decode_sequence, DecodeOptions, YuvFrame,
@@ -338,4 +339,52 @@ fn aic_flat_picture_is_exact() {
         assert!(decoded.cb.iter().all(|&p| p == 128), "{mode:?} cb not flat");
         assert!(decoded.cr.iter().all(|&p| p == 128), "{mode:?} cr not flat");
     }
+}
+
+/// The per-macroblock INTRA_MODE decision encoder round-trips within
+/// tolerance and is never larger than the worst fixed-mode encoding of
+/// the same frame (choosing the cheapest mode per macroblock can only
+/// help). Also exercised on directional content where mode 1 / 2 pay off.
+#[test]
+fn aic_auto_mode_round_trips_and_is_not_worse() {
+    let opts = DecodeOptions {
+        aic: true,
+        ..DecodeOptions::default()
+    };
+    // A frame with strong horizontal banding (rows constant, columns
+    // vary) plus a smooth luma gradient.
+    let lw = 176;
+    let lh = 144;
+    let mut src = gradient(lw, lh, 7);
+    for row in 0..lh {
+        for col in 0..lw {
+            // Vertical stripes → strong horizontal AC → mode selection
+            // has something to chew on.
+            let v = if (col / 4) % 2 == 0 { 40 } else { 200 };
+            src.y[row * lw + col] = v;
+        }
+    }
+
+    let q = 10;
+    let auto = encode_intra_picture_aic_auto(&src, q, 0).expect("encode auto");
+    let decoded = decode_picture_no_gob0_header(&auto, None, opts).expect("decode auto");
+    let mae = luma_mae(&src, &decoded);
+    assert!(mae < 10.0, "auto AIC luma MAE {mae}");
+
+    // The auto choice is <= the largest fixed-mode encoding.
+    let worst_fixed = [
+        IntraMode::DcOnly,
+        IntraMode::VerticalDcAc,
+        IntraMode::HorizontalDcAc,
+    ]
+    .iter()
+    .map(|&m| encode_intra_picture_aic(&src, q, 0, m).unwrap().len())
+    .max()
+    .unwrap();
+    assert!(
+        auto.len() <= worst_fixed,
+        "auto {} bytes worse than worst fixed {}",
+        auto.len(),
+        worst_fixed
+    );
 }

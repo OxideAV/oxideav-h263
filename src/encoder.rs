@@ -367,33 +367,55 @@ fn neigh(arr: &Option<[i32; COEFFS_PER_BLOCK]>) -> Neighbour<'_> {
     }
 }
 
-/// Plan and emit one Annex I §I.3 AIC INTRA macroblock at grid position
-/// `(mb_col, mb_row)` with the given INTRA_MODE, threading the §I.3
-/// neighbour predictors through `grid`.
+/// A fully-planned AIC INTRA macroblock: the six block plans plus the
+/// chosen INTRA_MODE. Produced by [`plan_macroblock_aic`] without
+/// mutating the grid, so several candidate modes can be planned and
+/// compared before one is committed.
+struct MbAicPlan {
+    mode: IntraMode,
+    luma: [AicBlockPlan; 4],
+    cb: AicBlockPlan,
+    cr: AicBlockPlan,
+}
+
+/// Plan one AIC INTRA macroblock with a fixed INTRA_MODE, reading the
+/// §I.3 neighbour predictors from `grid` **without** mutating it.
 ///
-/// Wire order (the exact inverse of `decode_intra_macroblock_aic`):
-/// MCBPC(INTRA) → INTRA_MODE (Table I.1) → CBPY → six Table-I.2 block
-/// streams (Y1..Y4, Cb, Cr). The CBP bits carry each block's §I.3
-/// coded / not-coded state (a not-coded block reconstructs from the
-/// predictor alone — DC included).
-fn encode_intra_macroblock_aic(
-    w: &mut BitWriter,
+/// The four luma blocks chain intra-macroblock: Y2's above is Y0, Y3's
+/// left is Y2, Y4's above/left are Y1/Y3 — those reconstructions come
+/// from a local scratch (not yet in the grid), while the top row / left
+/// column of the macroblock read the already-committed neighbours from
+/// `grid` (Figure-5 order, matching the decoder).
+fn plan_macroblock_aic(
+    grid: &AicEncodeGrid,
     mb: &MacroblockSamples,
     quant: u8,
     mode: IntraMode,
     mb_col: usize,
     mb_row: usize,
-    grid: &mut AicEncodeGrid,
-) -> Result<()> {
-    // Plan the four luma blocks in Figure-5 raster order, storing each
-    // reconstruction into the grid immediately so a later block of the
-    // same macroblock sees it as its own neighbour (Y3's above is Y1,
-    // Y4's left is Y3, etc.).
-    let mut luma_plans: [Option<AicBlockPlan>; 4] = [None, None, None, None];
-    for (blk, plan_slot) in luma_plans.iter_mut().enumerate() {
+) -> MbAicPlan {
+    // Local reconstructions of this macroblock's four luma blocks, filled
+    // as we plan them so later blocks see earlier ones as neighbours.
+    let mut local: [Option<[i32; COEFFS_PER_BLOCK]>; 4] = [None; 4];
+    let mut luma: [Option<AicBlockPlan>; 4] = [None, None, None, None];
+
+    for blk in 0..4 {
         let bx = 2 * mb_col + (blk & 1);
         let by = 2 * mb_row + (blk >> 1);
-        let (above, left) = grid.luma_neighbours(bx, by);
+        // Above neighbour: an intra-macroblock block (Y0/Y1) when this is a
+        // bottom-row block, else the committed grid block above.
+        let above = if (blk >> 1) == 1 {
+            local[blk - 2]
+        } else {
+            grid.luma_neighbours(bx, by).0
+        };
+        // Left neighbour: an intra-macroblock block (Y0/Y2) when this is a
+        // right-column block, else the committed grid block to the left.
+        let left = if (blk & 1) == 1 {
+            local[blk - 1]
+        } else {
+            grid.luma_neighbours(bx, by).1
+        };
         let plan = plan_intra_block_aic(
             &mb.luma[blk],
             mode,
@@ -402,14 +424,13 @@ fn encode_intra_macroblock_aic(
             neigh(&left),
             false,
         );
-        grid.luma[by * grid.luma_block_cols + bx] = Some(plan.rec);
-        *plan_slot = Some(plan);
+        local[blk] = Some(plan.rec);
+        luma[blk] = Some(plan);
     }
 
-    // Chroma Cb then Cr, at macroblock-resolution grid positions.
     let (cb_above, cb_left) =
         AicEncodeGrid::chroma_neighbours(&grid.cb, mb_col, mb_row, grid.mb_cols);
-    let cb_plan = plan_intra_block_aic(
+    let cb = plan_intra_block_aic(
         &mb.cb,
         mode,
         quant,
@@ -417,11 +438,10 @@ fn encode_intra_macroblock_aic(
         neigh(&cb_left),
         false,
     );
-    grid.cb[mb_row * grid.mb_cols + mb_col] = Some(cb_plan.rec);
 
     let (cr_above, cr_left) =
         AicEncodeGrid::chroma_neighbours(&grid.cr, mb_col, mb_row, grid.mb_cols);
-    let cr_plan = plan_intra_block_aic(
+    let cr = plan_intra_block_aic(
         &mb.cr,
         mode,
         quant,
@@ -429,39 +449,116 @@ fn encode_intra_macroblock_aic(
         neigh(&cr_left),
         false,
     );
-    grid.cr[mb_row * grid.mb_cols + mb_col] = Some(cr_plan.rec);
 
+    MbAicPlan {
+        mode,
+        luma: luma.map(|p| p.unwrap()),
+        cb,
+        cr,
+    }
+}
+
+/// Emit a planned AIC INTRA macroblock (the exact inverse of
+/// `decode_intra_macroblock_aic`): MCBPC(INTRA) → §I.2 INTRA_MODE
+/// (Table I.1) → CBPY → six Table-I.2 block streams (Y1..Y4, Cb, Cr).
+/// The CBP bits carry each block's §I.3 coded/not-coded state (absorbed
+/// INTRADC — a not-coded block reconstructs from the predictor alone).
+fn write_macroblock_aic(w: &mut BitWriter, plan: &MbAicPlan) -> Result<()> {
     // §5.3.2 — MCBPC(INTRA): CBPC bit 0b10 = Cb coded, 0b01 = Cr coded.
     let mut cbpc = 0u8;
-    if cb_plan.coded {
+    if plan.cb.coded {
         cbpc |= 0b10;
     }
-    if cr_plan.coded {
+    if plan.cr.coded {
         cbpc |= 0b01;
     }
     write_mcbpc_i(w, MbType::Intra, cbpc)?;
 
     // §I.2 — INTRA_MODE (Table I.1), between MCBPC and CBPY.
-    write_intra_mode(w, mode);
+    write_intra_mode(w, plan.mode);
 
     // §5.3.5 — CBPY (INTRA orientation): bit (3 - blk) set when luma
-    // block blk is coded (in AIC the bit gates the whole block, DC
-    // included).
+    // block blk is coded (in AIC the bit gates the whole block).
     let mut cbpy = 0u8;
-    for (blk, plan) in luma_plans.iter().enumerate() {
-        if plan.as_ref().unwrap().coded {
+    for (blk, p) in plan.luma.iter().enumerate() {
+        if p.coded {
             cbpy |= 1 << (3 - blk);
         }
     }
     write_cbpy(w, cbpy)?;
 
     // §5.4 / §I.3 — six Table-I.2 block streams in order Y1..Y4, Cb, Cr.
-    for plan in &luma_plans {
-        write_intra_block_aic(w, plan.as_ref().unwrap(), false)?;
+    for p in &plan.luma {
+        write_intra_block_aic(w, p, false)?;
     }
-    write_intra_block_aic(w, &cb_plan, false)?;
-    write_intra_block_aic(w, &cr_plan, false)?;
+    write_intra_block_aic(w, &plan.cb, false)?;
+    write_intra_block_aic(w, &plan.cr, false)?;
+    Ok(())
+}
 
+/// Store a planned macroblock's reconstructions into `grid` so downstream
+/// macroblocks pick them up as §I.3 neighbours.
+fn commit_macroblock_aic(grid: &mut AicEncodeGrid, plan: &MbAicPlan, mb_col: usize, mb_row: usize) {
+    for (blk, p) in plan.luma.iter().enumerate() {
+        let bx = 2 * mb_col + (blk & 1);
+        let by = 2 * mb_row + (blk >> 1);
+        grid.luma[by * grid.luma_block_cols + bx] = Some(p.rec);
+    }
+    grid.cb[mb_row * grid.mb_cols + mb_col] = Some(plan.cb.rec);
+    grid.cr[mb_row * grid.mb_cols + mb_col] = Some(plan.cr.rec);
+}
+
+/// The estimated wire cost (in bits) of a planned AIC macroblock — used
+/// by the per-macroblock INTRA_MODE decision to pick the cheapest mode.
+/// Measured exactly by emitting into a scratch writer.
+fn macroblock_aic_bit_cost(plan: &MbAicPlan) -> u64 {
+    let mut scratch = BitWriter::new();
+    // write_macroblock_aic only errors on unrepresentable fields, which a
+    // valid plan never has; treat an error as "infinite" cost.
+    if write_macroblock_aic(&mut scratch, plan).is_err() {
+        return u64::MAX;
+    }
+    scratch.bit_position()
+}
+
+/// Plan, choose the cheapest INTRA_MODE for, emit, and commit one AIC
+/// INTRA macroblock. When `fixed_mode` is `Some`, that mode is used;
+/// otherwise all three §I.2 modes are planned and the one with the
+/// smallest exact bit cost wins (§I.3 directional prediction pays off on
+/// content with a dominant orientation).
+fn encode_choose_macroblock_aic(
+    w: &mut BitWriter,
+    mb: &MacroblockSamples,
+    quant: u8,
+    fixed_mode: Option<IntraMode>,
+    mb_col: usize,
+    mb_row: usize,
+    grid: &mut AicEncodeGrid,
+) -> Result<()> {
+    let plan = match fixed_mode {
+        Some(mode) => plan_macroblock_aic(grid, mb, quant, mode, mb_col, mb_row),
+        None => {
+            let mut best: Option<(u64, MbAicPlan)> = None;
+            for mode in [
+                IntraMode::DcOnly,
+                IntraMode::VerticalDcAc,
+                IntraMode::HorizontalDcAc,
+            ] {
+                let candidate = plan_macroblock_aic(grid, mb, quant, mode, mb_col, mb_row);
+                let cost = macroblock_aic_bit_cost(&candidate);
+                let improves = match &best {
+                    None => true,
+                    Some((best_cost, _)) => cost < *best_cost,
+                };
+                if improves {
+                    best = Some((cost, candidate));
+                }
+            }
+            best.unwrap().1
+        }
+    };
+    write_macroblock_aic(w, &plan)?;
+    commit_macroblock_aic(grid, &plan, mb_col, mb_row);
     Ok(())
 }
 
@@ -516,11 +613,61 @@ pub fn encode_intra_picture_aic(
     for mb_row in 0..mb_rows {
         for mb_col in 0..mb_cols {
             let mb = extract_macroblock(frame, mb_col, mb_row);
-            encode_intra_macroblock_aic(&mut w, &mb, quant, mode, mb_col, mb_row, &mut grid)?;
+            encode_choose_macroblock_aic(
+                &mut w,
+                &mb,
+                quant,
+                Some(mode),
+                mb_col,
+                mb_row,
+                &mut grid,
+            )?;
         }
     }
 
     // §5.1.28 — PSTUF.
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an Annex I **Advanced INTRA
+/// Coding** (§I) INTRA picture with a **per-macroblock INTRA_MODE
+/// decision**: each macroblock is planned under all three §I.2 modes
+/// (DC-only / vertical / horizontal) and the mode with the smallest exact
+/// wire cost is emitted, so §I.3 directional prediction is spent only
+/// where a macroblock's content has a dominant orientation.
+///
+/// Otherwise identical to [`encode_intra_picture_aic`] (single
+/// video-picture segment, closed-loop neighbour reconstruction, decode
+/// with `DecodeOptions { aic: true, .. }`).
+pub fn encode_intra_picture_aic_auto(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+
+    let mut w = BitWriter::new();
+    write_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ false,
+        PtypeFlags::default(),
+        None,
+    );
+
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+    let mut grid = AicEncodeGrid::new(mb_cols, mb_rows);
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let mb = extract_macroblock(frame, mb_col, mb_row);
+            encode_choose_macroblock_aic(&mut w, &mb, quant, None, mb_col, mb_row, &mut grid)?;
+        }
+    }
+
     w.align_to_byte_zero();
     Ok(w.finish())
 }
