@@ -6,6 +6,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **§5.1.4 PLUSPTYPE picture-header writer, encoder** (round 432):
+  `encoder::write_plus_picture_header` + the `PlusModes` mode set emit
+  the extended-PTYPE (H.263+) picture header — PSC / TR / PTYPE bits
+  1-5 + the `"111"` escape, UFEP `"001"`, the 18-bit OPPTYPE (Annex
+  D / F / I / J / K / S / T mode bits, bit-15 emulation guard), the
+  9-bit MPPTYPE (I / P picture type, bit-9 guard), CPM = 0, the
+  conditional §5.1.9 UUI (`"1"`, Limited) and §5.1.10 SSS fields,
+  §5.1.19 PQUANT and §5.1.24 PEI = 0. Unit tests parse every emitted
+  variant back through `parse_picture_layer` and pin the full field
+  set, including all four SSS submode combinations and the
+  PQUANT/PEI tail position.
+
 ### Fixed
 
 - **§F.2 intra-macroblock candidate predictors, decoder** (round 384):

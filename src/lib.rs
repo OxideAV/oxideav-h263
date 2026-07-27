@@ -266,7 +266,8 @@ pub use encoder::{
     encode_inter_picture_motion, encode_inter_picture_umv, encode_intra_picture,
     encode_intra_picture_aic, encode_intra_picture_aic_auto, encode_intra_picture_aic_mq,
     encode_intra_picture_dquant, encode_intra_picture_gobs, encode_intra_sequence,
-    encode_intra_sequence_aic, encode_pb_picture, encode_sequence, GopConfig, PbConfig, EOS_BYTES,
+    encode_intra_sequence_aic, encode_pb_picture, encode_sequence, write_plus_picture_header,
+    GopConfig, PbConfig, PlusModes, EOS_BYTES,
 };
 pub use encoder_aic::{plan_intra_block_aic, write_intra_block_aic, AicBlockPlan};
 pub use encoder_block::{

@@ -166,6 +166,145 @@ fn write_gob_header(w: &mut BitWriter, gn: u32, gfid: u8, gquant: u8) {
     w.write_bits(gquant as u32, GQUANT_BITS);
 }
 
+/// The optional-mode set an extended-PTYPE (PLUSPTYPE / H.263+)
+/// picture header signals on the wire, mapped onto the §5.1.4.2
+/// OPPTYPE mode bits the crate's decoder stages.
+///
+/// Every mode defaults to *off*; [`PlusModes::default`] therefore
+/// describes a plain H.263+ baseline picture (all OPPTYPE mode bits
+/// zero). Mode bits the decoder refuses (SAC, RPS, ISD, custom PCF,
+/// custom source formats) are not exposed — the writer cannot emit a
+/// header the crate's own decoder would reject.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlusModes {
+    /// OPPTYPE bit 5 — Annex D Unrestricted Motion Vector mode. The
+    /// §5.1.9 UUI codeword `"1"` (motion-vector range limited per
+    /// Tables D.1/D.2) is emitted alongside.
+    pub umv: bool,
+    /// OPPTYPE bit 7 — Annex F Advanced Prediction mode.
+    pub advanced_prediction: bool,
+    /// OPPTYPE bit 8 — Annex I Advanced INTRA Coding mode.
+    pub advanced_intra: bool,
+    /// OPPTYPE bit 9 — Annex J Deblocking Filter mode.
+    pub deblocking: bool,
+    /// OPPTYPE bit 10 — Annex K Slice Structured mode, with the
+    /// §5.1.10 SSS submode bits that follow CPM on the wire.
+    pub slice_structured: Option<crate::plus_ptype::SliceStructuredSubmode>,
+    /// OPPTYPE bit 13 — Annex S Alternative INTER VLC mode.
+    pub alt_inter_vlc: bool,
+    /// OPPTYPE bit 14 — Annex T Modified Quantization mode.
+    pub modified_quant: bool,
+}
+
+/// Write an extended-PTYPE (PLUSPTYPE, §5.1.4) picture header: PSC, TR,
+/// PTYPE bits 1-5 + the `"111"` extended escape, UFEP `"001"`, the
+/// 18-bit OPPTYPE, the 9-bit MPPTYPE, CPM = 0, the conditional §5.1.9
+/// UUI / §5.1.10 SSS fields, §5.1.19 PQUANT and §5.1.24 PEI = 0.
+///
+/// The writer always emits the full-update `UFEP = "001"` form (legal
+/// on every picture, and the only form a stateless decoder can accept),
+/// with:
+///
+/// * a standard §5.1.4.2 source format (custom CPFMT formats are not
+///   staged — [`Error::NotImplemented`] for
+///   [`H263SourceFormat::Reserved110`]),
+/// * standard CIF picture clock frequency (OPPTYPE bit 4 = 0),
+/// * MPPTYPE picture type `"000"` (I) or `"001"` (P) per `is_inter`,
+///   RPR / RRU off and RTYPE = 0,
+/// * CPM = 0 (no PSBI), no scalability / RPS / RPR trailing fields.
+///
+/// After this header the picture body follows immediately: the GOB-0
+/// macroblock stream for the GOB layout (§5.2.2 first-GOB header
+/// elision), or the first slice's reduced header (§K.2.2) when
+/// [`PlusModes::slice_structured`] is signalled.
+///
+/// The emitted header parses back through
+/// [`crate::picture_header::parse_picture_layer`] and decodes through
+/// [`crate::picture::decode_picture_layer`] / `decode_sequence`, which
+/// auto-activate the wire-signalled Annex I / J / S / T modes without
+/// any caller-side [`crate::picture::DecodeOptions`].
+pub fn write_plus_picture_header(
+    w: &mut BitWriter,
+    fmt: H263SourceFormat,
+    quant: u8,
+    tr: u8,
+    is_inter: bool,
+    modes: PlusModes,
+) -> Result<()> {
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if matches!(fmt, H263SourceFormat::Reserved110) {
+        return Err(Error::NotImplemented);
+    }
+    // §5.1.1 — Picture Start Code (22 bits).
+    w.write_bits(PSC_VALUE, 22);
+    // §5.1.2 — Temporal Reference (8 bits).
+    w.write_bits(tr as u32, 8);
+    // §5.1.3 — PTYPE bits 1-5 (bit1 = 1, bit2 = 0, split-screen /
+    // document-camera / freeze-release = 0), then bits 6-8 = "111":
+    // the extended-PTYPE escape (§5.1.4).
+    w.write_bit(true);
+    w.write_bit(false);
+    w.write_bit(false);
+    w.write_bit(false);
+    w.write_bit(false);
+    w.write_bits(0b111, 3);
+    // §5.1.4.1 — UFEP "001": the full optional part follows.
+    w.write_bits(0b001, 3);
+    // §5.1.4.2 — OPPTYPE (18 bits). Bit n sits at shift 18-n.
+    let mut opptype: u32 = 0;
+    opptype |= source_format_bits(fmt) << 15; // bits 1-3 — source format
+    if modes.umv {
+        opptype |= 1 << 13; // bit 5 — Annex D
+    }
+    if modes.advanced_prediction {
+        opptype |= 1 << 11; // bit 7 — Annex F
+    }
+    if modes.advanced_intra {
+        opptype |= 1 << 10; // bit 8 — Annex I
+    }
+    if modes.deblocking {
+        opptype |= 1 << 9; // bit 9 — Annex J
+    }
+    if modes.slice_structured.is_some() {
+        opptype |= 1 << 8; // bit 10 — Annex K
+    }
+    if modes.alt_inter_vlc {
+        opptype |= 1 << 5; // bit 13 — Annex S
+    }
+    if modes.modified_quant {
+        opptype |= 1 << 4; // bit 14 — Annex T
+    }
+    opptype |= 1 << 3; // bit 15 — "1", start-code-emulation guard
+    w.write_bits(opptype, 18);
+    // §5.1.4.3 — MPPTYPE (9 bits): picture type, RPR / RRU / RTYPE = 0,
+    // reserved "00", bit 9 = "1".
+    let mut mpptype: u32 = 0;
+    if is_inter {
+        mpptype |= 0b001 << 6; // "001" P-picture ("000" is I)
+    }
+    mpptype |= 1; // bit 9 — start-code-emulation guard
+    w.write_bits(mpptype, 9);
+    // §5.1.4.7 / §5.1.20 — CPM = 0 (no PSBI follows).
+    w.write_bit(false);
+    // §5.1.9 — UUI, present iff UMV mode on (UFEP = "001"): "1" =
+    // motion-vector range per Tables D.1/D.2 (the crate's §D.2 range).
+    if modes.umv {
+        w.write_bit(true);
+    }
+    // §5.1.10 — SSS, present iff Slice Structured mode on.
+    if let Some(sss) = modes.slice_structured {
+        w.write_bit(sss.rectangular);
+        w.write_bit(sss.arbitrary_order);
+    }
+    // §5.1.19 — PQUANT (5 bits).
+    w.write_bits(quant as u32, 5);
+    // §5.1.24 — PEI = 0 (no PSUPP extension).
+    w.write_bit(false);
+    Ok(())
+}
+
 /// Encode a planar 4:2:0 [`YuvFrame`] as a baseline H.263 **INTRA**
 /// (I-) picture with a §5.2 **GOB header on every GOB after the
 /// first**, carrying a per-GOB quantiser.
@@ -1886,6 +2025,156 @@ pub fn encode_intra_sequence_aic(frames: &[YuvFrame], quant: u8, tr0: u8) -> Res
 mod tests {
     use super::*;
     use crate::picture::{decode_picture_no_gob0_header, DecodeOptions};
+    use crate::picture_header::{parse_picture_layer, H263PictureLayer};
+    use crate::plus_ptype::{
+        InheritedExtendedState, PlusPictureType, PlusSourceFormat, SliceStructuredSubmode, Uui,
+    };
+    use oxideav_core::bits::BitReader;
+
+    /// Emit a PLUSPTYPE header and parse it back through the picture-layer
+    /// parser, returning the extended header + a reader positioned at
+    /// PQUANT.
+    fn plus_header_round_trip(
+        fmt: H263SourceFormat,
+        quant: u8,
+        tr: u8,
+        is_inter: bool,
+        modes: PlusModes,
+    ) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        write_plus_picture_header(&mut w, fmt, quant, tr, is_inter, modes).unwrap();
+        w.align_to_byte_zero();
+        w.finish()
+    }
+
+    #[test]
+    fn plus_header_intra_no_modes_parses_back() {
+        let bytes =
+            plus_header_round_trip(H263SourceFormat::Qcif, 7, 42, false, PlusModes::default());
+        let mut r = BitReader::new(&bytes);
+        let layer = parse_picture_layer(&mut r, InheritedExtendedState::default()).unwrap();
+        let ext = match layer {
+            H263PictureLayer::Extended(e) => e,
+            H263PictureLayer::Baseline(_) => panic!("expected extended header"),
+        };
+        assert_eq!(ext.prefix.temporal_reference, 42);
+        assert_eq!(ext.plus.ufep, 0b001);
+        let opp = ext.plus.opptype.expect("UFEP=001 carries OPPTYPE");
+        assert_eq!(opp.source_format, PlusSourceFormat::Qcif);
+        assert!(!opp.custom_pcf);
+        assert!(!opp.umv && !opp.sac && !opp.advanced_prediction);
+        assert!(!opp.advanced_intra && !opp.deblocking && !opp.slice_structured);
+        assert!(!opp.reference_picture_selection && !opp.independent_segment_decoding);
+        assert!(!opp.alternative_inter_vlc && !opp.modified_quantization);
+        assert_eq!(ext.plus.mpptype.picture_type, PlusPictureType::Intra);
+        assert!(!ext.plus.mpptype.reference_picture_resampling);
+        assert!(!ext.plus.mpptype.reduced_resolution_update);
+        assert!(!ext.plus.mpptype.rounding_type);
+        assert!(!ext.plus.cpm);
+        assert_eq!(ext.plus.uui, None);
+        assert_eq!(ext.plus.sss, None);
+        // §5.1.19 PQUANT + §5.1.24 PEI follow the parsed block.
+        assert_eq!(r.read_u32(5).unwrap(), 7);
+        assert!(!r.read_bit().unwrap());
+    }
+
+    #[test]
+    fn plus_header_inter_aic_mq_parses_back() {
+        let modes = PlusModes {
+            advanced_intra: true,
+            modified_quant: true,
+            ..PlusModes::default()
+        };
+        let bytes = plus_header_round_trip(H263SourceFormat::Cif, 31, 3, true, modes);
+        let mut r = BitReader::new(&bytes);
+        let layer = parse_picture_layer(&mut r, InheritedExtendedState::default()).unwrap();
+        let ext = match layer {
+            H263PictureLayer::Extended(e) => e,
+            H263PictureLayer::Baseline(_) => panic!("expected extended header"),
+        };
+        let opp = ext.plus.opptype.unwrap();
+        assert_eq!(opp.source_format, PlusSourceFormat::Cif);
+        assert!(opp.advanced_intra);
+        assert!(opp.modified_quantization);
+        assert!(!opp.umv && !opp.advanced_prediction && !opp.slice_structured);
+        assert_eq!(ext.plus.mpptype.picture_type, PlusPictureType::Inter);
+        assert_eq!(r.read_u32(5).unwrap(), 31);
+        assert!(!r.read_bit().unwrap());
+    }
+
+    #[test]
+    fn plus_header_umv_emits_limited_uui() {
+        let modes = PlusModes {
+            umv: true,
+            ..PlusModes::default()
+        };
+        let bytes = plus_header_round_trip(H263SourceFormat::SubQcif, 12, 0, true, modes);
+        let mut r = BitReader::new(&bytes);
+        let layer = parse_picture_layer(&mut r, InheritedExtendedState::default()).unwrap();
+        let ext = match layer {
+            H263PictureLayer::Extended(e) => e,
+            H263PictureLayer::Baseline(_) => panic!("expected extended header"),
+        };
+        assert!(ext.plus.opptype.unwrap().umv);
+        assert_eq!(ext.plus.uui, Some(Uui::Limited));
+        assert_eq!(r.read_u32(5).unwrap(), 12);
+    }
+
+    #[test]
+    fn plus_header_slice_structured_sss_round_trips() {
+        for &(rect, aso) in &[(false, false), (false, true), (true, false), (true, true)] {
+            let modes = PlusModes {
+                slice_structured: Some(SliceStructuredSubmode {
+                    rectangular: rect,
+                    arbitrary_order: aso,
+                }),
+                ..PlusModes::default()
+            };
+            let bytes = plus_header_round_trip(H263SourceFormat::Qcif, 5, 9, false, modes);
+            let mut r = BitReader::new(&bytes);
+            let layer = parse_picture_layer(&mut r, InheritedExtendedState::default()).unwrap();
+            let ext = match layer {
+                H263PictureLayer::Extended(e) => e,
+                H263PictureLayer::Baseline(_) => panic!("expected extended header"),
+            };
+            assert!(ext.plus.opptype.unwrap().slice_structured);
+            assert_eq!(
+                ext.plus.sss,
+                Some(SliceStructuredSubmode {
+                    rectangular: rect,
+                    arbitrary_order: aso,
+                })
+            );
+            assert_eq!(r.read_u32(5).unwrap(), 5);
+        }
+    }
+
+    #[test]
+    fn plus_header_rejects_bad_inputs() {
+        let mut w = BitWriter::new();
+        assert!(matches!(
+            write_plus_picture_header(
+                &mut w,
+                H263SourceFormat::Qcif,
+                0,
+                0,
+                false,
+                PlusModes::default()
+            ),
+            Err(Error::InvalidQuantiser)
+        ));
+        assert!(matches!(
+            write_plus_picture_header(
+                &mut w,
+                H263SourceFormat::Reserved110,
+                8,
+                0,
+                false,
+                PlusModes::default()
+            ),
+            Err(Error::NotImplemented)
+        ));
+    }
 
     /// Build a deterministic test frame with a smooth gradient on each
     /// plane (so the encoder exercises both DC and AC paths).
