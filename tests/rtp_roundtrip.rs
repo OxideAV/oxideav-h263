@@ -68,6 +68,25 @@ fn packetize_check(stream: &[u8], max_payload: usize) -> Vec<u8> {
             assert!(header.p, "first packet must be a segment packet");
         }
     }
+
+    // §7 — every Picture Start Code must begin its own packet: the
+    // number of P=1 packets whose (stripped) start code is a PSC must
+    // equal the number of byte-aligned PSCs in the stream.
+    let stream_pscs = (0..stream.len().saturating_sub(2))
+        .filter(|&i| stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] & 0xFC == 0x80)
+        .count();
+    let packet_pscs = payloads
+        .iter()
+        .filter(|p| {
+            let (header, offset) = parse_payload_header(p).unwrap();
+            header.p && p[offset] & 0xFC == 0x80
+        })
+        .count();
+    assert_eq!(
+        packet_pscs, stream_pscs,
+        "every PSC must begin a picture segment packet"
+    );
+
     depacketize_payloads(&payloads).expect("depacketize")
 }
 
@@ -304,4 +323,127 @@ fn redundant_header_on_h263p_slices() {
     }
     assert!(saw_attached > 0);
     assert_eq!(depacketize_payloads(&payloads).unwrap(), stream);
+}
+
+/// RFC 2190 Mode A: a baseline GOB-headered I + P stream packetizes
+/// at GOB boundaries with full start codes, the per-picture
+/// SRC/I/U/S/A fields mirror each picture's PTYPE, and reassembly is
+/// byte-exact with decoded-frame equality.
+#[test]
+fn rfc2190_mode_a_round_trips() {
+    use oxideav_h263::encoder::{encode_inter_picture_gobs, encode_intra_picture_gobs};
+    use oxideav_h263::picture::decode_picture_no_gob0_header;
+    use oxideav_h263::rtp::{
+        depacketize_payloads_rfc2190, packetize_stream_rfc2190, parse_rfc2190_mode_a,
+    };
+
+    let f0 = gradient(176, 144, 2);
+    let f1 = gradient(176, 144, 7);
+    let i_bytes = encode_intra_picture_gobs(&f0, 4, |_| 6).expect("I");
+    let anchor =
+        decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).expect("dec I");
+    let p_bytes = encode_inter_picture_gobs(&f1, &anchor, 6, 5, 4).expect("P");
+    let mut stream = i_bytes.clone();
+    stream.extend_from_slice(&p_bytes);
+
+    let payloads = packetize_stream_rfc2190(
+        &stream,
+        PacketizeConfig {
+            max_payload: 512,
+            ..PacketizeConfig::default()
+        },
+    )
+    .expect("packetize 2190");
+    assert!(payloads.len() > 1);
+
+    let mut saw_intra = false;
+    let mut saw_inter = false;
+    for p in &payloads {
+        assert!(p.len() <= 512);
+        let (h, offset) = parse_rfc2190_mode_a(p).expect("mode A header");
+        // Mode A carries the full start code: 16 zero bits first.
+        assert_eq!(&p[offset..offset + 2], &[0, 0]);
+        assert_eq!(h.sbit, 0);
+        assert_eq!(h.ebit, 0);
+        assert_eq!(h.src, 0b010, "QCIF SRC code");
+        assert!(!h.pb_frames);
+        assert!(!h.umv && !h.sac && !h.advanced_prediction);
+        assert_eq!((h.dbq, h.trb, h.tr), (0, 0, 0));
+        saw_intra |= !h.inter;
+        saw_inter |= h.inter;
+    }
+    assert!(saw_intra && saw_inter);
+
+    let rebuilt = depacketize_payloads_rfc2190(&payloads).expect("depacketize 2190");
+    assert_eq!(rebuilt, stream);
+}
+
+/// RFC 2190 Mode A PB-frames: the DBQ / TRB / TR header fields mirror
+/// the §5.1.22 / §5.1.23 picture-header fields of a PB-picture, and
+/// oversized single segments (Mode B territory) are refused rather
+/// than mis-packetized.
+#[test]
+fn rfc2190_mode_a_pb_fields_and_mode_b_refusal() {
+    use oxideav_h263::encoder::{encode_intra_picture, encode_pb_picture, PbConfig};
+    use oxideav_h263::picture::decode_picture_no_gob0_header;
+    use oxideav_h263::rtp::{
+        depacketize_payloads_rfc2190, packetize_stream_rfc2190, parse_rfc2190_mode_a,
+    };
+
+    let f0 = gradient(128, 96, 0);
+    let f1 = gradient(128, 96, 4);
+    let f2 = gradient(128, 96, 8);
+    let i_bytes = encode_intra_picture(&f0, 6, 0).expect("I");
+    let anchor =
+        decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).expect("dec I");
+    let pb = encode_pb_picture(
+        &f2,
+        &f1,
+        &anchor,
+        /* tr_p */ 8,
+        /* prev_tr */ 0,
+        &PbConfig {
+            quant: 6,
+            dbquant: 1,
+            trb: 4,
+            search_half: 4,
+        },
+    )
+    .expect("PB");
+
+    let payloads = packetize_stream_rfc2190(
+        &pb,
+        PacketizeConfig {
+            max_payload: 65_000,
+            ..PacketizeConfig::default()
+        },
+    )
+    .expect("packetize PB");
+    assert_eq!(payloads.len(), 1);
+    let (h, _) = parse_rfc2190_mode_a(&payloads[0]).unwrap();
+    assert!(h.pb_frames && h.inter);
+    assert_eq!(h.dbq, 1);
+    assert_eq!(h.trb, 4);
+    assert_eq!(h.tr, 8);
+    assert_eq!(depacketize_payloads_rfc2190(&payloads).unwrap(), pb);
+
+    // A single-segment picture larger than the budget cannot be cut at
+    // a Mode A boundary: Mode B is unstaged, refuse.
+    assert!(matches!(
+        packetize_stream_rfc2190(
+            &pb,
+            PacketizeConfig {
+                max_payload: 64,
+                ..PacketizeConfig::default()
+            },
+        ),
+        Err(oxideav_h263::Error::NotImplemented)
+    ));
+
+    // H.263+ (PLUSPTYPE) streams are refused on the legacy format.
+    let plus = oxideav_h263::encoder::encode_intra_picture_plus(&f0, 6, 0).expect("plus I");
+    assert!(matches!(
+        packetize_stream_rfc2190(&plus, PacketizeConfig::default()),
+        Err(oxideav_h263::Error::NotImplemented)
+    ));
 }

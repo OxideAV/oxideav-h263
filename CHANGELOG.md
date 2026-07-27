@@ -109,6 +109,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   with the primary header (baseline + H.263+ slice streams), with
   reassembly still byte-exact.
 
+- **RFC 2190 legacy `video/H263` Mode A** (round 432): the four-byte
+  §5.1 Mode A payload header (write + parse; Mode B/C recognised and
+  refused), `packetize_stream_rfc2190` (GOB/picture-boundary-only
+  cuts with the start code carried in full, per-picture
+  `SRC`/`I`/`U`/`S`/`A` PTYPE mirrors and PB-frame `DBQ`/`TRB`/`TR`
+  fields extracted from each picture header, H.263+ and oversized
+  Mode-B-territory segments refused) and
+  `depacketize_payloads_rfc2190`. Both packetizers (RFC 4629 and
+  2190) now enforce the **hard picture-boundary rule** — a packet
+  never runs past the next PSC / EOS, so every coded frame begins
+  its own segment packet (RFC 4629 §7 / §6.1.3) — with a test
+  asserting PSC-count == picture-packet-count on every split.
+
 ### Fixed
 
 - **§F.2 intra-macroblock candidate predictors, decoder** (round 384):

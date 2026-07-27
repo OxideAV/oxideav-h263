@@ -397,14 +397,32 @@ pub fn packetize_stream(stream: &[u8], cfg: PacketizeConfig) -> Result<Vec<Vec<u
         // Data to emit for this packet: on a boundary the two zero
         // bytes are stripped and represented by P=1.
         let data_start = if at_boundary { pos + 2 } else { pos };
-        let max_end = (data_start + budget).min(stream.len());
+        // §7 — "every start of a coded frame has to be encapsulated as
+        // a picture segment packet": a packet must never run past the
+        // next Picture Start Code, which must itself begin a packet.
+        // The same hard stop applies before an EOS / EOSBS
+        // sequence-ending packet (§6.1.3 — no Picture / GOB / Slice
+        // start codes in the same packet as an EOS).
+        let hard_stop = boundaries[boundary_idx..]
+            .iter()
+            .copied()
+            .filter(|&b| b > pos)
+            .find(|&b| {
+                matches!(
+                    start_code_kind(stream, b),
+                    StartCodeKind::Picture | StartCodeKind::SequenceEnd
+                )
+            })
+            .unwrap_or(stream.len());
+        let max_end = (data_start + budget).min(hard_stop);
 
         // Preferred cut: the last start-code boundary in
-        // `(data_start, max_end]`... a boundary *at* data_start would
-        // yield an empty packet, so it must be strictly beyond.
+        // `(data_start, max_end]` (a boundary *at* data_start would
+        // yield an empty packet, so it must be strictly beyond); the
+        // hard stop itself is a boundary (or the stream end).
         let mut cut = max_end;
-        let mut next_at_boundary = false;
-        if max_end < stream.len() {
+        let mut next_at_boundary = max_end == hard_stop && hard_stop < stream.len();
+        if max_end < hard_stop {
             let candidate = boundaries[boundary_idx..]
                 .iter()
                 .copied()
@@ -415,9 +433,6 @@ pub fn packetize_stream(stream: &[u8], cfg: PacketizeConfig) -> Result<Vec<Vec<u
                 cut = b;
                 next_at_boundary = true;
             }
-        } else {
-            // Final packet: runs to the end of the stream.
-            cut = stream.len();
         }
 
         let (extra_picture_header, pebit) = extra.unwrap_or((Vec::new(), 0));
@@ -485,6 +500,301 @@ where
             // §6.1 — re-synthesise the two stripped zero bytes.
             stream.push(0);
             stream.push(0);
+        }
+        stream.extend_from_slice(&payload[offset..]);
+    }
+    Ok(stream)
+}
+
+// ---------------------------------------------------------------------
+// RFC 2190 — the legacy `video/H263` payload format.
+// ---------------------------------------------------------------------
+
+/// Length in bytes of the RFC 2190 §5.1 Mode A payload header.
+pub const RFC2190_MODE_A_BYTES: usize = 4;
+
+/// RFC 2190 §5.1 — the four-byte **Mode A** payload header of the
+/// legacy `video/H263` payload format (`F = 0`).
+///
+/// Mode A packets start at a Picture or GOB boundary and carry the
+/// start code **in full** (no leading-zero-byte stripping — that is an
+/// RFC 2429/4629 mechanism). The `SRC` / `I` / `U` / `S` / `A` fields
+/// mirror PTYPE bits 6-13 of the current picture header, and `DBQ` /
+/// `TRB` / `TR` mirror the §5.1.23 / §5.1.22 / §5.1.2 fields when the
+/// PB-frames option is in use (zero otherwise).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rfc2190ModeA {
+    /// `P` — the picture is coded with the PB-frames option.
+    pub pb_frames: bool,
+    /// `SBIT` — most-significant bits to ignore in the first data byte.
+    pub sbit: u8,
+    /// `EBIT` — least-significant bits to ignore in the last data byte.
+    pub ebit: u8,
+    /// `SRC` — PTYPE bits 6-8 (the §5.1.3 source-format code).
+    pub src: u8,
+    /// `I` — PTYPE bit 9: `false` intra-coded, `true` inter-coded.
+    pub inter: bool,
+    /// `U` — PTYPE bit 10 (Annex D Unrestricted Motion Vectors).
+    pub umv: bool,
+    /// `S` — PTYPE bit 11 (Annex E Syntax-based Arithmetic Coding).
+    pub sac: bool,
+    /// `A` — PTYPE bit 12 (Annex F Advanced Prediction).
+    pub advanced_prediction: bool,
+    /// `DBQ` — §5.1.23 DBQUANT (zero when PB-frames is off).
+    pub dbq: u8,
+    /// `TRB` — §5.1.22 Temporal Reference for the B-part (zero when
+    /// PB-frames is off).
+    pub trb: u8,
+    /// `TR` — §5.1.2 Temporal Reference of the (P-)picture (zero when
+    /// PB-frames is off, per RFC 2190 §5.1).
+    pub tr: u8,
+}
+
+/// Serialize an RFC 2190 §5.1 Mode A payload header (4 bytes, `F = 0`).
+pub fn write_rfc2190_mode_a(out: &mut Vec<u8>, h: &Rfc2190ModeA) -> Result<()> {
+    if h.sbit > 7 || h.ebit > 7 || h.src > 7 || h.dbq > 3 || h.trb > 7 {
+        return Err(Error::RtpBadPayloadHeader);
+    }
+    // Word layout: F(1)=0 P(1) SBIT(3) EBIT(3) SRC(3) I(1) U(1) S(1)
+    // A(1) R(4)=0 DBQ(2) TRB(3) TR(8).
+    let mut word: u32 = 0;
+    if h.pb_frames {
+        word |= 1 << 30;
+    }
+    word |= (h.sbit as u32) << 27;
+    word |= (h.ebit as u32) << 24;
+    word |= (h.src as u32) << 21;
+    if h.inter {
+        word |= 1 << 20;
+    }
+    if h.umv {
+        word |= 1 << 19;
+    }
+    if h.sac {
+        word |= 1 << 18;
+    }
+    if h.advanced_prediction {
+        word |= 1 << 17;
+    }
+    word |= (h.dbq as u32) << 11;
+    word |= (h.trb as u32) << 8;
+    word |= h.tr as u32;
+    out.extend_from_slice(&word.to_be_bytes());
+    Ok(())
+}
+
+/// Parse an RFC 2190 payload header from the front of `payload`,
+/// returning the Mode A fields and the data offset.
+///
+/// Mode B (`F = 1, P = 0`) and Mode C (`F = 1, P = 1`) headers — the
+/// macroblock-boundary fragmentation forms — are recognised but not
+/// staged ([`Error::NotImplemented`]): this crate's packetizer never
+/// fragments below GOB granularity on the legacy format.
+pub fn parse_rfc2190_mode_a(payload: &[u8]) -> Result<(Rfc2190ModeA, usize)> {
+    if payload.len() < RFC2190_MODE_A_BYTES {
+        return Err(Error::RtpTruncatedPacket);
+    }
+    let word = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if word & (1 << 31) != 0 {
+        // F = 1: Mode B / Mode C.
+        return Err(Error::NotImplemented);
+    }
+    Ok((
+        Rfc2190ModeA {
+            pb_frames: word & (1 << 30) != 0,
+            sbit: ((word >> 27) & 0b111) as u8,
+            ebit: ((word >> 24) & 0b111) as u8,
+            src: ((word >> 21) & 0b111) as u8,
+            inter: word & (1 << 20) != 0,
+            umv: word & (1 << 19) != 0,
+            sac: word & (1 << 18) != 0,
+            advanced_prediction: word & (1 << 17) != 0,
+            dbq: ((word >> 11) & 0b11) as u8,
+            trb: ((word >> 8) & 0b111) as u8,
+            tr: (word & 0xFF) as u8,
+        },
+        RFC2190_MODE_A_BYTES,
+    ))
+}
+
+/// The per-picture RFC 2190 Mode A header fields, extracted from a
+/// baseline picture header starting at `picture[0]` (byte-aligned
+/// PSC).
+///
+/// RFC 2190 predates H.263+; an extended-PTYPE (PLUSPTYPE) picture
+/// cannot be described by the `SRC`/`I`/`U`/`S`/`A` PTYPE mirror and
+/// yields [`Error::NotImplemented`] — use the RFC 4629 packetizer
+/// ([`packetize_stream`]) for H.263+ streams.
+fn rfc2190_fields_for_picture(picture: &[u8]) -> Result<Rfc2190ModeA> {
+    use crate::picture_header::{parse_picture_layer, H263PictureCodingType, H263PictureLayer};
+    use crate::plus_ptype::InheritedExtendedState;
+    use oxideav_core::bits::BitReader;
+
+    let mut r = BitReader::new(picture);
+    let header = match parse_picture_layer(&mut r, InheritedExtendedState::default())? {
+        H263PictureLayer::Baseline(h) => h,
+        H263PictureLayer::Extended(_) => return Err(Error::NotImplemented),
+    };
+    let src = match header.source_format {
+        crate::picture_header::H263SourceFormat::SubQcif => 0b001,
+        crate::picture_header::H263SourceFormat::Qcif => 0b010,
+        crate::picture_header::H263SourceFormat::Cif => 0b011,
+        crate::picture_header::H263SourceFormat::Cif4 => 0b100,
+        crate::picture_header::H263SourceFormat::Cif16 => 0b101,
+        crate::picture_header::H263SourceFormat::Reserved110 => 0b110,
+    };
+    // §5.1.19 PQUANT + §5.1.20 CPM (+ §5.1.21 PSBI) precede the
+    // PB-frame TRB / DBQUANT fields.
+    let (dbq, trb) = if header.pb_frames {
+        r.skip(5).map_err(|_| Error::UnexpectedEof)?;
+        let cpm = r.read_bit().map_err(|_| Error::UnexpectedEof)?;
+        if cpm {
+            r.skip(2).map_err(|_| Error::UnexpectedEof)?;
+        }
+        let trb = r.read_u32(3).map_err(|_| Error::UnexpectedEof)? as u8;
+        let dbq = r.read_u32(2).map_err(|_| Error::UnexpectedEof)? as u8;
+        (dbq, trb)
+    } else {
+        (0, 0)
+    };
+    Ok(Rfc2190ModeA {
+        pb_frames: header.pb_frames,
+        sbit: 0,
+        ebit: 0,
+        src,
+        inter: matches!(header.coding_type, H263PictureCodingType::Inter),
+        umv: header.umv_mode,
+        sac: header.sac_mode,
+        advanced_prediction: header.advanced_prediction,
+        dbq,
+        trb,
+        // RFC 2190 §5.1: TR is "set to zero if the PB-frames option is
+        // not used".
+        tr: if header.pb_frames {
+            header.temporal_reference
+        } else {
+            0
+        },
+    })
+}
+
+/// Packetize a **baseline** H.263 elementary stream into RFC 2190
+/// Mode A payloads (the legacy `video/H263` format).
+///
+/// Every packet begins at a byte-aligned Picture or GOB start code —
+/// carried in full, no byte stripping — and greedily extends to the
+/// last such boundary that fits `cfg.max_payload` (which includes the
+/// 4-byte Mode A header). The per-picture `SRC`/`I`/`U`/`S`/`A` and
+/// PB-frame `DBQ`/`TRB`/`TR` header fields are extracted from each
+/// picture header. `SBIT`/`EBIT` are always zero (this crate's
+/// encoders byte-align every GOB via GSTUF).
+///
+/// # Errors
+///
+/// * [`Error::RtpPayloadTooSmall`] — the budget cannot hold the Mode A
+///   header plus one bitstream byte.
+/// * [`Error::BadPictureStartCode`] — the stream does not begin with a
+///   byte-aligned start code.
+/// * [`Error::NotImplemented`] — an extended-PTYPE (H.263+) picture
+///   (RFC 2190 predates PLUSPTYPE — use [`packetize_stream`]), or a
+///   Picture/GOB segment larger than the budget (Mode B macroblock
+///   fragmentation is not staged).
+pub fn packetize_stream_rfc2190(stream: &[u8], cfg: PacketizeConfig) -> Result<Vec<Vec<u8>>> {
+    if cfg.max_payload < RFC2190_MODE_A_BYTES + 1 {
+        return Err(Error::RtpPayloadTooSmall);
+    }
+    if stream.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !is_start_code_at(stream, 0) {
+        return Err(Error::BadPictureStartCode);
+    }
+
+    let mut boundaries: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i + 3 <= stream.len() {
+        if is_start_code_at(stream, i) {
+            boundaries.push(i);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    let budget = cfg.max_payload - RFC2190_MODE_A_BYTES;
+    let mut payloads = Vec::new();
+    let mut fields: Option<Rfc2190ModeA> = None;
+    let mut pos = 0usize;
+    let mut boundary_idx = 0usize;
+
+    while pos < stream.len() {
+        // Refresh the per-picture fields at every PSC.
+        if start_code_kind(stream, pos) == StartCodeKind::Picture {
+            fields = Some(rfc2190_fields_for_picture(&stream[pos..])?);
+        }
+        let fields = fields.ok_or(Error::BadPictureStartCode)?;
+
+        // A packet never runs past the next Picture Start Code: the
+        // per-picture header fields (SRC / I / TR ...) describe one
+        // picture, so every PSC starts a fresh packet.
+        let hard_stop = boundaries[boundary_idx..]
+            .iter()
+            .copied()
+            .filter(|&b| b > pos)
+            .find(|&b| {
+                matches!(
+                    start_code_kind(stream, b),
+                    StartCodeKind::Picture | StartCodeKind::SequenceEnd
+                )
+            })
+            .unwrap_or(stream.len());
+        let max_end = (pos + budget).min(hard_stop);
+        let cut = if max_end == hard_stop {
+            hard_stop
+        } else {
+            // Mode A: the cut must land on a Picture/GOB boundary.
+            boundaries[boundary_idx..]
+                .iter()
+                .copied()
+                .take_while(|&b| b <= max_end)
+                .filter(|&b| b > pos)
+                .last()
+                .ok_or(Error::NotImplemented)?
+        };
+
+        let mut packet = Vec::with_capacity(RFC2190_MODE_A_BYTES + (cut - pos));
+        write_rfc2190_mode_a(&mut packet, &fields)?;
+        packet.extend_from_slice(&stream[pos..cut]);
+        payloads.push(packet);
+
+        pos = cut;
+        while boundary_idx < boundaries.len() && boundaries[boundary_idx] < pos {
+            boundary_idx += 1;
+        }
+    }
+
+    Ok(payloads)
+}
+
+/// Reassemble an H.263 elementary stream from RFC 2190 Mode A
+/// payloads (in transmission order, losslessly received) — the inverse
+/// of [`packetize_stream_rfc2190`].
+///
+/// Non-zero `SBIT` / `EBIT` (bit-granular GOB boundaries) are refused
+/// with [`Error::NotImplemented`]: this crate's encoders byte-align
+/// every GOB, so its own packetizer never produces them, and a
+/// bit-shifting reassembler is unstaged.
+pub fn depacketize_payloads_rfc2190<I, B>(payloads: I) -> Result<Vec<u8>>
+where
+    I: IntoIterator<Item = B>,
+    B: AsRef<[u8]>,
+{
+    let mut stream = Vec::new();
+    for payload in payloads {
+        let payload = payload.as_ref();
+        let (header, offset) = parse_rfc2190_mode_a(payload)?;
+        if header.sbit != 0 || header.ebit != 0 {
+            return Err(Error::NotImplemented);
         }
         stream.extend_from_slice(&payload[offset..]);
     }

@@ -69,11 +69,14 @@ The **`rtp` module** stages the RFC 4629 RTP payload format: the
 §5.1 `RR|P|V|PLEN|PEBIT` payload header + §5.2 VRC extension,
 `packetize_stream` (P=1 segment packets at byte-aligned
 PSC/GBSC/SSC/EOS with the two zero bytes stripped, budget-aware
-last-boundary cuts, §6.2 Follow-on fallback, optional §6.1.2
-redundant picture-header attachment with exact PEBIT) and
-`depacketize_payloads` (byte-exact reassembly) — validated over
-crate-encoded GOP/GOB/slice streams and the vendored conformance
-fixtures across payload budgets from 32 to 4096 bytes.
+last-boundary cuts honouring the §7 every-PSC-starts-a-packet rule,
+§6.2 Follow-on fallback, optional §6.1.2 redundant picture-header
+attachment with exact PEBIT) and `depacketize_payloads` (byte-exact
+reassembly) — validated over crate-encoded GOP/GOB/slice streams and
+the vendored conformance fixtures across payload budgets from 32 to
+4096 bytes. The RFC 2190 legacy `video/H263` **Mode A** header +
+packetizer/depacketizer (full start codes, per-picture PTYPE-mirror
+fields, PB-frame DBQ/TRB/TR) cover the pre-H.263+ interop case.
 
 `register()` is currently a no-op pending a frame-yielding
 `oxideav_core::Decoder` adapter — callers drive the decoder through the
@@ -427,10 +430,13 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   (only whole AIC I-pictures encode so far); rate control
   beyond the per-MB DQUANT / per-GOB GQUANT / per-slice SQUANT /
   per-MB INTRA_MODE primitives.
-* RTP: the RFC 2190 legacy (`video/H263`) Mode A / B / C payload
-  headers (the staged RFC 4629 `video/H263-1998` format is
-  implemented); RTP transport-header (RFC 3550) concerns
-  (sequencing, timestamps, marker bit) stay caller-side.
+* RTP: the RFC 2190 legacy Mode B / C macroblock-boundary
+  fragmentation headers (Mode A and the RFC 4629 `video/H263-1998`
+  format are implemented; a legacy segment larger than the payload
+  budget is refused rather than Mode-B-fragmented); non-byte-aligned
+  GOB boundaries (SBIT/EBIT are always emitted zero); RTP
+  transport-header (RFC 3550) concerns (sequencing, timestamps,
+  marker bit) stay caller-side.
 * `oxideav_core::Decoder` registration; `register()` is a no-op
   pending a frame-yielding decoder adapter.
 
