@@ -340,8 +340,8 @@ pub use scal_upsample::{
 };
 pub use slice_header::{
     parse_first_slice_header, parse_slice_layer, skip_sstuf, skip_sstuf_at, ssbi_to_subbitstream,
-    FirstSliceLayer, SliceHeaderContext, SliceLayer, SEPB_BITS, SQUANT_BITS, SSBI_BITS, SSC_BITS,
-    SSC_VALUE, SSTUF_MAX_BITS,
+    write_first_slice_header, write_slice_layer, FirstSliceLayer, SliceHeaderContext, SliceLayer,
+    SEPB_BITS, SQUANT_BITS, SSBI_BITS, SSC_BITS, SSC_VALUE, SSTUF_MAX_BITS,
 };
 
 /// Crate-local error type. The orphan-rebuild scaffold returns

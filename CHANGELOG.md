@@ -33,6 +33,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   two header forms and drive a mixed H.263+ I + P + UMV-P elementary
   stream end-to-end.
 
+- **§K.2 slice-header writers, encoder** (round 432):
+  `slice_header::write_first_slice_header` (reduced form — SEPB1 +
+  MBA + conditional SEPB2/SWI + SEPB3) and
+  `slice_header::write_slice_layer` (SSTUF byte alignment + SSC +
+  SEPB1 + MBA + conditional SEPB2 + SQUANT + conditional SWI + SEPB3
+  + GFID) are the exact inverses of the Annex K parsers, with
+  writer-side §K.2.5 MBA / §K.2.7 SQUANT / §K.2.8 SWI range
+  validation. Round-trip tests cover all five standard formats, all
+  eight SSTUF alignments, the 16CIF SEPB2-mandatory case and the
+  Rectangular-Slice SWI form.
+
 ### Fixed
 
 - **§F.2 intra-macroblock candidate predictors, decoder** (round 384):

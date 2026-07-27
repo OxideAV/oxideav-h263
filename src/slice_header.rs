@@ -70,7 +70,7 @@
 //!   we do not yet validate any picture-level RRU flag; the caller
 //!   chooses the column.
 
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 
 use crate::picture::PictureLayout;
 use crate::picture_header::H263SourceFormat;
@@ -663,6 +663,144 @@ pub fn parse_first_slice_header(
         swi_actual_width,
         header_bits: bits,
     })
+}
+
+/// Validate the encoder-side MBA / SWI arguments shared by the two
+/// slice-header writers: MBA against the §K.2.5 Table-K.2 range and the
+/// SWI presence/range against the §K.2.8 Rectangular-Slice gate.
+///
+/// Returns `(mba_width, swi)` where `swi` is `Some((swi_width, raw))`
+/// when the Rectangular Slice submode is in effect (`raw` is the
+/// on-wire `actual_width - 1` value).
+fn check_writer_fields(
+    ctx: &SliceHeaderContext,
+    mba: u32,
+    swi_actual_width: Option<u32>,
+) -> Result<(u32, Option<(u32, u32)>)> {
+    let mba_width = ctx
+        .mba_field_width()
+        .ok_or(Error::UnsupportedPictureGeometry)?;
+    let mba_max = ctx
+        .mba_max_value()
+        .ok_or(Error::UnsupportedPictureGeometry)?;
+    if mba > mba_max {
+        return Err(Error::SliceMbaOutOfRange);
+    }
+    let swi = match (ctx.swi_field_width(), swi_actual_width) {
+        // §K.2.8 — SWI on the wire iff Rectangular Slice submode.
+        (Some(swi_width), Some(actual_width)) => {
+            let mbs_per_row = ctx.picture_width.div_ceil(16);
+            if actual_width == 0 || actual_width > mbs_per_row {
+                return Err(Error::SliceSwiOutOfRange);
+            }
+            Some((swi_width, actual_width - 1))
+        }
+        (None, None) => None,
+        // Caller supplied a width without the RS submode (or vice
+        // versa) — the header cannot carry it.
+        _ => Err(Error::SliceSwiOutOfRange)?,
+    };
+    Ok((mba_width, swi))
+}
+
+/// Write the §K.2 reduced-form header for the slice that immediately
+/// follows the Picture Start Code — the exact inverse of
+/// [`parse_first_slice_header`].
+///
+/// Emits SEPB1 (`"1"`), the Table-K.2-width MBA, SEPB2 (`"1"`, iff the
+/// Rectangular Slice submode is in use, §K.2.6 last sentence), SWI
+/// (iff RS submode; `swi_actual_width` is the slice width in
+/// macroblocks, emitted as `SWI = width - 1` per §K.2.8) and SEPB3
+/// (`"1"`). No SSTUF/SSC precede it (§K.2.2: the first slice carries
+/// no start code — the picture header's PSTUF already aligned that
+/// boundary) and no SQUANT (the slice runs at the §5.1.19 PQUANT).
+///
+/// # Errors
+///
+/// * [`Error::UnsupportedPictureGeometry`] — the context's picture
+///   size resolves no Table-K.2 MBA width.
+/// * [`Error::SliceMbaOutOfRange`] — `mba` exceeds the §K.2.5 maximum.
+/// * [`Error::SliceSwiOutOfRange`] — `swi_actual_width` is
+///   inconsistent with the context's Rectangular-Slice submode or
+///   exceeds the picture's macroblocks-per-row.
+pub fn write_first_slice_header(
+    w: &mut BitWriter,
+    ctx: &SliceHeaderContext,
+    mba: u32,
+    swi_actual_width: Option<u32>,
+) -> Result<()> {
+    let (mba_width, swi) = check_writer_fields(ctx, mba, swi_actual_width)?;
+    // §K.2.3 — SEPB1.
+    w.write_bit(true);
+    // §K.2.5 — MBA.
+    w.write_bits(mba, mba_width);
+    // §K.2.6 — SEPB2, iff Rectangular Slice submode (first-slice rule).
+    if ctx.rectangular_slices {
+        w.write_bit(true);
+    }
+    // §K.2.8 — SWI.
+    if let Some((swi_width, raw)) = swi {
+        w.write_bits(raw, swi_width);
+    }
+    // §K.2.9 — SEPB3.
+    w.write_bit(true);
+    Ok(())
+}
+
+/// Write a non-first §K.2 slice-layer header — the exact inverse of
+/// [`parse_slice_layer`] — preceded by the §K.2.1 SSTUF zero-stuffing
+/// that byte-aligns the SSC.
+///
+/// Emits SSTUF (zero bits to the next byte boundary), the 17-bit SSC,
+/// SEPB1 (`"1"`), the Table-K.2-width MBA, SEPB2 (`"1"`, iff
+/// [`SliceHeaderContext::sepb2_present`]), the 5-bit SQUANT, SWI (iff
+/// the Rectangular Slice submode is in use), SEPB3 (`"1"`) and the
+/// 2-bit GFID. SSBI is not emitted (CPM = "1" contexts are rejected —
+/// the crate's decoder refuses CPM streams).
+///
+/// # Errors
+///
+/// The union of [`write_first_slice_header`]'s, plus
+/// [`Error::InvalidQuantiser`] for `squant` outside `1..=31` and
+/// [`Error::NotImplemented`] for a CPM context (SSBI unstaged).
+pub fn write_slice_layer(
+    w: &mut BitWriter,
+    ctx: &SliceHeaderContext,
+    mba: u32,
+    squant: u8,
+    gfid: u8,
+    swi_actual_width: Option<u32>,
+) -> Result<()> {
+    if ctx.cpm {
+        return Err(Error::NotImplemented);
+    }
+    if squant == 0 || squant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let (mba_width, swi) = check_writer_fields(ctx, mba, swi_actual_width)?;
+    // §K.2.1 — SSTUF: zero bits until the SSC is byte aligned.
+    w.align_to_byte_zero();
+    // §K.2.2 — SSC.
+    w.write_bits(SSC_VALUE, SSC_BITS);
+    // §K.2.3 — SEPB1.
+    w.write_bit(true);
+    // §K.2.5 — MBA (no SSBI: CPM = 0).
+    w.write_bits(mba, mba_width);
+    // §K.2.6 — SEPB2, conditionally present.
+    if ctx.sepb2_present() {
+        w.write_bit(true);
+    }
+    // §K.2.7 — SQUANT.
+    w.write_bits(squant as u32, SQUANT_BITS);
+    // §K.2.8 — SWI.
+    if let Some((swi_width, raw)) = swi {
+        w.write_bits(raw, swi_width);
+    }
+    // §K.2.9 — SEPB3.
+    w.write_bit(true);
+    // §5.2.5 — GFID.
+    w.write_bits(gfid as u32 & 0b11, GFID_BITS);
+    Ok(())
 }
 
 /// `true` iff `raw` is one of the four Table K.1 legal SSBI codewords.
@@ -1403,5 +1541,149 @@ mod tests {
         let (skipped, bit_pos) = skip_sstuf_at(&data, 0, 0).expect("aligned");
         assert_eq!(skipped, 0);
         assert_eq!(bit_pos, 0);
+    }
+
+    // --- §K.2 slice-header writers (encoder side) ---
+
+    /// The reduced first-slice writer is the exact inverse of
+    /// `parse_first_slice_header` for every standard format.
+    #[test]
+    fn write_first_slice_header_round_trips() {
+        for fmt in [
+            H263SourceFormat::SubQcif,
+            H263SourceFormat::Qcif,
+            H263SourceFormat::Cif,
+            H263SourceFormat::Cif4,
+            H263SourceFormat::Cif16,
+        ] {
+            let ctx = SliceHeaderContext::for_standard_format(fmt).unwrap();
+            let mba = ctx.mba_max_value().unwrap() / 3;
+            let mut w = BitWriter::new();
+            write_first_slice_header(&mut w, &ctx, mba, None).unwrap();
+            w.align_to_byte_zero();
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            let parsed = parse_first_slice_header(&mut r, &ctx).unwrap();
+            assert_eq!(parsed.mba, mba, "{fmt:?}");
+            assert_eq!(parsed.swi_actual_width, None);
+        }
+    }
+
+    /// The non-first slice writer (SSTUF + SSC + full header) is the
+    /// exact inverse of `skip_sstuf` + `parse_slice_layer`, from every
+    /// starting bit offset within a byte (exercising all SSTUF widths).
+    #[test]
+    fn write_slice_layer_round_trips_at_every_alignment() {
+        let ctx = ctx_qcif();
+        for lead_bits in 0..8u32 {
+            let mut w = BitWriter::new();
+            // Simulate preceding macroblock data ending mid-byte: `1`
+            // bits so a mis-read would corrupt the parse.
+            for _ in 0..lead_bits {
+                w.write_bit(true);
+            }
+            write_slice_layer(&mut w, &ctx, 33, 17, 0b10, None).unwrap();
+            w.align_to_byte_zero();
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            for _ in 0..lead_bits {
+                assert!(r.read_bit().unwrap());
+            }
+            let skipped = skip_sstuf(&mut r).unwrap();
+            assert_eq!(skipped, (8 - lead_bits) % 8);
+            let parsed = parse_slice_layer(&mut r, &ctx).unwrap();
+            assert_eq!(parsed.mba, 33);
+            assert_eq!(parsed.squant, 17);
+            assert_eq!(parsed.gfid, 0b10);
+            assert_eq!(parsed.ssbi, None);
+            assert_eq!(parsed.swi_actual_width, None);
+        }
+    }
+
+    /// 16CIF has a 13-bit MBA field (> 11), so §K.2.6 places SEPB2 on
+    /// the wire in non-first headers; the writer emits it and the
+    /// parser consumes it.
+    #[test]
+    fn write_slice_layer_emits_sepb2_for_16cif() {
+        let ctx = ctx_16cif();
+        assert!(ctx.sepb2_present());
+        let mut w = BitWriter::new();
+        write_slice_layer(&mut w, &ctx, 6000, 31, 3, None).unwrap();
+        w.align_to_byte_zero();
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        skip_sstuf(&mut r).unwrap();
+        let parsed = parse_slice_layer(&mut r, &ctx).unwrap();
+        assert_eq!(parsed.mba, 6000);
+        assert_eq!(parsed.squant, 31);
+        assert_eq!(parsed.gfid, 3);
+    }
+
+    /// Rectangular Slice submode: both writers emit SWI (`width - 1`)
+    /// and the first-slice form adds the RS-mandated SEPB2; the parsers
+    /// recover the actual width.
+    #[test]
+    fn writers_round_trip_rectangular_swi() {
+        let mut ctx = ctx_cif();
+        ctx.rectangular_slices = true;
+        // First slice, 8 MBs wide.
+        let mut w = BitWriter::new();
+        write_first_slice_header(&mut w, &ctx, 0, Some(8)).unwrap();
+        w.align_to_byte_zero();
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let first = parse_first_slice_header(&mut r, &ctx).unwrap();
+        assert_eq!(first.mba, 0);
+        assert_eq!(first.swi_actual_width, Some(8));
+        // Non-first slice, 22 MBs wide (full row width).
+        let mut w = BitWriter::new();
+        write_slice_layer(&mut w, &ctx, 100, 4, 1, Some(22)).unwrap();
+        w.align_to_byte_zero();
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        skip_sstuf(&mut r).unwrap();
+        let parsed = parse_slice_layer(&mut r, &ctx).unwrap();
+        assert_eq!(parsed.mba, 100);
+        assert_eq!(parsed.swi_actual_width, Some(22));
+    }
+
+    /// Writer-side range and consistency validation.
+    #[test]
+    fn writers_reject_bad_fields() {
+        let ctx = ctx_qcif();
+        let mut w = BitWriter::new();
+        // MBA beyond the 99-MB QCIF grid.
+        assert!(matches!(
+            write_first_slice_header(&mut w, &ctx, 99, None),
+            Err(Error::SliceMbaOutOfRange)
+        ));
+        // SQUANT = 0.
+        assert!(matches!(
+            write_slice_layer(&mut w, &ctx, 1, 0, 0, None),
+            Err(Error::InvalidQuantiser)
+        ));
+        // SWI supplied without the Rectangular Slice submode.
+        assert!(matches!(
+            write_slice_layer(&mut w, &ctx, 1, 8, 0, Some(4)),
+            Err(Error::SliceSwiOutOfRange)
+        ));
+        // RS submode but SWI missing / too wide.
+        let mut rs = ctx;
+        rs.rectangular_slices = true;
+        assert!(matches!(
+            write_slice_layer(&mut w, &rs, 1, 8, 0, None),
+            Err(Error::SliceSwiOutOfRange)
+        ));
+        assert!(matches!(
+            write_slice_layer(&mut w, &rs, 1, 8, 0, Some(12)),
+            Err(Error::SliceSwiOutOfRange)
+        ));
+        // CPM contexts are unstaged on the writer (SSBI).
+        let mut cpm = ctx;
+        cpm.cpm = true;
+        assert!(matches!(
+            write_slice_layer(&mut w, &cpm, 1, 8, 0, None),
+            Err(Error::NotImplemented)
+        ));
     }
 }
