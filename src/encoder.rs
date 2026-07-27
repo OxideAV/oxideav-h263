@@ -421,6 +421,47 @@ pub fn encode_intra_picture(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u
     Ok(w.finish())
 }
 
+/// Encode a planar 4:2:0 [`YuvFrame`] as an **extended-PTYPE (H.263+)
+/// INTRA** picture: the §5.1.4 PLUSPTYPE header (UFEP `"001"`, no
+/// optional modes) followed by the same single-segment §5.2.2
+/// macroblock stream [`encode_intra_picture`] emits.
+///
+/// The output is self-describing on the wire and decodes through
+/// [`crate::picture::decode_picture_layer`] and
+/// [`crate::picture::decode_sequence`] (extended-PTYPE dispatch) with
+/// `DecodeOptions::default()`.
+pub fn encode_intra_picture_plus(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ false,
+        PlusModes::default(),
+    )?;
+
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let mb = extract_macroblock(frame, mb_col, mb_row);
+            encode_intra_macroblock(
+                &mut w, &mb, quant, /* write_cod */ false, /* picture_is_inter */ false,
+            )?;
+        }
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
 /// Encoder-side mirror of the decoder's `AicState` §I.3 neighbour grid,
 /// for a **single video picture segment** (a header-less I-picture, so
 /// every already-encoded in-bounds block is an available `RecA'` /
@@ -750,7 +791,7 @@ pub fn encode_intra_picture_aic(
     tr: u8,
     mode: IntraMode,
 ) -> Result<Vec<u8>> {
-    encode_intra_picture_aic_core(frame, quant, tr, Some(mode), false)
+    encode_intra_picture_aic_core(frame, quant, tr, Some(mode), false, /* plus */ false)
 }
 
 /// Encode a planar 4:2:0 [`YuvFrame`] as an Annex I **Advanced INTRA
@@ -764,7 +805,7 @@ pub fn encode_intra_picture_aic(
 /// video-picture segment, closed-loop neighbour reconstruction, decode
 /// with `DecodeOptions { aic: true, .. }`).
 pub fn encode_intra_picture_aic_auto(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
-    encode_intra_picture_aic_core(frame, quant, tr, None, false)
+    encode_intra_picture_aic_core(frame, quant, tr, None, false, /* plus */ false)
 }
 
 /// Encode an Annex I **Advanced INTRA Coding** picture with Annex T
@@ -776,22 +817,49 @@ pub fn encode_intra_picture_aic_auto(frame: &YuvFrame, quant: u8, tr: u8) -> Res
 /// The stream must be decoded with
 /// `DecodeOptions { aic: true, modified_quant: true, .. }` — neither §I
 /// nor §T is signalled on the baseline PTYPE wire (both are H.263+
-/// PLUSPTYPE-gated modes; PLUSPTYPE emission is future work).
+/// PLUSPTYPE-gated modes; the on-wire form is
+/// [`encode_intra_picture_aic_mq_plus`]).
 pub fn encode_intra_picture_aic_mq(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
-    encode_intra_picture_aic_core(frame, quant, tr, None, true)
+    encode_intra_picture_aic_core(frame, quant, tr, None, true, /* plus */ false)
 }
 
-/// Shared body of the AIC INTRA picture encoders: baseline INTRA header,
-/// then an all-INTRA macroblock stream (single video-picture segment).
-/// `fixed_mode` selects a picture-wide INTRA_MODE or the per-macroblock
-/// rate decision (`None`); `modified_quant` activates Annex T (§T.3
-/// chroma `QUANT_C`, §T.4 EXTENDED-ESCAPE).
+/// Encode an Annex I **Advanced INTRA Coding** picture with the §I mode
+/// **signalled on the wire**: the §5.1.4 PLUSPTYPE header carries the
+/// OPPTYPE bit-8 AIC flag, so the stream is self-describing and decodes
+/// through [`crate::picture::decode_picture_layer`] /
+/// [`crate::picture::decode_sequence`] with `DecodeOptions::default()`
+/// (the decoder auto-activates §I from OPPTYPE). Uses the
+/// per-macroblock INTRA_MODE decision; the macroblock stream is
+/// bit-identical to [`encode_intra_picture_aic_auto`]'s.
+pub fn encode_intra_picture_aic_plus(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    encode_intra_picture_aic_core(frame, quant, tr, None, false, /* plus */ true)
+}
+
+/// Encode an Annex I **Advanced INTRA Coding** + Annex T **Modified
+/// Quantization** picture with both modes **signalled on the wire**
+/// (PLUSPTYPE OPPTYPE bits 8 and 14). Self-describing: decodes through
+/// [`crate::picture::decode_picture_layer`] /
+/// [`crate::picture::decode_sequence`] with `DecodeOptions::default()`.
+/// The macroblock stream is bit-identical to
+/// [`encode_intra_picture_aic_mq`]'s.
+pub fn encode_intra_picture_aic_mq_plus(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    encode_intra_picture_aic_core(frame, quant, tr, None, true, /* plus */ true)
+}
+
+/// Shared body of the AIC INTRA picture encoders: picture header
+/// (baseline PTYPE, or the §5.1.4 PLUSPTYPE form with the §I / §T mode
+/// bits when `plus` is set), then an all-INTRA macroblock stream
+/// (single video-picture segment). `fixed_mode` selects a picture-wide
+/// INTRA_MODE or the per-macroblock rate decision (`None`);
+/// `modified_quant` activates Annex T (§T.3 chroma `QUANT_C`, §T.4
+/// EXTENDED-ESCAPE).
 fn encode_intra_picture_aic_core(
     frame: &YuvFrame,
     quant: u8,
     tr: u8,
     fixed_mode: Option<IntraMode>,
     modified_quant: bool,
+    plus: bool,
 ) -> Result<Vec<u8>> {
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -813,15 +881,30 @@ fn encode_intra_picture_aic_core(
     };
 
     let mut w = BitWriter::new();
-    write_picture_header(
-        &mut w,
-        fmt,
-        quant,
-        tr,
-        /* is_inter */ false,
-        PtypeFlags::default(),
-        None,
-    );
+    if plus {
+        write_plus_picture_header(
+            &mut w,
+            fmt,
+            quant,
+            tr,
+            /* is_inter */ false,
+            PlusModes {
+                advanced_intra: true,
+                modified_quant,
+                ..PlusModes::default()
+            },
+        )?;
+    } else {
+        write_picture_header(
+            &mut w,
+            fmt,
+            quant,
+            tr,
+            /* is_inter */ false,
+            PtypeFlags::default(),
+            None,
+        );
+    }
 
     let mb_cols = frame.luma_width / 16;
     let mb_rows = frame.luma_height / 16;
@@ -1076,6 +1159,34 @@ pub fn encode_inter_picture_motion(
         search_half,
         /* umv */ false,
         /* gob_headers */ false,
+        /* plus */ false,
+    )
+}
+
+/// As [`encode_inter_picture_motion`], but with an **extended-PTYPE
+/// (H.263+) picture header**: the §5.1.4 PLUSPTYPE form (UFEP `"001"`,
+/// MPPTYPE picture type `"001"` P-picture, no optional modes) replaces
+/// the baseline PTYPE. Self-describing: decodes through
+/// [`crate::picture::decode_picture_layer`] /
+/// [`crate::picture::decode_sequence`] (extended-PTYPE dispatch) with
+/// `DecodeOptions::default()`; the macroblock stream is bit-identical
+/// to [`encode_inter_picture_motion`]'s.
+pub fn encode_inter_picture_plus(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+) -> Result<Vec<u8>> {
+    encode_inter_picture_motion_impl(
+        frame,
+        reference,
+        quant,
+        tr,
+        search_half,
+        /* umv */ false,
+        /* gob_headers */ false,
+        /* plus */ true,
     )
 }
 
@@ -1101,6 +1212,7 @@ pub fn encode_inter_picture_gobs(
         search_half,
         /* umv */ false,
         /* gob_headers */ true,
+        /* plus */ false,
     )
 }
 
@@ -1141,6 +1253,35 @@ pub fn encode_inter_picture_umv(
         search_half,
         /* umv */ true,
         /* gob_headers */ false,
+        /* plus */ false,
+    )
+}
+
+/// As [`encode_inter_picture_umv`], but with an **extended-PTYPE
+/// (H.263+) picture header**: the OPPTYPE bit-5 UMV flag signals Annex
+/// D on the wire and the §5.1.9 UUI codeword `"1"` selects the
+/// Tables-D.1/D.2 limited range (the crate's §D.2 `[-31.5, 31.5]`
+/// extended range). Self-describing: decodes through
+/// [`crate::picture::decode_picture_layer`] /
+/// [`crate::picture::decode_sequence`] with `DecodeOptions::default()`;
+/// the macroblock stream is bit-identical to
+/// [`encode_inter_picture_umv`]'s.
+pub fn encode_inter_picture_umv_plus(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+) -> Result<Vec<u8>> {
+    encode_inter_picture_motion_impl(
+        frame,
+        reference,
+        quant,
+        tr,
+        search_half,
+        /* umv */ true,
+        /* gob_headers */ false,
+        /* plus */ true,
     )
 }
 
@@ -1358,6 +1499,7 @@ pub fn encode_inter_picture_ap(
 /// differ only in the PTYPE bit-10 flag, the estimator range and the
 /// MVD derivation; `gob_headers` selects the §5.2 every-GOB-header
 /// stream shape (with the per-GOB predictor segmentation).
+#[allow(clippy::too_many_arguments)]
 fn encode_inter_picture_motion_impl(
     frame: &YuvFrame,
     reference: &YuvFrame,
@@ -1366,6 +1508,7 @@ fn encode_inter_picture_motion_impl(
     search_half: i32,
     umv: bool,
     gob_headers: bool,
+    plus: bool,
 ) -> Result<Vec<u8>> {
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -1377,18 +1520,32 @@ fn encode_inter_picture_motion_impl(
         source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
 
     let mut w = BitWriter::new();
-    write_picture_header(
-        &mut w,
-        fmt,
-        quant,
-        tr,
-        /* is_inter */ true,
-        PtypeFlags {
-            umv,
-            ..PtypeFlags::default()
-        },
-        None,
-    );
+    if plus {
+        write_plus_picture_header(
+            &mut w,
+            fmt,
+            quant,
+            tr,
+            /* is_inter */ true,
+            PlusModes {
+                umv,
+                ..PlusModes::default()
+            },
+        )?;
+    } else {
+        write_picture_header(
+            &mut w,
+            fmt,
+            quant,
+            tr,
+            /* is_inter */ true,
+            PtypeFlags {
+                umv,
+                ..PtypeFlags::default()
+            },
+            None,
+        );
+    }
 
     let lw = frame.luma_width;
     let lh = frame.luma_height;

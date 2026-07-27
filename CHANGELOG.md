@@ -20,6 +20,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   set, including all four SSS submode combinations and the
   PQUANT/PEI tail position.
 
+- **On-wire H.263+ picture encoders** (round 432):
+  `encode_intra_picture_plus`, `encode_intra_picture_aic_plus`,
+  `encode_intra_picture_aic_mq_plus`, `encode_inter_picture_plus` and
+  `encode_inter_picture_umv_plus` emit extended-PTYPE pictures whose
+  Annex I / T / D modes are signalled in OPPTYPE (+ §5.1.9 UUI), so
+  the streams are **self-describing**: they decode through
+  `decode_picture_layer` / `decode_sequence` with
+  `DecodeOptions::default()` — no caller-side option flags. The
+  macroblock streams are bit-identical to the baseline-PTYPE forms;
+  integration tests pin byte-exact reconstruction parity between the
+  two header forms and drive a mixed H.263+ I + P + UMV-P elementary
+  stream end-to-end.
+
 ### Fixed
 
 - **§F.2 intra-macroblock candidate predictors, decoder** (round 384):

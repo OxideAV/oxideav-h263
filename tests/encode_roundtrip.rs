@@ -433,3 +433,129 @@ fn aic_intra_sequence_decodes_all_frames() {
         assert!(mae < 10.0, "AIC sequence frame {i} luma MAE {mae}");
     }
 }
+
+/// An extended-PTYPE (PLUSPTYPE) INTRA picture from
+/// `encode_intra_picture_plus` is self-describing: it decodes through
+/// the wire-driven `decode_picture_layer` / `decode_sequence` entry
+/// points with `DecodeOptions::default()`, and reconstructs the exact
+/// same frame as the baseline-PTYPE form (the macroblock stream is
+/// bit-identical, only the header differs).
+#[test]
+fn plus_intra_picture_is_self_describing() {
+    use oxideav_h263::encoder::encode_intra_picture_plus;
+    use oxideav_h263::picture::decode_picture_layer;
+
+    let src = gradient(176, 144, 11);
+    let plus = encode_intra_picture_plus(&src, 6, 3).expect("encode plus I");
+    let base = encode_intra_picture(&src, 6, 3).expect("encode baseline I");
+
+    let from_plus =
+        decode_picture_layer(&plus, None, DecodeOptions::default()).expect("decode plus");
+    let from_base =
+        decode_picture_no_gob0_header(&base, None, DecodeOptions::default()).expect("decode base");
+    assert_eq!(from_plus.y, from_base.y);
+    assert_eq!(from_plus.cb, from_base.cb);
+    assert_eq!(from_plus.cr, from_base.cr);
+
+    // decode_sequence dispatches on the extended-PTYPE escape too.
+    let seq = decode_sequence(&plus, DecodeOptions::default()).expect("sequence");
+    assert_eq!(seq.len(), 1);
+    assert_eq!(seq[0].y, from_base.y);
+}
+
+/// The on-wire AIC form (`encode_intra_picture_aic_plus`) decodes with
+/// **default** options — the decoder activates §I from the OPPTYPE AIC
+/// bit — and reconstructs identically to the baseline-PTYPE AIC stream
+/// decoded with the explicit `aic` option.
+#[test]
+fn plus_aic_picture_signals_aic_on_the_wire() {
+    use oxideav_h263::encoder::encode_intra_picture_aic_plus;
+    use oxideav_h263::picture::decode_picture_layer;
+
+    let src = gradient(176, 144, 27);
+    let plus = encode_intra_picture_aic_plus(&src, 7, 0).expect("encode plus AIC");
+    let base = encode_intra_picture_aic_auto(&src, 7, 0).expect("encode baseline AIC");
+
+    let from_plus =
+        decode_picture_layer(&plus, None, DecodeOptions::default()).expect("decode plus AIC");
+    let from_base = decode_picture_no_gob0_header(
+        &base,
+        None,
+        DecodeOptions {
+            aic: true,
+            ..DecodeOptions::default()
+        },
+    )
+    .expect("decode base AIC");
+    assert_eq!(from_plus.y, from_base.y);
+    assert_eq!(from_plus.cb, from_base.cb);
+    assert_eq!(from_plus.cr, from_base.cr);
+    let mae = luma_mae(&src, &from_plus);
+    assert!(mae < 10.0, "plus-AIC luma MAE {mae}");
+}
+
+/// The on-wire AIC + Modified Quantization form
+/// (`encode_intra_picture_aic_mq_plus`) decodes with default options
+/// (§I + §T auto-activated from OPPTYPE bits 8/14), matching the
+/// explicit-options decode of the baseline-PTYPE form byte-exactly.
+#[test]
+fn plus_aic_mq_picture_signals_both_modes_on_the_wire() {
+    use oxideav_h263::encoder::encode_intra_picture_aic_mq_plus;
+    use oxideav_h263::picture::decode_picture_layer;
+
+    for &q in &[3u8, 12, 25] {
+        let src = gradient(176, 144, 4);
+        let plus = encode_intra_picture_aic_mq_plus(&src, q, 9).expect("encode plus AIC+MQ");
+        let base = encode_intra_picture_aic_mq(&src, q, 9).expect("encode baseline AIC+MQ");
+
+        let from_plus = decode_picture_layer(&plus, None, DecodeOptions::default())
+            .expect("decode plus AIC+MQ");
+        let from_base = decode_picture_no_gob0_header(
+            &base,
+            None,
+            DecodeOptions {
+                aic: true,
+                modified_quant: true,
+                ..DecodeOptions::default()
+            },
+        )
+        .expect("decode base AIC+MQ");
+        assert_eq!(from_plus.y, from_base.y, "q{q} luma mismatch");
+        assert_eq!(from_plus.cb, from_base.cb, "q{q} cb mismatch");
+        assert_eq!(from_plus.cr, from_base.cr, "q{q} cr mismatch");
+    }
+}
+
+/// A mixed extended-PTYPE elementary stream — H.263+ I-picture followed
+/// by H.263+ motion P-pictures (plain and Annex D UMV signalled via
+/// OPPTYPE + UUI) — decodes end-to-end through `decode_sequence` with
+/// default options, threading the reference across pictures.
+#[test]
+fn plus_inter_sequence_round_trips() {
+    use oxideav_h263::encoder::{
+        encode_inter_picture_plus, encode_inter_picture_umv_plus, encode_intra_picture_plus,
+    };
+
+    let f0 = gradient(176, 144, 0);
+    // Frame 1: shift the gradient (small motion).
+    let f1 = gradient(176, 144, 6);
+    // Frame 2: larger shift for the UMV picture.
+    let f2 = gradient(176, 144, 60);
+
+    let q = 6;
+    let i0 = encode_intra_picture_plus(&f0, q, 0).expect("I");
+    let r0 = decode_sequence(&i0, DecodeOptions::default()).expect("dec I")[0].clone();
+    let p1 = encode_inter_picture_plus(&f1, &r0, q, 1, 4).expect("P");
+    let mut stream = i0.clone();
+    stream.extend_from_slice(&p1);
+    let r1 = decode_sequence(&stream, DecodeOptions::default()).expect("dec I+P")[1].clone();
+    let p2 = encode_inter_picture_umv_plus(&f2, &r1, q, 2, 20).expect("UMV P");
+    stream.extend_from_slice(&p2);
+
+    let frames = decode_sequence(&stream, DecodeOptions::default()).expect("dec I+P+UMV");
+    assert_eq!(frames.len(), 3);
+    for (i, (src, dec)) in [&f0, &f1, &f2].iter().zip(frames.iter()).enumerate() {
+        let mae = luma_mae(src, dec);
+        assert!(mae < 8.0, "plus sequence frame {i} luma MAE {mae}");
+    }
+}
