@@ -57,6 +57,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   measurable fine/coarse error split (q=2 band MAE < 1.5 vs q=28
   band), and decode a two-picture slice-structured stream.
 
+- **Annex K + Annex I (+ Annex T) slice-structured AIC encoder**
+  (round 432): `encode_intra_picture_slices_aic` /
+  `encode_intra_picture_slices_aic_mq` encode the AIC (+ MQ) +
+  Slice-Structured mode set of the `advanced-intra-coding`
+  conformance fixture. The encoder-side `AicEncodeGrid` now records a
+  per-macroblock video-picture-segment id and collapses
+  cross-segment neighbours to unavailable, mirroring the decoder's
+  §I.3 page-78 per-segment availability rule — so every slice's
+  DC/AC prediction restarts exactly as the decoder expects. Tests:
+  single-slice form reconstructs byte-exactly equal to the
+  non-slice on-wire AIC encode, multi-slice AIC / AIC+MQ round-trips
+  at MAE < 3.0 across four slice heights, and a flat AIC+MQ
+  slice-structured picture is byte-exact.
+
 ### Fixed
 
 - **§F.2 intra-macroblock candidate predictors, decoder** (round 384):

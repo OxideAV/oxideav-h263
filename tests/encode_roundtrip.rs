@@ -649,3 +649,70 @@ fn slice_structured_intra_sequence_decodes() {
         assert!(mae < 8.0, "slice sequence MAE {mae}");
     }
 }
+
+/// A whole-picture single slice AIC encode is bit-equivalent in its
+/// macroblock stream to the non-slice on-wire AIC encode: with
+/// `mb_rows_per_slice == mb_rows` there is exactly one segment, so the
+/// §I.3 neighbour availability matches the single-segment picture and
+/// the reconstruction must be byte-exact between the two forms.
+#[test]
+fn slice_structured_aic_single_slice_matches_plus_aic() {
+    use oxideav_h263::encoder::{encode_intra_picture_aic_plus, encode_intra_picture_slices_aic};
+    use oxideav_h263::picture::decode_picture_layer;
+
+    let src = gradient(176, 144, 21);
+    let sliced = encode_intra_picture_slices_aic(&src, 6, 2, 9).expect("encode AIC slices");
+    let plain = encode_intra_picture_aic_plus(&src, 6, 2).expect("encode AIC plus");
+    let from_sliced =
+        decode_picture_layer(&sliced, None, DecodeOptions::default()).expect("decode AIC slices");
+    let from_plain =
+        decode_picture_layer(&plain, None, DecodeOptions::default()).expect("decode AIC plus");
+    assert_eq!(from_sliced.y, from_plain.y);
+    assert_eq!(from_sliced.cb, from_plain.cb);
+    assert_eq!(from_sliced.cr, from_plain.cr);
+}
+
+/// Multi-slice AIC (+ MQ) pictures decode with default options within
+/// a tight tolerance at fine quantisation — a segment-availability
+/// mismatch between encoder and decoder would corrupt the §I.3 DC/AC
+/// prediction at every slice top and blow the bound.
+#[test]
+fn slice_structured_aic_mq_round_trips() {
+    use oxideav_h263::encoder::{
+        encode_intra_picture_slices_aic, encode_intra_picture_slices_aic_mq,
+    };
+    use oxideav_h263::picture::decode_picture_layer;
+
+    let src = gradient(176, 144, 13);
+    for rows_per_slice in [1usize, 2, 3, 4] {
+        let aic =
+            encode_intra_picture_slices_aic(&src, 4, 0, rows_per_slice).expect("encode AIC slices");
+        let dec =
+            decode_picture_layer(&aic, None, DecodeOptions::default()).expect("decode AIC slices");
+        let mae = luma_mae(&src, &dec);
+        assert!(mae < 3.0, "AIC slices ({rows_per_slice} rows) MAE {mae}");
+
+        let mq = encode_intra_picture_slices_aic_mq(&src, 4, 0, rows_per_slice)
+            .expect("encode AIC+MQ slices");
+        let dec = decode_picture_layer(&mq, None, DecodeOptions::default())
+            .expect("decode AIC+MQ slices");
+        let mae = luma_mae(&src, &dec);
+        assert!(mae < 3.0, "AIC+MQ slices ({rows_per_slice} rows) MAE {mae}");
+    }
+}
+
+/// A flat AIC + MQ slice-structured picture reconstructs byte-exactly
+/// (no AC, the §I.3 closed loop is lossless on flat content), proving
+/// the whole slice framing + AIC + MQ pipeline is bit-consistent.
+#[test]
+fn slice_structured_aic_mq_flat_is_exact() {
+    use oxideav_h263::encoder::encode_intra_picture_slices_aic_mq;
+    use oxideav_h263::picture::decode_picture_layer;
+
+    let src = YuvFrame::grey(128, 96);
+    let bytes = encode_intra_picture_slices_aic_mq(&src, 14, 5, 2).expect("encode");
+    let dec = decode_picture_layer(&bytes, None, DecodeOptions::default()).expect("decode");
+    assert!(dec.y.iter().all(|&p| p == 128));
+    assert!(dec.cb.iter().all(|&p| p == 128));
+    assert!(dec.cr.iter().all(|&p| p == 128));
+}

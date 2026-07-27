@@ -474,6 +474,119 @@ where
     Ok(w.finish())
 }
 
+/// Encode an Annex K **Slice Structured** + Annex I **Advanced INTRA
+/// Coding** H.263+ INTRA picture: §K.2 slices every
+/// `mb_rows_per_slice` macroblock rows, each macroblock coded with the
+/// §I.2 per-macroblock INTRA_MODE decision and §I.3 DC/AC prediction —
+/// where each slice is its own §I.3 **video picture segment**, so a
+/// predictor candidate in a different slice is unavailable (the
+/// page-78 availability rule), exactly mirroring the decoder's
+/// per-segment `AicState`. Both SS and AIC are signalled in PLUSPTYPE;
+/// the stream decodes with `DecodeOptions::default()`.
+pub fn encode_intra_picture_slices_aic(
+    frame: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    mb_rows_per_slice: usize,
+) -> Result<Vec<u8>> {
+    encode_intra_picture_slices_aic_core(frame, quant, tr, mb_rows_per_slice, false)
+}
+
+/// As [`encode_intra_picture_slices_aic`], with Annex T **Modified
+/// Quantization** mode also active and signalled (§T.3 chroma `QUANT_C`
+/// + §T.4 / §T.5-rule-2 EXTENDED-ESCAPE on the Table-I.2 VLC) — the
+/// AIC + MQ + Slice-Structured mode set of the `advanced-intra-coding`
+/// conformance fixture, now producible as well as decodable.
+pub fn encode_intra_picture_slices_aic_mq(
+    frame: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    mb_rows_per_slice: usize,
+) -> Result<Vec<u8>> {
+    encode_intra_picture_slices_aic_core(frame, quant, tr, mb_rows_per_slice, true)
+}
+
+/// Shared body of the Annex K AIC slice encoders: PLUSPTYPE (SS + AIC
+/// (+ MQ)), reduced first slice header, then per-slice §K.2 headers
+/// with the picture QUANT as every SQUANT; the AIC planning threads a
+/// per-slice segment id through the neighbour grid.
+fn encode_intra_picture_slices_aic_core(
+    frame: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    mb_rows_per_slice: usize,
+    modified_quant: bool,
+) -> Result<Vec<u8>> {
+    use crate::plus_ptype::SliceStructuredSubmode;
+    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let layout =
+        crate::picture::PictureLayout::for_source_format(fmt).ok_or(Error::NotImplemented)?;
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+    if mb_rows_per_slice == 0 || mb_rows_per_slice > mb_rows {
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+
+    // §T.3 — chrominance QUANT_C under Modified Quantization mode.
+    let chroma_quant = if modified_quant {
+        crate::annex_t::quant_c_from_quant(quant)?
+    } else {
+        quant
+    };
+
+    let sss = SliceStructuredSubmode {
+        rectangular: false,
+        arbitrary_order: false,
+    };
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ false,
+        PlusModes {
+            advanced_intra: true,
+            modified_quant,
+            slice_structured: Some(sss),
+            ..PlusModes::default()
+        },
+    )?;
+
+    let ctx = SliceHeaderContext::from_picture_layout(&layout, Some(sss), false, false);
+    let gfid = tr & 0b11;
+    write_first_slice_header(&mut w, &ctx, 0, None)?;
+
+    let mut grid = AicEncodeGrid::new(mb_cols, mb_rows);
+    for mb_row in 0..mb_rows {
+        let slice_index = mb_row / mb_rows_per_slice;
+        if mb_row > 0 && mb_row % mb_rows_per_slice == 0 {
+            let mba = (mb_row * mb_cols) as u32;
+            write_slice_layer(&mut w, &ctx, mba, quant, gfid, None)?;
+        }
+        let params = AicParams {
+            quant,
+            chroma_quant,
+            modified_quant,
+            segment: slice_index as u32,
+        };
+        for mb_col in 0..mb_cols {
+            let mb = extract_macroblock(frame, mb_col, mb_row);
+            encode_choose_macroblock_aic(&mut w, &mb, params, None, mb_col, mb_row, &mut grid)?;
+        }
+    }
+
+    // §5.1.28 — PSTUF.
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
 /// Encode a planar 4:2:0 [`YuvFrame`] as a baseline H.263 **INTRA**
 /// (I-) picture at the given `quant` and 8-bit temporal reference `tr`.
 ///
@@ -564,14 +677,19 @@ pub fn encode_intra_picture_plus(frame: &YuvFrame, quant: u8, tr: u8) -> Result<
     Ok(w.finish())
 }
 
-/// Encoder-side mirror of the decoder's `AicState` §I.3 neighbour grid,
-/// for a **single video picture segment** (a header-less I-picture, so
-/// every already-encoded in-bounds block is an available `RecA'` /
-/// `RecB'` predictor — no segment-id bookkeeping is required).
+/// Encoder-side mirror of the decoder's `AicState` §I.3 neighbour grid.
 ///
 /// Holds the reconstructed `RecC'(u,v)` block-position arrays keyed by
 /// the same grid coordinates the decoder uses (`luma_block_grid_pos`):
 /// luma at `2·mb_cols × 2·mb_rows`, chroma at `mb_cols × mb_rows`.
+///
+/// Mirrors the §I.3 page-78 availability rule at video-picture-segment
+/// granularity: each committed macroblock records the segment id it was
+/// encoded in, and a neighbour whose segment differs from the current
+/// macroblock's collapses to [`Neighbour::None`] — exactly the
+/// decoder's `AicBlockMeta` treatment. Single-segment pictures (the
+/// header-less I-picture form) pass segment `0` everywhere, which
+/// reduces to "every in-bounds encoded block is available".
 struct AicEncodeGrid {
     luma_block_cols: usize,
     mb_cols: usize,
@@ -579,6 +697,10 @@ struct AicEncodeGrid {
     luma: Vec<Option<[i32; COEFFS_PER_BLOCK]>>,
     cb: Vec<Option<[i32; COEFFS_PER_BLOCK]>>,
     cr: Vec<Option<[i32; COEFFS_PER_BLOCK]>>,
+    /// §6.1.1 / §I.3 video-picture-segment id per **macroblock**
+    /// (`u32::MAX` = not yet encoded). All six blocks of a macroblock
+    /// share one segment, so MB granularity suffices.
+    segment: Vec<u32>,
 }
 
 impl AicEncodeGrid {
@@ -591,26 +713,36 @@ impl AicEncodeGrid {
             luma: vec![None; luma_block_cols * luma_block_rows],
             cb: vec![None; mb_cols * mb_rows],
             cr: vec![None; mb_cols * mb_rows],
+            segment: vec![u32::MAX; mb_cols * mb_rows],
         }
     }
 
+    /// Whether the macroblock owning luma-block-grid column `bx` / row
+    /// `by` was encoded in `segment`.
+    fn luma_block_in_segment(&self, bx: usize, by: usize, segment: u32) -> bool {
+        self.segment[(by / 2) * self.mb_cols + (bx / 2)] == segment
+    }
+
     /// The `RecA'` (above) / `RecB'` (left) luma neighbour arrays at grid
-    /// position `(bx, by)`, copied out so the caller can build
-    /// [`Neighbour`] tags without borrowing the grid while it mutates.
+    /// position `(bx, by)` for a macroblock in `segment`, copied out so
+    /// the caller can build [`Neighbour`] tags without borrowing the
+    /// grid while it mutates. A neighbour from a different video picture
+    /// segment is unavailable (§I.3 page-78 rule).
     fn luma_neighbours(
         &self,
         bx: usize,
         by: usize,
+        segment: u32,
     ) -> (
         Option<[i32; COEFFS_PER_BLOCK]>,
         Option<[i32; COEFFS_PER_BLOCK]>,
     ) {
-        let above = if by > 0 {
+        let above = if by > 0 && self.luma_block_in_segment(bx, by - 1, segment) {
             self.luma[(by - 1) * self.luma_block_cols + bx]
         } else {
             None
         };
-        let left = if bx > 0 {
+        let left = if bx > 0 && self.luma_block_in_segment(bx - 1, by, segment) {
             self.luma[by * self.luma_block_cols + (bx - 1)]
         } else {
             None
@@ -618,21 +750,26 @@ impl AicEncodeGrid {
         (above, left)
     }
 
+    /// Chroma-plane analogue of [`Self::luma_neighbours`]: the grid is
+    /// at macroblock granularity, so the segment check indexes
+    /// `segments` directly.
     fn chroma_neighbours(
         planes: &[Option<[i32; COEFFS_PER_BLOCK]>],
+        segments: &[u32],
         col: usize,
         row: usize,
         cols: usize,
+        segment: u32,
     ) -> (
         Option<[i32; COEFFS_PER_BLOCK]>,
         Option<[i32; COEFFS_PER_BLOCK]>,
     ) {
-        let above = if row > 0 {
+        let above = if row > 0 && segments[(row - 1) * cols + col] == segment {
             planes[(row - 1) * cols + col]
         } else {
             None
         };
-        let left = if col > 0 {
+        let left = if col > 0 && segments[row * cols + (col - 1)] == segment {
             planes[row * cols + (col - 1)]
         } else {
             None
@@ -671,6 +808,10 @@ struct AicParams {
     quant: u8,
     chroma_quant: u8,
     modified_quant: bool,
+    /// §6.1.1 / §I.3 video-picture-segment id the macroblock is encoded
+    /// in (0 for single-segment pictures; the slice index in Annex K
+    /// Slice-Structured pictures).
+    segment: u32,
 }
 
 /// Plan one AIC INTRA macroblock with a fixed INTRA_MODE, reading the
@@ -694,6 +835,7 @@ fn plan_macroblock_aic(
         quant,
         chroma_quant,
         modified_quant,
+        segment,
     } = params;
     // Local reconstructions of this macroblock's four luma blocks, filled
     // as we plan them so later blocks see earlier ones as neighbours.
@@ -708,14 +850,14 @@ fn plan_macroblock_aic(
         let above = if (blk >> 1) == 1 {
             local[blk - 2]
         } else {
-            grid.luma_neighbours(bx, by).0
+            grid.luma_neighbours(bx, by, segment).0
         };
         // Left neighbour: an intra-macroblock block (Y0/Y2) when this is a
         // right-column block, else the committed grid block to the left.
         let left = if (blk & 1) == 1 {
             local[blk - 1]
         } else {
-            grid.luma_neighbours(bx, by).1
+            grid.luma_neighbours(bx, by, segment).1
         };
         let plan = plan_intra_block_aic(
             &mb.luma[blk],
@@ -729,8 +871,14 @@ fn plan_macroblock_aic(
         luma[blk] = Some(plan);
     }
 
-    let (cb_above, cb_left) =
-        AicEncodeGrid::chroma_neighbours(&grid.cb, mb_col, mb_row, grid.mb_cols);
+    let (cb_above, cb_left) = AicEncodeGrid::chroma_neighbours(
+        &grid.cb,
+        &grid.segment,
+        mb_col,
+        mb_row,
+        grid.mb_cols,
+        segment,
+    );
     let cb = plan_intra_block_aic(
         &mb.cb,
         mode,
@@ -740,8 +888,14 @@ fn plan_macroblock_aic(
         modified_quant,
     );
 
-    let (cr_above, cr_left) =
-        AicEncodeGrid::chroma_neighbours(&grid.cr, mb_col, mb_row, grid.mb_cols);
+    let (cr_above, cr_left) = AicEncodeGrid::chroma_neighbours(
+        &grid.cr,
+        &grid.segment,
+        mb_col,
+        mb_row,
+        grid.mb_cols,
+        segment,
+    );
     let cr = plan_intra_block_aic(
         &mb.cr,
         mode,
@@ -800,8 +954,15 @@ fn write_macroblock_aic(w: &mut BitWriter, plan: &MbAicPlan) -> Result<()> {
 }
 
 /// Store a planned macroblock's reconstructions into `grid` so downstream
-/// macroblocks pick them up as §I.3 neighbours.
-fn commit_macroblock_aic(grid: &mut AicEncodeGrid, plan: &MbAicPlan, mb_col: usize, mb_row: usize) {
+/// macroblocks pick them up as §I.3 neighbours, recording the video
+/// picture segment the macroblock was encoded in.
+fn commit_macroblock_aic(
+    grid: &mut AicEncodeGrid,
+    plan: &MbAicPlan,
+    mb_col: usize,
+    mb_row: usize,
+    segment: u32,
+) {
     for (blk, p) in plan.luma.iter().enumerate() {
         let bx = 2 * mb_col + (blk & 1);
         let by = 2 * mb_row + (blk >> 1);
@@ -809,6 +970,7 @@ fn commit_macroblock_aic(grid: &mut AicEncodeGrid, plan: &MbAicPlan, mb_col: usi
     }
     grid.cb[mb_row * grid.mb_cols + mb_col] = Some(plan.cb.rec);
     grid.cr[mb_row * grid.mb_cols + mb_col] = Some(plan.cr.rec);
+    grid.segment[mb_row * grid.mb_cols + mb_col] = segment;
 }
 
 /// The estimated wire cost (in bits) of a planned AIC macroblock — used
@@ -861,7 +1023,7 @@ fn encode_choose_macroblock_aic(
         }
     };
     write_macroblock_aic(w, &plan)?;
-    commit_macroblock_aic(grid, &plan, mb_col, mb_row);
+    commit_macroblock_aic(grid, &plan, mb_col, mb_row, params.segment);
     Ok(())
 }
 
@@ -980,6 +1142,7 @@ fn encode_intra_picture_aic_core(
         quant,
         chroma_quant,
         modified_quant,
+        segment: 0,
     };
 
     let mut w = BitWriter::new();
