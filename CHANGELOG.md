@@ -83,6 +83,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   byte-exact single-slice parity with the non-slice H.263+ P-form,
   and a slice-structured AIC-I + P + P GOP through `decode_sequence`.
 
+- **RFC 4629 RTP payload format** (round 432): the new `rtp` module
+  stages the H.263+ payload level — the §5.1 `RR|P|V|PLEN|PEBIT`
+  payload header (writer + parser, RR ignored on receive per the
+  spec), the §5.2 VRC extension, `packetize_stream` (P=1 segment
+  packets at byte-aligned Picture/GOB/Slice/EOS start codes with the
+  two zero bytes stripped, preferring the last in-budget start-code
+  boundary as the cut, §6.2 P=0 Follow-on fallback for oversized
+  segments) and `depacketize_payloads` (byte-exact reassembly,
+  redundant PLEN headers discarded). Tests: header field round-trips
+  incl. VRC / 63-byte PLEN / error paths, GOP + GOB + slice streams
+  byte-exact across budgets 32..4096 with decoded-frame equality,
+  GBSC/SSC cut preference (all-P=1 splits), and five vendored
+  conformance fixtures byte-exact at three budgets each.
+
 ### Fixed
 
 - **§F.2 intra-macroblock candidate predictors, decoder** (round 384):

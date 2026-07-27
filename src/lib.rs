@@ -237,6 +237,7 @@ pub mod picture_header;
 pub mod plus_ptype;
 pub mod rru_filter;
 pub mod rru_upsample;
+pub mod rtp;
 pub mod scal_upsample;
 pub mod scalability;
 pub mod slice_header;
@@ -336,6 +337,11 @@ pub use rru_filter::{
 };
 pub use rru_upsample::{
     upsample_prediction_error, RRU_IN_DIM, RRU_IN_LEN, RRU_OUT_DIM, RRU_OUT_LEN,
+};
+pub use rtp::{
+    depacketize_payloads, packetize_stream, parse_payload_header, write_payload_header,
+    H263PayloadHeader, PacketizeConfig, VrcHeader, PAYLOAD_HEADER_BYTES, PLEN_MAX,
+    VRC_HEADER_BYTES,
 };
 pub use scal_upsample::{
     upsample_plane_1d_horizontal, upsample_plane_1d_vertical, upsample_plane_2d,
@@ -490,6 +496,18 @@ pub enum Error {
     /// videomux-dependent layout is not staged on the forward-channel
     /// decode path (a forward-channel BCI is always `"01"`).
     BadBackChannelMessage,
+    /// An RFC 4629 §5.1 payload header carried inconsistent fields: a
+    /// PLEN above 63, a PEBIT above 7, a non-zero PEBIT with PLEN = 0,
+    /// a VRC TID / Trun out of range, or a depacketized stream that
+    /// began with a Follow-on (`P = 0`) packet.
+    RtpBadPayloadHeader,
+    /// An RTP payload ended before its own declared header fields
+    /// (the 16-bit fixed part, the VRC extension, or the PLEN-byte
+    /// redundant picture header) could be read.
+    RtpTruncatedPacket,
+    /// The packetizer's `max_payload` budget cannot hold the payload
+    /// header plus at least one bitstream byte.
+    RtpPayloadTooSmall,
 }
 
 impl core::fmt::Display for Error {
@@ -620,6 +638,18 @@ impl core::fmt::Display for Error {
             Error::BadBackChannelMessage => write!(
                 f,
                 "oxideav-h263: Annex N GOB/slice-layer BCI signalled a present back-channel message (forward-channel BCI must be \"01\")"
+            ),
+            Error::RtpBadPayloadHeader => write!(
+                f,
+                "oxideav-h263: inconsistent RFC 4629 RTP payload header fields"
+            ),
+            Error::RtpTruncatedPacket => write!(
+                f,
+                "oxideav-h263: RTP payload shorter than its declared header fields"
+            ),
+            Error::RtpPayloadTooSmall => write!(
+                f,
+                "oxideav-h263: RTP max_payload cannot hold header plus data"
             ),
         }
     }
