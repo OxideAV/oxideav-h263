@@ -170,6 +170,113 @@ fn is_start_code_at(data: &[u8], pos: usize) -> bool {
     data.len() >= pos + 3 && data[pos] == 0 && data[pos + 1] == 0 && data[pos + 2] & 0x80 != 0
 }
 
+/// The kind of byte-aligned start code at a stream position,
+/// classified by the five Group Number bits that follow the 17-bit
+/// start-code prefix (§5.2.3): GN 0 continues into a Picture Start
+/// Code, GN 31 (`"11111"`) is EOS, GN 30 (`"11110"`) is EOSBS, and
+/// GN 1..=29 are GOB (or, in Slice Structured mode, MBA) values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartCodeKind {
+    Picture,
+    GobOrSlice,
+    SequenceEnd,
+}
+
+/// Classify the byte-aligned start code at `pos` (the caller must have
+/// established [`is_start_code_at`]).
+fn start_code_kind(data: &[u8], pos: usize) -> StartCodeKind {
+    match (data[pos + 2] >> 2) & 0x1F {
+        0 => StartCodeKind::Picture,
+        30 | 31 => StartCodeKind::SequenceEnd,
+        _ => StartCodeKind::GobOrSlice,
+    }
+}
+
+/// Extract the RFC 4629 §6.1.2 **redundant picture header** of the
+/// picture starting (with a byte-aligned PSC) at the front of
+/// `picture`: the picture-header bytes from bit 16 of the PSC (the
+/// `"100000"` tail) through the end of the §5.1.24 / §5.1.25
+/// PEI / PSUPP loop, plus the PEBIT count of trailing bits to ignore
+/// in the last byte.
+///
+/// Returns `Ok(None)` when the header should **not** be attached per
+/// the RFC: an extended-PTYPE picture with an incomplete
+/// (`UFEP = "000"`) header — §6.1.1 requires an attached header to be
+/// complete — or a header longer than the 6-bit PLEN field can
+/// describe.
+///
+/// The returned bytes drop straight into
+/// [`H263PayloadHeader::extra_picture_header`]; prepending two zero
+/// bytes (see [`assemble_picture_header`]) reconstitutes a parseable
+/// byte-aligned picture header.
+pub fn redundant_picture_header(picture: &[u8]) -> Result<Option<(Vec<u8>, u8)>> {
+    use crate::picture_header::{parse_picture_layer, H263PictureLayer};
+    use crate::plus_ptype::InheritedExtendedState;
+    use oxideav_core::bits::BitReader;
+
+    let mut r = BitReader::new(picture);
+    let layer = parse_picture_layer(&mut r, InheritedExtendedState::default())?;
+    match &layer {
+        H263PictureLayer::Baseline(h) => {
+            // §5.1.19 PQUANT.
+            r.skip(5).map_err(|_| Error::UnexpectedEof)?;
+            // §5.1.20 CPM + §5.1.21 PSBI (iff CPM).
+            let cpm = r.read_bit().map_err(|_| Error::UnexpectedEof)?;
+            if cpm {
+                r.skip(2).map_err(|_| Error::UnexpectedEof)?;
+            }
+            // §5.1.22 TRB + §5.1.23 DBQUANT — PB-frames only.
+            if h.pb_frames {
+                r.skip(3 + 2).map_err(|_| Error::UnexpectedEof)?;
+            }
+        }
+        H263PictureLayer::Extended(e) => {
+            // §6.1.1 — only a complete (UFEP = "001") header may be
+            // attached as a redundant copy.
+            if e.plus.opptype.is_none() {
+                return Ok(None);
+            }
+            // §5.1.19 PQUANT (CPM / PSBI already inside PLUSPTYPE).
+            r.skip(5).map_err(|_| Error::UnexpectedEof)?;
+        }
+    }
+    // §5.1.24 / §5.1.25 — PEI + PSUPP extension loop closes the header.
+    loop {
+        let pei = r.read_bit().map_err(|_| Error::UnexpectedEof)?;
+        if !pei {
+            break;
+        }
+        r.skip(8).map_err(|_| Error::UnexpectedEof)?;
+    }
+
+    let header_bits = r.bit_position();
+    debug_assert!(header_bits > 16);
+    let payload_bits = header_bits - 16;
+    let plen = payload_bits.div_ceil(8) as usize;
+    let pebit = (plen as u64 * 8 - payload_bits) as u8;
+    if plen > PLEN_MAX as usize || picture.len() < 2 + plen {
+        return Ok(None);
+    }
+    Ok(Some((picture[2..2 + plen].to_vec(), pebit)))
+}
+
+/// Reconstitute a byte-aligned, parseable picture header from a
+/// payload header carrying a `PLEN > 0` redundant picture header
+/// (§6.1.2): the sixteen leading `'0'` bits of the PSC are prepended
+/// to the attached bytes. Returns `None` when `PLEN = 0`. The last
+/// [`H263PayloadHeader::pebit`] bits of the result are padding and
+/// carry no header information.
+pub fn assemble_picture_header(header: &H263PayloadHeader) -> Option<Vec<u8>> {
+    if header.extra_picture_header.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(2 + header.extra_picture_header.len());
+    out.push(0);
+    out.push(0);
+    out.extend_from_slice(&header.extra_picture_header);
+    Some(out)
+}
+
 /// Configuration for [`packetize_stream`].
 #[derive(Debug, Clone, Copy)]
 pub struct PacketizeConfig {
@@ -178,13 +285,25 @@ pub struct PacketizeConfig {
     /// Must leave room for the 2-byte payload header plus at least one
     /// bitstream byte.
     pub max_payload: usize,
+    /// RFC 4629 §6.1.2 — attach a redundant copy of the current
+    /// picture's header (`PLEN > 0` + PEBIT) to every packet that
+    /// begins at a GOB or slice start code, so a receiver can decode
+    /// the segment even when the packet carrying the primary picture
+    /// header was lost. Picture packets (§6.1.1) and sequence-ending
+    /// packets (§6.1.3) always keep `PLEN = 0`, as do Follow-on
+    /// packets. Attachment is skipped for a picture whose header is
+    /// incomplete (`UFEP = "000"`) or too long for PLEN.
+    pub attach_picture_header: bool,
 }
 
 impl Default for PacketizeConfig {
     fn default() -> Self {
         // A common Ethernet-MTU-derived RTP payload budget: 1500 minus
         // IP/UDP/RTP headers, conservatively.
-        PacketizeConfig { max_payload: 1440 }
+        PacketizeConfig {
+            max_payload: 1440,
+            attach_picture_header: false,
+        }
     }
 }
 
@@ -236,15 +355,45 @@ pub fn packetize_stream(stream: &[u8], cfg: PacketizeConfig) -> Result<Vec<Vec<u
         }
     }
 
-    let budget = cfg.max_payload - PAYLOAD_HEADER_BYTES;
     let mut payloads = Vec::new();
     let mut pos = 0usize;
     // Whether the current position sits on a start-code boundary (the
     // first two zero bytes still present in `stream` at `pos`).
     let mut at_boundary = true;
     let mut boundary_idx = 0usize; // index into `boundaries` of `pos`
+                                   // §6.1.2 — the current picture's redundant header, refreshed at
+                                   // every Picture Start Code when attachment is enabled.
+    let mut redundant: Option<(Vec<u8>, u8)> = None;
 
     while pos < stream.len() {
+        // §6.1.2 — a packet beginning at a GOB / slice start code may
+        // carry a redundant copy of the current picture's header;
+        // picture / sequence-end / Follow-on packets keep PLEN = 0.
+        let mut extra: Option<(Vec<u8>, u8)> = None;
+        if at_boundary {
+            match start_code_kind(stream, pos) {
+                StartCodeKind::Picture => {
+                    if cfg.attach_picture_header {
+                        redundant = redundant_picture_header(&stream[pos..])?;
+                    }
+                }
+                StartCodeKind::GobOrSlice => {
+                    if cfg.attach_picture_header {
+                        extra = redundant.clone();
+                    }
+                }
+                StartCodeKind::SequenceEnd => {}
+            }
+        }
+        // The attached header eats into the data budget; drop it when
+        // no bitstream byte would fit any more.
+        let mut header_extra_len = extra.as_ref().map(|(b, _)| b.len()).unwrap_or(0);
+        if cfg.max_payload < PAYLOAD_HEADER_BYTES + header_extra_len + 1 {
+            extra = None;
+            header_extra_len = 0;
+        }
+        let budget = cfg.max_payload - PAYLOAD_HEADER_BYTES - header_extra_len;
+
         // Data to emit for this packet: on a boundary the two zero
         // bytes are stripped and represented by P=1.
         let data_start = if at_boundary { pos + 2 } else { pos };
@@ -271,14 +420,16 @@ pub fn packetize_stream(stream: &[u8], cfg: PacketizeConfig) -> Result<Vec<Vec<u
             cut = stream.len();
         }
 
-        let mut packet = Vec::with_capacity(PAYLOAD_HEADER_BYTES + (cut - data_start));
+        let (extra_picture_header, pebit) = extra.unwrap_or((Vec::new(), 0));
+        let mut packet =
+            Vec::with_capacity(PAYLOAD_HEADER_BYTES + header_extra_len + (cut - data_start));
         write_payload_header(
             &mut packet,
             &H263PayloadHeader {
                 p: at_boundary,
                 vrc: None,
-                extra_picture_header: Vec::new(),
-                pebit: 0,
+                extra_picture_header,
+                pebit,
             },
         )?;
         packet.extend_from_slice(&stream[data_start..cut]);

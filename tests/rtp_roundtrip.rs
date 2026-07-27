@@ -38,7 +38,14 @@ fn gradient(lw: usize, lh: usize, seed: u8) -> YuvFrame {
 /// Packetize at the given budget, assert every invariant the RFC
 /// requires, and return the reassembled stream.
 fn packetize_check(stream: &[u8], max_payload: usize) -> Vec<u8> {
-    let payloads = packetize_stream(stream, PacketizeConfig { max_payload }).expect("packetize");
+    let payloads = packetize_stream(
+        stream,
+        PacketizeConfig {
+            max_payload,
+            ..PacketizeConfig::default()
+        },
+    )
+    .expect("packetize");
     assert!(!payloads.is_empty());
     for (i, p) in payloads.iter().enumerate() {
         assert!(
@@ -131,8 +138,14 @@ fn gob_stream_prefers_segment_cuts() {
     let src = gradient(176, 144, 9);
     let stream = encode_intra_picture_gobs(&src, 0, |_| 6).expect("encode GOBs");
     // QCIF at q=6: each GOB is well under 600 bytes.
-    let payloads =
-        packetize_stream(&stream, PacketizeConfig { max_payload: 600 }).expect("packetize");
+    let payloads = packetize_stream(
+        &stream,
+        PacketizeConfig {
+            max_payload: 600,
+            ..PacketizeConfig::default()
+        },
+    )
+    .expect("packetize");
     assert!(payloads.len() > 1, "expected a multi-packet split");
     for (i, p) in payloads.iter().enumerate() {
         let (header, _) = parse_payload_header(p).unwrap();
@@ -150,8 +163,14 @@ fn slice_stream_round_trips() {
 
     let src = gradient(176, 144, 40);
     let stream = encode_intra_picture_slices(&src, 0, 2, |_| 8).expect("encode slices");
-    let payloads =
-        packetize_stream(&stream, PacketizeConfig { max_payload: 500 }).expect("packetize");
+    let payloads = packetize_stream(
+        &stream,
+        PacketizeConfig {
+            max_payload: 500,
+            ..PacketizeConfig::default()
+        },
+    )
+    .expect("packetize");
     assert!(payloads.len() > 1);
     for p in &payloads {
         let (header, _) = parse_payload_header(p).unwrap();
@@ -185,4 +204,104 @@ fn conformance_fixtures_round_trip() {
             );
         }
     }
+}
+
+/// §6.1.2 redundant picture header attachment: every GOB-boundary
+/// packet of a GOB-headered stream carries PLEN > 0 whose re-assembled
+/// bytes parse into the exact same picture-layer fields as the primary
+/// picture header; picture packets keep PLEN = 0; the reassembled
+/// stream stays byte-exact (the redundant copies are discarded).
+#[test]
+fn redundant_picture_header_attachment() {
+    use oxideav_core::bits::BitReader;
+    use oxideav_h263::encoder::encode_intra_picture_gobs;
+    use oxideav_h263::picture_header::{parse_picture_layer, H263PictureLayer};
+    use oxideav_h263::plus_ptype::InheritedExtendedState;
+    use oxideav_h263::rtp::assemble_picture_header;
+
+    let src = gradient(176, 144, 17);
+    let stream = encode_intra_picture_gobs(&src, 6, |_| 6).expect("encode GOBs");
+
+    // Parse the primary picture header for reference.
+    let primary = {
+        let mut r = BitReader::new(&stream);
+        match parse_picture_layer(&mut r, InheritedExtendedState::default()).unwrap() {
+            H263PictureLayer::Baseline(h) => h,
+            H263PictureLayer::Extended(_) => panic!("baseline stream expected"),
+        }
+    };
+
+    let payloads = packetize_stream(
+        &stream,
+        PacketizeConfig {
+            max_payload: 600,
+            attach_picture_header: true,
+        },
+    )
+    .expect("packetize");
+    assert!(payloads.len() > 1);
+
+    let mut saw_attached = 0;
+    for (i, p) in payloads.iter().enumerate() {
+        let (header, _) = parse_payload_header(p).unwrap();
+        assert!(header.p);
+        if i == 0 {
+            // Picture packet: PLEN = 0 (§6.1.1).
+            assert!(header.extra_picture_header.is_empty());
+            continue;
+        }
+        // GOB packets: redundant header attached.
+        let bytes = assemble_picture_header(&header).expect("PLEN > 0 on GOB packet");
+        let mut r = BitReader::new(&bytes);
+        let reparsed = match parse_picture_layer(&mut r, InheritedExtendedState::default()) {
+            Ok(H263PictureLayer::Baseline(h)) => h,
+            other => panic!("redundant header did not reparse: {other:?}"),
+        };
+        assert_eq!(reparsed, primary, "packet {i} redundant header mismatch");
+        saw_attached += 1;
+    }
+    assert!(saw_attached > 0);
+
+    // Reassembly discards the redundant copies: byte-exact stream.
+    assert_eq!(depacketize_payloads(&payloads).unwrap(), stream);
+}
+
+/// Redundant headers also attach to H.263+ slice packets (complete
+/// UFEP=001 headers), and `redundant_picture_header` computes a PEBIT
+/// consistent with the actual header bit length.
+#[test]
+fn redundant_header_on_h263p_slices() {
+    use oxideav_h263::encoder::encode_intra_picture_slices;
+    use oxideav_h263::rtp::redundant_picture_header;
+
+    let src = gradient(176, 144, 29);
+    let stream = encode_intra_picture_slices(&src, 1, 2, |_| 8).expect("encode slices");
+
+    let (bytes, pebit) = redundant_picture_header(&stream)
+        .expect("parse")
+        .expect("complete header must be attachable");
+    assert!(!bytes.is_empty());
+    assert!(pebit < 8);
+    // The attached copy starts with the '100000' PSC tail.
+    assert_eq!(bytes[0] & 0xFC, 0x80);
+
+    let payloads = packetize_stream(
+        &stream,
+        PacketizeConfig {
+            max_payload: 500,
+            attach_picture_header: true,
+        },
+    )
+    .expect("packetize");
+    let mut saw_attached = 0;
+    for (i, p) in payloads.iter().enumerate() {
+        let (header, _) = parse_payload_header(p).unwrap();
+        if i > 0 && header.p {
+            assert_eq!(header.extra_picture_header, bytes, "packet {i}");
+            assert_eq!(header.pebit, pebit);
+            saw_attached += 1;
+        }
+    }
+    assert!(saw_attached > 0);
+    assert_eq!(depacketize_payloads(&payloads).unwrap(), stream);
 }

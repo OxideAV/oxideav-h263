@@ -97,6 +97,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   GBSC/SSC cut preference (all-P=1 splits), and five vendored
   conformance fixtures byte-exact at three budgets each.
 
+- **RFC 4629 §6.1.2 redundant picture headers** (round 432):
+  `rtp::redundant_picture_header` extracts the current picture's
+  header (the `"100000"` PSC tail through the PEI/PSUPP loop, exact
+  PEBIT), refusing incomplete `UFEP = "000"` headers per §6.1.1;
+  `PacketizeConfig::attach_picture_header` attaches it (`PLEN > 0`)
+  to every GOB / slice segment packet for loss resilience, and
+  `rtp::assemble_picture_header` reconstitutes a parseable
+  byte-aligned header on the receive side. Tests re-parse the
+  attached copy of every GOB packet and pin field-exact equality
+  with the primary header (baseline + H.263+ slice streams), with
+  reassembly still byte-exact.
+
 ### Fixed
 
 - **§F.2 intra-macroblock candidate predictors, decoder** (round 384):

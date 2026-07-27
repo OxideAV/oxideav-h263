@@ -339,9 +339,9 @@ pub use rru_upsample::{
     upsample_prediction_error, RRU_IN_DIM, RRU_IN_LEN, RRU_OUT_DIM, RRU_OUT_LEN,
 };
 pub use rtp::{
-    depacketize_payloads, packetize_stream, parse_payload_header, write_payload_header,
-    H263PayloadHeader, PacketizeConfig, VrcHeader, PAYLOAD_HEADER_BYTES, PLEN_MAX,
-    VRC_HEADER_BYTES,
+    assemble_picture_header, depacketize_payloads, packetize_stream, parse_payload_header,
+    redundant_picture_header, write_payload_header, H263PayloadHeader, PacketizeConfig, VrcHeader,
+    PAYLOAD_HEADER_BYTES, PLEN_MAX, VRC_HEADER_BYTES,
 };
 pub use scal_upsample::{
     upsample_plane_1d_horizontal, upsample_plane_1d_vertical, upsample_plane_2d,
