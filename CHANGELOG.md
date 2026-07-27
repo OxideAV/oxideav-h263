@@ -71,6 +71,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   at MAE < 3.0 across four slice heights, and a flat AIC+MQ
   slice-structured picture is byte-exact.
 
+- **Annex K Slice-Structured INTER encoder** (round 432):
+  `encode_inter_picture_slices` encodes a motion-estimated H.263+
+  P-picture as §K.2 slices, each slice its own §6.1.1 video picture
+  segment — the encoder's predictor grid replays the decoder's
+  slice-top `MV2 = MV3 = MV1` rule (row-aligned uniform slices make
+  the segment-id check collapse to the same row test), so every MVD
+  reconstructs exactly. The shared motion encoder now takes an
+  `InterFraming` (single segment / GOB headers / slices). Tests:
+  translated-content P-slices at MAE < 4.0 for three slice heights,
+  byte-exact single-slice parity with the non-slice H.263+ P-form,
+  and a slice-structured AIC-I + P + P GOP through `decode_sequence`.
+
 ### Fixed
 
 - **§F.2 intra-macroblock candidate predictors, decoder** (round 384):

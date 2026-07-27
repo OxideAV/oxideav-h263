@@ -716,3 +716,92 @@ fn slice_structured_aic_mq_flat_is_exact() {
     assert!(dec.cb.iter().all(|&p| p == 128));
     assert!(dec.cr.iter().all(|&p| p == 128));
 }
+
+/// A translated-content P-picture in Annex K Slice-Structured mode:
+/// motion estimation + per-slice segment predictor replay round-trips
+/// through the wire-driven decoder with default options, for several
+/// slice heights, and a whole-picture single slice reconstructs
+/// byte-exactly like the single-segment H.263+ P-picture.
+#[test]
+fn slice_structured_inter_round_trips() {
+    use oxideav_h263::encoder::{encode_inter_picture_plus, encode_inter_picture_slices};
+    use oxideav_h263::picture::decode_picture_layer;
+
+    // Reference: gradient. Current: the same gradient shifted right by
+    // 3 pixels and down by 1 (global motion).
+    let lw = 176;
+    let lh = 144;
+    let reference = gradient(lw, lh, 10);
+    let mut cur = reference.clone();
+    for row in 0..lh {
+        for col in 0..lw {
+            let sr = row.saturating_sub(1);
+            let sc = col.saturating_sub(3);
+            cur.y[row * lw + col] = reference.y[sr * lw + sc];
+        }
+    }
+    let cw = lw / 2;
+    let chh = lh / 2;
+    for row in 0..chh {
+        for col in 0..cw {
+            let sr = row.saturating_sub(1);
+            let sc = col.saturating_sub(2);
+            cur.cb[row * cw + col] = reference.cb[sr * cw + sc];
+            cur.cr[row * cw + col] = reference.cr[sr * cw + sc];
+        }
+    }
+
+    // Decode the reference I-picture first so both paths predict from
+    // the decoder-reconstructed anchor.
+    let i_bytes =
+        oxideav_h263::encoder::encode_intra_picture_plus(&reference, 5, 0).expect("encode I");
+    let anchor = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).expect("decode I");
+
+    for rows_per_slice in [1usize, 3, 9] {
+        let p_bytes = encode_inter_picture_slices(&cur, &anchor, 5, 1, 6, rows_per_slice)
+            .expect("encode P slices");
+        let dec = decode_picture_layer(&p_bytes, Some(&anchor), DecodeOptions::default())
+            .expect("decode P slices");
+        let mae = luma_mae(&cur, &dec);
+        assert!(mae < 4.0, "P slices ({rows_per_slice} rows) MAE {mae}");
+    }
+
+    // Single whole-picture slice == single segment: byte-exact parity
+    // with the non-slice H.263+ P-picture.
+    let sliced = encode_inter_picture_slices(&cur, &anchor, 5, 1, 6, 9).expect("slices");
+    let plain = encode_inter_picture_plus(&cur, &anchor, 5, 1, 6).expect("plain");
+    let a = decode_picture_layer(&sliced, Some(&anchor), DecodeOptions::default()).unwrap();
+    let b = decode_picture_layer(&plain, Some(&anchor), DecodeOptions::default()).unwrap();
+    assert_eq!(a.y, b.y);
+    assert_eq!(a.cb, b.cb);
+    assert_eq!(a.cr, b.cr);
+}
+
+/// A full slice-structured GOP — H.263+ AIC I-picture in slices
+/// followed by two motion P-pictures in slices — decodes end-to-end
+/// through `decode_sequence` with default options (closed loop: each
+/// P predicts from the decoder's reconstruction).
+#[test]
+fn slice_structured_gop_decodes_end_to_end() {
+    use oxideav_h263::encoder::{encode_inter_picture_slices, encode_intra_picture_slices_aic};
+
+    let frames = [
+        gradient(128, 96, 0),
+        gradient(128, 96, 8),
+        gradient(128, 96, 16),
+    ];
+    let q = 5;
+    let mut stream = encode_intra_picture_slices_aic(&frames[0], q, 0, 2).expect("I slices");
+    let mut recon = decode_sequence(&stream, DecodeOptions::default()).expect("dec I");
+    for (i, f) in frames.iter().enumerate().skip(1) {
+        let p = encode_inter_picture_slices(f, recon.last().unwrap(), q, i as u8, 5, 3)
+            .expect("P slices");
+        stream.extend_from_slice(&p);
+        recon = decode_sequence(&stream, DecodeOptions::default()).expect("dec seq");
+    }
+    assert_eq!(recon.len(), 3);
+    for (i, (src, dec)) in frames.iter().zip(recon.iter()).enumerate() {
+        let mae = luma_mae(src, dec);
+        assert!(mae < 6.0, "slice GOP frame {i} MAE {mae}");
+    }
+}

@@ -1424,7 +1424,7 @@ pub fn encode_inter_picture_motion(
         tr,
         search_half,
         /* umv */ false,
-        /* gob_headers */ false,
+        InterFraming::Single,
         /* plus */ false,
     )
 }
@@ -1451,7 +1451,43 @@ pub fn encode_inter_picture_plus(
         tr,
         search_half,
         /* umv */ false,
-        /* gob_headers */ false,
+        InterFraming::Single,
+        /* plus */ true,
+    )
+}
+
+/// Encode a motion-estimated **INTER** (P-) picture in Annex K **Slice
+/// Structured** mode: an H.263+ P-picture whose body is §K.2 slices
+/// every `mb_rows_per_slice` macroblock rows (free-running submode,
+/// signalled in PLUSPTYPE), each slice its own §6.1.1 video picture
+/// segment — the encoder replays the decoder's per-segment
+/// median-predictor treatment (`MV2 = MV3 = MV1` at every slice-top
+/// row), so every emitted MVD reconstructs to exactly the searched
+/// vector. Otherwise identical to [`encode_inter_picture_motion`]
+/// (SAD + half-pel estimation, skip / INTRA-refresh decisions).
+///
+/// Self-describing: decodes through
+/// [`crate::picture::decode_picture_layer`] /
+/// [`crate::picture::decode_sequence`] with `DecodeOptions::default()`
+/// (the Annex K slice routing engages from the wire).
+pub fn encode_inter_picture_slices(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+    mb_rows_per_slice: usize,
+) -> Result<Vec<u8>> {
+    encode_inter_picture_motion_impl(
+        frame,
+        reference,
+        quant,
+        tr,
+        search_half,
+        /* umv */ false,
+        InterFraming::Slices {
+            rows: mb_rows_per_slice,
+        },
         /* plus */ true,
     )
 }
@@ -1477,7 +1513,7 @@ pub fn encode_inter_picture_gobs(
         tr,
         search_half,
         /* umv */ false,
-        /* gob_headers */ true,
+        InterFraming::GobHeaders,
         /* plus */ false,
     )
 }
@@ -1518,7 +1554,7 @@ pub fn encode_inter_picture_umv(
         tr,
         search_half,
         /* umv */ true,
-        /* gob_headers */ false,
+        InterFraming::Single,
         /* plus */ false,
     )
 }
@@ -1546,7 +1582,7 @@ pub fn encode_inter_picture_umv_plus(
         tr,
         search_half,
         /* umv */ true,
-        /* gob_headers */ false,
+        InterFraming::Single,
         /* plus */ true,
     )
 }
@@ -1760,11 +1796,27 @@ pub fn encode_inter_picture_ap(
     Ok(w.finish())
 }
 
+/// Segment framing for the motion-estimated INTER picture encode.
+#[derive(Debug, Clone, Copy)]
+enum InterFraming {
+    /// Single video-picture segment (§5.2.2 GOB-0 elided, no later GOB
+    /// headers).
+    Single,
+    /// §5.2 GOB header on every GOB after the first, each GOB its own
+    /// §6.1.1 segment (baseline-PTYPE stream shape).
+    GobHeaders,
+    /// Annex K free-running slices every `rows` macroblock rows, each
+    /// slice its own §6.1.1 segment. Requires the PLUSPTYPE header
+    /// (`plus = true`) — the SS mode bit lives in OPPTYPE.
+    Slices { rows: usize },
+}
+
 /// Shared motion-estimated INTER picture encode: the default-mode
 /// (§6.1.1 wrap, `umv = false`) and Annex D UMV (`umv = true`) paths
 /// differ only in the PTYPE bit-10 flag, the estimator range and the
-/// MVD derivation; `gob_headers` selects the §5.2 every-GOB-header
-/// stream shape (with the per-GOB predictor segmentation).
+/// MVD derivation; `framing` selects the single-segment, §5.2
+/// every-GOB-header or Annex K slice stream shape (with the matching
+/// per-segment predictor treatment).
 #[allow(clippy::too_many_arguments)]
 fn encode_inter_picture_motion_impl(
     frame: &YuvFrame,
@@ -1773,9 +1825,12 @@ fn encode_inter_picture_motion_impl(
     tr: u8,
     search_half: i32,
     umv: bool,
-    gob_headers: bool,
+    framing: InterFraming,
     plus: bool,
 ) -> Result<Vec<u8>> {
+    use crate::plus_ptype::SliceStructuredSubmode;
+    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
     }
@@ -1784,6 +1839,26 @@ fn encode_inter_picture_motion_impl(
     }
     let fmt =
         source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let layout =
+        crate::picture::PictureLayout::for_source_format(fmt).ok_or(Error::NotImplemented)?;
+    let mb_rows_total = frame.luma_height / 16;
+    // Annex K slices ride the PLUSPTYPE header only, and the slice
+    // height must tile the picture's MB rows.
+    let sss = match framing {
+        InterFraming::Slices { rows } => {
+            if !plus {
+                return Err(Error::NotImplemented);
+            }
+            if rows == 0 || rows > mb_rows_total {
+                return Err(Error::UnsupportedPictureGeometry);
+            }
+            Some(SliceStructuredSubmode {
+                rectangular: false,
+                arbitrary_order: false,
+            })
+        }
+        _ => None,
+    };
 
     let mut w = BitWriter::new();
     if plus {
@@ -1795,6 +1870,7 @@ fn encode_inter_picture_motion_impl(
             /* is_inter */ true,
             PlusModes {
                 umv,
+                slice_structured: sss,
                 ..PlusModes::default()
             },
         )?;
@@ -1813,6 +1889,14 @@ fn encode_inter_picture_motion_impl(
         );
     }
 
+    // §K.2 slice-header context + the §K.2.2 reduced first-slice header
+    // (MBA 0) for the slice framing.
+    let slice_ctx =
+        sss.map(|sss| SliceHeaderContext::from_picture_layout(&layout, Some(sss), false, false));
+    if let Some(ctx) = slice_ctx.as_ref() {
+        write_first_slice_header(&mut w, ctx, 0, None)?;
+    }
+
     let lw = frame.luma_width;
     let lh = frame.luma_height;
     let cw = frame.chroma_width();
@@ -1821,13 +1905,20 @@ fn encode_inter_picture_motion_impl(
     let mb_rows = lh / 16;
     // §4.2.1 — macroblock rows per GOB for the standard source formats
     // (1 for sub-QCIF..CIF, 2 for 4CIF, 4 for 16CIF).
-    let rows_per_gob = crate::picture::PictureLayout::for_source_format(fmt)
-        .ok_or(Error::NotImplemented)?
-        .mb_rows_per_gob as usize;
-    let mut grid = if gob_headers {
-        crate::encoder_motion::MvGrid::with_gob_headers(mb_cols, mb_rows, rows_per_gob)
-    } else {
-        crate::encoder_motion::MvGrid::new(mb_cols, mb_rows)
+    let rows_per_gob = layout.mb_rows_per_gob as usize;
+    // The per-segment predictor treatment: GOB headers and row-aligned
+    // slices both reduce to "rule-3 top border every k rows", which
+    // `MvGrid::with_gob_headers` replays exactly (the decoder's
+    // segment-id check collapses to the same row test for row-aligned
+    // uniform segments).
+    let mut grid = match framing {
+        InterFraming::Single => crate::encoder_motion::MvGrid::new(mb_cols, mb_rows),
+        InterFraming::GobHeaders => {
+            crate::encoder_motion::MvGrid::with_gob_headers(mb_cols, mb_rows, rows_per_gob)
+        }
+        InterFraming::Slices { rows } => {
+            crate::encoder_motion::MvGrid::with_gob_headers(mb_cols, mb_rows, rows)
+        }
     };
     let gfid = tr & 0b11;
     // λ in SAD units per half-pel of MVD; a small bias keeps static
@@ -1835,10 +1926,25 @@ fn encode_inter_picture_motion_impl(
     let lambda = 2 * quant as u32;
 
     for mb_row in 0..mb_rows {
-        // §5.2 — a GOB header before the first macroblock row of every
-        // GOB after GOB 0 (which is always header-less, §5.2.2).
-        if gob_headers && mb_row > 0 && mb_row % rows_per_gob == 0 {
-            write_gob_header(&mut w, (mb_row / rows_per_gob) as u32, gfid, quant);
+        match framing {
+            InterFraming::Single => {}
+            // §5.2 — a GOB header before the first macroblock row of
+            // every GOB after GOB 0 (which is always header-less,
+            // §5.2.2).
+            InterFraming::GobHeaders => {
+                if mb_row > 0 && mb_row % rows_per_gob == 0 {
+                    write_gob_header(&mut w, (mb_row / rows_per_gob) as u32, gfid, quant);
+                }
+            }
+            // §K.2 — SSTUF + SSC slice header at every slice start
+            // after the first (reduced-header) slice.
+            InterFraming::Slices { rows } => {
+                if mb_row > 0 && mb_row % rows == 0 {
+                    let ctx = slice_ctx.as_ref().expect("slice framing has a context");
+                    let mba = (mb_row * mb_cols) as u32;
+                    write_slice_layer(&mut w, ctx, mba, quant, gfid, None)?;
+                }
+            }
         }
         for mb_col in 0..mb_cols {
             let predictor = grid.predict(mb_col, mb_row);
