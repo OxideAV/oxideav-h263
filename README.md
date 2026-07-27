@@ -35,16 +35,45 @@ Table I.2 separate INTRA VLC, and the optional **Annex T** §T.3
 chroma `QUANT_C` + §T.4 EXTENDED-ESCAPE range), and the closed-loop
 GOP driver `encode_sequence` (I + P GOPs predicting from the
 encoder's own decoded reconstruction — no drift; optional §5.1.27
-EOS). Everything is built bottom-up from reusable layers —
+EOS).
+
+The encoder also emits **on-wire H.263+ (PLUSPTYPE)** pictures:
+`write_plus_picture_header` (§5.1.4 UFEP `"001"` + OPPTYPE +
+MPPTYPE + UUI / SSS emission) underpins the self-describing
+`encode_intra_picture_plus` / `encode_inter_picture_plus` /
+`encode_inter_picture_umv_plus` / `encode_intra_picture_aic_plus` /
+`encode_intra_picture_aic_mq_plus` entry points, whose Annex
+I / T / D modes are signalled in OPPTYPE and decode with
+`DecodeOptions::default()`. **Annex K Slice Structured encoding**
+is landed on both picture types: `encode_intra_picture_slices`
+(per-slice §K.2.7 SQUANT rate control), `encode_inter_picture_slices`
+(motion + per-slice §6.1.1 predictor segments) and
+`encode_intra_picture_slices_aic` / `_aic_mq` (per-slice §I.3
+AIC availability — the conformance fixtures' AIC + MQ + SS mode set,
+now producible as well as decodable), all via the §K.2 slice-header
+writers `write_first_slice_header` / `write_slice_layer`.
+
+Everything is built bottom-up from reusable layers —
 `encoder_vlc`, `fdct`, `encoder_block` (§5.4), `encoder_aic` (§I.3
 block plan + Table I.2 emit), `encoder_mb` (§5.3), `encoder_motion`
 (§6.1.1/§F.2/§D.2 estimation + predictor replay) and `encoder`
-(§5.1 / §5.2 picture layer) — each round-trip-verified against the
-decoder, including a mixed-mode I + P + UMV-P + AP-P + PB elementary
-stream decoded end-to-end by `decode_sequence`. The AIC closed loop
-reconstructs every block through the exact decoder primitive so
-encoder and decoder never drift (flat AIC pictures are byte-exact).
-Annex K slice-structured encoding is the next milestone.
+(§5.1 / §5.2 / §5.1.4 / §K.2 picture layer) — each
+round-trip-verified against the decoder, including a mixed-mode
+I + P + UMV-P + AP-P + PB elementary stream decoded end-to-end by
+`decode_sequence`. The AIC closed loop reconstructs every block
+through the exact decoder primitive so encoder and decoder never
+drift (flat AIC pictures are byte-exact, single-slice forms are
+byte-exact against their single-segment counterparts).
+
+The **`rtp` module** stages the RFC 4629 RTP payload format: the
+§5.1 `RR|P|V|PLEN|PEBIT` payload header + §5.2 VRC extension,
+`packetize_stream` (P=1 segment packets at byte-aligned
+PSC/GBSC/SSC/EOS with the two zero bytes stripped, budget-aware
+last-boundary cuts, §6.2 Follow-on fallback, optional §6.1.2
+redundant picture-header attachment with exact PEBIT) and
+`depacketize_payloads` (byte-exact reassembly) — validated over
+crate-encoded GOP/GOB/slice streams and the vendored conformance
+fixtures across payload budgets from 32 to 4096 bytes.
 
 `register()` is currently a no-op pending a frame-yielding
 `oxideav_core::Decoder` adapter — callers drive the decoder through the
@@ -390,14 +419,18 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   an end-to-end RRU reconstruction).
 * GSBI (CPM = "1"); the EOSBS end marker (the §5.1.27 EOS is emitted
   by the encoder and transparently skipped by `decode_sequence`).
-* Encoder: Annex K slice-structured encoding; UMV + AP combined mode;
+* Encoder: Annex K Rectangular Slice / Arbitrary Slice Ordering
+  submodes and non-row-aligned free-running slices (the slice
+  encoders emit row-aligned slices only); UMV + AP combined mode;
   PB-frames with non-zero MVDB / Annex M Improved-PB; INTRA-refresh
   inside the AP and PB paths; AIC INTRA macroblocks inside a P-picture
-  (only whole AIC I-pictures encode so far); on-wire PLUSPTYPE
-  signalling of the §I / §T modes (they currently ride a baseline PTYPE
-  and require `DecodeOptions { aic / modified_quant }`); rate control
-  beyond the per-MB DQUANT / per-GOB GQUANT / per-MB INTRA_MODE
-  primitives.
+  (only whole AIC I-pictures encode so far); rate control
+  beyond the per-MB DQUANT / per-GOB GQUANT / per-slice SQUANT /
+  per-MB INTRA_MODE primitives.
+* RTP: the RFC 2190 legacy (`video/H263`) Mode A / B / C payload
+  headers (the staged RFC 4629 `video/H263-1998` format is
+  implemented); RTP transport-header (RFC 3550) concerns
+  (sequencing, timestamps, marker bit) stay caller-side.
 * `oxideav_core::Decoder` registration; `register()` is a no-op
   pending a frame-yielding decoder adapter.
 
@@ -414,7 +447,14 @@ picture-decode tests. `tests/encode_roundtrip.rs` additionally drives
 the public encode API back through the decoder, including the Annex I
 AIC I-picture / auto-mode / AIC+MQ / AIC-sequence encoders (flat AIC
 pictures byte-exact, AC-bearing content within the round-trip
-tolerance).
+tolerance), the self-describing H.263+ (`_plus`) entry points
+(byte-exact reconstruction parity with the baseline-PTYPE forms) and
+the Annex K slice encoders (single-slice forms byte-exact against
+their single-segment counterparts; per-slice SQUANT / AIC-availability
+behaviour pinned). `tests/rtp_roundtrip.rs` round-trips crate-encoded
+and vendored conformance streams through the RFC 4629 packetizer
+across payload budgets, including redundant-picture-header
+re-parse checks.
 
 `tests/fixture_decode.rs` adds end-to-end **conformance** tests against
 real H.263 elementary streams (the reference encoder) vendored under
