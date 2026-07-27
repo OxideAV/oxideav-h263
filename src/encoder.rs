@@ -493,10 +493,11 @@ pub fn encode_intra_picture_slices_aic(
 }
 
 /// As [`encode_intra_picture_slices_aic`], with Annex T **Modified
-/// Quantization** mode also active and signalled (§T.3 chroma `QUANT_C`
-/// + §T.4 / §T.5-rule-2 EXTENDED-ESCAPE on the Table-I.2 VLC) — the
-/// AIC + MQ + Slice-Structured mode set of the `advanced-intra-coding`
-/// conformance fixture, now producible as well as decodable.
+/// Quantization** mode also active and signalled (the §T.3 chroma
+/// `QUANT_C` step and the §T.4 / §T.5-rule-2 EXTENDED-ESCAPE on the
+/// Table-I.2 VLC) — the AIC / MQ / Slice-Structured mode set of the
+/// `advanced-intra-coding` conformance fixture, now producible as well
+/// as decodable.
 pub fn encode_intra_picture_slices_aic_mq(
     frame: &YuvFrame,
     quant: u8,
