@@ -372,6 +372,108 @@ where
     Ok(w.finish())
 }
 
+/// Encode a planar 4:2:0 [`YuvFrame`] as an Annex K **Slice
+/// Structured** H.263+ **INTRA** picture: the §5.1.4 PLUSPTYPE header
+/// signals the OPPTYPE bit-10 SS mode with the §5.1.10 SSS
+/// free-running / sequential-order submode, and the picture body is a
+/// sequence of §K.2 slices — the reduced-header first slice (§K.2.2,
+/// running at the §5.1.19 PQUANT) followed by SSTUF + SSC-delimited
+/// slices, each `mb_rows_per_slice` macroblock rows tall and carrying
+/// its own §K.2.7 SQUANT.
+///
+/// `slice_quant(slice_index)` supplies each slice's quantiser
+/// (`1..=31`; slice 0's value doubles as PQUANT). Like GOB-level
+/// GQUANT, SQUANT can jump anywhere in `1..=31` between slices —
+/// coarse-grained rate control with byte-aligned resynchronisation
+/// points — but the slice layout is decoupled from the §4.2.1 GOB
+/// grid: any `1..=mb_rows` row count per slice is legal.
+///
+/// Each slice is its own §6.1.1 / §I.3 video picture segment. INTRA
+/// macroblocks carry no cross-macroblock prediction in the baseline
+/// coding (absolute Table-15 INTRADC per block), so the segmentation
+/// needs no encoder-side state; the emitted macroblock stream at a
+/// given QUANT is bit-identical to the GOB-layer form's.
+///
+/// The output is self-describing and decodes through
+/// [`crate::picture::decode_picture_layer`] /
+/// [`crate::picture::decode_sequence`] with `DecodeOptions::default()`
+/// (the Annex K routing engages from the wire).
+pub fn encode_intra_picture_slices<F>(
+    frame: &YuvFrame,
+    tr: u8,
+    mb_rows_per_slice: usize,
+    mut slice_quant: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(usize) -> u8,
+{
+    use crate::plus_ptype::SliceStructuredSubmode;
+    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let layout =
+        crate::picture::PictureLayout::for_source_format(fmt).ok_or(Error::NotImplemented)?;
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+    if mb_rows_per_slice == 0 || mb_rows_per_slice > mb_rows {
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+
+    let pquant = slice_quant(0);
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+
+    let sss = SliceStructuredSubmode {
+        rectangular: false,
+        arbitrary_order: false,
+    };
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        fmt,
+        pquant,
+        tr,
+        /* is_inter */ false,
+        PlusModes {
+            slice_structured: Some(sss),
+            ..PlusModes::default()
+        },
+    )?;
+
+    // §K.2 slice-header context: free-running submode, CPM / RRU off.
+    let ctx = SliceHeaderContext::from_picture_layout(&layout, Some(sss), false, false);
+    let gfid = tr & 0b11;
+
+    // §K.2.2 — the slice following the picture header uses the reduced
+    // form (no SSC / SQUANT; it runs at PQUANT) and starts at MBA 0.
+    write_first_slice_header(&mut w, &ctx, 0, None)?;
+
+    let mut quant = pquant;
+    for mb_row in 0..mb_rows {
+        if mb_row > 0 && mb_row % mb_rows_per_slice == 0 {
+            let slice_index = mb_row / mb_rows_per_slice;
+            quant = slice_quant(slice_index);
+            if quant == 0 || quant > 31 {
+                return Err(Error::InvalidQuantiser);
+            }
+            let mba = (mb_row * mb_cols) as u32;
+            write_slice_layer(&mut w, &ctx, mba, quant, gfid, None)?;
+        }
+        for mb_col in 0..mb_cols {
+            let mb = extract_macroblock(frame, mb_col, mb_row);
+            encode_intra_macroblock(
+                &mut w, &mb, quant, /* write_cod */ false, /* picture_is_inter */ false,
+            )?;
+        }
+    }
+
+    // §5.1.28 — PSTUF.
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
 /// Encode a planar 4:2:0 [`YuvFrame`] as a baseline H.263 **INTRA**
 /// (I-) picture at the given `quant` and 8-bit temporal reference `tr`.
 ///

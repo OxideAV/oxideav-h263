@@ -44,6 +44,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   eight SSTUF alignments, the 16CIF SEPB2-mandatory case and the
   Rectangular-Slice SWI form.
 
+- **Annex K Slice-Structured INTRA encoder** (round 432):
+  `encode_intra_picture_slices` emits an H.263+ I-picture whose body
+  is §K.2 slices — the reduced-header first slice at PQUANT, then
+  SSTUF + SSC slices every `mb_rows_per_slice` rows, each with its
+  own §K.2.7 SQUANT (per-slice rate control decoupled from the GOB
+  grid) — with the SS mode + free-running SSS signalled in PLUSPTYPE.
+  Self-describing: decodes via `decode_picture_layer` /
+  `decode_sequence` with default options. Tests pin byte-exact
+  reconstruction parity with the single-segment encode at constant
+  QUANT across five slice heights, verify per-slice SQUANT drives a
+  measurable fine/coarse error split (q=2 band MAE < 1.5 vs q=28
+  band), and decode a two-picture slice-structured stream.
+
 ### Fixed
 
 - **§F.2 intra-macroblock candidate predictors, decoder** (round 384):

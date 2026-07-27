@@ -559,3 +559,93 @@ fn plus_inter_sequence_round_trips() {
         assert!(mae < 8.0, "plus sequence frame {i} luma MAE {mae}");
     }
 }
+
+/// An Annex K Slice-Structured INTRA picture at a constant quantiser
+/// reconstructs **byte-exactly** the same frame as the single-segment
+/// baseline encode: INTRA macroblock coding carries no cross-segment
+/// state, so only the header/slice framing differs.
+#[test]
+fn slice_structured_intra_matches_single_segment_reconstruction() {
+    use oxideav_h263::encoder::encode_intra_picture_slices;
+    use oxideav_h263::picture::decode_picture_layer;
+
+    let src = gradient(176, 144, 5);
+    for rows_per_slice in [1usize, 2, 3, 4, 9] {
+        let sliced =
+            encode_intra_picture_slices(&src, 0, rows_per_slice, |_| 7).expect("encode slices");
+        let from_sliced = decode_picture_layer(&sliced, None, DecodeOptions::default())
+            .expect("decode slice-structured");
+        let base = encode_intra_picture(&src, 7, 0).expect("encode base");
+        let from_base = decode_picture_no_gob0_header(&base, None, DecodeOptions::default())
+            .expect("decode base");
+        assert_eq!(
+            from_sliced.y, from_base.y,
+            "rows_per_slice {rows_per_slice}"
+        );
+        assert_eq!(from_sliced.cb, from_base.cb);
+        assert_eq!(from_sliced.cr, from_base.cr);
+    }
+}
+
+/// Per-slice SQUANT drives real quantiser changes: a picture whose top
+/// half runs fine (q=2) and bottom half coarse (q=28) shows lower
+/// reconstruction error in the fine-quantised slices, and the whole
+/// picture stays within the INTRA round-trip tolerance.
+#[test]
+fn slice_structured_intra_per_slice_squant() {
+    use oxideav_h263::encoder::encode_intra_picture_slices;
+    use oxideav_h263::picture::decode_picture_layer;
+
+    let src = gradient(176, 144, 33);
+    // 9 MB rows; 3-row slices → slices 0..=2 at q 2 / 20 / 28.
+    let quants = [2u8, 20, 28];
+    let bytes =
+        encode_intra_picture_slices(&src, 4, 3, |s| quants[s.min(2)]).expect("encode slices");
+    let decoded =
+        decode_picture_layer(&bytes, None, DecodeOptions::default()).expect("decode slices");
+
+    // Mean absolute luma error per slice band (48 luma rows each).
+    let band_mae = |band: usize| -> f64 {
+        let lw = src.luma_width;
+        let rows = 48;
+        let y0 = band * rows;
+        let mut sum = 0u64;
+        for row in y0..y0 + rows {
+            for col in 0..lw {
+                let a = src.y[row * lw + col] as i32;
+                let b = decoded.y[row * lw + col] as i32;
+                sum += (a - b).unsigned_abs() as u64;
+            }
+        }
+        sum as f64 / (rows * lw) as f64
+    };
+    let fine = band_mae(0);
+    let coarse = band_mae(2);
+    assert!(
+        fine < coarse,
+        "fine-slice MAE {fine} should beat coarse-slice MAE {coarse}"
+    );
+    assert!(fine < 1.5, "q=2 band MAE {fine}");
+    assert!(coarse < 12.0, "q=28 band MAE {coarse}");
+}
+
+/// A multi-picture stream of Slice-Structured INTRA pictures decodes
+/// through `decode_sequence` with default options (extended-PTYPE
+/// dispatch + Annex K routing per picture).
+#[test]
+fn slice_structured_intra_sequence_decodes() {
+    use oxideav_h263::encoder::encode_intra_picture_slices;
+
+    let frames = [gradient(128, 96, 0), gradient(128, 96, 50)];
+    let mut stream = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        let pic = encode_intra_picture_slices(f, i as u8, 2, |_| 9).expect("encode");
+        stream.extend_from_slice(&pic);
+    }
+    let decoded = decode_sequence(&stream, DecodeOptions::default()).expect("decode sequence");
+    assert_eq!(decoded.len(), 2);
+    for (src, dec) in frames.iter().zip(decoded.iter()) {
+        let mae = luma_mae(src, dec);
+        assert!(mae < 8.0, "slice sequence MAE {mae}");
+    }
+}
