@@ -11,7 +11,7 @@ clean-room against [ITU-T Recommendation H.263 (01/2005)][spec].
 Full baseline **decoder**, plus a growing **encoder**. The decoder
 implements the H.263 baseline picture / GOB / macroblock / block layers
 and reconstructs INTRA and INTER pictures end-to-end, plus a wide set of
-optional Annexes (D, F, I, J, K, M, N, O, P, Q, S, T).
+optional Annexes (D, E, F, I, J, K, M, N, O, P, Q, S, T).
 
 The encoder (round 376 onward) produces baseline **INTRA (I-)** and
 **INTER (P-)** pictures plus a growing set of optional modes:
@@ -51,7 +51,43 @@ is landed on both picture types: `encode_intra_picture_slices`
 `encode_intra_picture_slices_aic` / `_aic_mq` (per-slice §I.3
 AIC availability — the conformance fixtures' AIC + MQ + SS mode set,
 now producible as well as decodable), all via the §K.2 slice-header
-writers `write_first_slice_header` / `write_slice_layer`.
+writers `write_first_slice_header` / `write_slice_layer`. The §K.1
+**Rectangular Slice** and **Arbitrary Slice Ordering** submodes are
+staged on both sides (round 438): the decoder walks each slice's
+macroblocks in scanning order within its SWI-wide rectangle and —
+under ASO — accepts slices in any bitstream order (coverage-driven
+completion, per-segment predictor rules already order-independent);
+`encode_intra_picture_slices_rect` / `encode_inter_picture_slices_rect`
+emit full-height vertical stripes (SWI on the wire, optional
+right-to-left ASO emission).
+
+**Annex E Syntax-based Arithmetic Coding** is implemented in both
+directions (round 438): the `sac` module stages the §E.2/§E.3
+arithmetic coders, the §E.5 PSC_FIFO stuffing rule (with the zero-run
+counter spanning the header/arithmetic boundary) and all §E.8
+`cumul_freq` models with §E.7 clause-5-table indexing.
+`decode_picture_sac` decodes a baseline-PTYPE SAC picture (I / P, UMV
+legal per §5.1.4.6; Annex S/T barred; AP/PB refused pending), and
+`decode_sequence` routes SAC pictures automatically from PTYPE
+bit 11 — pure-SAC and mixed VLC + SAC elementary streams both work.
+The encoder arm — `encode_intra_picture_sac`,
+`encode_inter_picture_sac` (zero-MV) and
+`encode_inter_picture_motion_sac` (SAD + half-pel search, intra
+refresh) — shares the VLC encoder's transform/quantiser stage, so SAC
+and VLC pictures of the same source reconstruct **byte-identically**;
+measured entropy-layer saving on the gradient QCIF corpus is
+6.4–25.5 % on I-pictures (QP 31 → QP 2).
+
+The encoder also has **rate control** (round 438): the
+`rate_control` module pairs the Annex B Hypothetical Reference
+Decoder buffer simulation (`HrdModel` — §B.3/§B.4 examinations, the
+post-removal occupancy-below-`B = 4·R/PCF` requirement) with a
+virtual-buffer QUANT governor (`RateController`), and
+`encode_sequence_rate_controlled` drives the closed-loop I + P GOP
+encoder against a bits-per-picture budget with §B.4-violation /
+overshoot re-encodes. Measured steady-state accuracy on the
+moving-square QCIF clip: mean bits/picture within −9.1 % … +4.6 % of
+target across 1.5 k–5 k budgets, all §B.4-conformant at `B = 4T`.
 
 Everything is built bottom-up from reusable layers —
 `encoder_vlc`, `fdct`, `encoder_block` (§5.4), `encoder_aic` (§I.3
@@ -74,9 +110,16 @@ last-boundary cuts honouring the §7 every-PSC-starts-a-packet rule,
 attachment with exact PEBIT) and `depacketize_payloads` (byte-exact
 reassembly) — validated over crate-encoded GOP/GOB/slice streams and
 the vendored conformance fixtures across payload budgets from 32 to
-4096 bytes. The RFC 2190 legacy `video/H263` **Mode A** header +
-packetizer/depacketizer (full start codes, per-picture PTYPE-mirror
-fields, PB-frame DBQ/TRB/TR) cover the pre-H.263+ interop case.
+4096 bytes. The RFC 2190 legacy `video/H263` format covers all three
+header modes (round 438): **Mode A** (GOB/picture-boundary packets,
+full start codes, per-picture PTYPE-mirror fields, PB-frame
+DBQ/TRB/TR) plus **Mode B / Mode C** macroblock-boundary
+fragmentation — `enumerate_mb_boundaries` walks a picture without
+pixel reconstruction to build the §5.2 resumption side channel
+(GOBN / MBA / QUANT / §6.1.1 MV predictors), the packetizer fragments
+over-budget segments at MB boundaries with SBIT/EBIT bit-granular
+cuts, and the depacketizer reassembles any mode mix at bit
+granularity.
 
 `register()` is currently a no-op pending a frame-yielding
 `oxideav_core::Decoder` adapter — callers drive the decoder through the
@@ -146,6 +189,14 @@ planar 4:2:0 `YuvFrame`:
 * **Annex D §D.2** — Unrestricted Motion Vector mode (PLUSPTYPE-absent
   extended `[-63, 63]` half-pel range with predictor-dependent
   difference-pair selection).
+* **Annex E** — Syntax-based Arithmetic Coding mode end-to-end:
+  the §E.2 / §E.3 arithmetic coders, the §E.5 stuffing rule and the
+  §E.8 models under §E.7 indexing, decoded through
+  `decode_picture_sac` (baseline-PTYPE I / P, single video picture
+  segment, UMV supported) and auto-routed by `decode_sequence` from
+  PTYPE bit 11. §5.1.4.6 bars Annex S / T combinations; AP and
+  PB-frames inside SAC are refused pending. Reconstruction is
+  byte-identical to the VLC path at equal quantised coefficients.
 * **Annex F §F.2 / §F.3** — Advanced Prediction: four-motion-vector
   candidate-predictor redefinition (Figure F.1, threading each
   just-reconstructed vector back in as an intra-macroblock candidate),
@@ -178,11 +229,17 @@ planar 4:2:0 `YuvFrame`:
   skipped).
 * **Annex K §K.2** — Slice Structured mode: the slice-layer header
   parse (SSC + SEPB1/2/3 + optional SSBI + MBA + SQUANT + optional
-  SWI + GFID, plus the first-slice reduced form) and the free-running
-  (non-Rectangular-Slice) end-to-end decode driver, including the
-  §5.1.24 PEI / §5.1.25 PSUPP picture-header tail consumed before the
-  first reduced slice header. The `slice-structured-mode` QCIF I+P+P
-  conformance fixture decodes byte-exact within the Annex A.7 tolerance.
+  SWI + GFID, plus the first-slice reduced form) and the end-to-end
+  decode driver, including the §5.1.24 PEI / §5.1.25 PSUPP
+  picture-header tail consumed before the first reduced slice header.
+  Both §K.1 submodes decode (round 438): **Rectangular Slice** (each
+  slice's macroblocks in scanning order within its `SWI + 1`-wide
+  rectangle; overhanging rectangles refused) and **Arbitrary Slice
+  Ordering** (slices land by MBA in any bitstream order; the
+  strictly-increasing rule applies only with ASO off; completion is
+  the §K.1 exactly-once coverage invariant). The
+  `slice-structured-mode` QCIF I+P+P conformance fixture decodes
+  byte-exact within the Annex A.7 tolerance.
 * **Annex S §S.2 / §S.3** — Alternative INTER VLC mode: each INTER
   coefficient block is interpreted with the baseline INTER VLC (Table
   16) first and re-interpreted with the Annex I INTRA VLC (Table I.2)
@@ -407,8 +464,13 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   unstaged within those modes: Advanced Prediction / INTER4V B-blocks, UMV
   over-boundary forward vectors (Annex M), AIC, SAC, and the Annex K
   Slice-Structured + Improved-PB combination.
-* Annex K Rectangular Slice submode, Annex K with Advanced Prediction /
-  CPM, and Arbitrary Slice Ordering.
+* Annex K with Advanced Prediction / CPM (the Rectangular Slice and
+  Arbitrary Slice Ordering submodes decode and encode — see the
+  supported list).
+* Annex E SAC combined with Advanced Prediction / INTER4V, PB-frames,
+  or mid-picture GOB headers (the §E.5 start-code resynchronisation
+  inside a picture); §5.1.4.6 bars the Annex S / Annex T combinations
+  outright.
 * Annex O CPM-multiplexed / Advanced-Prediction / SAC / Annex-K-slice
   enhancement-layer pictures (refused on the EI / EP / B paths); the
   Annex P explicit-warp resampling engine (see the supported list) is
@@ -422,21 +484,20 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   an end-to-end RRU reconstruction).
 * GSBI (CPM = "1"); the EOSBS end marker (the §5.1.27 EOS is emitted
   by the encoder and transparently skipped by `decode_sequence`).
-* Encoder: Annex K Rectangular Slice / Arbitrary Slice Ordering
-  submodes and non-row-aligned free-running slices (the slice
-  encoders emit row-aligned slices only); UMV + AP combined mode;
-  PB-frames with non-zero MVDB / Annex M Improved-PB; INTRA-refresh
-  inside the AP and PB paths; AIC INTRA macroblocks inside a P-picture
-  (only whole AIC I-pictures encode so far); rate control
-  beyond the per-MB DQUANT / per-GOB GQUANT / per-slice SQUANT /
-  per-MB INTRA_MODE primitives.
-* RTP: the RFC 2190 legacy Mode B / C macroblock-boundary
-  fragmentation headers (Mode A and the RFC 4629 `video/H263-1998`
-  format are implemented; a legacy segment larger than the payload
-  budget is refused rather than Mode-B-fragmented); non-byte-aligned
-  GOB boundaries (SBIT/EBIT are always emitted zero); RTP
-  transport-header (RFC 3550) concerns (sequencing, timestamps,
-  marker bit) stay caller-side.
+* Encoder: arbitrary (non-stripe) rectangular slice shapes and
+  non-row-aligned free-running slices (the slice encoders emit
+  row-aligned slices; the rect encoders emit full-height vertical
+  stripes); UMV + AP combined mode; PB-frames with non-zero MVDB /
+  Annex M Improved-PB; INTRA-refresh inside the AP and PB paths; AIC
+  INTRA macroblocks inside a P-picture (only whole AIC I-pictures
+  encode so far); within-picture adaptive quantisation for rate
+  control (the Annex B HRD loop regulates per picture — the per-MB
+  DQUANT / per-GOB GQUANT / per-slice SQUANT primitives are not yet
+  driven by the controller).
+* RTP: RFC 2190 Mode B/C fragmentation of SAC or Advanced-Prediction
+  pictures (no macroblock-aligned bit boundaries / no 4MV predictor
+  side channel); RTP transport-header (RFC 3550) concerns
+  (sequencing, timestamps, marker bit) stay caller-side.
 * `oxideav_core::Decoder` registration; `register()` is a no-op
   pending a frame-yielding decoder adapter.
 
@@ -457,10 +518,18 @@ tolerance), the self-describing H.263+ (`_plus`) entry points
 (byte-exact reconstruction parity with the baseline-PTYPE forms) and
 the Annex K slice encoders (single-slice forms byte-exact against
 their single-segment counterparts; per-slice SQUANT / AIC-availability
-behaviour pinned). `tests/rtp_roundtrip.rs` round-trips crate-encoded
+behaviour pinned). `tests/sac_roundtrip.rs` pins the Annex E arm:
+byte-identical SAC-vs-VLC reconstruction across sizes and quantisers,
+SAC elementary streams (pure and mixed with VLC pictures) through
+`decode_sequence`, §5.1.4.6 barred-combination refusals and a
+no-PSC-emulation byte scan. `tests/rate_control.rs` pins the measured
+rate-accuracy numbers and Annex B §B.4 conformance of the regulated
+GOP encoder. `tests/rtp_roundtrip.rs` round-trips crate-encoded
 and vendored conformance streams through the RFC 4629 packetizer
-across payload budgets, including redundant-picture-header
-re-parse checks.
+across payload budgets, including redundant-picture-header re-parse
+checks, plus the RFC 2190 legs: Mode A GOB packets, Mode B / Mode C
+macroblock-boundary fragmentation with the side channel cross-checked
+against `enumerate_mb_boundaries`, and bit-granular reassembly.
 
 `tests/fixture_decode.rs` adds end-to-end **conformance** tests against
 real H.263 elementary streams (the reference encoder) vendored under
