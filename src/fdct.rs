@@ -102,17 +102,29 @@ pub fn fdct_8x8(samples: &[i16; COEFFS_PER_BLOCK]) -> [f64; COEFFS_PER_BLOCK] {
     out
 }
 
+/// The maximum LEVEL magnitude a baseline (non-Modified-Quantization)
+/// bitstream can represent: Table 16 tops out well below it and the
+/// §5.4.2 ESCAPE LEVEL field is 8-bit two's complement with `0x00`
+/// and `0x80` forbidden, so `|LEVEL| ≤ 127`. A conformant encoder
+/// must not produce an event outside this range; the forward
+/// quantiser saturates to it (the reconstruction merely clips at the
+/// largest representable magnitude — the same policy as the Annex I
+/// planner's `MAX_LEVEL_BASELINE` clamp).
+const MAX_AC_LEVEL_BASELINE: i32 = 127;
+
 /// Forward-quantise a single AC coefficient `coef` (frequency-domain
 /// value) to a signed quantised LEVEL using the dead-zone rule
 /// `|L| = floor(|coef| / (2·quant))`.
 ///
 /// `quant` is the §5.2.6 / §5.3.6 step size (`1..=31`). Returns the
 /// signed LEVEL; small coefficients in the `|coef| < 2·quant` dead zone
-/// quantise to zero.
+/// quantise to zero, and the magnitude saturates at the §5.4.2
+/// baseline-representable maximum of 127 (sharp content at very fine
+/// quantisers would otherwise demand an unrepresentable event).
 pub fn quantise_ac_coefficient(coef: f64, quant: u8) -> i16 {
     let q = quant.clamp(1, 31) as f64;
     let mag = (coef.abs() / (2.0 * q)).floor();
-    let level = mag as i32;
+    let level = (mag as i32).min(MAX_AC_LEVEL_BASELINE);
     if level == 0 {
         return 0;
     }

@@ -34,6 +34,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   Prediction and mid-picture GOB headers are refused pending later
   rounds.
 
+- **Encoder rate control — Annex B HRD-regulated bit-budget loop**
+  (round 438): the new `rate_control` module stages `HrdModel` (the
+  Annex B Hypothetical Reference Decoder buffer simulation — §B.3
+  empty start, §B.4 picture-clock examinations with instantaneous
+  removal, the post-removal occupancy-below-`B = 4·R/PCF` §B.2/§B.4
+  requirement) and `RateController` (a virtual-buffer QUANT governor:
+  fullness integrates `actual − target` with symmetric caps, QUANT
+  follows proportionally with a bounded ±4 step).
+  `encode_sequence_rate_controlled` pairs them over the closed-loop
+  I + P GOP encoder: per-picture QUANT from the controller, §B.4
+  violations re-encoded at finer QUANT and > 4×-budget overshoots at
+  coarser QUANT (bounded by `max_reencodes`), with per-picture
+  bits / QUANTs and HRD conformance reported on
+  `RateControlledStream`. Measured steady-state accuracy on the
+  moving-square QCIF clip: mean bits/picture within **−9.1 % … +4.6 %**
+  of target across 1.5 k–5 k bit/picture budgets, all §B.4-conformant
+  at `B = 4T`; integration tests pin the long-run average (±25 %),
+  budget scaling (thin stream smaller + coarser steady QUANT),
+  HRD conformance and I-burst absorption.
+
+### Fixed
+
+- **Forward quantiser could emit unrepresentable LEVELs**
+  (round 438): `fdct::quantise_ac_coefficient` now saturates the
+  quantised magnitude at 127 — the §5.4.2 baseline ESCAPE LEVEL
+  ceiling (8-bit two's complement, `0x00`/`0x80` forbidden). Sharp
+  content at very fine quantisers (e.g. a 70-step edge at QUANT ≤ 2)
+  previously produced |LEVEL| > 127 and the VLC/SAC emitters failed
+  with `BadTcoefCode`; the clamp mirrors the Annex I planner's
+  existing `MAX_LEVEL_BASELINE` policy (the MQ extended-range paths
+  quantise through the Annex I planner and are unaffected).
+
+### Added
+
 - **Annex K Rectangular Slice + Arbitrary Slice Ordering submodes**
   (round 438): the Slice-Structured decode driver now stages both §K.1
   submodes. Under **RS** each slice header carries the §K.2.8 SWI

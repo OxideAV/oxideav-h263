@@ -3035,6 +3035,178 @@ pub fn encode_sequence(frames: &[YuvFrame], cfg: &GopConfig, tr0: u8) -> Result<
     Ok(out)
 }
 
+/// Configuration for [`encode_sequence_rate_controlled`].
+#[derive(Debug, Clone, Copy)]
+pub struct RateControlConfig {
+    /// Bit budget per coded picture (the [`crate::rate_control::RateController`]
+    /// target). For a CBR channel of `R` bits/s at `PCF` pictures/s
+    /// this is `R / PCF`.
+    pub target_bits_per_picture: u32,
+    /// QUANT for the first picture; the controller adapts from here.
+    pub initial_quant: u8,
+    /// An INTRA picture every `intra_period` frames (frame 0 always).
+    /// `0` = only frame 0 is INTRA.
+    pub intra_period: usize,
+    /// Motion-search window for P-pictures (±whole pixels).
+    pub search_half: i32,
+    /// Annex B HRD parameters to regulate against; `None` runs the
+    /// virtual-buffer controller without the HRD conformance loop.
+    pub hrd: Option<crate::rate_control::HrdParams>,
+    /// Maximum re-encodes of a single picture when it lands outside
+    /// the regulation bounds (HRD violation → finer QUANT; > 4× budget
+    /// → coarser QUANT). `0` disables re-encoding.
+    pub max_reencodes: u8,
+}
+
+impl Default for RateControlConfig {
+    fn default() -> Self {
+        RateControlConfig {
+            target_bits_per_picture: 24_000,
+            initial_quant: 10,
+            intra_period: 12,
+            search_half: 8,
+            hrd: None,
+            max_reencodes: 1,
+        }
+    }
+}
+
+/// Output of [`encode_sequence_rate_controlled`]: the elementary
+/// stream plus the per-picture measurements the regulation produced.
+#[derive(Debug, Clone)]
+pub struct RateControlledStream {
+    /// The H.263 elementary stream (decodes through
+    /// [`crate::picture::decode_sequence`]).
+    pub bytes: Vec<u8>,
+    /// Coded size of each picture in bits.
+    pub picture_bits: Vec<u32>,
+    /// QUANT each picture was finally coded at.
+    pub picture_quants: Vec<u8>,
+    /// Whether every picture kept the Annex B §B.4 requirement
+    /// (`true` when no HRD parameters were supplied).
+    pub hrd_conformant: bool,
+    /// Largest §B.4 post-removal occupancy observed (0 without HRD).
+    pub hrd_max_occupancy: u64,
+}
+
+/// Encode a sequence of frames as a **rate-controlled** I + P GOP
+/// elementary stream: the closed-loop structure of
+/// [`encode_sequence`] (each P-picture predicts from the decoder's
+/// reconstruction) with the per-picture QUANT chosen by a
+/// [`crate::rate_control::RateController`] virtual-buffer loop aiming
+/// at [`RateControlConfig::target_bits_per_picture`], optionally
+/// regulated against the **Annex B Hypothetical Reference Decoder**:
+///
+/// * each coded picture is fed through the
+///   [`crate::rate_control::HrdModel`] CBR simulation; a picture whose
+///   removal would leave the buffer at or above `B` (§B.4 — the
+///   picture undershot the channel so far that the buffer backlog
+///   crossed the bound) is re-encoded at a **finer** QUANT (more
+///   bits), up to [`RateControlConfig::max_reencodes`] times;
+/// * a picture overshooting 4× the budget is re-encoded at a
+///   **coarser** QUANT, bounding worst-case channel latency.
+///
+/// Any residual §B.4 violation after the re-encode budget is spent is
+/// *reported* on [`RateControlledStream::hrd_conformant`] rather than
+/// silently ignored.
+pub fn encode_sequence_rate_controlled(
+    frames: &[YuvFrame],
+    cfg: &RateControlConfig,
+    tr0: u8,
+) -> Result<RateControlledStream> {
+    use crate::picture::{decode_picture_no_gob0_header, DecodeOptions};
+    use crate::rate_control::{HrdModel, RateController};
+
+    if cfg.initial_quant == 0 || cfg.initial_quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+
+    let mut rc = RateController::new(cfg.target_bits_per_picture, cfg.initial_quant);
+    let mut hrd = cfg.hrd.map(HrdModel::new);
+    let mut out = Vec::new();
+    let mut picture_bits = Vec::with_capacity(frames.len());
+    let mut picture_quants = Vec::with_capacity(frames.len());
+    let mut hrd_conformant = true;
+    let mut recon: Option<YuvFrame> = None;
+
+    for (i, frame) in frames.iter().enumerate() {
+        let tr = tr0.wrapping_add(i as u8);
+        let force_intra = recon.is_none() || (cfg.intra_period != 0 && i % cfg.intra_period == 0);
+
+        let mut quant = rc.next_quant();
+        let mut bytes;
+        let mut reencodes = cfg.max_reencodes;
+        loop {
+            bytes = if force_intra {
+                encode_intra_picture(frame, quant, tr)?
+            } else {
+                let reference = recon.as_ref().expect("recon present for P-picture");
+                encode_inter_picture_motion(frame, reference, quant, tr, cfg.search_half)?
+            };
+            let bits = bytes.len() as u64 * 8;
+
+            // Probe the regulation bounds on scratch state; commit only
+            // the final encode.
+            let hrd_violation = hrd
+                .as_ref()
+                .map(|h| !{
+                    let mut probe = *h;
+                    probe.push_picture(bits).conformant
+                })
+                .unwrap_or(false);
+            let overshoot = bits > 4 * cfg.target_bits_per_picture as u64;
+
+            if reencodes == 0 || (!hrd_violation && !overshoot) {
+                break;
+            }
+            reencodes -= 1;
+            if hrd_violation {
+                // §B.4 — the picture is too small for the channel
+                // backlog; spend more bits (finer QUANT).
+                if quant == 1 {
+                    break;
+                }
+                quant = quant.saturating_sub(4).max(1);
+            } else {
+                // Latency bound: too many channel intervals for one
+                // picture; spend fewer bits (coarser QUANT).
+                if quant == 31 {
+                    break;
+                }
+                quant = (quant + 4).min(31);
+            }
+        }
+
+        let bits = bytes.len() as u64 * 8;
+        if let Some(h) = hrd.as_mut() {
+            let outcome = h.push_picture(bits);
+            hrd_conformant &= outcome.conformant;
+        }
+        rc.update(bits);
+        picture_bits.push(bits as u32);
+        picture_quants.push(quant);
+
+        // Closed loop: predict the next picture from the decoded
+        // reconstruction of this one.
+        let decoded = decode_picture_no_gob0_header(
+            &bytes,
+            if force_intra { None } else { recon.as_ref() },
+            DecodeOptions::default(),
+        )?;
+        out.extend_from_slice(&bytes);
+        recon = Some(decoded);
+    }
+
+    let hrd_max_occupancy = hrd.map(|h| h.max_occupancy_after_removal()).unwrap_or(0);
+    Ok(RateControlledStream {
+        bytes: out,
+        picture_bits,
+        picture_quants,
+        hrd_conformant,
+        hrd_max_occupancy,
+    })
+}
+
 /// Encode a sequence of frames as an all-INTRA H.263 elementary stream.
 ///
 /// Each frame is encoded as a baseline I-picture (via

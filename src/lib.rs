@@ -235,6 +235,7 @@ pub mod pb_layer;
 pub mod picture;
 pub mod picture_header;
 pub mod plus_ptype;
+pub mod rate_control;
 pub mod rru_filter;
 pub mod rru_upsample;
 pub mod rtp;
@@ -273,8 +274,9 @@ pub use encoder::{
     encode_intra_picture_gobs, encode_intra_picture_plus, encode_intra_picture_sac,
     encode_intra_picture_slices, encode_intra_picture_slices_aic,
     encode_intra_picture_slices_aic_mq, encode_intra_picture_slices_rect, encode_intra_sequence,
-    encode_intra_sequence_aic, encode_pb_picture, encode_sequence, write_plus_picture_header,
-    GopConfig, PbConfig, PlusModes, EOS_BYTES,
+    encode_intra_sequence_aic, encode_pb_picture, encode_sequence, encode_sequence_rate_controlled,
+    write_plus_picture_header, GopConfig, PbConfig, PlusModes, RateControlConfig,
+    RateControlledStream, EOS_BYTES,
 };
 pub use encoder_aic::{plan_intra_block_aic, write_intra_block_aic, AicBlockPlan};
 pub use encoder_block::{
@@ -335,6 +337,7 @@ pub use plus_ptype::{
     CPCFC_BITS, CPFMT_BITS, EPAR_BITS, ETR_BITS, MPPTYPE_BITS, OPPTYPE_BITS, SSS_BITS, UFEP_BITS,
     UFEP_FULL, UFEP_MANDATORY_ONLY,
 };
+pub use rate_control::{HrdModel, HrdParams, HrdPictureOutcome, RateController};
 pub use rru_filter::{
     rru_default_tap, rru_filter_plane, RruEdgeCondition, RruFilterMode, RRU_BLOCK_DIM,
 };
