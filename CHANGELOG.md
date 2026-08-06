@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex E SAC pictures end-to-end** (round 438): `decode_picture_sac`
+  decodes a baseline-PTYPE picture whose §5.1.3 bit 11 (SAC) is set —
+  fixed-length header layer (PQUANT / CPM / PEI-PSUPP, §E.6), then the
+  §E.3 `decoder_reset` and a single-segment arithmetic macroblock walk
+  (`sac::parse_macroblock_sac` — COD / MCBPC / CBPY / DQUANT / MVD
+  under their §E.7 models — plus the §E.4 block layer), reconstructed
+  through the exact baseline primitives (Figure-12 median predictor
+  with the Annex D UMV range when PTYPE signals it, Table-18 chroma
+  vectors, §6.1–§6.3 block reconstruction, optional Annex J post
+  filter). The encoder arm lands alongside:
+  `encode_intra_picture_sac` / `encode_inter_picture_sac` (PTYPE
+  bit-11 header + `sac::encode_intra_macroblock_sac` /
+  `encode_inter_macroblock_sac` / `encode_skipped_macroblock_sac` +
+  §E.6 flush + PSTUF) share the VLC encoder's transform / quantiser
+  stage, so SAC and VLC pictures of the same source reconstruct
+  **byte-identically** — pinned by integration tests across
+  sub-QCIF/QCIF/CIF at QP 2/4/13/31 (I) and QP 6 (P), together with
+  flat-exactness, all-skip losslessness, mutual driver rejection,
+  §5.1.4.6 barred-combination refusal (Annex S / T / AIC), and a
+  no-PSC-emulation byte scan. Measured entropy-layer saving on the
+  gradient QCIF corpus: SAC I-pictures are 6.4–25.5 % smaller than
+  the VLC pictures (QP 31 → QP 2); an all-skip SAC P-picture is
+  ≤ 32 bytes. §5.1.4.6 combinations (Annex S/T), PB-frames, Advanced
+  Prediction and mid-picture GOB headers are refused pending later
+  rounds.
+
 - **Annex E Syntax-based Arithmetic Coding core** (round 438): the new
   `sac` module stages the §E.2 arithmetic encoder (`SacEncoder` —
   `encode_a_symbol` + the §E.6 `encoder_flush`), the §E.3 arithmetic

@@ -784,6 +784,312 @@ fn skip_pei_psupp(reader: &mut BitReader<'_>) -> Result<()> {
     }
 }
 
+/// Decode a single **Annex E Syntax-based Arithmetic Coding** (SAC)
+/// picture — a baseline-PTYPE picture whose §5.1.3 bit 11 is set, with
+/// every macroblock- and block-layer VLC replaced by its §E.7
+/// arithmetic model.
+///
+/// The picture-header layer is fixed-length and parsed exactly like
+/// [`decode_picture_no_gob0_header`] (§E.6 — header strings pass
+/// through the coded stream unmodified): PSC / TR / PTYPE, §5.1.19
+/// PQUANT, §5.1.20 CPM (the `"1"` branch is refused) and the §5.1.24 /
+/// §5.1.25 PEI / PSUPP loop. The [`crate::sac::SacDecoder`] is then
+/// initialised at the first macroblock bit (§E.3 `decoder_reset`) and
+/// the macroblock stream is decoded as **one video picture segment**:
+/// the §5.2.2 GOB-0 header elision plus the §5.2 every-later-header-
+/// omitted layout the crate's own SAC encoder emits (a mid-picture GOB
+/// header would require an §E.5 start-code resynchronisation that is
+/// not yet staged).
+///
+/// Reconstruction reuses the exact baseline primitives — the §6.1.1 /
+/// Figure-12 median predictor (with the Annex D §D.2 extended range
+/// when PTYPE signals UMV — legal alongside SAC when PLUSPTYPE is
+/// absent, §5.1.4.6), Table-18 chroma vectors, half-pel compensation
+/// and the §6.1–§6.3 block reconstruction — so an SAC picture and a
+/// VLC picture carrying the same quantised coefficients decode to
+/// byte-identical frames.
+///
+/// # Errors
+///
+/// * [`Error::NotImplemented`] — the header does not signal SAC, or it
+///   signals a combination not staged on this path: PB-frames,
+///   Advanced Prediction / INTER4V, CPM = "1", or the
+///   [`DecodeOptions`] AIC / Modified-Quantization / Alternative-
+///   INTER-VLC flags (§5.1.4.6 bars Annexes S and T with SAC
+///   outright).
+/// * The picture-header / quantiser errors of
+///   [`decode_picture_no_gob0_header`].
+pub fn decode_picture_sac(
+    data: &[u8],
+    reference: Option<&YuvFrame>,
+    options: DecodeOptions,
+) -> Result<YuvFrame> {
+    let mut reader = BitReader::new(data);
+    let header = parse_picture_header(&mut reader)?;
+    if !header.sac_mode {
+        return Err(Error::NotImplemented);
+    }
+    // Unstaged mode combinations. §5.1.4.6 bars Annex S / Annex T with
+    // SAC; AP (INTER4V + OBMC) and PB-frames are legal but not staged
+    // on this driver; AIC needs PLUSPTYPE which a baseline-PTYPE SAC
+    // picture cannot carry.
+    if header.pb_frames
+        || header.advanced_prediction
+        || options.aic
+        || options.modified_quant
+        || options.alt_inter_vlc
+    {
+        return Err(Error::NotImplemented);
+    }
+    let layout =
+        PictureLayout::for_source_format(header.source_format).ok_or(Error::NotImplemented)?;
+
+    // §5.1.19 — PQUANT.
+    let pquant = reader.read_u32(5).map_err(|_| Error::UnexpectedEof)? as u8;
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    // §5.1.20 — CPM ("1" pulls in PSBI / GSBI, refused).
+    let cpm = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    if cpm {
+        return Err(Error::NotImplemented);
+    }
+    // §5.1.24 / §5.1.25 — PEI + PSUPP.
+    skip_pei_psupp(&mut reader)?;
+
+    decode_sac_macroblock_stream(&mut reader, &header, &layout, reference, options, pquant)
+}
+
+/// The single-segment SAC macroblock walk behind [`decode_picture_sac`]:
+/// `reader` is positioned at the first arithmetic-coded bit (the §E.3
+/// `decoder_reset` happens here).
+fn decode_sac_macroblock_stream(
+    reader: &mut BitReader<'_>,
+    header: &H263PictureHeader,
+    layout: &PictureLayout,
+    reference: Option<&YuvFrame>,
+    options: DecodeOptions,
+    pquant: u8,
+) -> Result<YuvFrame> {
+    use crate::sac::{parse_macroblock_sac, SacDecoder};
+
+    let luma_w = layout.luma_width as usize;
+    let luma_h = layout.luma_height as usize;
+    let mb_cols = luma_w / 16;
+    let mb_rows_total = luma_h / 16;
+    let chroma_w = luma_w / 2;
+    let chroma_h = luma_h / 2;
+
+    let is_inter_picture = matches!(header.coding_type, H263PictureCodingType::Inter);
+    if is_inter_picture {
+        match reference {
+            Some(r) if r.luma_width == luma_w && r.luma_height == luma_h => {}
+            _ => return Err(Error::NotImplemented),
+        }
+    }
+
+    let mut frame = YuvFrame {
+        y: vec![0u8; luma_w * luma_h],
+        cb: vec![0u8; chroma_w * chroma_h],
+        cr: vec![0u8; chroma_w * chroma_h],
+        luma_width: luma_w,
+        luma_height: luma_h,
+    };
+
+    let mut grid = vec![MbGridEntry::OUTSIDE; mb_cols * mb_rows_total];
+    let mut mb_quant = vec![0u8; mb_cols * mb_rows_total];
+    let mut current_quant = pquant;
+
+    let mut dec = SacDecoder::new(reader);
+    for row in 0..mb_rows_total {
+        for col in 0..mb_cols {
+            // §5.3.2 — MCBPC stuffing carries no macroblock data.
+            let mb = loop {
+                let mb = parse_macroblock_sac(
+                    &mut dec,
+                    MbContext {
+                        picture_coding_type: header.coding_type,
+                        advanced_prediction: false,
+                        deblocking_filter: false,
+                        aic_intra_mode: false,
+                        pb_frames: false,
+                        pb_annex_m: false,
+                        quantiser_before: current_quant,
+                        modified_quant: false,
+                    },
+                )?;
+                if matches!(mb.mb_type, Some(MbType::Stuffing)) {
+                    continue;
+                }
+                break mb;
+            };
+
+            let (mv, mvs4) = decode_one_macroblock_sac(
+                &mut dec,
+                &mb,
+                reference,
+                &mut frame,
+                &grid,
+                mb_cols,
+                col,
+                row,
+                header.umv_mode,
+                &mut current_quant,
+            )?;
+            record_grid(
+                &mut grid,
+                &mut mb_quant,
+                mb_cols,
+                col,
+                row,
+                &mb,
+                current_quant,
+                mv,
+                mvs4,
+                /* segment */ 0,
+            );
+        }
+    }
+
+    if options.deblock {
+        apply_deblocking(&mut frame, &grid, &mb_quant, mb_cols, mb_rows_total);
+    }
+
+    Ok(frame)
+}
+
+/// Reconstruct one SAC macroblock into the frame planes — the Annex E
+/// mirror of [`decode_one_macroblock`]'s baseline INTRA / INTER /
+/// skipped branches, with every block read through
+/// [`crate::sac::parse_block_sac`] instead of the Table 16 VLC.
+#[allow(clippy::too_many_arguments)]
+fn decode_one_macroblock_sac(
+    dec: &mut crate::sac::SacDecoder<'_, '_>,
+    mb: &H263Macroblock,
+    reference: Option<&YuvFrame>,
+    frame: &mut YuvFrame,
+    grid: &[MbGridEntry],
+    mb_cols: usize,
+    col: usize,
+    row: usize,
+    umv_mode: bool,
+    current_quant: &mut u8,
+) -> Result<(MotionVector, Mb4Mv)> {
+    use crate::sac::parse_block_sac;
+
+    let luma_stride = frame.luma_width;
+    let chroma_stride = frame.chroma_width();
+    let mb_x = col * 16;
+    let mb_y = row * 16;
+    let c_x = col * 8;
+    let c_y = row * 8;
+
+    // Skipped macroblock (COD = 1): reference copy with a zero MV.
+    if !mb.coded {
+        let reference = reference.ok_or(Error::NotImplemented)?;
+        copy_inter_macroblock(
+            reference,
+            frame,
+            mb_x,
+            mb_y,
+            c_x,
+            c_y,
+            MotionVector::new(0, 0),
+        );
+        let zero = MotionVector::new(0, 0);
+        return Ok((zero, [zero; 4]));
+    }
+
+    let mb_type = mb.mb_type.ok_or(Error::NotImplemented)?;
+    *current_quant = mb.quantiser_after;
+    let quant = mb.quantiser_after;
+    let cbpy = mb.cbpy.unwrap_or(0);
+    let cbpc = mb.cbpc.unwrap_or(0);
+
+    if mb_type.is_intra() {
+        // INTRA / INTRA+Q — every block carries the INTRADC symbol;
+        // CBPY / CBPC gate the AC event stream.
+        for blk in 0..4 {
+            let has_ac = (cbpy >> (3 - blk)) & 1 == 1;
+            let block = parse_block_sac(dec, true, has_ac, true)?;
+            let samples = reconstruct_intra_block(&block, quant);
+            let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+            blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+        }
+        let cb_block = parse_block_sac(dec, true, cbpc & 0b10 != 0, true)?;
+        let cb_samples = reconstruct_intra_block(&cb_block, quant);
+        blit_block(&mut frame.cb, chroma_stride, c_x, c_y, &cb_samples);
+        let cr_block = parse_block_sac(dec, true, cbpc & 0b01 != 0, true)?;
+        let cr_samples = reconstruct_intra_block(&cr_block, quant);
+        blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
+
+        let zero = MotionVector::new(0, 0);
+        return Ok((zero, [zero; 4]));
+    }
+
+    // INTER / INTER+Q (single MV).
+    let reference = reference.ok_or(Error::NotImplemented)?;
+    let predictor = predict_mv(
+        grid, mb_cols, col, row, /* gob_top_row */ 0, /* gob_header_present */ true,
+        /* pb_mode */ false, /* segment */ 0,
+    );
+    let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
+    let luma_mv = if umv_mode {
+        reconstruct_mv_umv(predictor, mvd)
+    } else {
+        reconstruct_mv(predictor, mvd)
+    };
+    let chroma_vec = chroma_mv(luma_mv);
+
+    // §5.3.5 — the CBPY symbol carries the Table 12 index; INTER
+    // macroblocks complement it to the actual coded pattern.
+    let inter_cbpy = cbpy ^ 0b1111;
+
+    let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
+    for blk in 0..4 {
+        let has_coef = (inter_cbpy >> (3 - blk)) & 1 == 1;
+        let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+        let prediction = motion_compensate_block(&y_ref, bx, by, luma_mv, RCONTROL_DEFAULT);
+        let samples = if has_coef {
+            let block = parse_block_sac(dec, false, true, false)?;
+            reconstruct_inter_block_with_prediction(&block, quant, &prediction)
+        } else {
+            prediction
+        };
+        blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+    }
+
+    let cb_ref = RefPlane::new(
+        &reference.cb,
+        reference.chroma_width(),
+        reference.chroma_height(),
+    );
+    let cb_pred = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cb_samples = if cbpc & 0b10 != 0 {
+        let block = parse_block_sac(dec, false, true, false)?;
+        reconstruct_inter_block_with_prediction(&block, quant, &cb_pred)
+    } else {
+        cb_pred
+    };
+    blit_block(&mut frame.cb, chroma_stride, c_x, c_y, &cb_samples);
+
+    let cr_ref = RefPlane::new(
+        &reference.cr,
+        reference.chroma_width(),
+        reference.chroma_height(),
+    );
+    let cr_pred = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cr_samples = if cbpc & 0b01 != 0 {
+        let block = parse_block_sac(dec, false, true, false)?;
+        reconstruct_inter_block_with_prediction(&block, quant, &cr_pred)
+    } else {
+        cr_pred
+    };
+    blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
+
+    Ok((luma_mv, [luma_mv; 4]))
+}
+
 /// Locate the byte offset of the next Picture Start Code in `data` at or
 /// after byte `from`, scanning only byte boundaries.
 ///

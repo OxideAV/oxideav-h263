@@ -887,6 +887,241 @@ pub fn write_block_sac(
     Ok(())
 }
 
+/// Parse one macroblock header of an SAC picture (§5.3 syntax with
+/// every VLC replaced by its §E.7 model): COD (P-pictures), MCBPC,
+/// CBPY, optional DQUANT and the MVD pair. The returned
+/// [`H263Macroblock`] uses the exact conventions of
+/// [`crate::macroblock::parse_macroblock`] (CBPY in INTRA orientation,
+/// `quantiser_after` post-DQUANT, `Stuffing` surfaced for the caller's
+/// re-read loop).
+///
+/// Staged subset: the baseline I/P macroblock forms (plus the Annex D
+/// UMV vector range — MVD symbols are Table 14 either way). PB-frames,
+/// Advanced INTRA Coding, Modified Quantization (barred with SAC by
+/// §5.1.4.6) and the INTER4V types return [`Error::NotImplemented`].
+pub fn parse_macroblock_sac(
+    dec: &mut SacDecoder<'_, '_>,
+    ctx: crate::macroblock::MbContext,
+) -> Result<crate::macroblock::H263Macroblock> {
+    use crate::macroblock::{H263Macroblock, MbContext, Mvd};
+    use crate::picture_header::H263PictureCodingType;
+
+    let MbContext {
+        picture_coding_type,
+        quantiser_before,
+        ..
+    } = ctx;
+    if ctx.pb_frames || ctx.aic_intra_mode || ctx.modified_quant {
+        return Err(Error::NotImplemented);
+    }
+    if quantiser_before == 0 || quantiser_before > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+
+    let empty = H263Macroblock {
+        coded: false,
+        mb_type: None,
+        cbpc: None,
+        cbpy: None,
+        dquant: None,
+        quantiser_after: quantiser_before,
+        mvd: None,
+        mvd234: [None; 3],
+        intra_mode: None,
+        modb: None,
+        annex_m_modb: None,
+        cbpb: None,
+        mvdb: None,
+    };
+
+    // §5.3.1 — COD, only in INTER pictures.
+    let is_inter_picture = matches!(picture_coding_type, H263PictureCodingType::Inter);
+    if is_inter_picture && !decode_cod(dec) {
+        return Ok(empty);
+    }
+
+    // §5.3.2 — MCBPC.
+    let (mb_type, cbpc) = if is_inter_picture {
+        decode_mcbpc_p_sac(dec)?
+    } else {
+        decode_mcbpc_i_sac(dec)?
+    };
+    if matches!(mb_type, MbType::Stuffing) {
+        return Ok(H263Macroblock {
+            coded: true,
+            mb_type: Some(MbType::Stuffing),
+            ..empty
+        });
+    }
+    if matches!(mb_type, MbType::Inter4V | MbType::Inter4VQ) {
+        // The four-vector types need Advanced Prediction / Deblocking
+        // Filter, neither of which is staged on the SAC path.
+        return Err(Error::NotImplemented);
+    }
+
+    // §5.3.5 — CBPY (model keyed on the macroblock type per §E.7).
+    let cbpy = decode_cbpy_sac(dec, mb_type.is_intra());
+
+    // §5.3.6 — DQUANT (baseline Table 13 differential; §5.1.4.6 bars
+    // the Annex T variable-length form with SAC).
+    let (dquant, quantiser_after) = if mb_type.has_dquant() {
+        let diff = decode_dquant_sac(dec);
+        let q = (quantiser_before as i16 + diff as i16).clamp(1, 31) as u8;
+        (Some(diff), q)
+    } else {
+        (None, quantiser_before)
+    };
+
+    // §5.3.7 — MVD (horizontal then vertical) for INTER types.
+    let mvd = if mb_type.has_mvd() {
+        let dx_half = decode_mvd_component_sac(dec);
+        let dy_half = decode_mvd_component_sac(dec);
+        Some(Mvd { dx_half, dy_half })
+    } else {
+        None
+    };
+
+    Ok(H263Macroblock {
+        coded: true,
+        mb_type: Some(mb_type),
+        cbpc: Some(cbpc),
+        cbpy: Some(cbpy),
+        dquant,
+        quantiser_after,
+        mvd,
+        ..empty
+    })
+}
+
+/// Encode a baseline **INTRA** macroblock of an SAC picture — the
+/// arithmetic-coded mirror of
+/// [`crate::encoder_mb::encode_intra_macroblock`]: optional COD
+/// (P-pictures), MCBPC, CBPY and the six §E.4 blocks (INTRADC symbol +
+/// AC TCOEF events each). The six blocks are forward-transformed and
+/// quantised at `quant` with the exact same
+/// [`crate::encoder_block::encode_intra_block`] stage as the VLC
+/// encoder, so SAC and VLC pictures of the same source reconstruct
+/// identically.
+pub fn encode_intra_macroblock_sac(
+    enc: &mut SacEncoder<'_>,
+    mb: &crate::encoder_mb::MacroblockSamples,
+    quant: u8,
+    write_cod: bool,
+    picture_is_inter: bool,
+) -> Result<()> {
+    use crate::encoder_block::encode_intra_block;
+
+    if write_cod {
+        encode_cod(enc, true);
+    }
+
+    let y_enc = [
+        encode_intra_block(&mb.luma[0], quant),
+        encode_intra_block(&mb.luma[1], quant),
+        encode_intra_block(&mb.luma[2], quant),
+        encode_intra_block(&mb.luma[3], quant),
+    ];
+    let cb_enc = encode_intra_block(&mb.cb, quant);
+    let cr_enc = encode_intra_block(&mb.cr, quant);
+
+    let mut cbpc = 0u8;
+    if cb_enc.has_ac {
+        cbpc |= 0b10;
+    }
+    if cr_enc.has_ac {
+        cbpc |= 0b01;
+    }
+    if picture_is_inter {
+        encode_mcbpc_p_sac(enc, MbType::Intra, cbpc)?;
+    } else {
+        encode_mcbpc_i_sac(enc, MbType::Intra, cbpc)?;
+    }
+
+    let mut cbpy = 0u8;
+    for (blk, e) in y_enc.iter().enumerate() {
+        if e.has_ac {
+            cbpy |= 1 << (3 - blk);
+        }
+    }
+    encode_cbpy_sac(enc, cbpy, true)?;
+
+    for e in &y_enc {
+        write_block_sac(enc, Some(e.dc_level), &e.scan, e.has_ac, true)?;
+    }
+    write_block_sac(
+        enc,
+        Some(cb_enc.dc_level),
+        &cb_enc.scan,
+        cb_enc.has_ac,
+        true,
+    )?;
+    write_block_sac(
+        enc,
+        Some(cr_enc.dc_level),
+        &cr_enc.scan,
+        cr_enc.has_ac,
+        true,
+    )?;
+
+    Ok(())
+}
+
+/// Encode a baseline **INTER** macroblock of an SAC picture — the
+/// arithmetic-coded mirror of
+/// [`crate::encoder_mb::encode_inter_macroblock`]: COD = coded, MCBPC,
+/// the complemented CBPY, the MVD pair and the coefficient payload.
+pub fn encode_inter_macroblock_sac(
+    enc: &mut SacEncoder<'_>,
+    luma: &[crate::encoder_block::EncodedInterBlock; 4],
+    cb: &crate::encoder_block::EncodedInterBlock,
+    cr: &crate::encoder_block::EncodedInterBlock,
+    mvd: crate::macroblock::Mvd,
+) -> Result<()> {
+    encode_cod(enc, true);
+
+    let mut cbpc = 0u8;
+    if cb.has_coeffs {
+        cbpc |= 0b10;
+    }
+    if cr.has_coeffs {
+        cbpc |= 0b01;
+    }
+    encode_mcbpc_p_sac(enc, MbType::Inter, cbpc)?;
+
+    let mut cbpy_intra = 0u8;
+    for (blk, e) in luma.iter().enumerate() {
+        if e.has_coeffs {
+            cbpy_intra |= 1 << (3 - blk);
+        }
+    }
+    // §5.3.5 — INTER macroblocks code the complement pattern (the
+    // Table 12 index the decoder complements back).
+    encode_cbpy_sac(enc, cbpy_intra ^ 0b1111, false)?;
+
+    encode_mvd_component_sac(enc, mvd.dx_half)?;
+    encode_mvd_component_sac(enc, mvd.dy_half)?;
+
+    for e in luma.iter() {
+        if e.has_coeffs {
+            write_block_sac(enc, None, &e.scan, true, false)?;
+        }
+    }
+    if cb.has_coeffs {
+        write_block_sac(enc, None, &cb.scan, true, false)?;
+    }
+    if cr.has_coeffs {
+        write_block_sac(enc, None, &cr.scan, true, false)?;
+    }
+
+    Ok(())
+}
+
+/// Emit a "not coded" (skipped) P-picture macroblock: the COD = "1"
+/// symbol (§5.3.1).
+pub fn encode_skipped_macroblock_sac(enc: &mut SacEncoder<'_>) {
+    encode_cod(enc, false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

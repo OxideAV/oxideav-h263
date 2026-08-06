@@ -104,6 +104,8 @@ fn extract_macroblock(frame: &YuvFrame, mb_col: usize, mb_row: usize) -> Macrobl
 struct PtypeFlags {
     /// Bit 10 — Annex D Unrestricted Motion Vector mode.
     umv: bool,
+    /// Bit 11 — Annex E Syntax-based Arithmetic Coding mode.
+    sac: bool,
     /// Bit 12 — Annex F Advanced Prediction mode.
     advanced_prediction: bool,
 }
@@ -137,7 +139,7 @@ fn write_picture_header(
     w.write_bits(source_format_bits(fmt), 3);
     w.write_bit(is_inter); // coding-type: 0 INTRA / 1 INTER
     w.write_bit(flags.umv); // UMV (Annex D)
-    w.write_bit(false); // SAC (Annex E)
+    w.write_bit(flags.sac); // SAC (Annex E)
     w.write_bit(flags.advanced_prediction); // AP (Annex F)
     w.write_bit(pb_fields.is_some()); // PB (Annex G)
                                       // §5.1.19 — PQUANT (5 bits).
@@ -633,6 +635,167 @@ pub fn encode_intra_picture(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u
 
     // §5.1.28 — PSTUF: pad to the next byte boundary with zero bits so
     // the picture (and any following PSC) is byte-aligned.
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an **Annex E Syntax-based
+/// Arithmetic Coding INTRA** picture at the given `quant` and temporal
+/// reference `tr`.
+///
+/// The picture header is the baseline §5.1 form with PTYPE bit 11
+/// (SAC) set; the macroblock stream is the same single-segment §5.2.2
+/// layout as [`encode_intra_picture`] but with every macroblock- and
+/// block-layer symbol arithmetic-coded under its §E.7 / §E.8 model
+/// through [`crate::sac::SacEncoder`] (the §E.5 stuffing rule keeps
+/// the coded stream free of start-code emulation). The §E.6
+/// `encoder_flush` terminates the arithmetic interval before the
+/// closing §5.1.28 PSTUF.
+///
+/// The forward transform / quantisation stage is shared with the VLC
+/// encoder, so the SAC picture reconstructs **byte-identically** to
+/// the [`encode_intra_picture`] output of the same source — only the
+/// entropy layer differs. Decodes through
+/// [`crate::picture::decode_picture_sac`] (and [`decode_sequence`]).
+pub fn encode_intra_picture_sac(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    use crate::sac::{encode_intra_macroblock_sac, SacEncoder};
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+
+    let mut w = BitWriter::new();
+    write_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ false,
+        PtypeFlags {
+            sac: true,
+            ..PtypeFlags::default()
+        },
+        None,
+    );
+
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+    {
+        let mut enc = SacEncoder::new(&mut w);
+        for mb_row in 0..mb_rows {
+            for mb_col in 0..mb_cols {
+                let mb = extract_macroblock(frame, mb_col, mb_row);
+                encode_intra_macroblock_sac(
+                    &mut enc, &mb, quant, /* write_cod */ false,
+                    /* picture_is_inter */ false,
+                )?;
+            }
+        }
+        // §E.6 — flush the arithmetic interval before the header/PSTUF
+        // string that follows.
+        enc.flush();
+    }
+
+    // §5.1.28 — PSTUF.
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an **Annex E SAC INTER**
+/// (P-) picture predicted from `reference` with zero motion vectors —
+/// the arithmetic-coded mirror of [`encode_inter_picture`].
+///
+/// Each macroblock's residual against the co-located reference block
+/// is transformed and quantised by the exact VLC-encoder stage; a
+/// macroblock with no surviving residual is skipped (the COD = "1"
+/// symbol). Decodes through [`crate::picture::decode_picture_sac`]
+/// against the same reference, reconstructing byte-identically to the
+/// [`encode_inter_picture`] output of the same source.
+pub fn encode_inter_picture_sac(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+) -> Result<Vec<u8>> {
+    use crate::sac::{encode_inter_macroblock_sac, encode_skipped_macroblock_sac, SacEncoder};
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if frame.luma_width != reference.luma_width || frame.luma_height != reference.luma_height {
+        return Err(Error::NotImplemented);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+
+    let mut w = BitWriter::new();
+    write_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ true,
+        PtypeFlags {
+            sac: true,
+            ..PtypeFlags::default()
+        },
+        None,
+    );
+
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+    {
+        let mut enc = SacEncoder::new(&mut w);
+        for mb_row in 0..mb_rows {
+            for mb_col in 0..mb_cols {
+                let src = extract_macroblock(frame, mb_col, mb_row);
+                let refmb = extract_macroblock(reference, mb_col, mb_row);
+
+                let luma_enc: Vec<crate::encoder_block::EncodedInterBlock> = (0..4)
+                    .map(|blk| {
+                        let residual = residual_of(&src.luma[blk], &refmb.luma[blk]);
+                        crate::encoder_block::encode_inter_block(&residual, quant)
+                    })
+                    .collect();
+                let cb_enc = crate::encoder_block::encode_inter_block(
+                    &residual_of(&src.cb, &refmb.cb),
+                    quant,
+                );
+                let cr_enc = crate::encoder_block::encode_inter_block(
+                    &residual_of(&src.cr, &refmb.cr),
+                    quant,
+                );
+
+                let any_coeffs =
+                    luma_enc.iter().any(|e| e.has_coeffs) || cb_enc.has_coeffs || cr_enc.has_coeffs;
+                if !any_coeffs {
+                    encode_skipped_macroblock_sac(&mut enc);
+                    continue;
+                }
+
+                let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
+                    luma_enc[0].clone(),
+                    luma_enc[1].clone(),
+                    luma_enc[2].clone(),
+                    luma_enc[3].clone(),
+                ];
+                encode_inter_macroblock_sac(
+                    &mut enc,
+                    &luma_arr,
+                    &cb_enc,
+                    &cr_enc,
+                    crate::macroblock::Mvd {
+                        dx_half: 0,
+                        dy_half: 0,
+                    },
+                )?;
+            }
+        }
+        enc.flush();
+    }
+
     w.align_to_byte_zero();
     Ok(w.finish())
 }
