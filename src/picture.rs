@@ -857,12 +857,43 @@ pub fn decode_picture_sac(
     // §5.1.24 / §5.1.25 — PEI + PSUPP.
     skip_pei_psupp(&mut reader)?;
 
-    decode_sac_macroblock_stream(&mut reader, &header, &layout, reference, options, pquant)
+    // §E.5 — the stuffing filter's zero-run counter spans the
+    // header/arithmetic boundary (runs are counted over the whole
+    // stream): seed it with the header's trailing zeros (PQUANT low
+    // bits + CPM = "0" + PEI = "0").
+    let header_zero_run = trailing_zero_run_before(data, reader.bit_position() as usize);
+
+    decode_sac_macroblock_stream(
+        &mut reader,
+        &header,
+        &layout,
+        reference,
+        options,
+        pquant,
+        header_zero_run,
+    )
+}
+
+/// Length (capped at 14) of the run of `0` bits immediately preceding
+/// bit position `bit_pos` of `data` — the §E.5 stuffing-filter seed for
+/// an arithmetic segment that starts right after a fixed-length header
+/// string.
+fn trailing_zero_run_before(data: &[u8], bit_pos: usize) -> u32 {
+    let mut run = 0u32;
+    while run < 14 && (run as usize) < bit_pos {
+        let idx = bit_pos - 1 - run as usize;
+        if data[idx / 8] & (0x80 >> (idx % 8)) != 0 {
+            break;
+        }
+        run += 1;
+    }
+    run
 }
 
 /// The single-segment SAC macroblock walk behind [`decode_picture_sac`]:
 /// `reader` is positioned at the first arithmetic-coded bit (the §E.3
 /// `decoder_reset` happens here).
+#[allow(clippy::too_many_arguments)]
 fn decode_sac_macroblock_stream(
     reader: &mut BitReader<'_>,
     header: &H263PictureHeader,
@@ -870,6 +901,7 @@ fn decode_sac_macroblock_stream(
     reference: Option<&YuvFrame>,
     options: DecodeOptions,
     pquant: u8,
+    header_zero_run: u32,
 ) -> Result<YuvFrame> {
     use crate::sac::{parse_macroblock_sac, SacDecoder};
 
@@ -900,7 +932,7 @@ fn decode_sac_macroblock_stream(
     let mut mb_quant = vec![0u8; mb_cols * mb_rows_total];
     let mut current_quant = pquant;
 
-    let mut dec = SacDecoder::new(reader);
+    let mut dec = SacDecoder::with_zero_run(reader, header_zero_run);
     for row in 0..mb_rows_total {
         for col in 0..mb_cols {
             // §5.3.2 — MCBPC stuffing carries no macroblock data.
@@ -1233,6 +1265,13 @@ pub fn decode_sequence(data: &[u8], options: DecodeOptions) -> Result<Vec<YuvFra
                 frames.push(b_frame);
                 prev_tr = Some(tr);
                 frames.push(p_frame);
+            } else if baseline_is_sac(picture)? {
+                // Annex E — PTYPE bit 11: the picture's macroblock and
+                // block layers are arithmetic-coded; route to the SAC
+                // driver (same reference threading as the VLC path).
+                let frame = decode_picture_sac(picture, reference, options)?;
+                prev_tr = Some(tr);
+                frames.push(frame);
             } else {
                 let frame = decode_picture_no_gob0_header(picture, reference, options)?;
                 prev_tr = Some(tr);
@@ -1334,6 +1373,27 @@ fn baseline_tr_and_pb(data: &[u8]) -> Result<(u8, bool)> {
         .map_err(|_| Error::UnexpectedEof)?;
     let pb_frames = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
     Ok((tr, pb_frames))
+}
+
+/// Peek the §5.1.3 PTYPE bit 11 (Annex E Syntax-based Arithmetic
+/// Coding) of a baseline (non-extended) picture. Used by
+/// [`decode_sequence`] to route an SAC picture to
+/// [`decode_picture_sac`]. The caller must only invoke this on a
+/// picture known to be baseline-PTYPE.
+fn baseline_is_sac(data: &[u8]) -> Result<bool> {
+    let mut reader = BitReader::new(data);
+    let psc = reader
+        .read_u32(PSC_BITS)
+        .map_err(|_| Error::UnexpectedEof)?;
+    if psc != PSC_VALUE {
+        return Err(Error::BadPictureStartCode);
+    }
+    // TR (8) + PTYPE bits 1-5 (5) + source format (3) + coding type (1)
+    // + UMV (1) precede the SAC bit.
+    reader
+        .skip(8 + 5 + 3 + 1 + 1)
+        .map_err(|_| Error::UnexpectedEof)?;
+    reader.read_bit().map_err(|_| Error::UnexpectedEof)
 }
 
 /// Decode a single H.263 picture from `data`, dispatching on the

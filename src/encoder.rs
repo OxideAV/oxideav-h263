@@ -683,7 +683,10 @@ pub fn encode_intra_picture_sac(frame: &YuvFrame, quant: u8, tr: u8) -> Result<V
     let mb_cols = frame.luma_width / 16;
     let mb_rows = frame.luma_height / 16;
     {
-        let mut enc = SacEncoder::new(&mut w);
+        // §E.5 — the zero-run counter spans the header/arithmetic
+        // boundary: the header tail is PQUANT's trailing zeros + CPM=0
+        // + PEI=0.
+        let mut enc = SacEncoder::with_zero_run(&mut w, 2 + quant.trailing_zeros());
         for mb_row in 0..mb_rows {
             for mb_col in 0..mb_cols {
                 let mb = extract_macroblock(frame, mb_col, mb_row);
@@ -747,7 +750,10 @@ pub fn encode_inter_picture_sac(
     let mb_cols = frame.luma_width / 16;
     let mb_rows = frame.luma_height / 16;
     {
-        let mut enc = SacEncoder::new(&mut w);
+        // §E.5 — the zero-run counter spans the header/arithmetic
+        // boundary: the header tail is PQUANT's trailing zeros + CPM=0
+        // + PEI=0.
+        let mut enc = SacEncoder::with_zero_run(&mut w, 2 + quant.trailing_zeros());
         for mb_row in 0..mb_rows {
             for mb_col in 0..mb_cols {
                 let src = extract_macroblock(frame, mb_col, mb_row);
@@ -791,6 +797,173 @@ pub fn encode_inter_picture_sac(
                         dy_half: 0,
                     },
                 )?;
+            }
+        }
+        enc.flush();
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an **Annex E SAC INTER**
+/// (P-) picture with **motion estimation** — the arithmetic-coded
+/// mirror of [`encode_inter_picture_motion`] (single-segment framing).
+///
+/// Each macroblock's vector is estimated by
+/// [`crate::encoder_motion::estimate_motion`] around the §6.1.1 median
+/// predictor (replayed through [`crate::encoder_motion::MvGrid`], so
+/// every emitted MVD symbol reconstructs to exactly the searched
+/// vector), the residual is computed against the motion-compensated
+/// prediction, and the classic intra-refresh heuristic converts a
+/// macroblock whose residual energy exceeds its own AC energy into a
+/// P-picture INTRA macroblock. A zero-vector macroblock with no
+/// surviving residual is skipped. Decodes through
+/// [`crate::picture::decode_picture_sac`] and
+/// [`crate::picture::decode_sequence`].
+pub fn encode_inter_picture_motion_sac(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+) -> Result<Vec<u8>> {
+    use crate::sac::{
+        encode_inter_macroblock_sac, encode_intra_macroblock_sac, encode_skipped_macroblock_sac,
+        SacEncoder,
+    };
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if frame.luma_width != reference.luma_width || frame.luma_height != reference.luma_height {
+        return Err(Error::NotImplemented);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+
+    let mut w = BitWriter::new();
+    write_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ true,
+        PtypeFlags {
+            sac: true,
+            ..PtypeFlags::default()
+        },
+        None,
+    );
+
+    let lw = frame.luma_width;
+    let lh = frame.luma_height;
+    let cw = frame.chroma_width();
+    let ch = frame.chroma_height();
+    let mb_cols = lw / 16;
+    let mb_rows = lh / 16;
+    let mut grid = crate::encoder_motion::MvGrid::new(mb_cols, mb_rows);
+    let lambda = 2 * quant as u32;
+
+    {
+        // §E.5 — the zero-run counter spans the header/arithmetic
+        // boundary: the header tail is PQUANT's trailing zeros + CPM=0
+        // + PEI=0.
+        let mut enc = SacEncoder::with_zero_run(&mut w, 2 + quant.trailing_zeros());
+        for mb_row in 0..mb_rows {
+            for mb_col in 0..mb_cols {
+                let predictor = grid.predict(mb_col, mb_row);
+                let mv = crate::encoder_motion::estimate_motion(
+                    frame,
+                    reference,
+                    mb_col,
+                    mb_row,
+                    predictor,
+                    search_half,
+                    lambda,
+                );
+
+                let mb_x = mb_col * 16;
+                let mb_y = mb_row * 16;
+                let c_x = mb_col * 8;
+                let c_y = mb_row * 8;
+                let chroma_mv = crate::motion::chroma_mv(mv);
+
+                let src = extract_macroblock(frame, mb_col, mb_row);
+                let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> =
+                    Vec::with_capacity(4);
+                let mut inter_sad = 0u32;
+                for blk in 0..4 {
+                    let bx = mb_x + (blk % 2) * 8;
+                    let by = mb_y + (blk / 2) * 8;
+                    let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
+                    let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
+                    for (d, &p) in pred_i16.iter_mut().zip(pred.iter()) {
+                        *d = p as i16;
+                    }
+                    for (&s, &p) in src.luma[blk].iter().zip(pred_i16.iter()) {
+                        inter_sad += (s as i32 - p as i32).unsigned_abs();
+                    }
+                    let residual = residual_of(&src.luma[blk], &pred_i16);
+                    luma_enc.push(crate::encoder_block::encode_inter_block(&residual, quant));
+                }
+                let cb_pred = motion_compensated_block(&reference.cb, cw, ch, c_x, c_y, chroma_mv);
+                let cr_pred = motion_compensated_block(&reference.cr, cw, ch, c_x, c_y, chroma_mv);
+                let mut cb_pred_i = [0i16; COEFFS_PER_BLOCK];
+                let mut cr_pred_i = [0i16; COEFFS_PER_BLOCK];
+                for i in 0..COEFFS_PER_BLOCK {
+                    cb_pred_i[i] = cb_pred[i] as i16;
+                    cr_pred_i[i] = cr_pred[i] as i16;
+                }
+                let cb_enc = crate::encoder_block::encode_inter_block(
+                    &residual_of(&src.cb, &cb_pred_i),
+                    quant,
+                );
+                let cr_enc = crate::encoder_block::encode_inter_block(
+                    &residual_of(&src.cr, &cr_pred_i),
+                    quant,
+                );
+
+                let any_coeffs =
+                    luma_enc.iter().any(|e| e.has_coeffs) || cb_enc.has_coeffs || cr_enc.has_coeffs;
+                let is_zero_mv = mv.dx_half == 0 && mv.dy_half == 0;
+
+                if !any_coeffs && is_zero_mv {
+                    encode_skipped_macroblock_sac(&mut enc);
+                    grid.set_zero_candidate(mb_col, mb_row);
+                    continue;
+                }
+
+                // Intra-refresh heuristic — same decision rule as the
+                // VLC motion encoder.
+                let intra_sad: u32 = src
+                    .luma
+                    .iter()
+                    .map(|blk| {
+                        let mean = blk.iter().map(|&v| v as i32).sum::<i32>() / 64;
+                        blk.iter()
+                            .map(|&v| (v as i32 - mean).unsigned_abs())
+                            .sum::<u32>()
+                    })
+                    .sum();
+                if intra_sad + 256 < inter_sad {
+                    encode_intra_macroblock_sac(
+                        &mut enc, &src, quant, /* write_cod */ true,
+                        /* picture_is_inter */ true,
+                    )?;
+                    grid.set_zero_candidate(mb_col, mb_row);
+                    continue;
+                }
+
+                let mvd = crate::encoder_motion::mvd_for(mv, predictor);
+                let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
+                    luma_enc[0].clone(),
+                    luma_enc[1].clone(),
+                    luma_enc[2].clone(),
+                    luma_enc[3].clone(),
+                ];
+                encode_inter_macroblock_sac(&mut enc, &luma_arr, &cb_enc, &cr_enc, mvd)?;
+                grid.set_inter(mb_col, mb_row, mv);
             }
         }
         enc.flush();

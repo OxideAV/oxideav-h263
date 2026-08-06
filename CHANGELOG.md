@@ -34,6 +34,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   Prediction and mid-picture GOB headers are refused pending later
   rounds.
 
+- **SAC streams + motion estimation** (round 438):
+  `encode_inter_picture_motion_sac` is the arithmetic-coded mirror of
+  the motion-search P encoder (SAD + half-pel estimation around the
+  §6.1.1 median predictor replayed through `MvGrid`, intra-refresh
+  decision, skip rule), and `decode_sequence` now routes a
+  baseline-PTYPE picture whose PTYPE bit 11 is set to
+  `decode_picture_sac` — so pure-SAC **and mixed VLC + SAC**
+  elementary streams decode through the headline entry point with
+  reference threading across the entropy-layer boundary. Integration
+  tests pin motion-SAC-vs-motion-VLC byte-identical reconstruction,
+  an SAC I + P(motion) + P(skip) stream and a VLC-I + SAC-P stream
+  through `decode_sequence`.
+
+### Fixed
+
+- **§E.5 zero-run continuity across the header boundary**
+  (round 438): the SAC stuffing / destuffing filters now seed their
+  zero-run counter with the trailing zeros of the fixed-length
+  picture-header string (`SacEncoder::with_zero_run` /
+  `SacDecoder::with_zero_run` — §E.5 counts runs over the *whole*
+  stream, headers included). Without the seed, a header tail of `k`
+  zeros (PQUANT low bits + CPM = 0 + PEI = 0) followed by 14
+  arithmetic zeros put `14 + k` consecutive zeros on the wire — for
+  `k ≥ 2` a byte-aligned start-code emulation that truncated the
+  picture inside `decode_sequence` (observed: a QP-6 P-picture
+  emulating a PSC at byte 6). Regression-pinned across QP
+  2/4/6/8/16/24 P-pictures plus the two elementary-stream tests.
+
+### Added
+
 - **Annex E Syntax-based Arithmetic Coding core** (round 438): the new
   `sac` module stages the §E.2 arithmetic encoder (`SacEncoder` —
   `encode_a_symbol` + the §E.6 `encoder_flush`), the §E.3 arithmetic

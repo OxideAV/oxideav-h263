@@ -314,13 +314,30 @@ impl core::fmt::Debug for SacDecoder<'_, '_> {
 impl<'r, 'd> SacDecoder<'r, 'd> {
     /// Initialise the decoder at the reader's current position —
     /// §E.3 `decoder_reset`: `code_value` is loaded with 16 bits.
+    ///
+    /// The §E.5 zero-run counter starts at 0; when the bits preceding
+    /// the reader's position end in a run of zeros (a header tail —
+    /// §E.5 counts runs over the whole FIFO stream, headers included),
+    /// use [`SacDecoder::with_zero_run`] so the destuffing filter
+    /// mirrors the encoder's stuffing decisions exactly.
     pub fn new(reader: &'r mut BitReader<'d>) -> Self {
+        Self::with_zero_run(reader, 0)
+    }
+
+    /// As [`SacDecoder::new`], but seeding the §E.5 destuffing filter
+    /// with the length of the zero run immediately preceding the
+    /// reader's position (the trailing zeros of the fixed-length
+    /// header string — e.g. a PQUANT low bit + CPM = 0 + PEI = 0
+    /// tail). §E.5 stuffs after each 14-zero run of the *whole*
+    /// stream, so a run that starts inside the header continues into
+    /// the arithmetic data.
+    pub fn with_zero_run(reader: &'r mut BitReader<'d>, zero_run: u32) -> Self {
         let mut dec = SacDecoder {
             reader,
             low: 0,
             high: TOP,
             code_value: 0,
-            zero_run: 0,
+            zero_run: zero_run.min(STUFF_RUN),
         };
         for _ in 0..16 {
             let bit = dec.next_bit();
@@ -425,14 +442,39 @@ impl<'w> SacEncoder<'w> {
     /// Initialise the encoder at the writer's current position with
     /// the §E.2 register defaults (`low = 0`, `high = top`,
     /// `opposite_bits = 0`).
+    ///
+    /// The §E.5 zero-run counter starts at 0; when the bits already in
+    /// the writer end in a run of zeros (a header tail), use
+    /// [`SacEncoder::with_zero_run`] so the stuffing filter counts the
+    /// run over the whole stream as §E.5 requires.
     pub fn new(writer: &'w mut BitWriter) -> Self {
-        SacEncoder {
+        Self::with_zero_run(writer, 0)
+    }
+
+    /// As [`SacEncoder::new`], but seeding the §E.5 stuffing filter
+    /// with the length of the zero run the writer's existing output
+    /// ends in (the trailing zeros of the fixed-length header string).
+    /// Without the seed, a header tail of `k` zeros followed by 14
+    /// arithmetic zeros would put `14 + k` consecutive zeros on the
+    /// wire — a start-code emulation for `k ≥ 2` at the wrong
+    /// alignment budget.
+    pub fn with_zero_run(writer: &'w mut BitWriter, zero_run: u32) -> Self {
+        let mut enc = SacEncoder {
             writer,
             low: 0,
             high: TOP,
             opposite_bits: 0,
-            zero_run: 0,
+            zero_run: zero_run.min(STUFF_RUN),
+        };
+        // §E.5 — a header tail that itself completes a 14-zero run is
+        // stuffed immediately (the decoder's seeded filter deletes the
+        // first "1" it reads). Unreachable for the crate's own header
+        // shapes (tail ≤ 6 zeros) but kept for symmetry.
+        if enc.zero_run == STUFF_RUN {
+            enc.writer.write_bit(true);
+            enc.zero_run = 0;
         }
+        enc
     }
 
     /// Emit one bit through the §E.5 stuffing filter: after each run
