@@ -583,13 +583,207 @@ pub fn write_rfc2190_mode_a(out: &mut Vec<u8>, h: &Rfc2190ModeA) -> Result<()> {
     Ok(())
 }
 
+/// Length in bytes of the RFC 2190 §5.2 Mode B payload header.
+pub const RFC2190_MODE_B_BYTES: usize = 8;
+
+/// Length in bytes of the RFC 2190 §5.3 Mode C payload header.
+pub const RFC2190_MODE_C_BYTES: usize = 12;
+
+/// RFC 2190 §5.2 — the eight-byte **Mode B** payload header
+/// (`F = 1, P = 0`): a packet starting at a macroblock boundary of a
+/// non-PB picture, carrying the resumption side channel (QUANT, GOB
+/// number, in-GOB macroblock address and the §6.1.1 motion-vector
+/// predictors of the first macroblock).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rfc2190ModeB {
+    /// `SBIT` — most-significant bits to ignore in the first data byte.
+    pub sbit: u8,
+    /// `EBIT` — least-significant bits to ignore in the last data byte.
+    pub ebit: u8,
+    /// `SRC` — PTYPE bits 6-8 (the §5.1.3 source-format code).
+    pub src: u8,
+    /// `QUANT` — quantiser in effect for the first macroblock of the
+    /// packet (zero when the packet begins with a GOB header).
+    pub quant: u8,
+    /// `GOBN` — GOB number in effect at the start of the packet.
+    pub gobn: u8,
+    /// `MBA` — address of the first macroblock within its GOB,
+    /// counting from zero in scanning order (9 bits).
+    pub mba: u16,
+    /// `I` — PTYPE bit 9: `false` intra-coded, `true` inter-coded.
+    pub inter: bool,
+    /// `U` — PTYPE bit 10 (Annex D Unrestricted Motion Vectors).
+    pub umv: bool,
+    /// `S` — PTYPE bit 11 (Annex E Syntax-based Arithmetic Coding).
+    pub sac: bool,
+    /// `A` — PTYPE bit 12 (Annex F Advanced Prediction).
+    pub advanced_prediction: bool,
+    /// `HMV1` / `VMV1` — the first macroblock's horizontal / vertical
+    /// motion-vector predictors, half-pel units, 7-bit two's
+    /// complement on the wire (block 1 under Advanced Prediction).
+    pub hmv1: i8,
+    /// See [`Rfc2190ModeB::hmv1`].
+    pub vmv1: i8,
+    /// `HMV2` / `VMV2` — block 3's predictors when four vectors per
+    /// macroblock are in use (zero otherwise).
+    pub hmv2: i8,
+    /// See [`Rfc2190ModeB::hmv2`].
+    pub vmv2: i8,
+}
+
+/// RFC 2190 §5.3 — the twelve-byte **Mode C** payload header
+/// (`F = 1, P = 1`): the Mode B resumption fields plus the PB-frames
+/// `DBQ` / `TRB` / `TR` picture fields (the §5.3 `RR` word-3 filler is
+/// reserved zero).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rfc2190ModeC {
+    /// The §5.2-shaped fields shared with Mode B.
+    pub b: Rfc2190ModeB,
+    /// `DBQ` — §5.1.23 DBQUANT.
+    pub dbq: u8,
+    /// `TRB` — §5.1.22 Temporal Reference for the B-part.
+    pub trb: u8,
+    /// `TR` — §5.1.2 Temporal Reference of the P-part.
+    pub tr: u8,
+}
+
+/// The half-pel predictor range a 7-bit two's-complement `HMV`/`VMV`
+/// field can carry.
+const RFC2190_MV_MIN: i16 = -64;
+const RFC2190_MV_MAX: i16 = 63;
+
+/// Serialize the two §5.2 words shared by Mode B and Mode C.
+fn write_rfc2190_bc_words(out: &mut Vec<u8>, h: &Rfc2190ModeB, mode_c: bool) -> Result<()> {
+    if h.sbit > 7 || h.ebit > 7 || h.src > 7 || h.quant > 31 || h.gobn > 31 || h.mba > 511 {
+        return Err(Error::RtpBadPayloadHeader);
+    }
+    // Word 1: F(1)=1 P(1) SBIT(3) EBIT(3) SRC(3) QUANT(5) GOBN(5)
+    // MBA(9) R(2)=0.
+    let mut w1: u32 = 1 << 31;
+    if mode_c {
+        w1 |= 1 << 30;
+    }
+    w1 |= (h.sbit as u32) << 27;
+    w1 |= (h.ebit as u32) << 24;
+    w1 |= (h.src as u32) << 21;
+    w1 |= (h.quant as u32) << 16;
+    w1 |= (h.gobn as u32) << 11;
+    w1 |= (h.mba as u32) << 2;
+    out.extend_from_slice(&w1.to_be_bytes());
+    // Word 2: I(1) U(1) S(1) A(1) HMV1(7) VMV1(7) HMV2(7) VMV2(7).
+    let mut w2: u32 = 0;
+    if h.inter {
+        w2 |= 1 << 31;
+    }
+    if h.umv {
+        w2 |= 1 << 30;
+    }
+    if h.sac {
+        w2 |= 1 << 29;
+    }
+    if h.advanced_prediction {
+        w2 |= 1 << 28;
+    }
+    let mv7 = |v: i8| -> u32 { (v as u32) & 0x7F };
+    w2 |= mv7(h.hmv1) << 21;
+    w2 |= mv7(h.vmv1) << 14;
+    w2 |= mv7(h.hmv2) << 7;
+    w2 |= mv7(h.vmv2);
+    out.extend_from_slice(&w2.to_be_bytes());
+    Ok(())
+}
+
+/// Serialize an RFC 2190 §5.2 Mode B payload header (8 bytes,
+/// `F = 1, P = 0`).
+pub fn write_rfc2190_mode_b(out: &mut Vec<u8>, h: &Rfc2190ModeB) -> Result<()> {
+    write_rfc2190_bc_words(out, h, /* mode_c */ false)
+}
+
+/// Serialize an RFC 2190 §5.3 Mode C payload header (12 bytes,
+/// `F = 1, P = 1`).
+pub fn write_rfc2190_mode_c(out: &mut Vec<u8>, h: &Rfc2190ModeC) -> Result<()> {
+    if h.dbq > 3 || h.trb > 7 {
+        return Err(Error::RtpBadPayloadHeader);
+    }
+    write_rfc2190_bc_words(out, &h.b, /* mode_c */ true)?;
+    // Word 3: RR(19)=0 DBQ(2) TRB(3) TR(8).
+    let w3: u32 = ((h.dbq as u32) << 11) | ((h.trb as u32) << 8) | h.tr as u32;
+    out.extend_from_slice(&w3.to_be_bytes());
+    Ok(())
+}
+
+/// Decode a 7-bit two's-complement motion-vector predictor field.
+fn mv7_decode(raw: u32) -> i8 {
+    let raw = (raw & 0x7F) as i16;
+    (if raw >= 64 { raw - 128 } else { raw }) as i8
+}
+
+/// Parse the two §5.2 words shared by Mode B and Mode C (the caller
+/// has already established `F = 1`).
+fn parse_rfc2190_bc_words(payload: &[u8]) -> Result<Rfc2190ModeB> {
+    let w1 = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let w2 = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    Ok(Rfc2190ModeB {
+        sbit: ((w1 >> 27) & 0b111) as u8,
+        ebit: ((w1 >> 24) & 0b111) as u8,
+        src: ((w1 >> 21) & 0b111) as u8,
+        quant: ((w1 >> 16) & 0b11111) as u8,
+        gobn: ((w1 >> 11) & 0b11111) as u8,
+        mba: ((w1 >> 2) & 0x1FF) as u16,
+        inter: w2 & (1 << 31) != 0,
+        umv: w2 & (1 << 30) != 0,
+        sac: w2 & (1 << 29) != 0,
+        advanced_prediction: w2 & (1 << 28) != 0,
+        hmv1: mv7_decode(w2 >> 21),
+        vmv1: mv7_decode(w2 >> 14),
+        hmv2: mv7_decode(w2 >> 7),
+        vmv2: mv7_decode(w2),
+    })
+}
+
+/// Parse an RFC 2190 §5.2 Mode B payload header (`F = 1, P = 0`),
+/// returning the fields and the data offset.
+pub fn parse_rfc2190_mode_b(payload: &[u8]) -> Result<(Rfc2190ModeB, usize)> {
+    if payload.len() < RFC2190_MODE_B_BYTES {
+        return Err(Error::RtpTruncatedPacket);
+    }
+    let w1 = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if w1 & (1 << 31) == 0 || w1 & (1 << 30) != 0 {
+        return Err(Error::RtpBadPayloadHeader);
+    }
+    Ok((parse_rfc2190_bc_words(payload)?, RFC2190_MODE_B_BYTES))
+}
+
+/// Parse an RFC 2190 §5.3 Mode C payload header (`F = 1, P = 1`),
+/// returning the fields and the data offset.
+pub fn parse_rfc2190_mode_c(payload: &[u8]) -> Result<(Rfc2190ModeC, usize)> {
+    if payload.len() < RFC2190_MODE_C_BYTES {
+        return Err(Error::RtpTruncatedPacket);
+    }
+    let w1 = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if w1 & (1 << 31) == 0 || w1 & (1 << 30) == 0 {
+        return Err(Error::RtpBadPayloadHeader);
+    }
+    let b = parse_rfc2190_bc_words(payload)?;
+    let w3 = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    Ok((
+        Rfc2190ModeC {
+            b,
+            dbq: ((w3 >> 11) & 0b11) as u8,
+            trb: ((w3 >> 8) & 0b111) as u8,
+            tr: (w3 & 0xFF) as u8,
+        },
+        RFC2190_MODE_C_BYTES,
+    ))
+}
+
 /// Parse an RFC 2190 payload header from the front of `payload`,
 /// returning the Mode A fields and the data offset.
 ///
 /// Mode B (`F = 1, P = 0`) and Mode C (`F = 1, P = 1`) headers — the
-/// macroblock-boundary fragmentation forms — are recognised but not
-/// staged ([`Error::NotImplemented`]): this crate's packetizer never
-/// fragments below GOB granularity on the legacy format.
+/// macroblock-boundary fragmentation forms — are parsed by
+/// [`parse_rfc2190_mode_b`] / [`parse_rfc2190_mode_c`]; this function
+/// returns [`Error::RtpBadPayloadHeader`] for them.
 pub fn parse_rfc2190_mode_a(payload: &[u8]) -> Result<(Rfc2190ModeA, usize)> {
     if payload.len() < RFC2190_MODE_A_BYTES {
         return Err(Error::RtpTruncatedPacket);
@@ -597,7 +791,7 @@ pub fn parse_rfc2190_mode_a(payload: &[u8]) -> Result<(Rfc2190ModeA, usize)> {
     let word = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     if word & (1 << 31) != 0 {
         // F = 1: Mode B / Mode C.
-        return Err(Error::NotImplemented);
+        return Err(Error::RtpBadPayloadHeader);
     }
     Ok((
         Rfc2190ModeA {
@@ -700,7 +894,7 @@ fn rfc2190_fields_for_picture(picture: &[u8]) -> Result<Rfc2190ModeA> {
 ///   Picture/GOB segment larger than the budget (Mode B macroblock
 ///   fragmentation is not staged).
 pub fn packetize_stream_rfc2190(stream: &[u8], cfg: PacketizeConfig) -> Result<Vec<Vec<u8>>> {
-    if cfg.max_payload < RFC2190_MODE_A_BYTES + 1 {
+    if cfg.max_payload < RFC2190_MODE_C_BYTES + 1 {
         return Err(Error::RtpPayloadTooSmall);
     }
     if stream.is_empty() {
@@ -710,6 +904,7 @@ pub fn packetize_stream_rfc2190(stream: &[u8], cfg: PacketizeConfig) -> Result<V
         return Err(Error::BadPictureStartCode);
     }
 
+    // Byte offsets of every byte-aligned start code (PSC / GBSC / EOS).
     let mut boundaries: Vec<usize> = Vec::new();
     let mut i = 0;
     while i + 3 <= stream.len() {
@@ -721,26 +916,50 @@ pub fn packetize_stream_rfc2190(stream: &[u8], cfg: PacketizeConfig) -> Result<V
         }
     }
 
-    let budget = cfg.max_payload - RFC2190_MODE_A_BYTES;
     let mut payloads = Vec::new();
     let mut fields: Option<Rfc2190ModeA> = None;
-    let mut pos = 0usize;
-    let mut boundary_idx = 0usize;
+    // Lazily-built macroblock-boundary side channel for the picture in
+    // progress (absolute bit offsets within `stream`); `None` until a
+    // fragmentation below GOB granularity is first needed.
+    let mut mb_bounds: Option<Vec<(u64, crate::picture::MbBoundaryInfo)>> = None;
+    let mut picture_start = 0usize;
+    // Current position in **bits** (mid-byte after a Mode B/C cut).
+    let mut pos_bits: u64 = 0;
+    let end_bits = stream.len() as u64 * 8;
 
-    while pos < stream.len() {
-        // Refresh the per-picture fields at every PSC.
-        if start_code_kind(stream, pos) == StartCodeKind::Picture {
-            fields = Some(rfc2190_fields_for_picture(&stream[pos..])?);
+    while pos_bits < end_bits {
+        let at_byte = pos_bits % 8 == 0;
+        let byte_pos = (pos_bits / 8) as usize;
+        let starts_at_code = at_byte && is_start_code_at(stream, byte_pos);
+        // Refresh the per-picture state at every PSC.
+        if starts_at_code && start_code_kind(stream, byte_pos) == StartCodeKind::Picture {
+            fields = Some(rfc2190_fields_for_picture(&stream[byte_pos..])?);
+            picture_start = byte_pos;
+            mb_bounds = None;
         }
-        let fields = fields.ok_or(Error::BadPictureStartCode)?;
+        let f = fields.ok_or(Error::BadPictureStartCode)?;
 
-        // A packet never runs past the next Picture Start Code: the
-        // per-picture header fields (SRC / I / TR ...) describe one
-        // picture, so every PSC starts a fresh packet.
-        let hard_stop = boundaries[boundary_idx..]
+        // RFC 2190 §5.4 — the mode is set by where the packet STARTS:
+        // Mode A at a Picture/GOB start code, Mode B (or C for a
+        // PB-picture) at a macroblock boundary.
+        let header_bytes = if starts_at_code {
+            RFC2190_MODE_A_BYTES
+        } else if f.pb_frames {
+            RFC2190_MODE_C_BYTES
+        } else {
+            RFC2190_MODE_B_BYTES
+        };
+        let budget = cfg.max_payload - header_bytes;
+
+        // A packet never runs past the next Picture Start Code. The
+        // byte span of a bit range [pos_bits, cut) is
+        // ceil(cut/8) − floor(pos_bits/8).
+        let span_fits =
+            |cut_bits: u64| -> bool { (cut_bits.div_ceil(8) - pos_bits / 8) as usize <= budget };
+        let hard_stop_byte = boundaries
             .iter()
             .copied()
-            .filter(|&b| b > pos)
+            .filter(|&b| (b as u64 * 8) > pos_bits)
             .find(|&b| {
                 matches!(
                     start_code_kind(stream, b),
@@ -748,57 +967,181 @@ pub fn packetize_stream_rfc2190(stream: &[u8], cfg: PacketizeConfig) -> Result<V
                 )
             })
             .unwrap_or(stream.len());
-        let max_end = (pos + budget).min(hard_stop);
-        let cut = if max_end == hard_stop {
-            hard_stop
+        let hard_stop_bits = hard_stop_byte as u64 * 8;
+
+        // Preferred cut: the picture end / the last start-code
+        // boundary that fits (keeps the following packet in Mode A).
+        let code_cut = if span_fits(hard_stop_bits) {
+            Some(hard_stop_bits)
         } else {
-            // Mode A: the cut must land on a Picture/GOB boundary.
-            boundaries[boundary_idx..]
+            boundaries
                 .iter()
                 .copied()
-                .take_while(|&b| b <= max_end)
-                .filter(|&b| b > pos)
-                .last()
-                .ok_or(Error::NotImplemented)?
+                .map(|b| b as u64 * 8)
+                .rfind(|&b| b > pos_bits && b < hard_stop_bits && span_fits(b))
+        };
+        let cut_bits = match code_cut {
+            Some(c) => c,
+            None => {
+                // GOB larger than the budget: fragment at a macroblock
+                // boundary (RFC 2190 §5.2 / §5.3). Build the side
+                // channel for this picture on first use.
+                if mb_bounds.is_none() {
+                    let picture_end = boundaries
+                        .iter()
+                        .copied()
+                        .find(|&b| {
+                            b > picture_start
+                                && matches!(
+                                    start_code_kind(stream, b),
+                                    StartCodeKind::Picture | StartCodeKind::SequenceEnd
+                                )
+                        })
+                        .unwrap_or(stream.len());
+                    let infos = crate::picture::enumerate_mb_boundaries(
+                        &stream[picture_start..picture_end],
+                    )?;
+                    mb_bounds = Some(
+                        infos
+                            .into_iter()
+                            .map(|inf| (picture_start as u64 * 8 + inf.bit_offset, inf))
+                            .collect(),
+                    );
+                }
+                let bounds = mb_bounds.as_ref().expect("just built");
+                bounds
+                    .iter()
+                    .map(|&(bit, _)| bit)
+                    .rfind(|&bit| bit > pos_bits && bit < hard_stop_bits && span_fits(bit))
+                    // Not even one macroblock fits the budget.
+                    .ok_or(Error::RtpPayloadTooSmall)?
+            }
         };
 
-        let mut packet = Vec::with_capacity(RFC2190_MODE_A_BYTES + (cut - pos));
-        write_rfc2190_mode_a(&mut packet, &fields)?;
-        packet.extend_from_slice(&stream[pos..cut]);
+        // Emit the packet: header (mode by starting boundary), then
+        // the byte span with SBIT/EBIT marking the partial bits.
+        let sbit = (pos_bits % 8) as u8;
+        let ebit = ((8 - (cut_bits % 8)) % 8) as u8;
+        let first_byte = (pos_bits / 8) as usize;
+        let last_byte = cut_bits.div_ceil(8) as usize;
+        let mut packet = Vec::with_capacity(header_bytes + (last_byte - first_byte));
+        if starts_at_code {
+            write_rfc2190_mode_a(&mut packet, &Rfc2190ModeA { sbit, ebit, ..f })?;
+        } else {
+            let bounds = mb_bounds.as_ref().ok_or(Error::RtpBadPayloadHeader)?;
+            let info = bounds
+                .iter()
+                .find(|&&(bit, _)| bit == pos_bits)
+                .map(|&(_, inf)| inf)
+                .ok_or(Error::RtpBadPayloadHeader)?;
+            if !(RFC2190_MV_MIN..=RFC2190_MV_MAX).contains(&info.pred1.0)
+                || !(RFC2190_MV_MIN..=RFC2190_MV_MAX).contains(&info.pred1.1)
+            {
+                return Err(Error::RtpBadPayloadHeader);
+            }
+            let b = Rfc2190ModeB {
+                sbit,
+                ebit,
+                src: f.src,
+                quant: info.quant,
+                gobn: info.gobn,
+                mba: info.mba_in_gob,
+                inter: f.inter,
+                umv: f.umv,
+                sac: f.sac,
+                advanced_prediction: f.advanced_prediction,
+                hmv1: info.pred1.0 as i8,
+                vmv1: info.pred1.1 as i8,
+                hmv2: 0,
+                vmv2: 0,
+            };
+            if f.pb_frames {
+                write_rfc2190_mode_c(
+                    &mut packet,
+                    &Rfc2190ModeC {
+                        b,
+                        dbq: f.dbq,
+                        trb: f.trb,
+                        tr: f.tr,
+                    },
+                )?;
+            } else {
+                write_rfc2190_mode_b(&mut packet, &b)?;
+            }
+        }
+        packet.extend_from_slice(&stream[first_byte..last_byte]);
         payloads.push(packet);
 
-        pos = cut;
-        while boundary_idx < boundaries.len() && boundaries[boundary_idx] < pos {
-            boundary_idx += 1;
-        }
+        pos_bits = cut_bits;
     }
 
     Ok(payloads)
 }
 
-/// Reassemble an H.263 elementary stream from RFC 2190 Mode A
-/// payloads (in transmission order, losslessly received) — the inverse
-/// of [`packetize_stream_rfc2190`].
+/// Reassemble an H.263 elementary stream from RFC 2190 payloads of
+/// **any mode** (A, B or C, intermixed, in transmission order,
+/// losslessly received) — the inverse of [`packetize_stream_rfc2190`].
 ///
-/// Non-zero `SBIT` / `EBIT` (bit-granular GOB boundaries) are refused
-/// with [`Error::NotImplemented`]: this crate's encoders byte-align
-/// every GOB, so its own packetizer never produces them, and a
-/// bit-shifting reassembler is unstaged.
+/// Fragments are merged at **bit** granularity: each payload
+/// contributes its data bytes minus the `SBIT` leading and `EBIT`
+/// trailing bits, so a byte split across two packets (the Mode B / C
+/// macroblock-boundary case, where fragment *n* carries its top
+/// `8 − EBIT` bits and fragment *n + 1* re-transmits the byte with
+/// `SBIT = 8 − EBIT`) reassembles exactly once.
+///
+/// # Errors
+///
+/// * [`Error::RtpTruncatedPacket`] — a payload shorter than its own
+///   mode's header, or with no data bits after SBIT/EBIT removal.
+/// * [`Error::RtpBadPayloadHeader`] — inconsistent SBIT/EBIT (more
+///   ignore-bits than data bits), or a reassembled stream that does
+///   not end on a byte boundary.
 pub fn depacketize_payloads_rfc2190<I, B>(payloads: I) -> Result<Vec<u8>>
 where
     I: IntoIterator<Item = B>,
     B: AsRef<[u8]>,
 {
-    let mut stream = Vec::new();
+    use oxideav_core::bits::{BitReader, BitWriter};
+
+    let mut w = BitWriter::new();
     for payload in payloads {
         let payload = payload.as_ref();
-        let (header, offset) = parse_rfc2190_mode_a(payload)?;
-        if header.sbit != 0 || header.ebit != 0 {
-            return Err(Error::NotImplemented);
+        if payload.is_empty() {
+            return Err(Error::RtpTruncatedPacket);
         }
-        stream.extend_from_slice(&payload[offset..]);
+        // Dispatch on F (bit 0) / P (bit 1).
+        let (sbit, ebit, offset) = if payload[0] & 0x80 == 0 {
+            let (h, off) = parse_rfc2190_mode_a(payload)?;
+            (h.sbit, h.ebit, off)
+        } else if payload[0] & 0x40 == 0 {
+            let (h, off) = parse_rfc2190_mode_b(payload)?;
+            (h.sbit, h.ebit, off)
+        } else {
+            let (h, off) = parse_rfc2190_mode_c(payload)?;
+            (h.b.sbit, h.b.ebit, off)
+        };
+        let data = &payload[offset..];
+        let total_bits = data.len() as u64 * 8;
+        let used = total_bits
+            .checked_sub(sbit as u64 + ebit as u64)
+            .ok_or(Error::RtpBadPayloadHeader)?;
+        if used == 0 {
+            return Err(Error::RtpTruncatedPacket);
+        }
+        let mut r = BitReader::new(data);
+        r.skip(sbit as u32).map_err(|_| Error::RtpTruncatedPacket)?;
+        let mut remaining = used;
+        while remaining > 0 {
+            let chunk = remaining.min(32) as u32;
+            let bits = r.read_u32(chunk).map_err(|_| Error::RtpTruncatedPacket)?;
+            w.write_bits(bits, chunk);
+            remaining -= chunk as u64;
+        }
     }
-    Ok(stream)
+    if !w.is_byte_aligned() {
+        return Err(Error::RtpBadPayloadHeader);
+    }
+    Ok(w.finish())
 }
 
 #[cfg(test)]

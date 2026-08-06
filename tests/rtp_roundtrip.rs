@@ -379,15 +379,17 @@ fn rfc2190_mode_a_round_trips() {
 }
 
 /// RFC 2190 Mode A PB-frames: the DBQ / TRB / TR header fields mirror
-/// the §5.1.22 / §5.1.23 picture-header fields of a PB-picture, and
-/// oversized single segments (Mode B territory) are refused rather
-/// than mis-packetized.
+/// the §5.1.22 / §5.1.23 picture-header fields of a PB-picture; an
+/// oversized PB picture fragments at macroblock boundaries with
+/// **Mode C** headers carrying the same PB fields, and reassembles
+/// byte-exactly.
 #[test]
-fn rfc2190_mode_a_pb_fields_and_mode_b_refusal() {
+fn rfc2190_mode_a_pb_fields_and_mode_c_fragmentation() {
     use oxideav_h263::encoder::{encode_intra_picture, encode_pb_picture, PbConfig};
     use oxideav_h263::picture::decode_picture_no_gob0_header;
     use oxideav_h263::rtp::{
         depacketize_payloads_rfc2190, packetize_stream_rfc2190, parse_rfc2190_mode_a,
+        parse_rfc2190_mode_c,
     };
 
     let f0 = gradient(128, 96, 0);
@@ -427,18 +429,35 @@ fn rfc2190_mode_a_pb_fields_and_mode_b_refusal() {
     assert_eq!(h.tr, 8);
     assert_eq!(depacketize_payloads_rfc2190(&payloads).unwrap(), pb);
 
-    // A single-segment picture larger than the budget cannot be cut at
-    // a Mode A boundary: Mode B is unstaged, refuse.
-    assert!(matches!(
-        packetize_stream_rfc2190(
-            &pb,
-            PacketizeConfig {
-                max_payload: 64,
-                ..PacketizeConfig::default()
-            },
-        ),
-        Err(oxideav_h263::Error::NotImplemented)
-    ));
+    // A single-segment PB picture larger than the budget fragments at
+    // macroblock boundaries: the first packet starts at the PSC (Mode
+    // A), every later one at a macroblock boundary (Mode C, F=1 P=1,
+    // with the PB DBQ/TRB/TR fields mirrored). Bit-level reassembly is
+    // byte-exact.
+    let payloads = packetize_stream_rfc2190(
+        &pb,
+        PacketizeConfig {
+            max_payload: 64,
+            ..PacketizeConfig::default()
+        },
+    )
+    .expect("packetize PB fragments");
+    assert!(payloads.len() > 1);
+    let mut saw_mode_c = 0usize;
+    for (i, p) in payloads.iter().enumerate() {
+        assert!(p.len() <= 64, "payload {i} is {} bytes", p.len());
+        if p[0] & 0x80 != 0 {
+            let (c, _) = parse_rfc2190_mode_c(p).expect("mode C header");
+            assert!(c.b.inter);
+            assert_eq!((c.dbq, c.trb, c.tr), (1, 4, 8));
+            assert!(c.b.quant >= 1 && c.b.quant <= 31);
+            saw_mode_c += 1;
+        } else {
+            assert_eq!(i, 0, "only the PSC packet may be Mode A here");
+        }
+    }
+    assert!(saw_mode_c > 0, "expected Mode C fragments");
+    assert_eq!(depacketize_payloads_rfc2190(&payloads).unwrap(), pb);
 
     // H.263+ (PLUSPTYPE) streams are refused on the legacy format.
     let plus = oxideav_h263::encoder::encode_intra_picture_plus(&f0, 6, 0).expect("plus I");
@@ -446,4 +465,147 @@ fn rfc2190_mode_a_pb_fields_and_mode_b_refusal() {
         packetize_stream_rfc2190(&plus, PacketizeConfig::default()),
         Err(oxideav_h263::Error::NotImplemented)
     ));
+}
+
+/// RFC 2190 Mode B: an oversized baseline I + P stream (single-segment
+/// pictures — no GOB headers on the wire) fragments at macroblock
+/// boundaries. Every non-first packet of a picture carries the Mode B
+/// resumption side channel — GOBN / MBA / QUANT and the §6.1.1
+/// motion-vector predictors — which is cross-checked against the
+/// crate's own `enumerate_mb_boundaries` ground truth; reassembly is
+/// bit-exact and the rebuilt stream decodes to the same frames.
+#[test]
+fn rfc2190_mode_b_fragments_round_trip() {
+    use oxideav_h263::encoder::{encode_inter_picture_motion, encode_intra_picture};
+    use oxideav_h263::picture::{decode_picture_no_gob0_header, enumerate_mb_boundaries};
+    use oxideav_h263::rtp::{
+        depacketize_payloads_rfc2190, packetize_stream_rfc2190, parse_rfc2190_mode_b,
+    };
+
+    let f0 = gradient(176, 144, 2);
+    let i_bytes = encode_intra_picture(&f0, 4, 0).expect("I");
+    let anchor =
+        decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).expect("dec I");
+    let mut f1 = anchor.clone();
+    for row in 0..144 {
+        for col in 0..176 {
+            let sc = (col + 4).min(175);
+            f1.y[row * 176 + col] = anchor.y[row * 176 + sc];
+        }
+    }
+    let p_bytes = encode_inter_picture_motion(&f1, &anchor, 5, 1, 6).expect("P");
+    let mut stream = i_bytes.clone();
+    stream.extend_from_slice(&p_bytes);
+
+    // Ground truth for the P-picture's macroblock side channel.
+    let p_bounds = enumerate_mb_boundaries(&p_bytes).expect("bounds");
+
+    // The busiest single INTRA macroblock of this content spans ~159
+    // bytes, so budgets from 192 exercise Mode B fragmentation while
+    // always fitting at least one macroblock per packet.
+    for &budget in &[192usize, 256, 512] {
+        let payloads = packetize_stream_rfc2190(
+            &stream,
+            PacketizeConfig {
+                max_payload: budget,
+                ..PacketizeConfig::default()
+            },
+        )
+        .expect("packetize");
+        assert!(payloads.len() > 2);
+
+        let mut saw_mode_b = 0usize;
+        for p in &payloads {
+            assert!(p.len() <= budget);
+            if p[0] & 0x80 == 0 {
+                continue; // Mode A (PSC packet)
+            }
+            let (b, _) = parse_rfc2190_mode_b(p).expect("mode B header");
+            assert!(!b.sac && !b.advanced_prediction);
+            assert_eq!(b.src, 0b010, "QCIF");
+            assert!(b.quant >= 1 && b.quant <= 31);
+            // The (GOBN, MBA, QUANT, predictor) tuple must appear in
+            // the ground-truth side channel of one of the pictures.
+            let matches_truth = p_bounds.iter().any(|inf| {
+                inf.gobn == b.gobn
+                    && inf.mba_in_gob == b.mba
+                    && inf.quant == b.quant
+                    && inf.pred1 == (b.hmv1 as i16, b.vmv1 as i16)
+            });
+            let i_bounds = enumerate_mb_boundaries(&i_bytes).expect("bounds I");
+            let matches_truth_i = i_bounds
+                .iter()
+                .any(|inf| inf.gobn == b.gobn && inf.mba_in_gob == b.mba && inf.quant == b.quant);
+            assert!(
+                matches_truth || matches_truth_i,
+                "Mode B header {b:?} not found in side channel"
+            );
+            saw_mode_b += 1;
+        }
+        assert!(saw_mode_b > 0, "budget {budget}: expected Mode B packets");
+
+        // Bit-exact reassembly …
+        let rebuilt = depacketize_payloads_rfc2190(&payloads).expect("depacketize");
+        assert_eq!(rebuilt, stream, "budget {budget}");
+        // … and the rebuilt stream decodes to the original frames.
+        let frames =
+            oxideav_h263::picture::decode_sequence(&rebuilt, DecodeOptions::default()).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].y, anchor.y);
+    }
+}
+
+/// RFC 2190 Mode B / C headers are exact wire inverses, including
+/// negative motion-vector predictors (7-bit two's complement).
+#[test]
+fn rfc2190_mode_b_c_headers_round_trip() {
+    use oxideav_h263::rtp::{
+        parse_rfc2190_mode_b, parse_rfc2190_mode_c, write_rfc2190_mode_b, write_rfc2190_mode_c,
+        Rfc2190ModeB, Rfc2190ModeC,
+    };
+
+    let b = Rfc2190ModeB {
+        sbit: 5,
+        ebit: 2,
+        src: 0b011,
+        quant: 17,
+        gobn: 8,
+        mba: 313,
+        inter: true,
+        umv: true,
+        sac: false,
+        advanced_prediction: false,
+        hmv1: -33,
+        vmv1: 63,
+        hmv2: -64,
+        vmv2: 0,
+    };
+    let mut bytes = Vec::new();
+    write_rfc2190_mode_b(&mut bytes, &b).unwrap();
+    bytes.extend_from_slice(&[0xAB, 0xCD]);
+    let (parsed, offset) = parse_rfc2190_mode_b(&bytes).unwrap();
+    assert_eq!(parsed, b);
+    assert_eq!(&bytes[offset..], &[0xAB, 0xCD]);
+
+    let c = Rfc2190ModeC {
+        b,
+        dbq: 2,
+        trb: 5,
+        tr: 200,
+    };
+    let mut bytes = Vec::new();
+    write_rfc2190_mode_c(&mut bytes, &c).unwrap();
+    bytes.extend_from_slice(&[0x11]);
+    let (parsed, offset) = parse_rfc2190_mode_c(&bytes).unwrap();
+    assert_eq!(parsed, c);
+    assert_eq!(&bytes[offset..], &[0x11]);
+
+    // Mode dispatch: a Mode B parser refuses a Mode C header and vice
+    // versa.
+    let mut cb = Vec::new();
+    write_rfc2190_mode_c(&mut cb, &c).unwrap();
+    assert!(parse_rfc2190_mode_b(&cb).is_err());
+    let mut bb = Vec::new();
+    write_rfc2190_mode_b(&mut bb, &b).unwrap();
+    assert!(parse_rfc2190_mode_c(&bb).is_err());
 }

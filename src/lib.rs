@@ -324,8 +324,9 @@ pub use picture::{
     decode_b_picture, decode_b_picture_layer, decode_ep_picture_layer, decode_improved_pb_picture,
     decode_improved_pb_picture_with_inherited, decode_pb_picture, decode_pb_picture_no_gob0_header,
     decode_picture, decode_picture_layer, decode_picture_layer_with_inherited,
-    decode_picture_no_gob0_header, decode_picture_sac, decode_sequence, BPictureTemporal,
-    DecodeOptions, DecodePictureOutcome, PbFramePair, PictureLayout, YuvFrame,
+    decode_picture_no_gob0_header, decode_picture_sac, decode_sequence, enumerate_mb_boundaries,
+    BPictureTemporal, DecodeOptions, DecodePictureOutcome, MbBoundaryInfo, PbFramePair,
+    PictureLayout, YuvFrame,
 };
 pub use picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
@@ -346,9 +347,11 @@ pub use rru_upsample::{
 };
 pub use rtp::{
     assemble_picture_header, depacketize_payloads, depacketize_payloads_rfc2190, packetize_stream,
-    packetize_stream_rfc2190, parse_payload_header, parse_rfc2190_mode_a, redundant_picture_header,
-    write_payload_header, write_rfc2190_mode_a, H263PayloadHeader, PacketizeConfig, Rfc2190ModeA,
-    VrcHeader, PAYLOAD_HEADER_BYTES, PLEN_MAX, RFC2190_MODE_A_BYTES, VRC_HEADER_BYTES,
+    packetize_stream_rfc2190, parse_payload_header, parse_rfc2190_mode_a, parse_rfc2190_mode_b,
+    parse_rfc2190_mode_c, redundant_picture_header, write_payload_header, write_rfc2190_mode_a,
+    write_rfc2190_mode_b, write_rfc2190_mode_c, H263PayloadHeader, PacketizeConfig, Rfc2190ModeA,
+    Rfc2190ModeB, Rfc2190ModeC, VrcHeader, PAYLOAD_HEADER_BYTES, PLEN_MAX, RFC2190_MODE_A_BYTES,
+    RFC2190_MODE_B_BYTES, RFC2190_MODE_C_BYTES, VRC_HEADER_BYTES,
 };
 pub use sac::{
     decode_cbpy_sac, decode_cod, decode_dquant_sac, decode_intradc_sac, decode_mcbpc_i_sac,

@@ -34,6 +34,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   Prediction and mid-picture GOB headers are refused pending later
   rounds.
 
+- **RFC 2190 Mode B / Mode C macroblock-boundary fragmentation**
+  (round 438): the legacy `video/H263` packetizer now fragments a
+  Picture/GOB segment larger than the budget at **macroblock
+  boundaries** instead of refusing. `picture::enumerate_mb_boundaries`
+  walks a baseline (plain or PB-frames) picture without pixel
+  reconstruction and returns the §5.2 resumption side channel per
+  macroblock — bit offset, GOBN, in-GOB MBA, QUANT in force and the
+  §6.1.1 median motion-vector predictor. The packetizer emits the
+  first fragment of a start-code segment as Mode A (with EBIT) and
+  every mid-picture fragment as **Mode B** (8-byte header:
+  QUANT/GOBN/MBA + HMV1/VMV1 as 7-bit two's complement) or **Mode C**
+  for PB pictures (12-byte header adding DBQ/TRB/TR);
+  `depacketize_payloads_rfc2190` now reassembles **any mode mix at
+  bit granularity** (SBIT/EBIT-aware, shared split bytes merged
+  exactly once). Mode B/C header writers/parsers
+  (`Rfc2190ModeB`/`Rfc2190ModeC`) are exact wire inverses incl.
+  negative predictors. Tests: oversized baseline I+P streams
+  fragment/round-trip byte-exactly at 192/256/512-byte budgets with
+  the Mode B side channel cross-checked against
+  `enumerate_mb_boundaries` ground truth; an oversized PB picture
+  Mode-C-fragments and reassembles; header dispatch rejects
+  cross-mode parses. (SAC and Advanced Prediction pictures are not
+  fragmentable below GOB granularity and keep the refusal.)
+
 - **Encoder rate control — Annex B HRD-regulated bit-budget loop**
   (round 438): the new `rate_control` module stages `HrdModel` (the
   Annex B Hypothetical Reference Decoder buffer simulation — §B.3

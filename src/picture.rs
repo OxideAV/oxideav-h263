@@ -1122,6 +1122,245 @@ fn decode_one_macroblock_sac(
     Ok((luma_mv, [luma_mv; 4]))
 }
 
+/// Per-macroblock boundary side information for RFC 2190 Mode B / C
+/// packetization: everything a resuming decoder needs to pick the
+/// bitstream up at this macroblock without the preceding packets
+/// (RFC 2190 §5.2 — QUANT / GOBN / MBA / motion-vector predictors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MbBoundaryInfo {
+    /// Absolute bit offset of the macroblock's first bit within the
+    /// picture buffer (bit 0 = MSB of byte 0).
+    pub bit_offset: u64,
+    /// GOB number in effect at this macroblock (§5.2.3 numbering —
+    /// the §4.2.1 GOB grid position, whether or not the GOB's header
+    /// is on the wire).
+    pub gobn: u8,
+    /// Address of the macroblock within its GOB, counting from zero
+    /// in scanning order (the RFC 2190 §5.2 `MBA` field).
+    pub mba_in_gob: u16,
+    /// QUANT in effect immediately before this macroblock (after
+    /// every preceding DQUANT — the RFC 2190 §5.2 `QUANT` field).
+    pub quant: u8,
+    /// The §6.1.1 / Figure-12 median motion-vector predictor for this
+    /// macroblock (block 1), in half-pel units — the RFC 2190 §5.2
+    /// `HMV1` / `VMV1` fields.
+    pub pred1: (i16, i16),
+}
+
+/// Walk one **baseline-PTYPE** picture (the §5.2.2 GOB-0-elided /
+/// optional-later-GOB-header layout the crate's encoders emit) without
+/// reconstructing pixels, and return the [`MbBoundaryInfo`] record for
+/// every macroblock position — the side channel the RFC 2190 Mode B /
+/// Mode C packetizer needs to fragment at macroblock boundaries.
+///
+/// `data` starts at the byte-aligned PSC. Both plain and PB-frames
+/// pictures are supported (a PB macroblock's twelve block payload is
+/// skipped; the recorded predictor uses the §6.1.1 PB rules).
+/// Stuffing macroblocks are transparent (a boundary before stuffing
+/// records the position of the stuffing code — a resuming decoder
+/// consumes it exactly like the in-line parser does).
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] for the layouts the walk does not stage:
+/// extended PTYPE, SAC (bit-level entropy has no macroblock-aligned
+/// bit boundaries), Advanced Prediction / INTER4V (four-vector
+/// predictor side info is not staged), CPM.
+pub fn enumerate_mb_boundaries(data: &[u8]) -> Result<Vec<MbBoundaryInfo>> {
+    let mut reader = BitReader::new(data);
+    let header = parse_picture_header(&mut reader)?;
+    if header.sac_mode || header.advanced_prediction {
+        return Err(Error::NotImplemented);
+    }
+    let layout =
+        PictureLayout::for_source_format(header.source_format).ok_or(Error::NotImplemented)?;
+
+    // §5.1.19 PQUANT + §5.1.20 CPM.
+    let pquant = reader.read_u32(5).map_err(|_| Error::UnexpectedEof)? as u8;
+    if pquant == 0 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let cpm = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    if cpm {
+        return Err(Error::NotImplemented);
+    }
+    // §5.1.22 / §5.1.23 — TRB + DBQUANT for a PB picture.
+    if header.pb_frames {
+        reader.skip(3 + 2).map_err(|_| Error::UnexpectedEof)?;
+    }
+    skip_pei_psupp(&mut reader)?;
+
+    let mb_cols = (layout.luma_width / 16) as usize;
+    let mb_rows_total = (layout.luma_height / 16) as usize;
+    let mb_rows_per_gob = layout.mb_rows_per_gob as usize;
+    let num_gobs = layout.num_gobs as usize;
+    let pb_mode = header.pb_frames;
+
+    let mut grid = vec![MbGridEntry::OUTSIDE; mb_cols * mb_rows_total];
+    // `record_grid` scratch — the QUANT map is unused by this walk.
+    let mut quant_scratch = vec![0u8; mb_cols * mb_rows_total];
+    let mut out = Vec::with_capacity(mb_cols * mb_rows_total);
+
+    let mut picture_quant = pquant;
+    let mut current_segment: u32 = 0;
+    for gob_index in 0..num_gobs {
+        // §5.2 / §5.2.2 — GOB 0 is header-less; later GOB headers are
+        // optional (probed).
+        let (gob_quant, segment, gob_header_present) = if gob_index == 0 {
+            (pquant, 0u32, true)
+        } else if crate::gob_header::gob_header_present(&mut reader) {
+            let gob = parse_gob_layer(&mut reader)?;
+            picture_quant = gob.quantiser;
+            current_segment += 1;
+            (gob.quantiser, current_segment, true)
+        } else {
+            (picture_quant, current_segment, false)
+        };
+        let gob_top_row = gob_index * mb_rows_per_gob;
+
+        let mut current_quant = gob_quant;
+        for local_row in 0..mb_rows_per_gob {
+            let row = gob_top_row + local_row;
+            if row >= mb_rows_total {
+                break;
+            }
+            for col in 0..mb_cols {
+                let bit_offset = reader.bit_position();
+                let predictor = predict_mv(
+                    &grid,
+                    mb_cols,
+                    col,
+                    row,
+                    gob_top_row,
+                    gob_header_present,
+                    pb_mode,
+                    segment,
+                );
+                out.push(MbBoundaryInfo {
+                    bit_offset,
+                    gobn: gob_index as u8,
+                    mba_in_gob: (local_row * mb_cols + col) as u16,
+                    quant: current_quant,
+                    pred1: (predictor.dx_half as i16, predictor.dy_half as i16),
+                });
+
+                // Parse the macroblock (stuffing loop) and skip its
+                // block payload.
+                let mb = loop {
+                    let mb = parse_macroblock(
+                        &mut reader,
+                        MbContext {
+                            picture_coding_type: header.coding_type,
+                            advanced_prediction: false,
+                            deblocking_filter: false,
+                            aic_intra_mode: false,
+                            pb_frames: pb_mode,
+                            pb_annex_m: false,
+                            quantiser_before: current_quant,
+                            modified_quant: false,
+                        },
+                    )?;
+                    if matches!(mb.mb_type, Some(MbType::Stuffing)) {
+                        continue;
+                    }
+                    break mb;
+                };
+
+                // Reconstruct this macroblock's motion vector for the
+                // predictor grid (no pixels).
+                let mv = if !mb.coded {
+                    MotionVector::new(0, 0)
+                } else if let Some(mb_type) = mb.mb_type {
+                    if matches!(mb_type, MbType::Inter4V | MbType::Inter4VQ) {
+                        return Err(Error::NotImplemented);
+                    }
+                    if mb_type.has_mvd() || (pb_mode && mb.mvd.is_some()) {
+                        let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
+                        if header.umv_mode {
+                            reconstruct_mv_umv(predictor, mvd)
+                        } else {
+                            reconstruct_mv(predictor, mvd)
+                        }
+                    } else {
+                        MotionVector::new(0, 0)
+                    }
+                } else {
+                    MotionVector::new(0, 0)
+                };
+                current_quant = mb.quantiser_after;
+
+                // Skip the block payload: the six P-blocks per the
+                // CBP bits, then — in PB-frames mode — the six
+                // B-blocks per CBPB.
+                if mb.coded {
+                    let mb_type = mb.mb_type.ok_or(Error::NotImplemented)?;
+                    let cbpy = mb.cbpy.unwrap_or(0);
+                    let cbpc = mb.cbpc.unwrap_or(0);
+                    let is_intra = mb_type.is_intra();
+                    let luma_pattern = if is_intra { cbpy } else { cbpy ^ 0b1111 };
+                    for blk in 0..4 {
+                        let has_coef = (luma_pattern >> (3 - blk)) & 1 == 1;
+                        if is_intra || has_coef {
+                            parse_block(
+                                &mut reader,
+                                BlockContext {
+                                    has_intradc: is_intra,
+                                    has_coefficients: has_coef,
+                                    modified_quant: false,
+                                },
+                            )?;
+                        }
+                    }
+                    for chroma_bit in [0b10u8, 0b01] {
+                        let has_coef = cbpc & chroma_bit != 0;
+                        if is_intra || has_coef {
+                            parse_block(
+                                &mut reader,
+                                BlockContext {
+                                    has_intradc: is_intra,
+                                    has_coefficients: has_coef,
+                                    modified_quant: false,
+                                },
+                            )?;
+                        }
+                    }
+                    if pb_mode {
+                        let cbpb = mb.cbpb.unwrap_or(0);
+                        for b_block in 1..=6u32 {
+                            if crate::pb_layer::cbpb_block_present(cbpb, b_block) {
+                                parse_block(
+                                    &mut reader,
+                                    BlockContext {
+                                        has_intradc: false,
+                                        has_coefficients: true,
+                                        modified_quant: false,
+                                    },
+                                )?;
+                            }
+                        }
+                    }
+                }
+
+                record_grid(
+                    &mut grid,
+                    &mut quant_scratch,
+                    mb_cols,
+                    col,
+                    row,
+                    &mb,
+                    current_quant,
+                    mv,
+                    [mv; 4],
+                    segment,
+                );
+            }
+            picture_quant = current_quant;
+        }
+    }
+
+    Ok(out)
+}
+
 /// Locate the byte offset of the next Picture Start Code in `data` at or
 /// after byte `from`, scanning only byte boundaries.
 ///
