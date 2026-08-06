@@ -238,6 +238,7 @@ pub mod plus_ptype;
 pub mod rru_filter;
 pub mod rru_upsample;
 pub mod rtp;
+pub mod sac;
 pub mod scal_upsample;
 pub mod scalability;
 pub mod slice_header;
@@ -343,6 +344,12 @@ pub use rtp::{
     packetize_stream_rfc2190, parse_payload_header, parse_rfc2190_mode_a, redundant_picture_header,
     write_payload_header, write_rfc2190_mode_a, H263PayloadHeader, PacketizeConfig, Rfc2190ModeA,
     VrcHeader, PAYLOAD_HEADER_BYTES, PLEN_MAX, RFC2190_MODE_A_BYTES, VRC_HEADER_BYTES,
+};
+pub use sac::{
+    decode_cbpy_sac, decode_cod, decode_dquant_sac, decode_intradc_sac, decode_mcbpc_i_sac,
+    decode_mcbpc_p_sac, decode_mvd_component_sac, encode_cbpy_sac, encode_cod, encode_dquant_sac,
+    encode_intradc_sac, encode_mcbpc_i_sac, encode_mcbpc_p_sac, encode_mvd_component_sac,
+    parse_block_sac, write_block_sac, SacDecoder, SacEncoder,
 };
 pub use scal_upsample::{
     upsample_plane_1d_horizontal, upsample_plane_1d_vertical, upsample_plane_2d,

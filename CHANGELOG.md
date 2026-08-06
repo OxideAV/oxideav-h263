@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex E Syntax-based Arithmetic Coding core** (round 438): the new
+  `sac` module stages the §E.2 arithmetic encoder (`SacEncoder` —
+  `encode_a_symbol` + the §E.6 `encoder_flush`), the §E.3 arithmetic
+  decoder (`SacDecoder` — `decode_a_symbol` + `decoder_reset`), the
+  §E.5 PSC_FIFO stuffing rule (a `"1"` stuffed after each 14-zero run
+  on the encode side, the first `"1"` after each exactly-14-zero run
+  deleted on the decode side) folded into both coders' bit paths, and
+  all 23 §E.8 `cumul_freq` models needed by the baseline I/P syntax
+  (COD, MCBPC I/P, CBPY, DQUANT, MVD, INTRADC, the TCOEF1/2/3/r INTER
+  + INTRA families, SIGN, and the post-ESCAPE LAST/RUN/LEVEL models).
+  Per-syntax-element codecs follow the §E.7 model assignment with the
+  clause-5 table indexing (Table 7/8 MCBPC, Table 12 CBPY, Table 13
+  DQUANT, Table 14 MVD with index 32 = 0, Table 15 INTRADC, Table 16
+  TCOEF with ESCAPE = 102, Table 17 RUN/LEVEL), and
+  `parse_block_sac` / `write_block_sac` stage the §E.4 Figure E.1
+  block layer end-to-end. Unit tests pin model well-formedness
+  (strictly-decreasing cumulative tables), mixed-model and
+  600-symbol stress round-trips, most-probable-symbol compression,
+  the no-15-zero-run stuffing invariant, stuffing-filter
+  invertibility across 14/15/28/30-zero runs, and block-layer scan
+  reproduction including ESCAPE-coded levels.
+
 - **§5.1.4 PLUSPTYPE picture-header writer, encoder** (round 432):
   `encoder::write_plus_picture_header` + the `PlusModes` mode set emit
   the extended-PTYPE (H.263+) picture header — PSC / TR / PTYPE bits

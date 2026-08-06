@@ -722,6 +722,33 @@ const TCOEF_TABLE: &[TcoefRow] = &[
     escape_row(7, 0b0000_011), // 102: 0000 011 (then 1+6+8 fixed)
 ];
 
+/// The Table 16 index of the ESCAPE code-point. The Annex E SAC TCOEF
+/// models (`cumf_TCOEF*`, 103 symbols each) use the Table 16 index
+/// column directly (§E.7), so ESCAPE is symbol 102 there too.
+pub(crate) const TCOEF_ESCAPE_INDEX: usize = 102;
+
+/// Table 16 lookup **by spec index** (the `TCOEF_TABLE` array is laid
+/// out in exact index order): `(LAST, RUN, |LEVEL|)` for the regular
+/// code-points `0..=101`, `None` for the ESCAPE index 102 and anything
+/// out of range. Used by the Annex E SAC symbol codecs, whose models
+/// are indexed by this column (§E.7).
+pub(crate) fn tcoef_table_row(index: usize) -> Option<(bool, u8, u8)> {
+    let row = TCOEF_TABLE.get(index)?;
+    if row.is_escape {
+        return None;
+    }
+    Some((row.last, row.run, row.abs_level))
+}
+
+/// Inverse of [`tcoef_table_row`]: the Table 16 index of a regular
+/// `(LAST, RUN, |LEVEL|)` combination, or `None` when the event is not
+/// in the table (the caller then ESCAPE-codes it).
+pub(crate) fn tcoef_table_index(last: bool, run: u8, abs_level: u8) -> Option<usize> {
+    TCOEF_TABLE.iter().position(|row| {
+        !row.is_escape && row.last == last && row.run == run && row.abs_level == abs_level
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
