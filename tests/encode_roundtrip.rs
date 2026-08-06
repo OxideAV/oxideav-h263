@@ -777,6 +777,99 @@ fn slice_structured_inter_round_trips() {
     assert_eq!(a.cr, b.cr);
 }
 
+/// §K.1 Rectangular Slice submode round-trip: the vertical-stripe
+/// INTRA encoder reconstructs identically to the free-running
+/// whole-picture slice form at every stripe width (baseline INTRA
+/// macroblocks carry no cross-macroblock prediction, so only the
+/// stripe scan-order bookkeeping differs — any divergence would be a
+/// rectangle-walk bug on either side).
+#[test]
+fn rectangular_slice_intra_matches_free_running() {
+    use oxideav_h263::encoder::{encode_intra_picture_slices, encode_intra_picture_slices_rect};
+    use oxideav_h263::picture::decode_picture_layer;
+
+    let src = gradient(176, 144, 33);
+    let free = encode_intra_picture_slices(&src, 0, 9, |_| 6).expect("free-running");
+    let expect = decode_picture_layer(&free, None, DecodeOptions::default()).expect("decode free");
+    for stripe_width in [1usize, 3, 4, 6, 11] {
+        let rect = encode_intra_picture_slices_rect(&src, 6, 0, stripe_width, false)
+            .expect("encode rect stripes");
+        let dec = decode_picture_layer(&rect, None, DecodeOptions::default()).expect("decode rect");
+        assert_eq!(dec.y, expect.y, "stripe width {stripe_width} luma");
+        assert_eq!(dec.cb, expect.cb, "stripe width {stripe_width} cb");
+        assert_eq!(dec.cr, expect.cr, "stripe width {stripe_width} cr");
+    }
+}
+
+/// §K.1 Arbitrary Slice Ordering round-trip: right-to-left stripe
+/// emission (the reduced first slice is NOT the MBA-0 slice)
+/// reconstructs identically to the in-order form at every stripe
+/// width.
+#[test]
+fn rectangular_slice_aso_matches_in_order() {
+    use oxideav_h263::encoder::encode_intra_picture_slices_rect;
+    use oxideav_h263::picture::decode_picture_layer;
+
+    let src = gradient(176, 144, 42);
+    for stripe_width in [2usize, 4, 5] {
+        let seq = encode_intra_picture_slices_rect(&src, 7, 1, stripe_width, false)
+            .expect("encode sequential");
+        let aso =
+            encode_intra_picture_slices_rect(&src, 7, 1, stripe_width, true).expect("encode ASO");
+        let a = decode_picture_layer(&seq, None, DecodeOptions::default()).expect("decode seq");
+        let b = decode_picture_layer(&aso, None, DecodeOptions::default()).expect("decode ASO");
+        assert_eq!(a.y, b.y, "stripe width {stripe_width}");
+        assert_eq!(a.cb, b.cb);
+        assert_eq!(a.cr, b.cr);
+    }
+}
+
+/// Rectangular-slice INTER (zero-MV) pictures: a static P over the
+/// stripes is lossless (all-skip in every stripe), and a P with a
+/// moving square reconstructs identically to the plain zero-MV
+/// P-picture — in sequential and arbitrary order.
+#[test]
+fn rectangular_slice_inter_round_trips() {
+    use oxideav_h263::encoder::{encode_inter_picture, encode_inter_picture_slices_rect};
+    use oxideav_h263::picture::{decode_picture_layer, decode_picture_no_gob0_header};
+
+    let lw = 176;
+    let lh = 144;
+    let src = gradient(lw, lh, 3);
+    let i_bytes = oxideav_h263::encoder::encode_intra_picture_plus(&src, 5, 0).expect("encode I");
+    let anchor = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).expect("decode I");
+
+    // Static P: lossless, all stripes skipped.
+    let p_static =
+        encode_inter_picture_slices_rect(&anchor, &anchor, 6, 1, 4, false).expect("static P");
+    let dec = decode_picture_layer(&p_static, Some(&anchor), DecodeOptions::default())
+        .expect("decode static P");
+    assert_eq!(dec.y, anchor.y);
+    assert_eq!(dec.cb, anchor.cb);
+    assert_eq!(dec.cr, anchor.cr);
+
+    // Moving-content P: parity with the plain (GOB-form) zero-MV
+    // P-picture of the same pair, sequential and ASO emission.
+    let mut cur = anchor.clone();
+    for row in 40..88 {
+        for col in 30..78 {
+            cur.y[row * lw + col] = cur.y[row * lw + col].wrapping_add(45);
+        }
+    }
+    let plain = encode_inter_picture(&cur, &anchor, 6, 1).expect("plain P");
+    let expect = decode_picture_no_gob0_header(&plain, Some(&anchor), DecodeOptions::default())
+        .expect("decode plain P");
+    for aso in [false, true] {
+        let rect =
+            encode_inter_picture_slices_rect(&cur, &anchor, 6, 1, 4, aso).expect("encode rect P");
+        let dec = decode_picture_layer(&rect, Some(&anchor), DecodeOptions::default())
+            .expect("decode rect P");
+        assert_eq!(dec.y, expect.y, "aso={aso}");
+        assert_eq!(dec.cb, expect.cb);
+        assert_eq!(dec.cr, expect.cr);
+    }
+}
+
 /// A full slice-structured GOP — H.263+ AIC I-picture in slices
 /// followed by two motion P-pictures in slices — decodes end-to-end
 /// through `decode_sequence` with default options (closed loop: each

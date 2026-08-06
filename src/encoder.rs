@@ -476,6 +476,200 @@ where
     Ok(w.finish())
 }
 
+/// Encode an Annex K **Rectangular Slice submode** H.263+ INTRA
+/// picture: the picture is tiled into full-height vertical stripes
+/// `stripe_width_mbs` macroblocks wide (the right-most stripe takes
+/// the remainder), each stripe one §K.2 slice whose header carries the
+/// §K.2.8 SWI field (`SWI = width − 1`) and whose macroblocks run in
+/// scanning order **within the rectangle** (§K.1 submode 1). Each
+/// slice is its own §6.1.1 / §I.3 video picture segment.
+///
+/// With `arbitrary_order` set, the **Arbitrary Slice Ordering**
+/// submode (§K.1 submode 2) is signalled too and the stripes are
+/// emitted right-to-left — an out-of-order bitstream whose first
+/// (reduced-header) slice is *not* the MBA-0 slice, exercising the
+/// §K.1 "not necessarily the slice starting with macroblock 0" rule.
+/// Baseline INTRA macroblocks carry no cross-macroblock prediction,
+/// so the emitted stream reconstructs identically in either order.
+///
+/// The output is self-describing (SSS carries both submode bits) and
+/// decodes through [`crate::picture::decode_picture_layer`] /
+/// [`crate::picture::decode_sequence`] with `DecodeOptions::default()`.
+pub fn encode_intra_picture_slices_rect(
+    frame: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    stripe_width_mbs: usize,
+    arbitrary_order: bool,
+) -> Result<Vec<u8>> {
+    encode_picture_slices_rect_impl(frame, None, quant, tr, stripe_width_mbs, arbitrary_order)
+}
+
+/// Encode an Annex K **Rectangular Slice submode** H.263+ INTER (P-)
+/// picture predicted from `reference` with zero motion vectors — the
+/// rectangular-stripe counterpart of the free-running
+/// [`encode_inter_picture_slices`]. Stripe layout, SWI emission and
+/// the optional Arbitrary Slice Ordering right-to-left emission match
+/// [`encode_intra_picture_slices_rect`].
+///
+/// Every coded macroblock carries `MVD = (0, 0)`; since all
+/// reconstructed vectors are zero, the §6.1.1 per-segment predictor is
+/// zero at every macroblock regardless of the stripe scan order, so
+/// the emitted MVD reconstructs exactly. A macroblock with no
+/// surviving residual is skipped (COD = 1).
+pub fn encode_inter_picture_slices_rect(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    stripe_width_mbs: usize,
+    arbitrary_order: bool,
+) -> Result<Vec<u8>> {
+    if frame.luma_width != reference.luma_width || frame.luma_height != reference.luma_height {
+        return Err(Error::NotImplemented);
+    }
+    encode_picture_slices_rect_impl(
+        frame,
+        Some(reference),
+        quant,
+        tr,
+        stripe_width_mbs,
+        arbitrary_order,
+    )
+}
+
+/// Shared body of the Rectangular-Slice stripe encoders.
+/// `reference = None` encodes an INTRA picture; `Some(_)` a zero-MV
+/// INTER picture.
+fn encode_picture_slices_rect_impl(
+    frame: &YuvFrame,
+    reference: Option<&YuvFrame>,
+    quant: u8,
+    tr: u8,
+    stripe_width_mbs: usize,
+    arbitrary_order: bool,
+) -> Result<Vec<u8>> {
+    use crate::plus_ptype::SliceStructuredSubmode;
+    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let layout =
+        crate::picture::PictureLayout::for_source_format(fmt).ok_or(Error::NotImplemented)?;
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+    if stripe_width_mbs == 0 || stripe_width_mbs > mb_cols {
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+
+    let sss = SliceStructuredSubmode {
+        rectangular: true,
+        arbitrary_order,
+    };
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ reference.is_some(),
+        PlusModes {
+            slice_structured: Some(sss),
+            ..PlusModes::default()
+        },
+    )?;
+
+    let ctx = SliceHeaderContext::from_picture_layout(&layout, Some(sss), false, false);
+    let gfid = tr & 0b11;
+
+    // Stripe geometry: full-height vertical rectangles.
+    let stripe_count = mb_cols.div_ceil(stripe_width_mbs);
+    let stripe_of = |i: usize| -> (usize, usize) {
+        let col0 = i * stripe_width_mbs;
+        (col0, stripe_width_mbs.min(mb_cols - col0))
+    };
+    // ASO: emit the stripes right-to-left; the first (reduced-header)
+    // slice is then the right-most stripe.
+    let order: Vec<usize> = if arbitrary_order {
+        (0..stripe_count).rev().collect()
+    } else {
+        (0..stripe_count).collect()
+    };
+
+    for (emit_index, &stripe) in order.iter().enumerate() {
+        let (col0, width) = stripe_of(stripe);
+        let mba = col0 as u32;
+        if emit_index == 0 {
+            // §K.2.2 — the slice following the picture header uses the
+            // reduced form (no SSC / SQUANT; it runs at PQUANT).
+            write_first_slice_header(&mut w, &ctx, mba, Some(width as u32))?;
+        } else {
+            write_slice_layer(&mut w, &ctx, mba, quant, gfid, Some(width as u32))?;
+        }
+        // §K.1 — macroblocks in scanning order within the rectangle.
+        for mb_row in 0..mb_rows {
+            for mb_col in col0..col0 + width {
+                let src = extract_macroblock(frame, mb_col, mb_row);
+                match reference {
+                    None => {
+                        encode_intra_macroblock(
+                            &mut w, &src, quant, /* write_cod */ false,
+                            /* picture_is_inter */ false,
+                        )?;
+                    }
+                    Some(reference) => {
+                        let refmb = extract_macroblock(reference, mb_col, mb_row);
+                        let luma_enc: Vec<crate::encoder_block::EncodedInterBlock> = (0..4)
+                            .map(|blk| {
+                                let residual = residual_of(&src.luma[blk], &refmb.luma[blk]);
+                                crate::encoder_block::encode_inter_block(&residual, quant)
+                            })
+                            .collect();
+                        let cb_enc = crate::encoder_block::encode_inter_block(
+                            &residual_of(&src.cb, &refmb.cb),
+                            quant,
+                        );
+                        let cr_enc = crate::encoder_block::encode_inter_block(
+                            &residual_of(&src.cr, &refmb.cr),
+                            quant,
+                        );
+                        let any_coeffs = luma_enc.iter().any(|e| e.has_coeffs)
+                            || cb_enc.has_coeffs
+                            || cr_enc.has_coeffs;
+                        if !any_coeffs {
+                            crate::encoder_mb::encode_skipped_macroblock(&mut w);
+                            continue;
+                        }
+                        let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
+                            luma_enc[0].clone(),
+                            luma_enc[1].clone(),
+                            luma_enc[2].clone(),
+                            luma_enc[3].clone(),
+                        ];
+                        crate::encoder_mb::encode_inter_macroblock(
+                            &mut w,
+                            &luma_arr,
+                            &cb_enc,
+                            &cr_enc,
+                            crate::macroblock::Mvd {
+                                dx_half: 0,
+                                dy_half: 0,
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    // §5.1.28 — PSTUF.
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
 /// Encode an Annex K **Slice Structured** + Annex I **Advanced INTRA
 /// Coding** H.263+ INTRA picture: §K.2 slices every
 /// `mb_rows_per_slice` macroblock rows, each macroblock coded with the

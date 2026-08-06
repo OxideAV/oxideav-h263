@@ -5297,14 +5297,6 @@ fn decode_slice_structured_after_header_inner(
     if header.sac_mode || header.pb_frames || header.advanced_prediction {
         return Err(Error::NotImplemented);
     }
-    // The Rectangular Slice submode changes the macroblock scan order
-    // (a slice tiles an SWI-wide rectangle rather than running in
-    // picture raster order); this driver stages the free-running form
-    // only. SWI presence is gated by `sss.rectangular` in the slice
-    // header, so refuse here rather than mis-walk the rectangle.
-    if sss.rectangular {
-        return Err(Error::NotImplemented);
-    }
 
     let luma_w = layout.luma_width as usize;
     let luma_h = layout.luma_height as usize;
@@ -5369,15 +5361,25 @@ fn decode_slice_structured_after_header_inner(
 
     let mut slice_index: u32 = 0;
     // §K.1 (ASO off): MBA strictly increases from slice to slice. Track
-    // the previous slice's MBA to enforce it.
+    // the previous slice's MBA to enforce it. Under the Arbitrary Slice
+    // Ordering submode the slices may appear in any order and the check
+    // is waived.
     let mut prev_mba: Option<u32> = None;
 
     // The first slice after the Picture Start Code uses the reduced
     // header form (no SSC / SSBI / SQUANT / GFID, §K.2.2 / §K.2.7); its
-    // QUANT is the picture-layer PQUANT just read.
+    // QUANT is the picture-layer PQUANT just read. Under ASO it is not
+    // necessarily the slice starting with macroblock 0 (§K.1).
     let first = parse_first_slice_header(reader, &ctx)?;
     let mut slice_mba = first.mba;
     let mut slice_quant: u8 = pquant;
+    // §K.2.8 — the Rectangular Slice submode's actual slice width
+    // (SWI + 1) for the current slice; `None` in the free-running form.
+    let mut slice_width = first.swi_actual_width;
+    // §K.1 coverage progress — the outer loop ends when every
+    // macroblock has been decoded (an end-of-raster slice is not
+    // necessarily the bitstream's last under ASO or RS).
+    let mut decoded_count: usize = 0;
 
     // Annex N §N.4.1 — the prediction reference in force for the current
     // slice. The first (reduced-header) slice carries no NEWPRED fields,
@@ -5386,10 +5388,13 @@ fn decode_slice_structured_after_header_inner(
     let mut active_reference: Option<&YuvFrame> = reference;
 
     loop {
-        // §K.1: enforce strictly-increasing MBA (ASO off).
-        if let Some(p) = prev_mba {
-            if slice_mba <= p {
-                return Err(Error::BadSliceCoverage);
+        // §K.1: enforce strictly-increasing MBA — waived under the
+        // Arbitrary Slice Ordering submode.
+        if !sss.arbitrary_order {
+            if let Some(p) = prev_mba {
+                if slice_mba <= p {
+                    return Err(Error::BadSliceCoverage);
+                }
             }
         }
         prev_mba = Some(slice_mba);
@@ -5397,16 +5402,42 @@ fn decode_slice_structured_after_header_inner(
             return Err(Error::SliceMbaOutOfRange);
         }
 
+        // §K.1 / §K.2.8 — the Rectangular Slice submode's region: the
+        // slice occupies a rectangle `rect_width` macroblocks wide with
+        // its upper-left macroblock at MBA, walked in scanning order
+        // *within the rectangle*. The free-running form walks the
+        // picture raster from MBA.
+        let col0 = slice_mba as usize % mb_cols;
+        let row0 = slice_mba as usize / mb_cols;
+        let rect_width = match slice_width {
+            Some(w) => {
+                let w = w as usize;
+                // The rectangle must fit the picture horizontally.
+                if w == 0 || col0 + w > mb_cols {
+                    return Err(Error::SliceSwiOutOfRange);
+                }
+                Some(w)
+            }
+            None => None,
+        };
+
         // Each slice opens a fresh §6.1.1 / §I.3 video picture segment.
         let segment = slice_index;
         let mut current_quant = slice_quant;
-        let mut mb_addr = slice_mba as usize;
+        // Macroblock ordinal within the slice's scan order.
+        let mut k: usize = 0;
 
-        // Walk macroblocks in picture scanning order until the next SSC
-        // or the end of the picture.
+        // Walk macroblocks in the slice's scanning order until the next
+        // SSC or the end of the slice's region.
         loop {
-            let col = mb_addr % mb_cols;
-            let row = mb_addr / mb_cols;
+            let (col, row) = match rect_width {
+                Some(w) => (col0 + k % w, row0 + k / w),
+                None => {
+                    let addr = slice_mba as usize + k;
+                    (addr % mb_cols, addr / mb_cols)
+                }
+            };
+            let mb_addr = row * mb_cols + col;
 
             if decoded[mb_addr] {
                 // Overlap with an earlier slice — §K.1 forbids it.
@@ -5488,12 +5519,18 @@ fn decode_slice_structured_after_header_inner(
                 segment,
             );
             decoded[mb_addr] = true;
+            decoded_count += 1;
 
-            mb_addr += 1;
-            if mb_addr >= mb_count {
-                // Reached the bottom-right macroblock; no more slices.
-                // Any trailing SSTUF / EOS is the picture-layer's
-                // concern.
+            k += 1;
+            // Does the slice's scan order have a next position? A
+            // rectangular slice ends at the picture bottom of its
+            // rectangle; a free-running slice at the picture's
+            // bottom-right macroblock.
+            let next_exists = match rect_width {
+                Some(w) => row0 + k / w < mb_rows_total,
+                None => slice_mba as usize + k < mb_count,
+            };
+            if !next_exists {
                 break;
             }
             // A slice boundary (next SSC) ends this slice.
@@ -5502,19 +5539,24 @@ fn decode_slice_structured_after_header_inner(
             }
         }
 
-        if mb_addr >= mb_count {
+        // §K.1 — the picture is complete when every macroblock has been
+        // decoded (under ASO / RS the raster-final slice need not be
+        // the bitstream's last, so completion is coverage-driven). Any
+        // trailing SSTUF / EOS is the picture-layer's concern.
+        if decoded_count >= mb_count {
             break;
         }
 
         // Consume the next slice header. Discard SSTUF, read the full
         // §K.2 slice header (SSC + SEPB1 + MBA + (SEPB2?) + SQUANT +
-        // SEPB3 + GFID — SSBI absent because CPM is off, SWI absent
-        // because RS is off).
+        // (SWI iff RS) + SEPB3 + GFID — SSBI absent because CPM is
+        // off).
         skip_sstuf(reader)?;
         let next = parse_slice_layer(reader, &ctx)?;
         slice_index += 1;
         slice_mba = next.mba;
         slice_quant = next.squant;
+        slice_width = next.swi_actual_width;
 
         // Annex N §N.4.1 — a subsequent slice header carrying the NEWPRED
         // fields (Figure N.3) re-selects this slice's prediction
@@ -11107,52 +11149,197 @@ mod tests {
         assert!(matches!(r, Err(Error::NotImplemented)));
     }
 
-    /// Slice-Structured mode with the Rectangular Slice submode (SSS
-    /// bit `rectangular = 1`) is refused with `NotImplemented` — the
-    /// free-running slice driver stages picture-raster scan order only;
-    /// the rectangular-region scan order is out of scope for this
-    /// round. The refusal fires before any slice data is read, so the
-    /// stream may stop right after the SSS field.
-    #[test]
-    fn decode_picture_layer_plus_refuses_rectangular_slice() {
-        let mut w = BitWriter::new();
+    /// Write a QCIF PLUSPTYPE INTER picture-layer header with the
+    /// OPPTYPE Slice-Structured bit set and the given raw §5.1.10 SSS
+    /// field (`0b10` = Rectangular Slice, `0b11` = RS + Arbitrary Slice
+    /// Ordering). The reader is left at the first bit of PQUANT.
+    fn write_qcif_rs_inter_header(w: &mut BitWriter, sss_raw: u32) {
         w.write_u32(PSC_VALUE, PSC_BITS);
-        w.write_u32(0, 8);
-        w.write_bit(true);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_u32(0b111, 3);
-        w.write_u32(0b001, 3);
-        w.write_u32(0b010, 3);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(true); // SS bit
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(true);
-        w.write_u32(0, 3);
-        w.write_u32(0b000, 3);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(false);
-        w.write_bit(true);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true); // PTYPE bit1
+        w.write_bit(false); // bit2
+        w.write_bit(false); // split
+        w.write_bit(false); // doc-cam
+        w.write_bit(false); // freeze
+        w.write_u32(0b111, 3); // extended PTYPE
+        w.write_u32(0b001, 3); // UFEP = 001
+        w.write_u32(0b010, 3); // OPPTYPE source QCIF
+        for _ in 0..6 {
+            w.write_bit(false);
+        }
+        w.write_bit(true); // bit 10 — SS
+        for _ in 0..4 {
+            w.write_bit(false);
+        }
+        w.write_bit(true); // bit 15 SCE-guard
+        w.write_u32(0b000, 3); // bits 16-18
+        w.write_u32(0b001, 3); // MPPTYPE: INTER
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
         w.write_bit(false); // CPM
-                            // §5.1.10 SSS (2 bits): bit `rectangular = 1`,
-                            // `arbitrary_order = 0` ⇒ raw `0b10`.
-        w.write_u32(0b10, 2);
+        w.write_u32(sss_raw, 2); // §5.1.10 SSS
+    }
+
+    /// §K.1 Rectangular Slice submode end-to-end: a QCIF INTER picture
+    /// tiled into two full-height vertical stripes (cols 0..6 and
+    /// 6..11), every macroblock skipped. The first (reduced-header)
+    /// slice carries SEPB2 + SWI per the §K.2.6 / §K.2.8 first-slice
+    /// rules; the second is a full SSC header with SWI. All macroblocks
+    /// copy the reference — proving the rectangle scan order visited
+    /// every macroblock exactly once.
+    #[test]
+    fn decode_qcif_rs_two_stripe_inter_all_skipped_copies_reference() {
+        let reference = ramp_reference(176, 144);
+        let mut w = BitWriter::new();
+        write_qcif_rs_inter_header(&mut w, 0b10); // RS, sequential
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        w.write_bit(false); // PEI = "0"
+                            // First slice (reduced form, RS): SEPB1 + MBA + SEPB2 + SWI + SEPB3.
+        w.write_u32(1, SEPB_BITS); // SEPB1
+        w.write_u32(0, 7); // MBA 0 (upper-left of stripe A)
+        w.write_u32(1, SEPB_BITS); // SEPB2 (first slice, RS in use)
+        w.write_u32(5, 4); // SWI = 5 → width 6
+        w.write_u32(1, SEPB_BITS); // SEPB3
+        for _ in 0..(6 * 9) {
+            write_skipped_mb(&mut w); // stripe A: 6 cols × 9 rows
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false); // SSTUF
+        }
+        // Second slice (full form): SSC + SEPB1 + MBA + SQUANT + SWI +
+        // SEPB3 + GFID (QCIF MBA width 7 ⇒ no SEPB2).
+        w.write_u32(SSC_VALUE, SSC_BITS);
+        w.write_u32(1, SEPB_BITS); // SEPB1
+        w.write_u32(6, 7); // MBA 6 (upper-left of stripe B)
+        w.write_u32(8, SQUANT_BITS); // SQUANT
+        w.write_u32(4, 4); // SWI = 4 → width 5
+        w.write_u32(1, SEPB_BITS); // SEPB3
+        w.write_u32(0, K_GFID_BITS); // GFID
+        for _ in 0..(5 * 9) {
+            write_skipped_mb(&mut w); // stripe B: 5 cols × 9 rows
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
         let data = w.finish();
-        let r = decode_picture_layer(&data, None, DecodeOptions::default());
-        assert!(matches!(r, Err(Error::NotImplemented)));
+        let frame = decode_picture_layer(&data, Some(&reference), DecodeOptions::default())
+            .expect("rs inter decode");
+        assert_eq!(frame.y, reference.y);
+        assert_eq!(frame.cb, reference.cb);
+        assert_eq!(frame.cr, reference.cr);
+    }
+
+    /// §K.1 Arbitrary Slice Ordering: the same two-stripe rectangular
+    /// picture with the stripes sent **right-to-left** (the reduced
+    /// first slice starts at MBA 6 — "not necessarily the slice
+    /// starting with macroblock 0"). ASO waives the strictly-increasing
+    /// MBA rule; coverage completes when both stripes have landed.
+    #[test]
+    fn decode_qcif_rs_aso_out_of_order_stripes_copies_reference() {
+        let reference = ramp_reference(176, 144);
+        let mut w = BitWriter::new();
+        write_qcif_rs_inter_header(&mut w, 0b11); // RS + ASO
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        w.write_bit(false); // PEI = "0"
+                            // First slice in the bitstream = stripe B (cols 6..11).
+        w.write_u32(1, SEPB_BITS); // SEPB1
+        w.write_u32(6, 7); // MBA 6
+        w.write_u32(1, SEPB_BITS); // SEPB2
+        w.write_u32(4, 4); // SWI = 4 → width 5
+        w.write_u32(1, SEPB_BITS); // SEPB3
+        for _ in 0..(5 * 9) {
+            write_skipped_mb(&mut w);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        // Second slice in the bitstream = stripe A (cols 0..6).
+        w.write_u32(SSC_VALUE, SSC_BITS);
+        w.write_u32(1, SEPB_BITS); // SEPB1
+        w.write_u32(0, 7); // MBA 0
+        w.write_u32(8, SQUANT_BITS); // SQUANT
+        w.write_u32(5, 4); // SWI = 5 → width 6
+        w.write_u32(1, SEPB_BITS); // SEPB3
+        w.write_u32(0, K_GFID_BITS); // GFID
+        for _ in 0..(6 * 9) {
+            write_skipped_mb(&mut w);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let frame = decode_picture_layer(&data, Some(&reference), DecodeOptions::default())
+            .expect("rs+aso inter decode");
+        assert_eq!(frame.y, reference.y);
+        assert_eq!(frame.cb, reference.cb);
+        assert_eq!(frame.cr, reference.cr);
+    }
+
+    /// Without the ASO submode, out-of-order slices violate the §K.1
+    /// strictly-increasing MBA rule and are refused.
+    #[test]
+    fn decode_qcif_rs_out_of_order_without_aso_is_rejected() {
+        let reference = ramp_reference(176, 144);
+        let mut w = BitWriter::new();
+        write_qcif_rs_inter_header(&mut w, 0b10); // RS, sequential order
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        w.write_bit(false); // PEI
+                            // First slice = stripe B (MBA 6) — legal only under ASO.
+        w.write_u32(1, SEPB_BITS);
+        w.write_u32(6, 7);
+        w.write_u32(1, SEPB_BITS);
+        w.write_u32(4, 4);
+        w.write_u32(1, SEPB_BITS);
+        for _ in 0..(5 * 9) {
+            write_skipped_mb(&mut w);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        w.write_u32(SSC_VALUE, SSC_BITS);
+        w.write_u32(1, SEPB_BITS);
+        w.write_u32(0, 7); // MBA 0 < 6 — not strictly increasing
+        w.write_u32(8, SQUANT_BITS);
+        w.write_u32(5, 4);
+        w.write_u32(1, SEPB_BITS);
+        w.write_u32(0, K_GFID_BITS);
+        for _ in 0..(6 * 9) {
+            write_skipped_mb(&mut w);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let r = decode_picture_layer(&data, Some(&reference), DecodeOptions::default());
+        assert!(matches!(r, Err(Error::BadSliceCoverage)));
+    }
+
+    /// A rectangular slice whose SWI-declared rectangle would overhang
+    /// the right picture edge is refused (§K.2.8 — the rectangle must
+    /// fit the picture).
+    #[test]
+    fn decode_qcif_rs_rectangle_overhang_is_rejected() {
+        let reference = ramp_reference(176, 144);
+        let mut w = BitWriter::new();
+        write_qcif_rs_inter_header(&mut w, 0b10);
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        w.write_bit(false); // PEI
+        w.write_u32(1, SEPB_BITS); // SEPB1
+        w.write_u32(6, 7); // MBA 6 (col 6)
+        w.write_u32(1, SEPB_BITS); // SEPB2
+        w.write_u32(7, 4); // SWI = 7 → width 8; col 6 + 8 > 11
+        w.write_u32(1, SEPB_BITS); // SEPB3
+        write_skipped_mb(&mut w);
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let r = decode_picture_layer(&data, Some(&reference), DecodeOptions::default());
+        assert!(matches!(r, Err(Error::SliceSwiOutOfRange)));
     }
 
     // ---- Annex K Slice-Structured end-to-end decode ----------------

@@ -34,6 +34,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   Prediction and mid-picture GOB headers are refused pending later
   rounds.
 
+- **Annex K Rectangular Slice + Arbitrary Slice Ordering submodes**
+  (round 438): the Slice-Structured decode driver now stages both §K.1
+  submodes. Under **RS** each slice header carries the §K.2.8 SWI
+  field and the slice's macroblocks are walked in scanning order
+  *within* the `SWI + 1`-wide rectangle anchored at MBA (a rectangle
+  overhanging the right picture edge is refused with
+  `SliceSwiOutOfRange`); under **ASO** the §K.1 strictly-increasing
+  MBA rule is waived and slices land by address in any bitstream
+  order — picture completion is coverage-driven (every macroblock
+  decoded exactly once) rather than raster-driven, and the reduced
+  first slice need not be the MBA-0 slice. The encoder arm:
+  `encode_intra_picture_slices_rect` /
+  `encode_inter_picture_slices_rect` tile the picture into
+  full-height vertical stripes (each its own §6.1.1 segment, SWI on
+  the wire, self-describing SSS submode bits), with `arbitrary_order`
+  emitting the stripes right-to-left. Unit tests pin the two-stripe
+  skipped-INTER reference copy, ASO out-of-order placement,
+  out-of-order-without-ASO rejection and the rectangle-overhang
+  refusal; integration tests pin rect-vs-free-running INTRA
+  reconstruction identity across stripe widths 1/3/4/6/11, ASO-vs-
+  sequential identity, static rect-P losslessness and rect-P parity
+  with the plain zero-MV P-picture in both orders.
+
 - **SAC streams + motion estimation** (round 438):
   `encode_inter_picture_motion_sac` is the arithmetic-coded mirror of
   the motion-search P encoder (SAD + half-pel estimation around the
