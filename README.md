@@ -90,6 +90,17 @@ same source reconstruct **byte-identically** (pinned for the I / P /
 AP / PB shapes); measured entropy-layer saving on the gradient QCIF
 corpus is 6.4–25.5 % on I-pictures (QP 31 → QP 2).
 
+The encoder gained **Annex Q Reduced-Resolution Update** entry points
+(round 443): `encode_intra_picture_rru` (each 16×16 region
+down-sampled to the reduced 8×8 block, standard INTRA stage over the
+32×32 macroblock grid) and `encode_inter_picture_rru` (pseudo-domain
+motion search so every candidate expands to a legal §Q.4
+half-integer-or-zero vector, per-16×16-sub-block residuals
+down-sampled to 8×8) — both self-describing (MPPTYPE RRU bit) and
+round-tripped through the RRU decode driver (static P lossless,
+translated content within tolerance, I + P streams through
+`decode_sequence`).
+
 The encoder also has **rate control** (round 438): the
 `rate_control` module pairs the Annex B Hypothetical Reference
 Decoder buffer simulation (`HrdModel` — §B.3/§B.4 examinations, the
@@ -300,26 +311,26 @@ planar 4:2:0 `YuvFrame`:
   through the shared per-macroblock reconstruction on all three). The
   `advanced-intra-coding` (AIC + MQ + slice-structured) conformance
   fixture decodes byte-exact.
-* **Annex Q §Q.6** — Reduced-Resolution Update mode prediction-error
-  up-sampling: the 8×8 reduced-resolution reconstructed prediction-error
-  block is up-sampled to a 16×16 block with the block-closed §Q.6.1
-  interior filter (Figure Q.8 9/3/3/1 bilinear weights) and the §Q.6.2
-  boundary filter (Figure Q.9 corner copy + 3:1 edge interpolation), all
-  with §Q.6 division-by-truncation semantics. Exposed as the pure
-  `upsample_prediction_error` primitive.
-* **Annex Q §Q.7** — Reduced-Resolution Update block boundary filter run
-  along the edges of the 16×16 reconstructed blocks: the §Q.7.1 default
-  two-tap kernel (`A1 = (3A+B+2)/4`, `B1 = (A+3B+2)/4` with truncating
-  division) and the §Q.7.2 Deblocking-Filter-mode variant (the §J.3
-  four-tap filter with `STRENGTH = +∞`, which collapses `UpDownRamp` to
-  the identity so `d1 = (A−4B+4C−D)/8`). Both honour the §J.3 edge
-  ordering (horizontal-before-vertical), the coded-MB filter-on
-  condition, and the picture-edge skip, with slice/ISD-segment skips
-  surfaced through a per-edge condition closure. Exposed as the
-  `rru_filter_plane` plane-level driver (plus the `rru_default_tap`
-  kernel); the surrounding 32×32-macroblock RRU decode pipeline
-  (pseudo-MV §Q.4, enlarged OBMC §Q.5, reference extension §Q.3) is not
-  yet wired.
+* **Annex Q** — Reduced-Resolution Update mode **end-to-end** (round
+  443): an extended-PTYPE picture whose §5.1.4.3 MPPTYPE RRU bit is
+  set routes to the dedicated driver — §Q.1 geometry (display /
+  reference / coded sizes, the 32×32 macroblock grid), §Q.3 reference
+  extension by edge replication, standard §5.3/§5.4 macroblock syntax
+  with §Q.4 pseudo-motion-vector reconstruction (the §6.1.1 predictor
+  over the actual vectors converted to the pseudo domain, the
+  Table-14 MVD applied there, the result expanded to the
+  half-integer-or-zero lattice, `[-31.5, 30.5]`-pel default range),
+  four 16×16 luminance + two 16×16 chrominance prediction blocks,
+  §Q.2.2.2 texture decode + §Q.6 up-sampling (the block-closed
+  Figure-Q.8/Q.9 filters with the Implementors' Guide arithmetic-shift
+  rounding correction), §Q.2.2.3 summation + clip, the §Q.7.1 default
+  block boundary filter (coded-MB condition, §J.3 edge ordering) and
+  the §Q.2.3/§Q.2.4 crop back to the reference size. The staged
+  subset is the single-segment I/P stream shape at the five standard
+  formats; UMV / AP / DF / AIC / SAC / AIV / MQ / Annex K / B-EI-EP
+  combinations inside RRU are refused. The §Q.7.2 Deblocking-Filter
+  variant and §Q.5 enlarged OBMC stay as primitives
+  (`rru_filter_plane`, `STRENGTH_RRU_INFINITE`).
 * **Annex N §N.4.1 / §N.5** — Reference Picture Selection mode (forward
   channel) end-to-end, including **per-GOB** re-selection: the
   `RpsReferenceStore` picture memory keys decoded anchors by their 10-bit
@@ -516,12 +527,12 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   Annex P explicit-warp resampling engine (see the supported list) is
   not yet threaded into the EP / spatial-scalability path (only the §O.6
   factor-of-two upsample is wired there).
-* Annex Q Reduced-Resolution Update mode end-to-end (the §Q.6
-  prediction-error up-sampling primitive and the §Q.7 block boundary
-  filter are implemented as pure primitives; the 32×32 macroblock layer,
-  §Q.4 pseudo-MV reconstruction, §Q.5 enlarged OBMC and §Q.3 reference
-  extension are not yet wired, so the §Q.7 driver is not yet invoked from
-  an end-to-end RRU reconstruction).
+* Annex Q Reduced-Resolution Update combined with UMV (the Table D.3
+  pseudo-vector coding), Advanced Prediction (§Q.5 enlarged OBMC),
+  Deblocking Filter (§Q.7.2 filter variant), Annex K slices, custom
+  source formats or mid-picture GOB headers — the single-segment
+  standard-format I/P subset decodes and encodes end-to-end (see the
+  supported list).
 * GSBI (CPM = "1"); the EOSBS end marker (the §5.1.27 EOS is emitted
   by the encoder and transparently skipped by `decode_sequence`).
 * Encoder: arbitrary (non-stripe) rectangular slice shapes and

@@ -200,6 +200,8 @@ pub struct PlusModes {
     /// the 2-bit Picture Sub-Bitstream Indicator (`0..=3`, Annex C
     /// Continuous Presence Multipoint). `None` emits CPM = "0".
     pub cpm_psbi: Option<u8>,
+    /// MPPTYPE bit 5 — Annex Q Reduced-Resolution Update mode.
+    pub rru: bool,
 }
 
 /// Write an extended-PTYPE (PLUSPTYPE, §5.1.4) picture header: PSC, TR,
@@ -289,6 +291,9 @@ pub fn write_plus_picture_header(
     let mut mpptype: u32 = 0;
     if is_inter {
         mpptype |= 0b001 << 6; // "001" P-picture ("000" is I)
+    }
+    if modes.rru {
+        mpptype |= 1 << 4; // bit 5 — Annex Q Reduced-Resolution Update
     }
     mpptype |= 1; // bit 9 — start-code-emulation guard
     w.write_bits(mpptype, 9);
@@ -580,6 +585,305 @@ where
     }
 
     // §5.1.28 — PSTUF.
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+// ---------------------------------------------------------------------
+// Annex Q — Reduced-Resolution Update encoders.
+// ---------------------------------------------------------------------
+
+/// Down-sample one 16 × 16 source region (top-left at `(x0, y0)` of a
+/// `stride`-wide plane) to an 8 × 8 reduced-resolution block by 2 × 2
+/// averaging with round-to-nearest — the encoder-side inverse of the
+/// §Q.6 up-sampling (an encoder choice; §Q does not normify it).
+fn rru_downsample_16(plane: &[u8], stride: usize, x0: usize, y0: usize) -> [i16; COEFFS_PER_BLOCK] {
+    let mut out = [0i16; COEFFS_PER_BLOCK];
+    for j in 0..8 {
+        for i in 0..8 {
+            let a = plane[(y0 + 2 * j) * stride + x0 + 2 * i] as i32;
+            let b = plane[(y0 + 2 * j) * stride + x0 + 2 * i + 1] as i32;
+            let c = plane[(y0 + 2 * j + 1) * stride + x0 + 2 * i] as i32;
+            let d = plane[(y0 + 2 * j + 1) * stride + x0 + 2 * i + 1] as i32;
+            out[j * 8 + i] = ((a + b + c + d + 2) >> 2) as i16;
+        }
+    }
+    out
+}
+
+/// As [`rru_downsample_16`] but over a signed 16 × 16 residual block.
+fn rru_downsample_residual(res: &[i32; 256]) -> [i16; COEFFS_PER_BLOCK] {
+    let mut out = [0i16; COEFFS_PER_BLOCK];
+    for j in 0..8 {
+        for i in 0..8 {
+            let a = res[(2 * j) * 16 + 2 * i];
+            let b = res[(2 * j) * 16 + 2 * i + 1];
+            let c = res[(2 * j + 1) * 16 + 2 * i];
+            let d = res[(2 * j + 1) * 16 + 2 * i + 1];
+            // Arithmetic-shift average (floors negatives consistently
+            // with the Implementors' Guide §Q.6 rounding).
+            out[j * 8 + i] = ((a + b + c + d + 2) >> 2) as i16;
+        }
+    }
+    out
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an **Annex Q
+/// Reduced-Resolution Update INTRA** picture: the PLUSPTYPE header
+/// raises the §5.1.4.3 MPPTYPE RRU bit and the picture body is the
+/// standard §5.3 / §5.4 macroblock syntax over the §Q.1 32 × 32
+/// macroblock grid — each 16 × 16 source region is down-sampled to an
+/// 8 × 8 reduced-resolution block, forward-transformed and quantised
+/// by the exact baseline INTRA stage. The decoder up-samples per §Q.6
+/// and runs the §Q.7 boundary filter, so the round-trip is inherently
+/// low-passed (RRU trades detail for rate, §Q.1).
+///
+/// Self-describing: decodes through
+/// [`crate::picture::decode_picture_layer`] / `decode_sequence` with
+/// `DecodeOptions::default()`. The source dimensions must be one of
+/// the five standard formats; for formats whose reference size is not
+/// divisible by 32 (sub-QCIF / QCIF / 4CIF) the source is §Q.3-style
+/// edge-extended to the coded size before down-sampling.
+pub fn encode_intra_picture_rru(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    use crate::encoder_mb::{encode_intra_macroblock, MacroblockSamples};
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let geo = crate::picture::rru_geometry_for_display(frame.luma_width, frame.luma_height);
+    let ext = crate::picture::extend_frame_rru(frame, geo.0, geo.1);
+    let (hc, vc) = geo;
+    let mb_cols = hc / 32;
+    let mb_rows = vc / 32;
+
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ false,
+        PlusModes {
+            rru: true,
+            ..PlusModes::default()
+        },
+    )?;
+
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let mb_x = mb_col * 32;
+            let mb_y = mb_row * 32;
+            let c_x = mb_col * 16;
+            let c_y = mb_row * 16;
+            // Down-sample the four 16 × 16 luma regions and the two
+            // 16 × 16 chroma regions to the reduced 8 × 8 blocks.
+            let mut samples = MacroblockSamples {
+                luma: [[0i16; COEFFS_PER_BLOCK]; 4],
+                cb: [0i16; COEFFS_PER_BLOCK],
+                cr: [0i16; COEFFS_PER_BLOCK],
+            };
+            for blk in 0..4 {
+                let bx = mb_x + (blk % 2) * 16;
+                let by = mb_y + (blk / 2) * 16;
+                samples.luma[blk] = rru_downsample_16(&ext.y, hc, bx, by);
+            }
+            samples.cb = rru_downsample_16(&ext.cb, hc / 2, c_x, c_y);
+            samples.cr = rru_downsample_16(&ext.cr, hc / 2, c_x, c_y);
+            encode_intra_macroblock(
+                &mut w, &samples, quant, /* write_cod */ false,
+                /* picture_is_inter */ false,
+            )?;
+        }
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an **Annex Q
+/// Reduced-Resolution Update INTER** picture predicted from
+/// `reference` (the previously **decoded** reconstruction at the
+/// reference size, §Q.2.3): 32 × 32 macroblocks with one §Q.4
+/// pseudo-motion vector each — the search runs directly in the
+/// pseudo-vector domain over `± search_pseudo_half` half-pel steps
+/// around the pseudo-predictor, so every candidate expands to a legal
+/// half-integer-or-zero actual vector — and per-16 × 16-sub-block
+/// residuals down-sampled to 8 × 8, transformed and quantised by the
+/// baseline INTER stage. A zero-vector macroblock with no surviving
+/// residual is skipped.
+///
+/// Self-describing; decodes through
+/// [`crate::picture::decode_picture_layer`] / `decode_sequence`. The
+/// closed-loop GOP convention applies: pass the decoder's own
+/// reconstruction of the previous picture as `reference` so encoder
+/// and decoder never drift (the §Q.7 boundary filter is part of the
+/// decoded reference).
+pub fn encode_inter_picture_rru(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_pseudo_half: i32,
+) -> Result<Vec<u8>> {
+    use crate::motion::{rru_actual_mv, rru_pseudo_mv, MotionVector};
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if frame.luma_width != reference.luma_width || frame.luma_height != reference.luma_height {
+        return Err(Error::NotImplemented);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let (hc, vc) = crate::picture::rru_geometry_for_display(frame.luma_width, frame.luma_height);
+    let ext_src = crate::picture::extend_frame_rru(frame, hc, vc);
+    let ext_ref = crate::picture::extend_frame_rru(reference, hc, vc);
+    let mb_cols = hc / 32;
+    let mb_rows = vc / 32;
+
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ true,
+        PlusModes {
+            rru: true,
+            ..PlusModes::default()
+        },
+    )?;
+
+    let y_ref = crate::motion::RefPlane::new(&ext_ref.y, hc, vc);
+    let cb_ref = crate::motion::RefPlane::new(&ext_ref.cb, hc / 2, vc / 2);
+    let cr_ref = crate::motion::RefPlane::new(&ext_ref.cr, hc / 2, vc / 2);
+
+    // §6.1.1 predictor grid over the actual vectors (replayed like the
+    // decoder's).
+    let mut grid = crate::encoder_motion::MvGrid::new(mb_cols, mb_rows);
+
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let mb_x = mb_col * 32;
+            let mb_y = mb_row * 32;
+            let c_x = mb_col * 16;
+            let c_y = mb_row * 16;
+
+            // §Q.4 — the predictor over actual vectors, converted to
+            // the pseudo domain; the search walks pseudo candidates.
+            let pc = grid.predict(mb_col, mb_row);
+            let pseudo_pc = rru_pseudo_mv(pc);
+
+            let sad_for = |actual: MotionVector| -> u32 {
+                let mut sad = 0u32;
+                for blk in 0..4 {
+                    let bx = mb_x + (blk % 2) * 16;
+                    let by = mb_y + (blk / 2) * 16;
+                    let pred =
+                        crate::picture::rru_motion_compensate_16_pub(&y_ref, bx, by, actual, 0);
+                    for j in 0..16 {
+                        for i in 0..16 {
+                            let sv = ext_src.y[(by + j) * hc + bx + i] as i32;
+                            sad += (sv - pred[j * 16 + i] as i32).unsigned_abs();
+                        }
+                    }
+                }
+                sad
+            };
+
+            let mut best_pseudo = MotionVector::new(0, 0);
+            let mut best_cost = sad_for(MotionVector::new(0, 0));
+            let lambda = 2 * quant as u32;
+            for dy in -search_pseudo_half..=search_pseudo_half {
+                for dx in -search_pseudo_half..=search_pseudo_half {
+                    let cand = MotionVector {
+                        dx_half: pseudo_pc.dx_half + dx,
+                        dy_half: pseudo_pc.dy_half + dy,
+                    };
+                    // Pseudo range is the baseline [-32, 31] half-pel
+                    // window (§Q.4 item 2).
+                    if !(-32..=31).contains(&cand.dx_half) || !(-32..=31).contains(&cand.dy_half) {
+                        continue;
+                    }
+                    let actual = rru_actual_mv(cand);
+                    let mvbits = (cand.dx_half - pseudo_pc.dx_half).unsigned_abs()
+                        + (cand.dy_half - pseudo_pc.dy_half).unsigned_abs();
+                    let cost = sad_for(actual) + lambda * mvbits;
+                    if cost < best_cost {
+                        best_cost = cost;
+                        best_pseudo = cand;
+                    }
+                }
+            }
+            // The zero pseudo-vector must stay reachable through the
+            // Table-14 wrap; every candidate the loop admitted is.
+            let pseudo_mv = best_pseudo;
+            let mv = rru_actual_mv(pseudo_mv);
+            let chroma_vec = crate::motion::chroma_mv(mv);
+
+            // Residuals per 16 × 16 sub-block, down-sampled to 8 × 8.
+            let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(4);
+            for blk in 0..4 {
+                let bx = mb_x + (blk % 2) * 16;
+                let by = mb_y + (blk / 2) * 16;
+                let pred = crate::picture::rru_motion_compensate_16_pub(&y_ref, bx, by, mv, 0);
+                let mut res = [0i32; 256];
+                for j in 0..16 {
+                    for i in 0..16 {
+                        res[j * 16 + i] =
+                            ext_src.y[(by + j) * hc + bx + i] as i32 - pred[j * 16 + i] as i32;
+                    }
+                }
+                let reduced = rru_downsample_residual(&res);
+                luma_enc.push(crate::encoder_block::encode_inter_block(&reduced, quant));
+            }
+            let mut chroma_enc: Vec<crate::encoder_block::EncodedInterBlock> =
+                Vec::with_capacity(2);
+            for (plane, rp) in [(&ext_src.cb, &cb_ref), (&ext_src.cr, &cr_ref)] {
+                let pred =
+                    crate::picture::rru_motion_compensate_16_pub(rp, c_x, c_y, chroma_vec, 0);
+                let mut res = [0i32; 256];
+                for j in 0..16 {
+                    for i in 0..16 {
+                        res[j * 16 + i] =
+                            plane[(c_y + j) * (hc / 2) + c_x + i] as i32 - pred[j * 16 + i] as i32;
+                    }
+                }
+                let reduced = rru_downsample_residual(&res);
+                chroma_enc.push(crate::encoder_block::encode_inter_block(&reduced, quant));
+            }
+
+            let any_coeffs =
+                luma_enc.iter().any(|e| e.has_coeffs) || chroma_enc.iter().any(|e| e.has_coeffs);
+            let is_zero = mv.dx_half == 0 && mv.dy_half == 0;
+            if !any_coeffs && is_zero {
+                crate::encoder_mb::encode_skipped_macroblock(&mut w);
+                grid.set_zero_candidate(mb_col, mb_row);
+                continue;
+            }
+
+            // Emit: COD + MCBPC(INTER) + CBPY + MVD (pseudo-domain
+            // difference, Table 14 wrap) + blocks.
+            let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
+                luma_enc[0].clone(),
+                luma_enc[1].clone(),
+                luma_enc[2].clone(),
+                luma_enc[3].clone(),
+            ];
+            let mvd = crate::encoder_motion::mvd_for(pseudo_mv, pseudo_pc);
+            crate::encoder_mb::encode_inter_macroblock(
+                &mut w,
+                &luma_arr,
+                &chroma_enc[0],
+                &chroma_enc[1],
+                mvd,
+            )?;
+            grid.set_inter(mb_col, mb_row, mv);
+        }
+    }
+
     w.align_to_byte_zero();
     Ok(w.finish())
 }

@@ -1431,6 +1431,569 @@ fn decode_sac_inter_chroma(
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// Annex Q — Reduced-Resolution Update mode.
+// ---------------------------------------------------------------------
+
+/// §Q.1 picture geometry for the Reduced-Resolution Update mode:
+/// the display size `(h, v)` from the picture header, the reference
+/// size `(hr, vr) = ceil16(h, v)` (§4.1), and the coded size
+/// `(hc, vc) = ceil32(hr, vr)` the 32 × 32 macroblock grid tiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RruGeometry {
+    h: usize,
+    v: usize,
+    hr: usize,
+    vr: usize,
+    hc: usize,
+    vc: usize,
+}
+
+impl RruGeometry {
+    fn for_display(h: usize, v: usize) -> RruGeometry {
+        let hr = h.div_ceil(16) * 16;
+        let vr = v.div_ceil(16) * 16;
+        let hc = hr.div_ceil(32) * 32;
+        let vc = vr.div_ceil(32) * 32;
+        RruGeometry {
+            h,
+            v,
+            hr,
+            vr,
+            hc,
+            vc,
+        }
+    }
+
+    /// 32 × 32 macroblock grid of the coded picture.
+    fn mb_cols(&self) -> usize {
+        self.hc / 32
+    }
+    fn mb_rows(&self) -> usize {
+        self.vc / 32
+    }
+}
+
+/// §Q.3 — extend a reference picture to the coded size `(hc, vc)` by
+/// duplicating the right / bottom edge pixels (chroma to
+/// `(hc/2, vc/2)`). A no-op copy when the sizes already match.
+fn extend_reference_rru(reference: &YuvFrame, hc: usize, vc: usize) -> YuvFrame {
+    let extend_plane = |src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize| -> Vec<u8> {
+        let mut out = vec![0u8; dw * dh];
+        for y in 0..dh {
+            let sy = y.min(sh - 1);
+            for x in 0..dw {
+                let sx = x.min(sw - 1);
+                out[y * dw + x] = src[sy * sw + sx];
+            }
+        }
+        out
+    };
+    let lw = reference.luma_width;
+    let lh = reference.luma_height;
+    let cw = reference.chroma_width();
+    let ch = reference.chroma_height();
+    YuvFrame {
+        y: extend_plane(&reference.y, lw, lh, hc, vc),
+        cb: extend_plane(&reference.cb, cw, ch, hc / 2, vc / 2),
+        cr: extend_plane(&reference.cr, cw, ch, hc / 2, vc / 2),
+        luma_width: hc,
+        luma_height: vc,
+    }
+}
+
+/// Crop a plane-set frame to `(w, h)` (luma; chroma to `(w/2, h/2)`).
+fn crop_frame(frame: &YuvFrame, w: usize, h: usize) -> YuvFrame {
+    let crop_plane = |src: &[u8], sw: usize, dw: usize, dh: usize| -> Vec<u8> {
+        let mut out = vec![0u8; dw * dh];
+        for y in 0..dh {
+            out[y * dw..y * dw + dw].copy_from_slice(&src[y * sw..y * sw + dw]);
+        }
+        out
+    };
+    YuvFrame {
+        y: crop_plane(&frame.y, frame.luma_width, w, h),
+        cb: crop_plane(&frame.cb, frame.chroma_width(), w / 2, h / 2),
+        cr: crop_plane(&frame.cr, frame.chroma_width(), w / 2, h / 2),
+        luma_width: w,
+        luma_height: h,
+    }
+}
+
+/// §Q.2.2.2 — decode one 8 × 8 reduced-resolution reconstructed
+/// prediction-error block to the signed §6.2.4 inverse-transform
+/// output (INTRA: the §6.2.1 DC bypass applies; INTER: every slot
+/// under the standard formula). The §6.3.2 clip is **not** applied —
+/// the block is up-sampled first (§Q.6) and summed with the
+/// prediction (§Q.2.2.3).
+fn rru_error_block(block: &H263Block, quant: u8, is_intra: bool) -> [i16; COEFFS_PER_BLOCK] {
+    let mut scan = block.clone();
+    crate::dequant::dequantise_ac(&mut scan, quant, is_intra);
+    let scattered = crate::dequant::scatter_into_block(&scan.coefficients);
+    crate::idct::idct_8x8(&scattered)
+}
+
+/// Motion-compensate one 16 × 16 sub-block of an RRU macroblock from
+/// `plane` (the §Q.3 extended reference) at pixel origin `(x0, y0)`
+/// under `mv` (half-pel) — composed from four 8 × 8 compensations
+/// (§6.1.2 interpolation is position-independent, so the tiles equal
+/// one 16 × 16 compensation).
+fn rru_motion_compensate_16(
+    plane: &RefPlane<'_>,
+    x0: usize,
+    y0: usize,
+    mv: MotionVector,
+    rcontrol: i32,
+) -> [u8; 256] {
+    let mut out = [0u8; 256];
+    for ty in 0..2 {
+        for tx in 0..2 {
+            let tile = motion_compensate_block(plane, x0 + tx * 8, y0 + ty * 8, mv, rcontrol);
+            for j in 0..8 {
+                let dst = (ty * 8 + j) * 16 + tx * 8;
+                out[dst..dst + 8].copy_from_slice(&tile[j * 8..j * 8 + 8]);
+            }
+        }
+    }
+    out
+}
+
+/// §Q.2.2.3 — sum a 16 × 16 up-sampled prediction error with a
+/// 16 × 16 prediction and clip to `[0, 255]`, blitting into `plane`.
+fn rru_blit_sum(
+    plane: &mut [u8],
+    stride: usize,
+    x0: usize,
+    y0: usize,
+    prediction: &[u8; 256],
+    error: &[i16; 256],
+) {
+    for j in 0..16 {
+        for i in 0..16 {
+            let v = prediction[j * 16 + i] as i32 + error[j * 16 + i] as i32;
+            plane[(y0 + j) * stride + x0 + i] = v.clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// Blit a plain 16 × 16 block.
+fn rru_blit_16(plane: &mut [u8], stride: usize, x0: usize, y0: usize, block: &[u8; 256]) {
+    for j in 0..16 {
+        plane[(y0 + j) * stride + x0..(y0 + j) * stride + x0 + 16]
+            .copy_from_slice(&block[j * 16..j * 16 + 16]);
+    }
+}
+
+/// Encoder-facing §Q.1 geometry helper: the coded size `(HC, VC)` for
+/// a display size `(h, v)`.
+pub(crate) fn rru_geometry_for_display(h: usize, v: usize) -> (usize, usize) {
+    let geo = RruGeometry::for_display(h, v);
+    (geo.hc, geo.vc)
+}
+
+/// Encoder-facing §Q.3 edge extension (shared with the decode side).
+pub(crate) fn extend_frame_rru(frame: &YuvFrame, hc: usize, vc: usize) -> YuvFrame {
+    extend_reference_rru(frame, hc, vc)
+}
+
+/// Encoder-facing 16 × 16 motion compensation (shared with the decode
+/// side, so encoder prediction is bit-identical to the decoder's).
+pub(crate) fn rru_motion_compensate_16_pub(
+    plane: &RefPlane<'_>,
+    x0: usize,
+    y0: usize,
+    mv: MotionVector,
+    rcontrol: i32,
+) -> [u8; 256] {
+    rru_motion_compensate_16(plane, x0, y0, mv, rcontrol)
+}
+
+/// Decode the body of an **Annex Q Reduced-Resolution Update**
+/// picture — an extended-PTYPE I- or P-picture whose §5.1.4.3 MPPTYPE
+/// RRU bit is set. `reader` is positioned right after the parsed
+/// picture layer (the §5.1.19 PQUANT is next).
+///
+/// The staged subset is the single-video-picture-segment stream shape
+/// the crate's own RRU encoders emit: §5.2.2 GOB-0 header elision with
+/// no later GOB headers, one of the five standard source formats, and
+/// none of the optional modes (UMV / AP / DF / AIC / SAC / AIV / MQ /
+/// Annex K — each is either unstaged in RRU semantics or alters the
+/// pseudo-vector/OBMC/filter layers; all are refused). Per §Q:
+///
+/// 1. §Q.1 geometry: display `(H, V)`, reference `(HR, VR)`, coded
+///    `(HC, VC)`; the picture is tiled by 32 × 32 macroblocks.
+/// 2. §Q.2.1.2 / §Q.3 — an INTER reference (at `(HR, VR)`) is
+///    extended to `(HC, VC)` by edge replication.
+/// 3. §Q.2.2 — standard §5.3/§5.4 macroblock syntax; §Q.4
+///    pseudo-vector reconstruction (the §6.1.1 predictor over the
+///    **actual** vectors, converted to the pseudo domain, the Table-14
+///    MVD applied there, and the result expanded back to the
+///    half-integer-or-zero actual lattice); four 16 × 16 luminance
+///    prediction blocks + two 16 × 16 chrominance prediction blocks;
+///    §Q.2.2.2 texture decode + §Q.6 up-sampling; §Q.2.2.3 summation
+///    and clip.
+/// 4. §Q.7.1 — the default block boundary filter along the 16 × 16
+///    block edges (either adjoining macroblock coded), §J.3 edge
+///    ordering.
+/// 5. §Q.2.3 / §Q.2.4 — the reconstruction is cropped to `(HR, VR)`
+///    (the stored reference), which equals the display size for the
+///    standard formats.
+fn decode_rru_picture_body(
+    reader: &mut BitReader<'_>,
+    extended: &H263ExtendedPicture,
+    reference: Option<&YuvFrame>,
+    options: DecodeOptions,
+) -> Result<YuvFrame> {
+    use crate::motion::{rru_actual_mv, rru_pseudo_mv};
+    use crate::rru_filter::{rru_filter_plane, RruEdgeCondition, RruFilterMode};
+    use crate::rru_upsample::upsample_prediction_error;
+
+    let plus = &extended.plus;
+    // Self-describing UFEP=001 pictures only: the RRU semantics need
+    // the full OPPTYPE mode set on the wire.
+    let opptype = plus.opptype.ok_or(Error::NotImplemented)?;
+    let is_inter = match extended.plus.mpptype.picture_type {
+        PlusPictureType::Intra => false,
+        PlusPictureType::Inter => true,
+        // Improved-PB / B / EI / EP under RRU are unstaged.
+        _ => return Err(Error::NotImplemented),
+    };
+    // Unstaged mode combinations (each changes the RRU pseudo-vector,
+    // OBMC or filter layers).
+    if opptype.umv
+        || opptype.sac
+        || opptype.advanced_prediction
+        || opptype.advanced_intra
+        || opptype.deblocking
+        || opptype.slice_structured
+        || opptype.independent_segment_decoding
+        || opptype.alternative_inter_vlc
+        || opptype.modified_quantization
+        || plus.cpm
+        || plus.trpi.is_some()
+        || plus.rprp.is_some()
+        || options.aic
+        || options.modified_quant
+        || options.alt_inter_vlc
+        || options.deblock
+    {
+        return Err(Error::NotImplemented);
+    }
+    // Standard source formats only (custom CPFMT geometry unstaged).
+    let source_format = match opptype.source_format {
+        PlusSourceFormat::SubQcif => H263SourceFormat::SubQcif,
+        PlusSourceFormat::Qcif => H263SourceFormat::Qcif,
+        PlusSourceFormat::Cif => H263SourceFormat::Cif,
+        PlusSourceFormat::Cif4 => H263SourceFormat::Cif4,
+        PlusSourceFormat::Cif16 => H263SourceFormat::Cif16,
+        _ => return Err(Error::NotImplemented),
+    };
+    let layout = PictureLayout::for_source_format(source_format).ok_or(Error::NotImplemented)?;
+    let geo = RruGeometry::for_display(layout.luma_width as usize, layout.luma_height as usize);
+    let mb_cols = geo.mb_cols();
+    let mb_rows = geo.mb_rows();
+
+    // §5.1.19 — PQUANT; §5.1.24/§5.1.25 — PEI/PSUPP.
+    let pquant = reader.read_u32(5).map_err(|_| Error::UnexpectedEof)? as u8;
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    skip_pei_psupp(reader)?;
+
+    // §Q.2.1.2 / §Q.3 — extended reference for INTER pictures.
+    let extended_ref = if is_inter {
+        match reference {
+            Some(r) if r.luma_width == geo.hr && r.luma_height == geo.vr => {
+                Some(extend_reference_rru(r, geo.hc, geo.vc))
+            }
+            _ => return Err(Error::NotImplemented),
+        }
+    } else {
+        None
+    };
+
+    let rcontrol = extended.plus.mpptype.rounding_type as i32;
+
+    let mut frame = YuvFrame {
+        y: vec![0u8; geo.hc * geo.vc],
+        cb: vec![0u8; (geo.hc / 2) * (geo.vc / 2)],
+        cr: vec![0u8; (geo.hc / 2) * (geo.vc / 2)],
+        luma_width: geo.hc,
+        luma_height: geo.vc,
+    };
+    let luma_stride = geo.hc;
+    let chroma_stride = geo.hc / 2;
+
+    // §6.1.1 predictor grid over the **actual** motion vectors (§Q.4:
+    // "PC is defined as the median value of MV1, MV2 and MV3 as
+    // defined in 6.1.1"), at 32 × 32 macroblock granularity.
+    let mut grid = vec![MbGridEntry::OUTSIDE; mb_cols * mb_rows];
+    let mut mb_quant = vec![0u8; mb_cols * mb_rows];
+    let mut coded_mb = vec![false; mb_cols * mb_rows];
+    let mut current_quant = pquant;
+
+    let coding_type = if is_inter {
+        H263PictureCodingType::Inter
+    } else {
+        H263PictureCodingType::Intra
+    };
+
+    for row in 0..mb_rows {
+        for col in 0..mb_cols {
+            // §5.3.2 — MCBPC stuffing carries no macroblock data.
+            let mb = loop {
+                let mb = parse_macroblock(
+                    reader,
+                    MbContext {
+                        picture_coding_type: coding_type,
+                        advanced_prediction: false,
+                        deblocking_filter: false,
+                        aic_intra_mode: false,
+                        pb_frames: false,
+                        pb_annex_m: false,
+                        quantiser_before: current_quant,
+                        modified_quant: false,
+                    },
+                )?;
+                if matches!(mb.mb_type, Some(MbType::Stuffing)) {
+                    continue;
+                }
+                break mb;
+            };
+
+            let mb_x = col * 32;
+            let mb_y = row * 32;
+            let c_x = col * 16;
+            let c_y = row * 16;
+
+            // Skipped: zero-MV 32 × 32 reference copy (§5.3.1; the
+            // §Q.7 filter condition sees it as not coded).
+            if !mb.coded {
+                let r = extended_ref.as_ref().ok_or(Error::NotImplemented)?;
+                for j in 0..32 {
+                    let src = (mb_y + j) * geo.hc + mb_x;
+                    let dst = (mb_y + j) * luma_stride + mb_x;
+                    frame.y[dst..dst + 32].copy_from_slice(&r.y[src..src + 32]);
+                }
+                for j in 0..16 {
+                    let src = (c_y + j) * (geo.hc / 2) + c_x;
+                    let dst = (c_y + j) * chroma_stride + c_x;
+                    frame.cb[dst..dst + 16].copy_from_slice(&r.cb[src..src + 16]);
+                    frame.cr[dst..dst + 16].copy_from_slice(&r.cr[src..src + 16]);
+                }
+                let zero = MotionVector::new(0, 0);
+                record_grid(
+                    &mut grid,
+                    &mut mb_quant,
+                    mb_cols,
+                    col,
+                    row,
+                    &mb,
+                    current_quant,
+                    zero,
+                    [zero; 4],
+                    0,
+                );
+                continue;
+            }
+
+            let mb_type = mb.mb_type.ok_or(Error::NotImplemented)?;
+            current_quant = mb.quantiser_after;
+            let quant = mb.quantiser_after;
+            let cbpy = mb.cbpy.unwrap_or(0);
+            let cbpc = mb.cbpc.unwrap_or(0);
+            coded_mb[row * mb_cols + col] = true;
+
+            if mb_type.is_intra() {
+                // §Q.2.2.2 — the INTRA texture decodes at reduced
+                // resolution and up-samples; with no prediction the
+                // clip of the up-sampled block is the reconstruction.
+                for blk in 0..4 {
+                    let has_ac = (cbpy >> (3 - blk)) & 1 == 1;
+                    let block = parse_block(
+                        reader,
+                        BlockContext {
+                            has_intradc: true,
+                            has_coefficients: has_ac,
+                            ..Default::default()
+                        },
+                    )?;
+                    let error = rru_error_block(&block, quant, true);
+                    let up = upsample_prediction_error(&error);
+                    let bx = mb_x + (blk % 2) * 16;
+                    let by = mb_y + (blk / 2) * 16;
+                    rru_blit_sum(&mut frame.y, luma_stride, bx, by, &[0u8; 256], &up);
+                }
+                for (chroma_bit, plane) in [(0b10u8, 0usize), (0b01u8, 1usize)] {
+                    let block = parse_block(
+                        reader,
+                        BlockContext {
+                            has_intradc: true,
+                            has_coefficients: cbpc & chroma_bit != 0,
+                            ..Default::default()
+                        },
+                    )?;
+                    let error = rru_error_block(&block, quant, true);
+                    let up = upsample_prediction_error(&error);
+                    let dst = if plane == 0 {
+                        &mut frame.cb
+                    } else {
+                        &mut frame.cr
+                    };
+                    rru_blit_sum(dst, chroma_stride, c_x, c_y, &[0u8; 256], &up);
+                }
+                let zero = MotionVector::new(0, 0);
+                record_grid(
+                    &mut grid,
+                    &mut mb_quant,
+                    mb_cols,
+                    col,
+                    row,
+                    &mb,
+                    quant,
+                    zero,
+                    [zero; 4],
+                    0,
+                );
+                continue;
+            }
+
+            // INTER (single MV): §Q.4 pseudo-vector reconstruction.
+            let r = extended_ref.as_ref().ok_or(Error::NotImplemented)?;
+            let pc = predict_mv(
+                &grid, mb_cols, col, row, /* gob_top_row */ 0,
+                /* gob_header_present */ true, /* pb */ false, /* segment */ 0,
+            );
+            let pseudo_pc = rru_pseudo_mv(pc);
+            let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
+            let pseudo_mv = reconstruct_mv(pseudo_pc, mvd);
+            let mv = rru_actual_mv(pseudo_mv);
+            let chroma_vec = chroma_mv(mv);
+
+            let inter_cbpy = cbpy ^ 0b1111;
+            let y_ref = RefPlane::new(&r.y, r.luma_width, r.luma_height);
+            for blk in 0..4 {
+                let bx = mb_x + (blk % 2) * 16;
+                let by = mb_y + (blk / 2) * 16;
+                let prediction = rru_motion_compensate_16(&y_ref, bx, by, mv, rcontrol);
+                if (inter_cbpy >> (3 - blk)) & 1 == 1 {
+                    let block = parse_block(
+                        reader,
+                        BlockContext {
+                            has_intradc: false,
+                            has_coefficients: true,
+                            ..Default::default()
+                        },
+                    )?;
+                    let error = rru_error_block(&block, quant, false);
+                    let up = upsample_prediction_error(&error);
+                    rru_blit_sum(&mut frame.y, luma_stride, bx, by, &prediction, &up);
+                } else {
+                    rru_blit_16(&mut frame.y, luma_stride, bx, by, &prediction);
+                }
+            }
+            let cb_ref = RefPlane::new(&r.cb, r.chroma_width(), r.chroma_height());
+            let cr_ref = RefPlane::new(&r.cr, r.chroma_width(), r.chroma_height());
+            for (chroma_bit, plane) in [(0b10u8, 0usize), (0b01u8, 1usize)] {
+                let src_ref = if plane == 0 { &cb_ref } else { &cr_ref };
+                let prediction = rru_motion_compensate_16(src_ref, c_x, c_y, chroma_vec, rcontrol);
+                let dst = if plane == 0 {
+                    &mut frame.cb
+                } else {
+                    &mut frame.cr
+                };
+                if cbpc & chroma_bit != 0 {
+                    let block = parse_block(
+                        reader,
+                        BlockContext {
+                            has_intradc: false,
+                            has_coefficients: true,
+                            ..Default::default()
+                        },
+                    )?;
+                    let error = rru_error_block(&block, quant, false);
+                    let up = upsample_prediction_error(&error);
+                    rru_blit_sum(dst, chroma_stride, c_x, c_y, &prediction, &up);
+                } else {
+                    rru_blit_16(dst, chroma_stride, c_x, c_y, &prediction);
+                }
+            }
+            record_grid(
+                &mut grid,
+                &mut mb_quant,
+                mb_cols,
+                col,
+                row,
+                &mb,
+                quant,
+                mv,
+                [mv; 4],
+                0,
+            );
+        }
+    }
+    let _ = &mb_quant;
+
+    // §Q.7.1 — default block boundary filter along the 16 × 16 block
+    // edges: filter iff either adjoining 32 × 32 macroblock is coded
+    // (COD == 0 or INTRA); picture edges are skipped by the plane
+    // driver itself. Luma blocks are 2 × 2 per macroblock; each chroma
+    // plane has one 16 × 16 block per macroblock.
+    let luma_cond = |b1: (usize, usize), b2: (usize, usize)| -> RruEdgeCondition {
+        let coded = |b: (usize, usize)| -> bool {
+            let (mc, mr) = (b.0 / 2, b.1 / 2);
+            mc < mb_cols && mr < mb_rows && coded_mb[mr * mb_cols + mc]
+        };
+        if coded(b1) || coded(b2) {
+            RruEdgeCondition::Filter
+        } else {
+            RruEdgeCondition::Skip
+        }
+    };
+    let chroma_cond = |b1: (usize, usize), b2: (usize, usize)| -> RruEdgeCondition {
+        let coded = |b: (usize, usize)| -> bool {
+            b.0 < mb_cols && b.1 < mb_rows && coded_mb[b.1 * mb_cols + b.0]
+        };
+        if coded(b1) || coded(b2) {
+            RruEdgeCondition::Filter
+        } else {
+            RruEdgeCondition::Skip
+        }
+    };
+    rru_filter_plane(
+        &mut frame.y,
+        geo.hc,
+        geo.vc,
+        geo.hc,
+        RruFilterMode::Default,
+        luma_cond,
+    );
+    rru_filter_plane(
+        &mut frame.cb,
+        geo.hc / 2,
+        geo.vc / 2,
+        geo.hc / 2,
+        RruFilterMode::Default,
+        chroma_cond,
+    );
+    rru_filter_plane(
+        &mut frame.cr,
+        geo.hc / 2,
+        geo.vc / 2,
+        geo.hc / 2,
+        RruFilterMode::Default,
+        chroma_cond,
+    );
+
+    // §Q.2.3 / §Q.2.4 — crop to the reference size (HR, VR), which is
+    // also the display size for the standard formats.
+    if geo.hc != geo.hr || geo.vc != geo.vr {
+        Ok(crop_frame(&frame, geo.hr, geo.vr))
+    } else {
+        Ok(frame)
+    }
+}
+
 /// Per-macroblock boundary side information for RFC 2190 Mode B / C
 /// packetization: everything a resuming decoder needs to pick the
 /// bitstream up at this macroblock without the preceding packets
@@ -2136,6 +2699,20 @@ pub fn decode_picture_layer_with_inherited(
                 let layout = ei_layout_for(&extended)?;
                 let reference = reference.ok_or(Error::BadScalabilityReferenceGeometry)?;
                 let frame = decode_ei_picture(&mut reader, &extended, &layout, reference, options)?;
+                return Ok(DecodePictureOutcome {
+                    frame,
+                    inherited: next_inherited,
+                });
+            }
+
+            // Annex Q — Reduced-Resolution Update. The syntax is the
+            // standard macroblock/block syntax but the semantics change
+            // (32×32 macroblocks, §Q.4 pseudo-vectors, §Q.6 texture
+            // up-sampling, §Q.7 boundary filter): route to the
+            // dedicated driver before the baseline shim (which refuses
+            // the RRU bit).
+            if extended.plus.mpptype.reduced_resolution_update {
+                let frame = decode_rru_picture_body(&mut reader, &extended, reference, options)?;
                 return Ok(DecodePictureOutcome {
                     frame,
                     inherited: next_inherited,

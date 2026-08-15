@@ -6,7 +6,44 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Annex Q Reduced-Resolution Update end-to-end, both directions**
+  (round 443): the extended-PTYPE routing detects the §5.1.4.3
+  MPPTYPE RRU bit and decodes through the new dedicated driver —
+  §Q.1 geometry (`(H, V)` → reference `(HR, VR)` → coded `(HC, VC)`
+  with the 32×32 macroblock grid), §Q.3 reference extension by edge
+  replication, §Q.4 pseudo-motion-vector reconstruction
+  (`rru_pseudo_component` / `rru_actual_component` — the §6.1.1
+  predictor over actual vectors converted to the pseudo domain, the
+  Table-14 MVD wrap applied in the baseline `[-16, 15.5]`-pel pseudo
+  window, expansion to the half-integer-or-zero actual lattice),
+  16×16 prediction blocks, §Q.2.2.2 texture decode + §Q.6
+  up-sampling, §Q.2.2.3 summation/clip, the §Q.7.1 default boundary
+  filter (either-side coded-MB condition, §J.3 ordering) and the
+  §Q.2.3/§Q.2.4 crop. Encoder arm: `encode_intra_picture_rru`
+  (16×16 → 8×8 down-sampling into the standard INTRA stage) and
+  `encode_inter_picture_rru` (pseudo-domain SAD search so every
+  candidate is codable, per-sub-block residual down-sampling), both
+  self-describing via the new `PlusModes::rru` MPPTYPE bit.
+  Round-trips: the pseudo↔actual lattice is pinned exhaustively, a
+  static RRU P-picture is lossless, CIF (no extension) and QCIF
+  (§Q.3 extension + crop) I-pictures and translated P-pictures
+  reconstruct within the mode's low-pass budget, and RRU I + P
+  elementary streams decode through `decode_sequence`. Unstaged
+  combinations (UMV Table-D.3 pseudo-vectors, §Q.5 enlarged OBMC,
+  §Q.7.2 DF filtering, Annex K, custom formats, B/EI/EP) are
+  refused.
+
 ### Fixed
+
+- **§Q.6 up-sampling rounding follows the Implementors' Guide**
+  (round 443): the published Figure Q.8 / Q.9 divisions
+  ("division by truncation") mis-round negative numerators; the
+  Implementors' Guide for the Recommendation (2005-08) corrects them
+  to the arithmetic shift `(N + D/2) >> K`. `upsample_prediction_error`
+  now shifts, so a negative constant block up-samples to the same
+  constant instead of biasing toward zero.
 
 - **§F.2 / Figure F.1 candidate-predictor cells corrected** (round
   443): the four-vector candidate table read two cells wrong — B1's

@@ -139,6 +139,66 @@ pub fn reconstruct_mv(predictor: MotionVector, mvd: Mvd) -> MotionVector {
     }
 }
 
+// ---- Annex Q §Q.4 Reduced-Resolution Update pseudo-motion vectors ---
+
+/// §Q.4 item 1 — convert one **actual** motion-vector component (the
+/// §6.1.1 / §F.2 median predictor `PC`, half-pel units) into the
+/// pseudo-vector domain:
+///
+/// ```text
+/// pseudo-PC = 0                              if PC = 0
+/// pseudo-PC = sign(PC) · (|PC| + 0.5) / 2    if PC ≠ 0
+/// ```
+///
+/// Every reconstructed RRU motion-vector component is a half-integer
+/// or zero (§Q.4 item 3), i.e. an odd count of half-pels, so
+/// `(|PC| + 0.5) / 2` pels is exactly `(|PC_half| + 1) / 2` half-pels
+/// with no accuracy loss (the §Q.4 "floating-point division (without
+/// loss of accuracy)").
+pub fn rru_pseudo_component(pc_half: i32) -> i32 {
+    if pc_half == 0 {
+        0
+    } else {
+        pc_half.signum() * ((pc_half.abs() + 1) / 2)
+    }
+}
+
+/// §Q.4 item 3 — expand one **pseudo**-vector component back to the
+/// actual motion-vector component (half-pel units):
+///
+/// ```text
+/// MVC = 0                                          if pseudo-MVC = 0
+/// MVC = sign(pseudo-MVC) · (2 · |pseudo-MVC| − 0.5) if pseudo-MVC ≠ 0
+/// ```
+///
+/// In half-pel units: `MVC_half = sign · (2 · |pseudo_half| − 1)` —
+/// always an odd count of half-pels (a half-integer pel value) or
+/// zero, giving the enlarged `[-31.5, 30.5]`-pel default range from
+/// the `[-16, 15.5]`-pel pseudo range.
+pub fn rru_actual_component(pseudo_half: i32) -> i32 {
+    if pseudo_half == 0 {
+        0
+    } else {
+        pseudo_half.signum() * (2 * pseudo_half.abs() - 1)
+    }
+}
+
+/// §Q.4 item 1 applied to both components of a predictor vector.
+pub fn rru_pseudo_mv(pc: MotionVector) -> MotionVector {
+    MotionVector {
+        dx_half: rru_pseudo_component(pc.dx_half),
+        dy_half: rru_pseudo_component(pc.dy_half),
+    }
+}
+
+/// §Q.4 item 3 applied to both components of a pseudo-vector.
+pub fn rru_actual_mv(pseudo: MotionVector) -> MotionVector {
+    MotionVector {
+        dx_half: rru_actual_component(pseudo.dx_half),
+        dy_half: rru_actual_component(pseudo.dy_half),
+    }
+}
+
 // ---- Annex D §D.2 Unrestricted Motion Vector mode (non-PLUSPTYPE) ---
 
 /// Annex D §D.2 extended motion-vector component range, lower bound, in

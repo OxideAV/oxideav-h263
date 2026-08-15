@@ -47,13 +47,14 @@
 //!       `(3·A + B + 2) / 4` for the pixel nearest `A` and
 //!       `(A + 3·B + 2) / 4` for the pixel nearest `B`.
 //!
-//! `/` denotes division by truncation throughout §Q.6 (the figures say
-//! so explicitly), and the `+ 8` / `+ 2` are the rounding offsets that
-//! make the division round-to-nearest for non-negative numerators. The
-//! prediction-error samples are signed (the §6.2.4 inverse transform
-//! ranges over `[-256, +255]`); "division by truncation" means
-//! truncation toward zero, which is exactly the behaviour of Rust's `/`
-//! operator on `i32`, so all weights below divide with plain `/`.
+//! The published §Q.6 figures specify `/` as division by truncation,
+//! but the Implementors' Guide for the Recommendation (2005-08)
+//! corrects the Figure Q.8 / Figure Q.9 divisions to the arithmetic
+//! right shift `(N + D/2) >> K` (with `D = 2^K`): the truncating form
+//! mis-rounds negative numerators (e.g. `N = −1.25·D` would give `0`
+//! instead of the intended `−1`), and the prediction-error samples are
+//! signed (the §6.2.4 inverse transform ranges over `[-256, +255]`).
+//! The weights below therefore divide with an arithmetic shift.
 
 /// Side length of the reduced-resolution input block.
 pub const RRU_IN_DIM: usize = 8;
@@ -68,17 +69,19 @@ pub const RRU_OUT_LEN: usize = RRU_OUT_DIM * RRU_OUT_DIM;
 /// §Q.6.1 interior up-sampling weight. `s = [A, B, C, D]` are the four
 /// bounding reduced samples and `w = [wA, wB, wC, wD]` the per-output
 /// weights (which always sum to 16); the `+ 8` is the rounding offset
-/// and division by 16 truncates per §Q.6.
+/// and the division by 16 is the Implementors' Guide arithmetic shift
+/// (`>> 4`), which floors negative numerators.
 #[inline]
 fn interior(s: [i32; 4], w: [i32; 4]) -> i32 {
-    (w[0] * s[0] + w[1] * s[1] + w[2] * s[2] + w[3] * s[3] + 8) / 16
+    (w[0] * s[0] + w[1] * s[1] + w[2] * s[2] + w[3] * s[3] + 8) >> 4
 }
 
 /// §Q.6.2 boundary 1-D up-sampling weight, with the `+ 2` rounding
-/// offset and truncating division by 4. `near` carries weight 3.
+/// offset and the Implementors' Guide arithmetic shift by 2. `near`
+/// carries weight 3.
 #[inline]
 fn boundary(near: i32, far: i32) -> i32 {
-    (3 * near + far + 2) / 4
+    (3 * near + far + 2) >> 2
 }
 
 /// Annex Q.6 — up-sample an 8×8 reduced-resolution reconstructed
@@ -193,25 +196,31 @@ mod tests {
     /// when `k ≥ 0`. This test pins the spec-exact behaviour for a few
     /// negative constants instead of (wrongly) demanding round-trip.
     #[test]
-    fn negative_constant_block_truncates_toward_zero() {
-        // k = -50: interior (16*-50 + 8)/16 = -792/16 = -49 (trunc);
-        //          boundary (4*-50 + 2)/4 = -198/4 = -49.
+    fn negative_constant_block_rounds_per_implementors_guide() {
+        // The Implementors' Guide (2005-08) replaces the published
+        // truncating divisions of Figures Q.8 / Q.9 with the arithmetic
+        // shift `(N + D/2) >> K`, which is round-to-nearest for every
+        // sign. A constant block therefore up-samples to the same
+        // constant everywhere:
+        // k = -50: interior (16*-50 + 8) >> 4 = -792 >> 4 = -50;
+        //          boundary (4*-50 + 2) >> 2 = -198 >> 2 = -50.
         let input = [-50i16; RRU_IN_LEN];
         let out = upsample_prediction_error(&input);
         let at = |y: usize, x: usize| out[y * RRU_OUT_DIM + x];
-        // Corner is an exact copy (a = A), so it stays at -50.
+        // Corner is an exact copy (a = A).
         assert_eq!(at(0, 0), -50);
-        // An interior pixel and an edge pixel both bias to -49.
-        assert_eq!(at(1, 1), -49);
-        assert_eq!(at(0, 1), -49);
-        // -16 divides evenly: interior (16*-16 + 8)/16 = -248/16 = -15
-        // (trunc toward zero), so even "clean" multiples bias up by the
-        // rounding offset on the negative side.
-        let input = [-16i16; RRU_IN_LEN];
+        // Interior and edge pixels keep the constant (no positive bias
+        // — the truncating form would have given -49 here).
+        assert_eq!(at(1, 1), -50);
+        assert_eq!(at(0, 1), -50);
+        // The Guide's worked example: N = -1.25 * D gives -1 (the
+        // truncating form gives 0). For the interior filter D = 16, so
+        // a weighted sum of -28 (-28 + 8 = -20, >> 4) must give -2...
+        // exercise it through a real input: A = -7, B = C = D = -7 ->
+        // sum 16*-7 + 8 = -104, >> 4 = -7 exactly.
+        let input = [-7i16; RRU_IN_LEN];
         let out = upsample_prediction_error(&input);
-        let at = |y: usize, x: usize| out[y * RRU_OUT_DIM + x];
-        assert_eq!(at(0, 0), -16); // exact corner copy
-        assert_eq!(at(1, 1), -15); // (16*-16 + 8)/16 = -15
+        assert_eq!(out[RRU_OUT_DIM + 1], -7);
     }
 
     /// Corners copy the nearest reduced sample exactly (§Q.6.2 `a = A`).
