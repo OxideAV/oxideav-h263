@@ -64,19 +64,26 @@ right-to-left ASO emission).
 **Annex E Syntax-based Arithmetic Coding** is implemented in both
 directions (round 438): the `sac` module stages the §E.2/§E.3
 arithmetic coders, the §E.5 PSC_FIFO stuffing rule (with the zero-run
-counter spanning the header/arithmetic boundary) and all §E.8
+counter spanning the header/arithmetic boundary) and the §E.8
 `cumul_freq` models with §E.7 clause-5-table indexing.
 `decode_picture_sac` decodes a baseline-PTYPE SAC picture (I / P, UMV
-legal per §5.1.4.6; Annex S/T barred; AP/PB refused pending), and
-`decode_sequence` routes SAC pictures automatically from PTYPE
-bit 11 — pure-SAC and mixed VLC + SAC elementary streams both work.
-The encoder arm — `encode_intra_picture_sac`,
-`encode_inter_picture_sac` (zero-MV) and
+legal per §5.1.4.6; Annex S/T barred), and `decode_sequence` routes
+SAC pictures automatically from PTYPE bit 11 — pure-SAC and mixed
+VLC + SAC elementary streams both work. The SAC mode-combination tail
+is closed on both directions (round 443): **SAC + Annex F Advanced
+Prediction** (INTER4V four vectors under the §E.7 `cumf_MVD` model +
+the §F.3 deferred-OBMC luminance reconstruction) and **SAC + Annex G
+PB-frames** (`decode_pb_picture_sac` — MODB / CBPB / MVDB under their
+§E.7 models, the §G.2 INTRA-macroblock vector, and the §G.4/§G.5
+B-part through the shared reconstruction core). The encoder arm —
+`encode_intra_picture_sac`, `encode_inter_picture_sac` (zero-MV),
 `encode_inter_picture_motion_sac` (SAD + half-pel search, intra
-refresh) — shares the VLC encoder's transform/quantiser stage, so SAC
-and VLC pictures of the same source reconstruct **byte-identically**;
-measured entropy-layer saving on the gradient QCIF corpus is
-6.4–25.5 % on I-pictures (QP 31 → QP 2).
+refresh), `encode_inter_picture_ap_sac` (two-pass §F.2/§F.3 OBMC
+INTER4V) and `encode_pb_picture_sac` (P + B pair) — shares the VLC
+encoder's transform/quantiser stage, so SAC and VLC pictures of the
+same source reconstruct **byte-identically** (pinned for the I / P /
+AP / PB shapes); measured entropy-layer saving on the gradient QCIF
+corpus is 6.4–25.5 % on I-pictures (QP 31 → QP 2).
 
 The encoder also has **rate control** (round 438): the
 `rate_control` module pairs the Annex B Hypothetical Reference
@@ -194,8 +201,13 @@ planar 4:2:0 `YuvFrame`:
   §E.8 models under §E.7 indexing, decoded through
   `decode_picture_sac` (baseline-PTYPE I / P, single video picture
   segment, UMV supported) and auto-routed by `decode_sequence` from
-  PTYPE bit 11. §5.1.4.6 bars Annex S / T combinations; AP and
-  PB-frames inside SAC are refused pending. Reconstruction is
+  PTYPE bit 11. Advanced Prediction composes (INTER4V MVD2-4 under
+  `cumf_MVD`, §F.3 deferred-OBMC luminance, single-MV OBMC too) and
+  PB-frames compose (`decode_pb_picture_sac` — MODB / per-block CBPB
+  / MVDB models, §G.2 INTRA vectors, §G.4 / §G.5 B-parts through the
+  shared reconstruction core, auto-routed by `decode_sequence`).
+  §5.1.4.6 bars Annex S / T combinations; AP + PB together and
+  mid-picture GOB headers stay refused. Reconstruction is
   byte-identical to the VLC path at equal quantised coefficients.
 * **Annex F §F.2 / §F.3** — Advanced Prediction: four-motion-vector
   candidate-predictor redefinition (Figure F.1, threading each
@@ -467,10 +479,11 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * Annex K with Advanced Prediction / CPM (the Rectangular Slice and
   Arbitrary Slice Ordering submodes decode and encode — see the
   supported list).
-* Annex E SAC combined with Advanced Prediction / INTER4V, PB-frames,
-  or mid-picture GOB headers (the §E.5 start-code resynchronisation
-  inside a picture); §5.1.4.6 bars the Annex S / Annex T combinations
-  outright.
+* Annex E SAC combined with mid-picture GOB headers (the §E.5
+  start-code resynchronisation inside a picture), or with Advanced
+  Prediction **and** PB-frames simultaneously (each composes with SAC
+  on its own — see the supported list); §5.1.4.6 bars the Annex S /
+  Annex T combinations outright.
 * Annex O CPM-multiplexed / Advanced-Prediction / SAC / Annex-K-slice
   enhancement-layer pictures (refused on the EI / EP / B paths); the
   Annex P explicit-warp resampling engine (see the supported list) is
@@ -519,9 +532,11 @@ tolerance), the self-describing H.263+ (`_plus`) entry points
 the Annex K slice encoders (single-slice forms byte-exact against
 their single-segment counterparts; per-slice SQUANT / AIC-availability
 behaviour pinned). `tests/sac_roundtrip.rs` pins the Annex E arm:
-byte-identical SAC-vs-VLC reconstruction across sizes and quantisers,
-SAC elementary streams (pure and mixed with VLC pictures) through
-`decode_sequence`, §5.1.4.6 barred-combination refusals and a
+byte-identical SAC-vs-VLC reconstruction across sizes and quantisers
+— including the Advanced-Prediction (INTER4V + OBMC) and PB-frame
+shapes on both parts — SAC elementary streams (pure, mixed with VLC
+pictures, and I + AP-P + PB) through `decode_sequence`, static AP /
+PB losslessness, §5.1.4.6 barred-combination refusals and a
 no-PSC-emulation byte scan. `tests/rate_control.rs` pins the measured
 rate-accuracy numbers and Annex B §B.4 conformance of the regulated
 GOP encoder. `tests/rtp_roundtrip.rs` round-trips crate-encoded

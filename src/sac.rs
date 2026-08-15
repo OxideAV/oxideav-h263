@@ -84,6 +84,17 @@ pub(crate) static CUMF_CBPY_INTRA: [i64; 17] = [
 /// Model for DQUANT, Table 13 indexing (0 → −1, 1 → −2, 2 → +1, 3 → +2).
 pub(crate) static CUMF_DQUANT: [i64; 5] = [16383, 12287, 8192, 4095, 0];
 
+/// Model for MODB under Annex G PB-frames, Table 11 indexing (index
+/// 0 = neither CBPB nor MVDB, 1 = MVDB only, 2 = CBPB + MVDB).
+pub(crate) static CUMF_MODB_G: [i64; 4] = [16383, 6062, 2130, 0];
+
+/// Model for the luminance CBPBn bits (n = 1..=4), index 0 for
+/// CBPBn = 0 and 1 for CBPBn = 1 (§E.7).
+pub(crate) static CUMF_YCBPB: [i64; 3] = [16383, 6062, 0];
+
+/// Model for the chrominance CBPBn bits (n = 5, 6), same indexing.
+pub(crate) static CUMF_UVCBPB: [i64; 3] = [16383, 491, 0];
+
 /// Model for MVD / MVD2-4 / MVDB, Table 14 indexing (index 32 =
 /// vector difference 0; index `i` = difference `(i − 32) / 2` pixels).
 pub(crate) static CUMF_MVD: [i64; 65] = [
@@ -679,6 +690,61 @@ pub fn encode_dquant_sac(enc: &mut SacEncoder<'_>, diff: i8) -> Result<()> {
     Ok(())
 }
 
+/// Decode an Annex G MODB symbol (Table 11 indexing, `cumf_MODB_G`).
+pub fn decode_modb_sac(dec: &mut SacDecoder<'_, '_>) -> crate::pb_layer::ModbPresence {
+    use crate::pb_layer::ModbPresence;
+    match dec.decode_symbol(&CUMF_MODB_G) {
+        0 => ModbPresence::None,
+        1 => ModbPresence::MvdbOnly,
+        _ => ModbPresence::CbpbAndMvdb,
+    }
+}
+
+/// Encode an Annex G MODB symbol (Table 11 indexing).
+pub fn encode_modb_sac(enc: &mut SacEncoder<'_>, modb: crate::pb_layer::ModbPresence) {
+    use crate::pb_layer::ModbPresence;
+    let index = match modb {
+        ModbPresence::None => 0,
+        ModbPresence::MvdbOnly => 1,
+        ModbPresence::CbpbAndMvdb => 2,
+    };
+    enc.encode_symbol(index, &CUMF_MODB_G);
+}
+
+/// Decode the six §5.3.4 CBPB bits — one symbol per block in Figure-5
+/// order (blocks 1..=4 under `cumf_YCBPB`, blocks 5..=6 under
+/// `cumf_UVCBPB`, §E.7). The returned pattern uses the
+/// [`crate::pb_layer::cbpb_block_present`] convention (block 1 = MSB
+/// of the 6-bit field).
+pub fn decode_cbpb_sac(dec: &mut SacDecoder<'_, '_>) -> u8 {
+    let mut cbpb = 0u8;
+    for block_number in 1..=6u32 {
+        let model: &[i64] = if block_number <= 4 {
+            &CUMF_YCBPB
+        } else {
+            &CUMF_UVCBPB
+        };
+        if dec.decode_symbol(model) == 1 {
+            cbpb |= 1 << (6 - block_number);
+        }
+    }
+    cbpb
+}
+
+/// Encode the six §5.3.4 CBPB bits — the inverse of
+/// [`decode_cbpb_sac`].
+pub fn encode_cbpb_sac(enc: &mut SacEncoder<'_>, cbpb: u8) {
+    for block_number in 1..=6u32 {
+        let model: &[i64] = if block_number <= 4 {
+            &CUMF_YCBPB
+        } else {
+            &CUMF_UVCBPB
+        };
+        let bit = (cbpb >> (6 - block_number)) & 1;
+        enc.encode_symbol(bit as usize, model);
+    }
+}
+
 /// Decode one MVD component (Table 14 indexing: index 32 = 0). The
 /// returned value is in half-pel units, range `[-32, +31]`.
 pub fn decode_mvd_component_sac(dec: &mut SacDecoder<'_, '_>) -> i8 {
@@ -938,9 +1004,15 @@ pub fn write_block_sac(
 /// re-read loop).
 ///
 /// Staged subset: the baseline I/P macroblock forms (plus the Annex D
-/// UMV vector range — MVD symbols are Table 14 either way). PB-frames,
-/// Advanced INTRA Coding, Modified Quantization (barred with SAC by
-/// §5.1.4.6) and the INTER4V types return [`Error::NotImplemented`].
+/// UMV vector range — MVD symbols are Table 14 either way), the
+/// Annex F / Annex J INTER4V form (MVD2-4 under `cumf_MVD` when the
+/// context signals Advanced Prediction or Deblocking Filter mode) and
+/// the Annex G PB-frame fields (MODB under `cumf_MODB_G`, the six
+/// per-block CBPB symbols, the §G.2 INTRA-macroblock MVD and MVDB —
+/// all per §E.7). Advanced INTRA Coding and Modified Quantization
+/// (barred with SAC by §5.1.4.6) return [`Error::NotImplemented`], as
+/// does an INTER4V type outside AP / DF mode and the Annex M MODB
+/// form (Improved PB-frames are PLUSPTYPE-only).
 pub fn parse_macroblock_sac(
     dec: &mut SacDecoder<'_, '_>,
     ctx: crate::macroblock::MbContext,
@@ -953,7 +1025,7 @@ pub fn parse_macroblock_sac(
         quantiser_before,
         ..
     } = ctx;
-    if ctx.pb_frames || ctx.aic_intra_mode || ctx.modified_quant {
+    if ctx.aic_intra_mode || ctx.modified_quant || ctx.pb_annex_m {
         return Err(Error::NotImplemented);
     }
     if quantiser_before == 0 || quantiser_before > 31 {
@@ -995,11 +1067,29 @@ pub fn parse_macroblock_sac(
             ..empty
         });
     }
-    if matches!(mb_type, MbType::Inter4V | MbType::Inter4VQ) {
-        // The four-vector types need Advanced Prediction / Deblocking
-        // Filter, neither of which is staged on the SAC path.
+    if matches!(mb_type, MbType::Inter4V | MbType::Inter4VQ)
+        && !(ctx.advanced_prediction || ctx.deblocking_filter)
+    {
+        // Table 8 only defines the four-vector types under Advanced
+        // Prediction / Deblocking Filter mode (§5.3.8 / Table J.1).
         return Err(Error::NotImplemented);
     }
+
+    // §5.3.3 — MODB (Table 11 under `cumf_MODB_G`), between MCBPC and
+    // CBPY per Figure 10, for every coded non-stuffing macroblock in
+    // PB-frames mode.
+    let modb = if ctx.pb_frames {
+        Some(decode_modb_sac(dec))
+    } else {
+        None
+    };
+
+    // §5.3.4 — CBPB, between MODB and CBPY, when MODB indicates it.
+    let cbpb = if modb.is_some_and(|m| m.has_cbpb()) {
+        Some(decode_cbpb_sac(dec))
+    } else {
+        None
+    };
 
     // §5.3.5 — CBPY (model keyed on the macroblock type per §E.7).
     let cbpy = decode_cbpy_sac(dec, mb_type.is_intra());
@@ -1014,8 +1104,31 @@ pub fn parse_macroblock_sac(
         (None, quantiser_before)
     };
 
-    // §5.3.7 — MVD (horizontal then vertical) for INTER types.
-    let mvd = if mb_type.has_mvd() {
+    // §5.3.7 — MVD (horizontal then vertical) for INTER types; in
+    // PB-frames mode also for INTRA macroblocks (§G.2 — the vector
+    // predicts the B-blocks only).
+    let mvd = if mb_type.has_mvd() || (ctx.pb_frames && mb_type.is_intra()) {
+        let dx_half = decode_mvd_component_sac(dec);
+        let dy_half = decode_mvd_component_sac(dec);
+        Some(Mvd { dx_half, dy_half })
+    } else {
+        None
+    };
+
+    // §5.3.8 — MVD2-4 for the four-vector types (same `cumf_MVD`
+    // model per §E.7).
+    let mut mvd234 = [None; 3];
+    if mb_type.has_mvd2_4(ctx.advanced_prediction, ctx.deblocking_filter) {
+        for slot in mvd234.iter_mut() {
+            let dx_half = decode_mvd_component_sac(dec);
+            let dy_half = decode_mvd_component_sac(dec);
+            *slot = Some(Mvd { dx_half, dy_half });
+        }
+    }
+
+    // §5.3.9 — MVDB, last header field per Figure 10, when MODB
+    // indicates it (model `cumf_MVD` per §E.7).
+    let mvdb = if modb.is_some_and(|m| m.has_mvdb()) {
         let dx_half = decode_mvd_component_sac(dec);
         let dy_half = decode_mvd_component_sac(dec);
         Some(Mvd { dx_half, dy_half })
@@ -1031,6 +1144,10 @@ pub fn parse_macroblock_sac(
         dquant,
         quantiser_after,
         mvd,
+        mvd234,
+        modb,
+        cbpb,
+        mvdb,
         ..empty
     })
 }
@@ -1164,6 +1281,58 @@ pub fn encode_skipped_macroblock_sac(enc: &mut SacEncoder<'_>) {
     encode_cod(enc, false);
 }
 
+/// Encode an Annex F / Annex J **INTER4V** macroblock of an SAC
+/// picture — the arithmetic-coded mirror of
+/// [`crate::encoder_mb::encode_inter4v_macroblock`]: COD = coded, the
+/// Table-8 INTER4V MCBPC symbol, the complemented CBPY, the four MVD
+/// pairs (§5.3.7 / §5.3.8, all under `cumf_MVD`) and the coefficient
+/// payload.
+pub fn encode_inter4v_macroblock_sac(
+    enc: &mut SacEncoder<'_>,
+    luma: &[crate::encoder_block::EncodedInterBlock; 4],
+    cb: &crate::encoder_block::EncodedInterBlock,
+    cr: &crate::encoder_block::EncodedInterBlock,
+    mvds: &[crate::macroblock::Mvd; 4],
+) -> Result<()> {
+    encode_cod(enc, true);
+
+    let mut cbpc = 0u8;
+    if cb.has_coeffs {
+        cbpc |= 0b10;
+    }
+    if cr.has_coeffs {
+        cbpc |= 0b01;
+    }
+    encode_mcbpc_p_sac(enc, MbType::Inter4V, cbpc)?;
+
+    let mut cbpy_intra = 0u8;
+    for (blk, e) in luma.iter().enumerate() {
+        if e.has_coeffs {
+            cbpy_intra |= 1 << (3 - blk);
+        }
+    }
+    encode_cbpy_sac(enc, cbpy_intra ^ 0b1111, false)?;
+
+    for mvd in mvds {
+        encode_mvd_component_sac(enc, mvd.dx_half)?;
+        encode_mvd_component_sac(enc, mvd.dy_half)?;
+    }
+
+    for e in luma.iter() {
+        if e.has_coeffs {
+            write_block_sac(enc, None, &e.scan, true, false)?;
+        }
+    }
+    if cb.has_coeffs {
+        write_block_sac(enc, None, &cb.scan, true, false)?;
+    }
+    if cr.has_coeffs {
+        write_block_sac(enc, None, &cr.scan, true, false)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,6 +1349,9 @@ mod tests {
             ("CBPY", &CUMF_CBPY, 17),
             ("CBPY_intra", &CUMF_CBPY_INTRA, 17),
             ("DQUANT", &CUMF_DQUANT, 5),
+            ("MODB_G", &CUMF_MODB_G, 4),
+            ("YCBPB", &CUMF_YCBPB, 3),
+            ("UVCBPB", &CUMF_UVCBPB, 3),
             ("MVD", &CUMF_MVD, 65),
             ("INTRADC", &CUMF_INTRADC, 255),
             ("TCOEF1", &CUMF_TCOEF1, 104),

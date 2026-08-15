@@ -333,3 +333,209 @@ fn sac_picture_contains_no_emulated_psc() {
         decode_picture_sac(&p, Some(&recon), DecodeOptions::default()).expect("decode P");
     }
 }
+
+/// Translate a frame's luma content left by `shift` pixels (edge
+/// replication), chroma by `shift / 2` (the `encode_roundtrip.rs`
+/// convention).
+fn translated(frame: &YuvFrame, shift: usize) -> YuvFrame {
+    let lw = frame.luma_width;
+    let lh = frame.luma_height;
+    let cw = lw / 2;
+    let ch = lh / 2;
+    let mut out = frame.clone();
+    for row in 0..lh {
+        for col in 0..lw {
+            out.y[row * lw + col] = frame.y[row * lw + (col + shift).min(lw - 1)];
+        }
+    }
+    for row in 0..ch {
+        for col in 0..cw {
+            let src = (col + shift / 2).min(cw - 1);
+            out.cb[row * cw + col] = frame.cb[row * cw + src];
+            out.cr[row * cw + col] = frame.cr[row * cw + src];
+        }
+    }
+    out
+}
+
+/// An **SAC + Advanced Prediction** (INTER4V + §F.3 OBMC) P-picture
+/// reconstructs **byte-identically** to the VLC AP picture of the same
+/// (source, reference) pair — the two-pass §F.2 estimator, the OBMC
+/// prediction and the transform stage are all shared; only the entropy
+/// layer differs. Pinned across quantisers.
+#[test]
+fn sac_ap_matches_vlc_ap_reconstruction_exactly() {
+    use oxideav_h263::encoder::{encode_inter_picture_ap, encode_inter_picture_ap_sac};
+
+    let i_bytes = encode_intra_picture_sac(&gradient(176, 144, 0), 6, 0).expect("encode I");
+    let recon = decode_picture_sac(&i_bytes, None, DecodeOptions::default()).expect("decode I");
+    // Sheared content drives divergent per-block vectors (the INTER4V
+    // pay-off case).
+    let mut sheared = translated(&recon, 2);
+    for row in 72..144 {
+        for col in 0..176 {
+            sheared.y[row * 176 + col] = recon.y[row * 176 + (col + 4).min(175)];
+        }
+    }
+
+    for &quant in &[4u8, 8, 13] {
+        let vlc = encode_inter_picture_ap(&sheared, &recon, quant, 1, 3).expect("VLC AP");
+        let sac = encode_inter_picture_ap_sac(&sheared, &recon, quant, 1, 3).expect("SAC AP");
+        let vlc_rec = decode_picture_no_gob0_header(&vlc, Some(&recon), DecodeOptions::default())
+            .expect("decode VLC AP");
+        let sac_rec = decode_picture_sac(&sac, Some(&recon), DecodeOptions::default())
+            .expect("decode SAC AP");
+        assert_eq!(vlc_rec.y, sac_rec.y, "q{quant} luma");
+        assert_eq!(vlc_rec.cb, sac_rec.cb, "q{quant} cb");
+        assert_eq!(vlc_rec.cr, sac_rec.cr, "q{quant} cr");
+    }
+}
+
+/// A static SAC AP picture (source == reference) round-trips
+/// losslessly: every INTER4V macroblock estimates a zero vector and
+/// codes no residual, and the OBMC blend of all-equal vectors is the
+/// plain reference copy.
+#[test]
+fn sac_ap_static_picture_is_lossless() {
+    use oxideav_h263::encoder::encode_inter_picture_ap_sac;
+
+    let i_bytes = encode_intra_picture_sac(&gradient(176, 144, 7), 7, 0).expect("encode I");
+    let recon = decode_picture_sac(&i_bytes, None, DecodeOptions::default()).expect("decode I");
+    let p = encode_inter_picture_ap_sac(&recon, &recon, 7, 1, 3).expect("encode AP");
+    let dec = decode_picture_sac(&p, Some(&recon), DecodeOptions::default()).expect("decode AP");
+    assert_eq!(dec.y, recon.y);
+    assert_eq!(dec.cb, recon.cb);
+    assert_eq!(dec.cr, recon.cr);
+}
+
+/// An **SAC PB-frame** reconstructs **byte-identically** to the VLC
+/// PB-frame of the same (P-source, B-source, reference) triple in
+/// both parts — the P-part estimator, PREC reconstruction and §G.4 /
+/// §G.5 B-prediction are shared.
+#[test]
+fn sac_pb_matches_vlc_pb_reconstruction_exactly() {
+    use oxideav_h263::encoder::{encode_pb_picture, encode_pb_picture_sac, PbConfig};
+    use oxideav_h263::picture::{decode_pb_picture_no_gob0_header, decode_pb_picture_sac};
+
+    let i_bytes = encode_intra_picture_sac(&gradient(176, 144, 0), 6, 3).expect("encode I");
+    let recon = decode_picture_sac(&i_bytes, None, DecodeOptions::default()).expect("decode I");
+    let fb = translated(&recon, 2);
+    let fp = translated(&recon, 4);
+    let cfg = PbConfig {
+        quant: 6,
+        trb: 1,
+        dbquant: 1,
+        search_half: 3,
+    };
+    let vlc = encode_pb_picture(&fp, &fb, &recon, 5, 3, &cfg).expect("VLC PB");
+    let sac = encode_pb_picture_sac(&fp, &fb, &recon, 5, 3, &cfg).expect("SAC PB");
+
+    let vlc_pair = decode_pb_picture_no_gob0_header(&vlc, &recon, 3, DecodeOptions::default())
+        .expect("decode VLC PB");
+    let sac_pair =
+        decode_pb_picture_sac(&sac, &recon, 3, DecodeOptions::default()).expect("decode SAC PB");
+    assert_eq!(vlc_pair.p_frame.y, sac_pair.p_frame.y, "P luma");
+    assert_eq!(vlc_pair.p_frame.cb, sac_pair.p_frame.cb, "P cb");
+    assert_eq!(vlc_pair.p_frame.cr, sac_pair.p_frame.cr, "P cr");
+    assert_eq!(vlc_pair.b_frame.y, sac_pair.b_frame.y, "B luma");
+    assert_eq!(vlc_pair.b_frame.cb, sac_pair.b_frame.cb, "B cb");
+    assert_eq!(vlc_pair.b_frame.cr, sac_pair.b_frame.cr, "B cr");
+}
+
+/// A fully static SAC PB-frame is lossless on both parts (every
+/// macroblock skips: zero vector, no P-residual, no B-residual).
+#[test]
+fn sac_pb_static_is_lossless_both_parts() {
+    use oxideav_h263::encoder::{encode_pb_picture_sac, PbConfig};
+    use oxideav_h263::picture::decode_pb_picture_sac;
+
+    let i_bytes = encode_intra_picture_sac(&gradient(176, 144, 11), 9, 0).expect("encode I");
+    let recon = decode_picture_sac(&i_bytes, None, DecodeOptions::default()).expect("decode I");
+    let cfg = PbConfig {
+        quant: 9,
+        trb: 1,
+        dbquant: 0,
+        search_half: 3,
+    };
+    let pb = encode_pb_picture_sac(&recon, &recon, &recon, 2, 0, &cfg).expect("encode PB");
+    let pair = decode_pb_picture_sac(&pb, &recon, 0, DecodeOptions::default()).expect("decode PB");
+    assert_eq!(pair.p_frame.y, recon.y);
+    assert_eq!(pair.b_frame.y, recon.y);
+    assert_eq!(pair.p_frame.cb, recon.cb);
+    assert_eq!(pair.b_frame.cb, recon.cb);
+    assert_eq!(pair.p_frame.cr, recon.cr);
+    assert_eq!(pair.b_frame.cr, recon.cr);
+}
+
+/// A pure-SAC elementary stream carrying every staged coding shape —
+/// I, then an AP (INTER4V + OBMC) P, then a PB pair — decodes through
+/// the headline `decode_sequence` entry point in display order with
+/// every frame tracking its source.
+#[test]
+fn sac_ap_and_pb_stream_decodes_through_decode_sequence() {
+    use oxideav_h263::encoder::{encode_inter_picture_ap_sac, encode_pb_picture_sac, PbConfig};
+
+    fn luma_mae(a: &YuvFrame, b: &YuvFrame) -> f64 {
+        let sum: u64 =
+            a.y.iter()
+                .zip(b.y.iter())
+                .map(|(&x, &y)| (x as i64 - y as i64).unsigned_abs())
+                .sum();
+        sum as f64 / a.y.len() as f64
+    }
+
+    let f0 = gradient(176, 144, 0);
+    let i_bytes = encode_intra_picture_sac(&f0, 5, 0).unwrap();
+    let r0 = decode_picture_sac(&i_bytes, None, DecodeOptions::default()).unwrap();
+
+    // SAC AP P (2 px).
+    let f1 = translated(&r0, 2);
+    let p1 = encode_inter_picture_ap_sac(&f1, &r0, 5, 1, 3).unwrap();
+    let r1 = decode_picture_sac(&p1, Some(&r0), DecodeOptions::default()).unwrap();
+
+    // SAC PB pair: B at 3 px, P at 4 px (TR 1 -> 3, TRB 1).
+    let fb = translated(&r0, 3);
+    let fp = translated(&r0, 4);
+    let cfg = PbConfig {
+        quant: 5,
+        trb: 1,
+        dbquant: 0,
+        search_half: 3,
+    };
+    let pb = encode_pb_picture_sac(&fp, &fb, &r1, 3, 1, &cfg).unwrap();
+
+    let mut stream = Vec::new();
+    for part in [&i_bytes, &p1, &pb] {
+        stream.extend_from_slice(part);
+    }
+
+    let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.len(), 4, "expected I, P(AP), B, P");
+    for (i, (src, dec)) in [&f0, &f1, &fb, &fp].iter().zip(decoded.iter()).enumerate() {
+        let mae = luma_mae(src, dec);
+        assert!(mae < 8.0, "frame {i} luma MAE {mae}");
+    }
+}
+
+/// The single-picture SAC driver still refuses a PB-frame (the pair
+/// decodes through `decode_pb_picture_sac`), and the SAC PB driver
+/// refuses a non-PB SAC picture — the two entry points route apart.
+#[test]
+fn sac_pb_and_single_picture_drivers_route_apart() {
+    use oxideav_h263::encoder::{encode_pb_picture_sac, PbConfig};
+    use oxideav_h263::picture::decode_pb_picture_sac;
+
+    let i_bytes = encode_intra_picture_sac(&gradient(176, 144, 1), 8, 0).expect("encode I");
+    let recon = decode_picture_sac(&i_bytes, None, DecodeOptions::default()).expect("decode I");
+    let cfg = PbConfig::default();
+    let pb = encode_pb_picture_sac(&recon, &recon, &recon, 2, 0, &cfg).expect("encode PB");
+
+    assert_eq!(
+        decode_picture_sac(&pb, Some(&recon), DecodeOptions::default()).unwrap_err(),
+        Error::NotImplemented
+    );
+    assert_eq!(
+        decode_pb_picture_sac(&i_bytes, &recon, 0, DecodeOptions::default()).unwrap_err(),
+        Error::NotImplemented
+    );
+}

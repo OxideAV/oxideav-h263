@@ -8,6 +8,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex E SAC composed with Annex F Advanced Prediction** (round
+  443): `parse_macroblock_sac` now decodes the Table-8 INTER4V /
+  INTER4V+Q types with their §5.3.8 MVD2-4 pairs under the §E.7
+  `cumf_MVD` model, and `decode_picture_sac` reconstructs an
+  AP-signalled SAC picture through the exact VLC AP machinery — the
+  shared `reconstruct_inter4v_mvs` §F.2/Figure-F.1 four-vector
+  derivation (extracted from the VLC INTER4V path) and the §F.3
+  deferred-OBMC luminance flush (`PendingApLuma`), with single-MV
+  coded INTER macroblocks OBMC-blended too. The encoder arm
+  `encode_inter_picture_ap_sac` is the arithmetic mirror of the
+  two-pass VLC AP encoder (same estimation, same OBMC prediction,
+  same transform stage, emitted via the new
+  `sac::encode_inter4v_macroblock_sac`), so SAC-AP and VLC-AP
+  pictures of the same source reconstruct **byte-identically**
+  (pinned at QP 4/8/13 over sheared content; a static AP picture is
+  lossless).
+
+- **Annex E SAC composed with Annex G PB-frames** (round 443): the
+  §E.8 `cumf_MODB_G` / `cumf_YCBPB` / `cumf_UVCBPB` models land with
+  their §E.7 assignment — MODB (Table 11 indexing), the six per-block
+  CBPB symbols (luma vs chroma model split), MVDB under `cumf_MVD`
+  and the §G.2 PB-mode INTRA-macroblock vector. The new
+  `decode_pb_picture_sac` decodes a baseline-PTYPE SAC + PB picture
+  into the (B, P) pair — fixed-length header (PQUANT / CPM / TRB /
+  DBQUANT / PEI, §E.6) then a single arithmetic segment whose
+  per-macroblock B-parts run through the shared
+  `reconstruct_pb_b_part` core (split out of the VLC B-part decoder)
+  — and `decode_sequence` routes an SAC PB-frame there automatically.
+  `encode_pb_picture_sac` mirrors the VLC PB encoder (same P-part
+  estimation, §G.5 PREC reconstruction and §G.4 B-prediction), so SAC
+  and VLC PB-frames reconstruct **identically in both parts** (pinned;
+  a fully static SAC PB-frame is lossless on both parts; an SAC
+  I + AP-P + PB elementary stream decodes in display order through
+  `decode_sequence`). AP + PB together stays refused, mirroring the
+  VLC driver's B-part-vs-deferred-OBMC ordering hazard.
+
 - **Annex E SAC pictures end-to-end** (round 438): `decode_picture_sac`
   decodes a baseline-PTYPE picture whose §5.1.3 bit 11 (SAC) is set —
   fixed-length header layer (PQUANT / CPM / PEI-PSUPP, §E.6), then the

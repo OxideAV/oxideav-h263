@@ -265,18 +265,18 @@ pub use deblock::{
 };
 pub use dequant::{dequantise_ac, scatter_into_block, AC_REC_MAX, AC_REC_MIN};
 pub use encoder::{
-    encode_inter_picture, encode_inter_picture_ap, encode_inter_picture_gobs,
-    encode_inter_picture_motion, encode_inter_picture_motion_sac, encode_inter_picture_plus,
-    encode_inter_picture_sac, encode_inter_picture_slices, encode_inter_picture_slices_rect,
-    encode_inter_picture_umv, encode_inter_picture_umv_plus, encode_intra_picture,
-    encode_intra_picture_aic, encode_intra_picture_aic_auto, encode_intra_picture_aic_mq,
-    encode_intra_picture_aic_mq_plus, encode_intra_picture_aic_plus, encode_intra_picture_dquant,
-    encode_intra_picture_gobs, encode_intra_picture_plus, encode_intra_picture_sac,
-    encode_intra_picture_slices, encode_intra_picture_slices_aic,
+    encode_inter_picture, encode_inter_picture_ap, encode_inter_picture_ap_sac,
+    encode_inter_picture_gobs, encode_inter_picture_motion, encode_inter_picture_motion_sac,
+    encode_inter_picture_plus, encode_inter_picture_sac, encode_inter_picture_slices,
+    encode_inter_picture_slices_rect, encode_inter_picture_umv, encode_inter_picture_umv_plus,
+    encode_intra_picture, encode_intra_picture_aic, encode_intra_picture_aic_auto,
+    encode_intra_picture_aic_mq, encode_intra_picture_aic_mq_plus, encode_intra_picture_aic_plus,
+    encode_intra_picture_dquant, encode_intra_picture_gobs, encode_intra_picture_plus,
+    encode_intra_picture_sac, encode_intra_picture_slices, encode_intra_picture_slices_aic,
     encode_intra_picture_slices_aic_mq, encode_intra_picture_slices_rect, encode_intra_sequence,
-    encode_intra_sequence_aic, encode_pb_picture, encode_sequence, encode_sequence_rate_controlled,
-    write_plus_picture_header, GopConfig, PbConfig, PlusModes, RateControlConfig,
-    RateControlledStream, EOS_BYTES,
+    encode_intra_sequence_aic, encode_pb_picture, encode_pb_picture_sac, encode_sequence,
+    encode_sequence_rate_controlled, write_plus_picture_header, GopConfig, PbConfig, PlusModes,
+    RateControlConfig, RateControlledStream, EOS_BYTES,
 };
 pub use encoder_aic::{plan_intra_block_aic, write_intra_block_aic, AicBlockPlan};
 pub use encoder_block::{
@@ -323,10 +323,10 @@ pub use pb_layer::{
 pub use picture::{
     decode_b_picture, decode_b_picture_layer, decode_ep_picture_layer, decode_improved_pb_picture,
     decode_improved_pb_picture_with_inherited, decode_pb_picture, decode_pb_picture_no_gob0_header,
-    decode_picture, decode_picture_layer, decode_picture_layer_with_inherited,
-    decode_picture_no_gob0_header, decode_picture_sac, decode_sequence, enumerate_mb_boundaries,
-    BPictureTemporal, DecodeOptions, DecodePictureOutcome, MbBoundaryInfo, PbFramePair,
-    PictureLayout, YuvFrame,
+    decode_pb_picture_sac, decode_picture, decode_picture_layer,
+    decode_picture_layer_with_inherited, decode_picture_no_gob0_header, decode_picture_sac,
+    decode_sequence, enumerate_mb_boundaries, BPictureTemporal, DecodeOptions,
+    DecodePictureOutcome, MbBoundaryInfo, PbFramePair, PictureLayout, YuvFrame,
 };
 pub use picture_header::{
     parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
@@ -354,10 +354,11 @@ pub use rtp::{
     RFC2190_MODE_B_BYTES, RFC2190_MODE_C_BYTES, VRC_HEADER_BYTES,
 };
 pub use sac::{
-    decode_cbpy_sac, decode_cod, decode_dquant_sac, decode_intradc_sac, decode_mcbpc_i_sac,
-    decode_mcbpc_p_sac, decode_mvd_component_sac, encode_cbpy_sac, encode_cod, encode_dquant_sac,
+    decode_cbpb_sac, decode_cbpy_sac, decode_cod, decode_dquant_sac, decode_intradc_sac,
+    decode_mcbpc_i_sac, decode_mcbpc_p_sac, decode_modb_sac, decode_mvd_component_sac,
+    encode_cbpb_sac, encode_cbpy_sac, encode_cod, encode_dquant_sac, encode_inter4v_macroblock_sac,
     encode_inter_macroblock_sac, encode_intra_macroblock_sac, encode_intradc_sac,
-    encode_mcbpc_i_sac, encode_mcbpc_p_sac, encode_mvd_component_sac,
+    encode_mcbpc_i_sac, encode_mcbpc_p_sac, encode_modb_sac, encode_mvd_component_sac,
     encode_skipped_macroblock_sac, parse_block_sac, parse_macroblock_sac, write_block_sac,
     SacDecoder, SacEncoder,
 };

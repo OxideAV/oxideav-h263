@@ -812,11 +812,15 @@ fn skip_pei_psupp(reader: &mut BitReader<'_>) -> Result<()> {
 /// # Errors
 ///
 /// * [`Error::NotImplemented`] — the header does not signal SAC, or it
-///   signals a combination not staged on this path: PB-frames,
-///   Advanced Prediction / INTER4V, CPM = "1", or the
-///   [`DecodeOptions`] AIC / Modified-Quantization / Alternative-
-///   INTER-VLC flags (§5.1.4.6 bars Annexes S and T with SAC
-///   outright).
+///   signals a combination not staged on this path: PB-frames (those
+///   decode through [`decode_pb_picture_sac`], which returns the
+///   (B, P) pair), CPM = "1", or the [`DecodeOptions`] AIC /
+///   Modified-Quantization / Alternative-INTER-VLC flags (§5.1.4.6
+///   bars Annexes S and T with SAC outright). Advanced Prediction
+///   (INTER4V + §F.3 OBMC) **is** supported: the four MVD pairs
+///   decode under the §E.7 `cumf_MVD` model and the luminance
+///   reconstruction runs the same deferred-OBMC path as the VLC
+///   driver.
 /// * The picture-header / quantiser errors of
 ///   [`decode_picture_no_gob0_header`].
 pub fn decode_picture_sac(
@@ -830,15 +834,10 @@ pub fn decode_picture_sac(
         return Err(Error::NotImplemented);
     }
     // Unstaged mode combinations. §5.1.4.6 bars Annex S / Annex T with
-    // SAC; AP (INTER4V + OBMC) and PB-frames are legal but not staged
-    // on this driver; AIC needs PLUSPTYPE which a baseline-PTYPE SAC
-    // picture cannot carry.
-    if header.pb_frames
-        || header.advanced_prediction
-        || options.aic
-        || options.modified_quant
-        || options.alt_inter_vlc
-    {
+    // SAC; a PB-frame decodes into a pair and flows through
+    // `decode_pb_picture_sac`; AIC needs PLUSPTYPE which a
+    // baseline-PTYPE SAC picture cannot carry.
+    if header.pb_frames || options.aic || options.modified_quant || options.alt_inter_vlc {
         return Err(Error::NotImplemented);
     }
     let layout =
@@ -871,7 +870,120 @@ pub fn decode_picture_sac(
         options,
         pquant,
         header_zero_run,
+        None,
     )
+}
+
+/// Decode one **Annex E SAC + Annex G PB-frame** picture — a
+/// baseline-PTYPE INTER picture whose PTYPE signals both SAC (bit 11)
+/// and PB-frames mode (bit 13) — producing both the P-picture and the
+/// B-picture.
+///
+/// The fixed-length header layer is the same wire a VLC PB-frame
+/// carries (§E.6): §5.1.19 PQUANT, §5.1.20 CPM (the `"1"` branch
+/// refused), §5.1.22 TRB + §5.1.23 DBQUANT (present because PTYPE
+/// signals PB-frames), and the §5.1.24 / §5.1.25 PEI / PSUPP loop.
+/// The macroblock layer then decodes as one arithmetic-coded video
+/// picture segment: per macroblock the §5.3 / Figure 10 PB-frame
+/// fields (COD, MCBPC, MODB under `cumf_MODB_G`, the six per-block
+/// CBPB symbols, CBPY, DQUANT, MVD — including for INTRA macroblocks
+/// per §G.2 — and MVDB, §E.7) drive the six P-blocks and then the six
+/// §G.4 / §G.5 bidirectionally-predicted B-blocks through the exact
+/// reconstruction core the VLC PB driver uses, so an SAC PB-frame and
+/// a VLC PB-frame carrying the same quantised data reconstruct
+/// byte-identically in both parts.
+///
+/// `prev_tr` is the §5.1.2 Temporal Reference of the `reference`
+/// picture; §G.4 derives TRD as the TR increment from it (adding 256
+/// on wrap).
+///
+/// # Errors
+///
+/// The union of [`decode_picture_sac`]'s errors plus
+/// [`Error::BadPbTemporalReference`] (TRB = 0 or a zero TR increment)
+/// and [`Error::NotImplemented`] for an INTRA coding type, Advanced
+/// Prediction (§G.1-adjacent OBMC/B-part ordering is unstaged, as on
+/// the VLC PB driver) or a mismatched `reference` geometry.
+pub fn decode_pb_picture_sac(
+    data: &[u8],
+    reference: &YuvFrame,
+    prev_tr: u8,
+    options: DecodeOptions,
+) -> Result<PbFramePair> {
+    let mut reader = BitReader::new(data);
+    let header = parse_picture_header(&mut reader)?;
+    if !header.sac_mode || !header.pb_frames {
+        return Err(Error::NotImplemented);
+    }
+    if !matches!(header.coding_type, H263PictureCodingType::Inter) {
+        return Err(Error::NotImplemented);
+    }
+    if header.advanced_prediction || options.aic || options.modified_quant || options.alt_inter_vlc
+    {
+        return Err(Error::NotImplemented);
+    }
+    let layout =
+        PictureLayout::for_source_format(header.source_format).ok_or(Error::NotImplemented)?;
+
+    // §5.1.19 — PQUANT.
+    let pquant = reader.read_u32(5).map_err(|_| Error::UnexpectedEof)? as u8;
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    // §5.1.20 — CPM ("1" pulls in PSBI / GSBI, refused).
+    let cpm = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    if cpm {
+        return Err(Error::NotImplemented);
+    }
+    // §5.1.22 — TRB (3 bits at the standard CIF picture clock
+    // frequency); §5.1.23 — DBQUANT (2 bits).
+    let trb = reader.read_u32(3).map_err(|_| Error::UnexpectedEof)? as i32;
+    if trb == 0 {
+        return Err(Error::BadPbTemporalReference);
+    }
+    let dbquant = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)? as u8;
+    // §G.4 — TRD.
+    let mut trd = i32::from(header.temporal_reference) - i32::from(prev_tr);
+    if trd < 0 {
+        trd += 256;
+    }
+    if trd == 0 {
+        return Err(Error::BadPbTemporalReference);
+    }
+    // §5.1.24 / §5.1.25 — PEI + PSUPP.
+    skip_pei_psupp(&mut reader)?;
+
+    // §E.5 — seed the destuffing filter with the header's trailing
+    // zeros (runs are counted over the whole stream).
+    let header_zero_run = trailing_zero_run_before(data, reader.bit_position() as usize);
+
+    let luma_w = layout.luma_width as usize;
+    let luma_h = layout.luma_height as usize;
+    let mut b_frame = YuvFrame {
+        y: vec![0u8; luma_w * luma_h],
+        cb: vec![0u8; (luma_w / 2) * (luma_h / 2)],
+        cr: vec![0u8; (luma_w / 2) * (luma_h / 2)],
+        luma_width: luma_w,
+        luma_height: luma_h,
+    };
+    let p_frame = decode_sac_macroblock_stream(
+        &mut reader,
+        &header,
+        &layout,
+        Some(reference),
+        options,
+        pquant,
+        header_zero_run,
+        Some(PbPictureCtx {
+            trb,
+            trd,
+            dbquant,
+            annex_m: false,
+            left_bpb_forward_mv: None,
+            b_frame: &mut b_frame,
+        }),
+    )?;
+    Ok(PbFramePair { p_frame, b_frame })
 }
 
 /// Length (capped at 14) of the run of `0` bits immediately preceding
@@ -890,9 +1002,12 @@ fn trailing_zero_run_before(data: &[u8], bit_pos: usize) -> u32 {
     run
 }
 
-/// The single-segment SAC macroblock walk behind [`decode_picture_sac`]:
-/// `reader` is positioned at the first arithmetic-coded bit (the §E.3
-/// `decoder_reset` happens here).
+/// The single-segment SAC macroblock walk behind [`decode_picture_sac`]
+/// and [`decode_pb_picture_sac`]: `reader` is positioned at the first
+/// arithmetic-coded bit (the §E.3 `decoder_reset` happens here). `pb`
+/// carries the Annex G PB-frame context when the picture is a PB-frame
+/// (the B-part of each macroblock is decoded right after its P-part,
+/// §G.3).
 #[allow(clippy::too_many_arguments)]
 fn decode_sac_macroblock_stream(
     reader: &mut BitReader<'_>,
@@ -902,8 +1017,9 @@ fn decode_sac_macroblock_stream(
     options: DecodeOptions,
     pquant: u8,
     header_zero_run: u32,
+    mut pb: Option<PbPictureCtx<'_>>,
 ) -> Result<YuvFrame> {
-    use crate::sac::{parse_macroblock_sac, SacDecoder};
+    use crate::sac::{parse_block_sac, parse_macroblock_sac, SacDecoder};
 
     let luma_w = layout.luma_width as usize;
     let luma_h = layout.luma_height as usize;
@@ -911,6 +1027,14 @@ fn decode_sac_macroblock_stream(
     let mb_rows_total = luma_h / 16;
     let chroma_w = luma_w / 2;
     let chroma_h = luma_h / 2;
+
+    let advanced_prediction = header.advanced_prediction;
+    let pb_mode = pb.is_some();
+    if advanced_prediction && pb_mode {
+        // Mirror the VLC PB driver: the B-part reads the P-part's
+        // pixels before a deferred OBMC reconstruction would land.
+        return Err(Error::NotImplemented);
+    }
 
     let is_inter_picture = matches!(header.coding_type, H263PictureCodingType::Inter);
     if is_inter_picture {
@@ -931,6 +1055,8 @@ fn decode_sac_macroblock_stream(
     let mut grid = vec![MbGridEntry::OUTSIDE; mb_cols * mb_rows_total];
     let mut mb_quant = vec![0u8; mb_cols * mb_rows_total];
     let mut current_quant = pquant;
+    // §F.3 — the deferred-OBMC macroblock (see the VLC driver).
+    let mut pending_ap: Option<PendingApLuma> = None;
 
     let mut dec = SacDecoder::with_zero_run(reader, header_zero_run);
     for row in 0..mb_rows_total {
@@ -941,10 +1067,10 @@ fn decode_sac_macroblock_stream(
                     &mut dec,
                     MbContext {
                         picture_coding_type: header.coding_type,
-                        advanced_prediction: false,
+                        advanced_prediction,
                         deblocking_filter: false,
                         aic_intra_mode: false,
-                        pb_frames: false,
+                        pb_frames: pb_mode,
                         pb_annex_m: false,
                         quantiser_before: current_quant,
                         modified_quant: false,
@@ -956,7 +1082,7 @@ fn decode_sac_macroblock_stream(
                 break mb;
             };
 
-            let (mv, mvs4) = decode_one_macroblock_sac(
+            let (mv, mvs4, pending_new) = decode_one_macroblock_sac(
                 &mut dec,
                 &mb,
                 reference,
@@ -966,8 +1092,36 @@ fn decode_sac_macroblock_stream(
                 col,
                 row,
                 header.umv_mode,
+                advanced_prediction,
+                pb_mode,
                 &mut current_quant,
             )?;
+
+            // PB-frames mode: the six B-blocks follow the six P-blocks
+            // (§G.3). Parse them under the INTER TCOEF models, then
+            // run the shared reconstruction core.
+            if let Some(pb) = pb.as_mut() {
+                let prev = reference.ok_or(Error::NotImplemented)?;
+                let cbpb = mb.cbpb.unwrap_or(0);
+                let mut blocks: [Option<H263Block>; 6] = [None, None, None, None, None, None];
+                for (i, slot) in blocks.iter_mut().enumerate() {
+                    if crate::pb_layer::cbpb_block_present(cbpb, i as u32 + 1) {
+                        *slot = Some(parse_block_sac(&mut dec, false, true, false)?);
+                    }
+                }
+                reconstruct_pb_b_part(
+                    &mb,
+                    prev,
+                    &frame,
+                    pb,
+                    col,
+                    row,
+                    &mvs4,
+                    current_quant,
+                    &blocks,
+                )?;
+            }
+
             record_grid(
                 &mut grid,
                 &mut mb_quant,
@@ -980,6 +1134,20 @@ fn decode_sac_macroblock_stream(
                 mvs4,
                 /* segment */ 0,
             );
+            // §F.3 — the previous macroblock's OBMC right remote is
+            // resolved now that this macroblock's grid entry is
+            // recorded; flush its deferred luminance.
+            if let Some(p) = pending_ap.take() {
+                let r = reference.ok_or(Error::NotImplemented)?;
+                reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total);
+            }
+            pending_ap = pending_new;
+        }
+        // §F.3 — a still-pending macroblock is the row's last: its
+        // right neighbour is outside the picture.
+        if let Some(p) = pending_ap.take() {
+            let r = reference.ok_or(Error::NotImplemented)?;
+            reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total);
         }
     }
 
@@ -992,8 +1160,15 @@ fn decode_sac_macroblock_stream(
 
 /// Reconstruct one SAC macroblock into the frame planes — the Annex E
 /// mirror of [`decode_one_macroblock`]'s baseline INTRA / INTER /
-/// skipped branches, with every block read through
+/// INTER4V / skipped branches, with every block read through
 /// [`crate::sac::parse_block_sac`] instead of the Table 16 VLC.
+///
+/// Returns `(mb_mv, mvs4, pending)` with the same conventions as
+/// [`decode_one_macroblock`]: under Advanced Prediction the luminance
+/// of a coded INTER macroblock is deferred (§F.3 — the OBMC right
+/// remotes read the not-yet-parsed macroblock to the right) and comes
+/// back as a [`PendingApLuma`] the caller flushes once the next grid
+/// entry is recorded.
 #[allow(clippy::too_many_arguments)]
 fn decode_one_macroblock_sac(
     dec: &mut crate::sac::SacDecoder<'_, '_>,
@@ -1005,8 +1180,10 @@ fn decode_one_macroblock_sac(
     col: usize,
     row: usize,
     umv_mode: bool,
+    advanced_prediction: bool,
+    pb_mode: bool,
     current_quant: &mut u8,
-) -> Result<(MotionVector, Mb4Mv)> {
+) -> Result<(MotionVector, Mb4Mv, Option<PendingApLuma>)> {
     use crate::sac::parse_block_sac;
 
     let luma_stride = frame.luma_width;
@@ -1029,7 +1206,7 @@ fn decode_one_macroblock_sac(
             MotionVector::new(0, 0),
         );
         let zero = MotionVector::new(0, 0);
-        return Ok((zero, [zero; 4]));
+        return Ok((zero, [zero; 4], None));
     }
 
     let mb_type = mb.mb_type.ok_or(Error::NotImplemented)?;
@@ -1055,15 +1232,64 @@ fn decode_one_macroblock_sac(
         let cr_samples = reconstruct_intra_block(&cr_block, quant);
         blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
 
-        let zero = MotionVector::new(0, 0);
-        return Ok((zero, [zero; 4]));
+        // §G.2 — in PB-frames mode every INTRA macroblock carries a
+        // vector used for predicting its B-blocks only (reconstructed
+        // exactly like an INTER vector); the P-block reconstruction
+        // above is unaffected.
+        let mv = if pb_mode {
+            let predictor = predict_mv(
+                grid, mb_cols, col, row, /* gob_top_row */ 0,
+                /* gob_header_present */ true, pb_mode, /* segment */ 0,
+            );
+            let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
+            if umv_mode {
+                reconstruct_mv_umv(predictor, mvd)
+            } else {
+                reconstruct_mv(predictor, mvd)
+            }
+        } else {
+            MotionVector::new(0, 0)
+        };
+        return Ok((mv, [mv; 4], None));
+    }
+
+    let reference = reference.ok_or(Error::NotImplemented)?;
+
+    // INTER4V / INTER4V+Q — Annex F four vectors + §F.3 OBMC (the
+    // MCBPC decoder only emits these types when AP is signalled).
+    if matches!(mb_type, MbType::Inter4V | MbType::Inter4VQ) {
+        let mvs4 = reconstruct_inter4v_mvs(
+            mb, grid, mb_cols, col, row, /* gob_top_row */ 0,
+            /* gob_header_present */ true, umv_mode,
+        )?;
+        let chroma_vec = chroma_mv_4mv(&mvs4);
+        let inter_cbpy = cbpy ^ 0b1111;
+
+        // §F.3 OBMC luma is deferred (right remotes); parse the
+        // coefficient blocks now in bitstream order.
+        let mut blocks: [Option<H263Block>; 4] = [None, None, None, None];
+        for (blk_i, slot) in blocks.iter_mut().enumerate() {
+            if (inter_cbpy >> (3 - blk_i)) & 1 == 1 {
+                *slot = Some(parse_block_sac(dec, false, true, false)?);
+            }
+        }
+        let pending = Some(PendingApLuma {
+            col,
+            row,
+            quant,
+            mvs4,
+            blocks,
+        });
+
+        // Chroma: no OBMC (§F.2) — immediate reconstruction.
+        decode_sac_inter_chroma(dec, reference, frame, c_x, c_y, chroma_vec, cbpc, quant)?;
+        return Ok((mvs4[LumaBlockIndex::B1.index()], mvs4, pending));
     }
 
     // INTER / INTER+Q (single MV).
-    let reference = reference.ok_or(Error::NotImplemented)?;
     let predictor = predict_mv(
         grid, mb_cols, col, row, /* gob_top_row */ 0, /* gob_header_present */ true,
-        /* pb_mode */ false, /* segment */ 0,
+        pb_mode, /* segment */ 0,
     );
     let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
     let luma_mv = if umv_mode {
@@ -1077,20 +1303,63 @@ fn decode_one_macroblock_sac(
     // macroblocks complement it to the actual coded pattern.
     let inter_cbpy = cbpy ^ 0b1111;
 
-    let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
-    for blk in 0..4 {
-        let has_coef = (inter_cbpy >> (3 - blk)) & 1 == 1;
-        let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
-        let prediction = motion_compensate_block(&y_ref, bx, by, luma_mv, RCONTROL_DEFAULT);
-        let samples = if has_coef {
-            let block = parse_block_sac(dec, false, true, false)?;
-            reconstruct_inter_block_with_prediction(&block, quant, &prediction)
-        } else {
-            prediction
-        };
-        blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+    let mut pending: Option<PendingApLuma> = None;
+    if advanced_prediction {
+        // §F.2 / §F.3 — every coded INTER macroblock of an AP picture
+        // is OBMC-predicted (a one-vector macroblock is "four vectors
+        // with the same value"); defer the luminance like the VLC
+        // driver does.
+        let mut blocks: [Option<H263Block>; 4] = [None, None, None, None];
+        for (blk_i, slot) in blocks.iter_mut().enumerate() {
+            if (inter_cbpy >> (3 - blk_i)) & 1 == 1 {
+                *slot = Some(parse_block_sac(dec, false, true, false)?);
+            }
+        }
+        pending = Some(PendingApLuma {
+            col,
+            row,
+            quant,
+            mvs4: [luma_mv; 4],
+            blocks,
+        });
+    } else {
+        let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
+        for blk in 0..4 {
+            let has_coef = (inter_cbpy >> (3 - blk)) & 1 == 1;
+            let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+            let prediction = motion_compensate_block(&y_ref, bx, by, luma_mv, RCONTROL_DEFAULT);
+            let samples = if has_coef {
+                let block = parse_block_sac(dec, false, true, false)?;
+                reconstruct_inter_block_with_prediction(&block, quant, &prediction)
+            } else {
+                prediction
+            };
+            blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+        }
     }
 
+    decode_sac_inter_chroma(dec, reference, frame, c_x, c_y, chroma_vec, cbpc, quant)?;
+
+    Ok((luma_mv, [luma_mv; 4], pending))
+}
+
+/// Decode and reconstruct the two chrominance blocks of an SAC INTER
+/// macroblock (half-pel motion compensation by `chroma_vec` + optional
+/// arithmetic-coded residual per the CBPC bits).
+#[allow(clippy::too_many_arguments)]
+fn decode_sac_inter_chroma(
+    dec: &mut crate::sac::SacDecoder<'_, '_>,
+    reference: &YuvFrame,
+    frame: &mut YuvFrame,
+    c_x: usize,
+    c_y: usize,
+    chroma_vec: MotionVector,
+    cbpc: u8,
+    quant: u8,
+) -> Result<()> {
+    use crate::sac::parse_block_sac;
+
+    let chroma_stride = frame.chroma_width();
     let cb_ref = RefPlane::new(
         &reference.cb,
         reference.chroma_width(),
@@ -1118,8 +1387,7 @@ fn decode_one_macroblock_sac(
         cr_pred
     };
     blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
-
-    Ok((luma_mv, [luma_mv; 4]))
+    Ok(())
 }
 
 /// Per-macroblock boundary side information for RFC 2190 Mode B / C
@@ -1496,7 +1764,13 @@ pub fn decode_sequence(data: &[u8], options: DecodeOptions) -> Result<Vec<YuvFra
                 // P-part advances `prev_tr` / becomes the next reference.
                 let prev = prev_tr.ok_or(Error::BadPbTemporalReference)?;
                 let anchor = reference.ok_or(Error::BadPbTemporalReference)?;
-                let pair = decode_pb_picture_no_gob0_header(picture, anchor, prev, options)?;
+                // Annex E — a PB-frame whose PTYPE also signals SAC
+                // (bit 11) decodes through the arithmetic PB driver.
+                let pair = if baseline_is_sac(picture)? {
+                    decode_pb_picture_sac(picture, anchor, prev, options)?
+                } else {
+                    decode_pb_picture_no_gob0_header(picture, anchor, prev, options)?
+                };
                 let PbFramePair { p_frame, b_frame } = pair;
                 // Splice the B-frame in *before* the P-frame in display
                 // order. `reference` borrowed `frames`; it is dropped
@@ -2674,6 +2948,45 @@ fn decode_pb_b_part(
     mvs4: &Mb4Mv,
     quant: u8,
 ) -> Result<()> {
+    // §G.3 — the six B-blocks follow the P-blocks in Figure-5 order;
+    // only those CBPB lights carry a TCOEF sequence. The parse is
+    // separated from the reconstruction so the Annex E SAC driver can
+    // supply arithmetic-decoded blocks through the same
+    // reconstruction core.
+    let cbpb = mb.cbpb.unwrap_or(0);
+    let mut blocks: [Option<H263Block>; 6] = [None, None, None, None, None, None];
+    for (i, slot) in blocks.iter_mut().enumerate() {
+        if cbpb_block_present(cbpb, i as u32 + 1) {
+            *slot = Some(parse_block(
+                reader,
+                BlockContext {
+                    has_intradc: false,
+                    has_coefficients: true,
+                    ..Default::default()
+                },
+            )?);
+        }
+    }
+    reconstruct_pb_b_part(mb, reference, p_frame, pb, col, row, mvs4, quant, &blocks)
+}
+
+/// Reconstruct the B-part of one PB-macroblock from its already-parsed
+/// coefficient blocks — the entropy-coder-independent core behind
+/// [`decode_pb_b_part`], shared with the Annex E SAC PB driver.
+/// `blocks` is in Figure-5 order (`[Y1..Y4, Cb, Cr]`); a `None` slot is
+/// prediction-only (its CBPB bit was clear).
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_pb_b_part(
+    mb: &H263Macroblock,
+    reference: &YuvFrame,
+    p_frame: &YuvFrame,
+    pb: &mut PbPictureCtx<'_>,
+    col: usize,
+    row: usize,
+    mvs4: &Mb4Mv,
+    quant: u8,
+    blocks: &[Option<H263Block>; 6],
+) -> Result<()> {
     let mb_x = col * 16;
     let mb_y = row * 16;
     let c_x = col * 8;
@@ -2779,10 +3092,8 @@ fn decode_pb_b_part(
         )
     };
 
-    // §5.1.23 / Table 6 B-block quantiser; §5.3.4 CBPB pattern (all
-    // zeros when MODB carried no CBPB — no B-residuals).
+    // §5.1.23 / Table 6 B-block quantiser.
     let bquant = pb_bquant(pb.dbquant, quant);
-    let cbpb = mb.cbpb.unwrap_or(0);
 
     // Four luma B-blocks (Figure 5 blocks 1..=4), then Cb (block 5)
     // and Cr (block 6). "B-blocks are always coded in INTER mode,
@@ -2791,7 +3102,7 @@ fn decode_pb_b_part(
     // B-blocks" (§G.3) — every lit block is an INTER-style TCOEF
     // sequence summed onto the §G.5 prediction per §6.3.1 and clipped
     // per §6.3.2.
-    for blk in 0..4 {
+    for (blk, coeff_block) in blocks.iter().enumerate().take(4) {
         let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
         let ox = (blk & 1) * 8;
         let oy = (blk >> 1) * 8;
@@ -2799,18 +3110,9 @@ fn decode_pb_b_part(
         for j in 0..8 {
             pred[j * 8..j * 8 + 8].copy_from_slice(&prediction.luma[oy + j][ox..ox + 8]);
         }
-        let samples = if cbpb_block_present(cbpb, blk as u32 + 1) {
-            let block = parse_block(
-                reader,
-                BlockContext {
-                    has_intradc: false,
-                    has_coefficients: true,
-                    ..Default::default()
-                },
-            )?;
-            reconstruct_inter_block_with_prediction(&block, bquant, &pred)
-        } else {
-            pred
+        let samples = match coeff_block {
+            Some(block) => reconstruct_inter_block_with_prediction(block, bquant, &pred),
+            None => pred,
         };
         blit_block(&mut pb.b_frame.y, luma_stride, bx, by, &samples);
     }
@@ -2821,32 +3123,14 @@ fn decode_pb_b_part(
         pred_cb[j * 8..j * 8 + 8].copy_from_slice(&prediction.cb[j]);
         pred_cr[j * 8..j * 8 + 8].copy_from_slice(&prediction.cr[j]);
     }
-    let cb_samples = if cbpb_block_present(cbpb, 5) {
-        let block = parse_block(
-            reader,
-            BlockContext {
-                has_intradc: false,
-                has_coefficients: true,
-                ..Default::default()
-            },
-        )?;
-        reconstruct_inter_block_with_prediction(&block, bquant, &pred_cb)
-    } else {
-        pred_cb
+    let cb_samples = match &blocks[4] {
+        Some(block) => reconstruct_inter_block_with_prediction(block, bquant, &pred_cb),
+        None => pred_cb,
     };
     blit_block(&mut pb.b_frame.cb, chroma_stride, c_x, c_y, &cb_samples);
-    let cr_samples = if cbpb_block_present(cbpb, 6) {
-        let block = parse_block(
-            reader,
-            BlockContext {
-                has_intradc: false,
-                has_coefficients: true,
-                ..Default::default()
-            },
-        )?;
-        reconstruct_inter_block_with_prediction(&block, bquant, &pred_cr)
-    } else {
-        pred_cr
+    let cr_samples = match &blocks[5] {
+        Some(block) => reconstruct_inter_block_with_prediction(block, bquant, &pred_cr),
+        None => pred_cr,
     };
     blit_block(&mut pb.b_frame.cr, chroma_stride, c_x, c_y, &cr_samples);
 
@@ -6646,64 +6930,16 @@ fn decode_inter4v_macroblock(
     let cbpy = mb.cbpy.unwrap_or(0);
     let cbpc = mb.cbpc.unwrap_or(0);
 
-    // §5.3.7 / §5.3.8 — the parser already pulled the four MVDs for an
-    // INTER4V macroblock in AP mode. Block order is Figure 5
-    // (`[B1, B2, B3, B4]`).
-    let mvd_b1 = mb.mvd.ok_or(Error::NotImplemented)?;
-    let mut mvds = [mvd_b1; 4];
-    for (slot, raw) in mvds.iter_mut().skip(1).zip(mb.mvd234.iter()) {
-        *slot = raw.ok_or(Error::NotImplemented)?;
-    }
-
-    // Build the §F.2 / Figure-F.1 four-MV neighbourhood from the grid.
-    // The §6.1.1 INTRA / not-coded → zero collapse is folded into the
-    // None decision per the [`Mb4MvNeighbourhood`] contract. The
-    // `current` cells are filled progressively below: §F.2 / Figure F.1
-    // reads the **already-reconstructed** vectors of this macroblock as
-    // candidates for its later blocks (B2's MV1 is B1's vector, B3's
-    // MV2/MV3 are B1's/B2's, B4's MV1/MV2 are B3's/B2's).
-    let mut neighbourhood = build_4mv_neighbourhood(grid, mb_cols, col, row);
-
-    // Reconstruct each per-block luma MV from its (MV1, MV2, MV3)
-    // candidates, with the §6.1.1 rule-3 "above unavailable → MV2 =
-    // MV3 = MV1" rewrite applied per block, and §D.2 UMV extension
-    // when the picture header enables it.
-    let above_outside_picture = row == 0;
-    let above_outside_gob = gob_header_present && row == gob_top_row;
-    let top_border = above_outside_picture || above_outside_gob;
-    let mut mvs4: Mb4Mv = [MotionVector::default(); 4];
-    for &blk in &LumaBlockIndex::ALL {
-        let (mv1, mut mv2, mut mv3) = select_4mv_candidates(blk, &neighbourhood);
-
-        // §6.1.1 rule-3 applies to the top row of the *macroblock*: the
-        // upper blocks (B1, B2) read their MV2/MV3 from MB-above. When
-        // MB-above is unavailable, fold MV2/MV3 into MV1 per the rule.
-        if matches!(blk, LumaBlockIndex::B1 | LumaBlockIndex::B2) && top_border {
-            mv2 = mv1;
-            mv3 = mv1;
-        }
-        // §6.1.1 rule-4: right-edge macroblock's B2 / B4 have MV3
-        // coming from MB-above-right / MB-right; when that neighbour is
-        // off-picture, force MV3 = 0. `select_4mv_candidates` already
-        // returns zero for the missing neighbour, but a top-border
-        // collapse above could have rewritten it to MV1 — undo that.
-        let outside_right = col + 1 >= mb_cols;
-        if outside_right && matches!(blk, LumaBlockIndex::B2 | LumaBlockIndex::B4) {
-            mv3 = MotionVector::new(0, 0);
-        }
-
-        let predictor = predict_mv_median(mv1, mv2, mv3);
-        let mvd = mvds[blk.index()];
-        let mv = if umv_mode {
-            reconstruct_mv_umv(predictor, mvd)
-        } else {
-            reconstruct_mv(predictor, mvd)
-        };
-        mvs4[blk.index()] = mv;
-        // §F.2 — later blocks of this macroblock use the reconstructed
-        // vector as an intra-macroblock candidate predictor.
-        neighbourhood.current[blk.index()] = mv;
-    }
+    let mvs4 = reconstruct_inter4v_mvs(
+        mb,
+        grid,
+        mb_cols,
+        col,
+        row,
+        gob_top_row,
+        gob_header_present,
+        umv_mode,
+    )?;
 
     // Chroma vector per §F.2 / Table F.1: sum of the four luma vectors
     // divided by 8 with sixteenth → half snap.
@@ -6821,6 +7057,88 @@ fn decode_inter4v_macroblock(
     }
 
     Ok((mvs4[LumaBlockIndex::B1.index()], mvs4, pending))
+}
+
+/// Reconstruct the four §F.2 per-block luma motion vectors of an
+/// INTER4V macroblock from its parsed MVD / MVD2-4 fields and the
+/// already-decoded grid — the entropy-coder-independent core shared by
+/// the VLC ([`decode_inter4v_macroblock`]) and Annex E SAC drivers.
+///
+/// Builds the §F.2 / Figure-F.1 four-MV neighbourhood (threading each
+/// just-reconstructed vector back in as an intra-macroblock
+/// candidate), applies the §6.1.1 rule-3 top-border and rule-4
+/// right-edge rewrites per block, and reconstructs each vector with
+/// the §D.2 UMV extension when `umv_mode` is set.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_inter4v_mvs(
+    mb: &H263Macroblock,
+    grid: &[MbGridEntry],
+    mb_cols: usize,
+    col: usize,
+    row: usize,
+    gob_top_row: usize,
+    gob_header_present: bool,
+    umv_mode: bool,
+) -> Result<Mb4Mv> {
+    // §5.3.7 / §5.3.8 — the parser already pulled the four MVDs for an
+    // INTER4V macroblock in AP mode. Block order is Figure 5
+    // (`[B1, B2, B3, B4]`).
+    let mvd_b1 = mb.mvd.ok_or(Error::NotImplemented)?;
+    let mut mvds = [mvd_b1; 4];
+    for (slot, raw) in mvds.iter_mut().skip(1).zip(mb.mvd234.iter()) {
+        *slot = raw.ok_or(Error::NotImplemented)?;
+    }
+
+    // Build the §F.2 / Figure-F.1 four-MV neighbourhood from the grid.
+    // The §6.1.1 INTRA / not-coded → zero collapse is folded into the
+    // None decision per the [`Mb4MvNeighbourhood`] contract. The
+    // `current` cells are filled progressively below: §F.2 / Figure F.1
+    // reads the **already-reconstructed** vectors of this macroblock as
+    // candidates for its later blocks (B2's MV1 is B1's vector, B3's
+    // MV2/MV3 are B1's/B2's, B4's MV1/MV2 are B3's/B2's).
+    let mut neighbourhood = build_4mv_neighbourhood(grid, mb_cols, col, row);
+
+    // Reconstruct each per-block luma MV from its (MV1, MV2, MV3)
+    // candidates, with the §6.1.1 rule-3 "above unavailable → MV2 =
+    // MV3 = MV1" rewrite applied per block, and §D.2 UMV extension
+    // when the picture header enables it.
+    let above_outside_picture = row == 0;
+    let above_outside_gob = gob_header_present && row == gob_top_row;
+    let top_border = above_outside_picture || above_outside_gob;
+    let mut mvs4: Mb4Mv = [MotionVector::default(); 4];
+    for &blk in &LumaBlockIndex::ALL {
+        let (mv1, mut mv2, mut mv3) = select_4mv_candidates(blk, &neighbourhood);
+
+        // §6.1.1 rule-3 applies to the top row of the *macroblock*: the
+        // upper blocks (B1, B2) read their MV2/MV3 from MB-above. When
+        // MB-above is unavailable, fold MV2/MV3 into MV1 per the rule.
+        if matches!(blk, LumaBlockIndex::B1 | LumaBlockIndex::B2) && top_border {
+            mv2 = mv1;
+            mv3 = mv1;
+        }
+        // §6.1.1 rule-4: right-edge macroblock's B2 / B4 have MV3
+        // coming from MB-above-right / MB-right; when that neighbour is
+        // off-picture, force MV3 = 0. `select_4mv_candidates` already
+        // returns zero for the missing neighbour, but a top-border
+        // collapse above could have rewritten it to MV1 — undo that.
+        let outside_right = col + 1 >= mb_cols;
+        if outside_right && matches!(blk, LumaBlockIndex::B2 | LumaBlockIndex::B4) {
+            mv3 = MotionVector::new(0, 0);
+        }
+
+        let predictor = predict_mv_median(mv1, mv2, mv3);
+        let mvd = mvds[blk.index()];
+        let mv = if umv_mode {
+            reconstruct_mv_umv(predictor, mvd)
+        } else {
+            reconstruct_mv(predictor, mvd)
+        };
+        mvs4[blk.index()] = mv;
+        // §F.2 — later blocks of this macroblock use the reconstructed
+        // vector as an intra-macroblock candidate predictor.
+        neighbourhood.current[blk.index()] = mv;
+    }
+    Ok(mvs4)
 }
 
 /// Build the §F.2 / Figure-F.1 four-MV neighbourhood for a macroblock

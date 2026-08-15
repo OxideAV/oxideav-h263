@@ -1167,6 +1167,539 @@ pub fn encode_inter_picture_motion_sac(
     Ok(w.finish())
 }
 
+/// Length of the run of `"0"` bits a fixed-length header string ends
+/// in — the §E.5 stuffing-filter seed for the arithmetic segment that
+/// follows it. `fields` lists the header fields after PTYPE in wire
+/// order as `(value, bit_width)` pairs.
+fn header_tail_zero_run(fields: &[(u32, u32)]) -> u32 {
+    let mut run = 0u32;
+    'outer: for &(value, bits) in fields.iter().rev() {
+        for i in 0..bits {
+            if (value >> i) & 1 == 0 {
+                run += 1;
+            } else {
+                break 'outer;
+            }
+        }
+    }
+    run
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an **Annex E SAC + Annex F
+/// Advanced Prediction** INTER picture — the arithmetic-coded mirror
+/// of [`encode_inter_picture_ap`]: PTYPE signals both SAC (bit 11) and
+/// AP (bit 12), every macroblock carries four §F.2 motion vectors
+/// (MVD + MVD2-4 under the §E.7 `cumf_MVD` model) and the residual is
+/// taken against the exact §F.3 OBMC prediction the decoder
+/// reconstructs with.
+///
+/// The transform / quantiser stage is shared with the VLC AP encoder,
+/// so the SAC and VLC AP pictures of the same source reconstruct
+/// **byte-identically** through their respective drivers
+/// ([`crate::picture::decode_picture_sac`] /
+/// [`crate::picture::decode_picture`]-family).
+pub fn encode_inter_picture_ap_sac(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+) -> Result<Vec<u8>> {
+    use crate::encoder_motion::{estimate_block_motion, mvd_for, Mv4Grid};
+    use crate::motion::{chroma_mv_4mv, LumaBlockIndex, Mb4Mv, MotionVector, RemoteMv};
+    use crate::sac::{encode_inter4v_macroblock_sac, SacEncoder};
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if frame.luma_width != reference.luma_width || frame.luma_height != reference.luma_height {
+        return Err(Error::NotImplemented);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+
+    let lw = frame.luma_width;
+    let lh = frame.luma_height;
+    let mb_cols = lw / 16;
+    let mb_rows = lh / 16;
+    let lambda = 2 * quant as u32;
+
+    // ---- Pass 1: per-block motion estimation with §F.2 predictor
+    // replay (identical to the VLC AP encoder). ----------------------
+    let mut grid4 = Mv4Grid::new(mb_cols, mb_rows);
+    let mut field: Vec<Mb4Mv> = Vec::with_capacity(mb_cols * mb_rows);
+    let mut mvds_field: Vec<[crate::macroblock::Mvd; 4]> = Vec::with_capacity(mb_cols * mb_rows);
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let mut cur: Mb4Mv = [MotionVector::new(0, 0); 4];
+            let mut mvds = [crate::macroblock::Mvd {
+                dx_half: 0,
+                dy_half: 0,
+            }; 4];
+            for &blk in &LumaBlockIndex::ALL {
+                let blk_i = blk.index();
+                let bx = mb_col * 16 + (blk_i % 2) * 8;
+                let by = mb_row * 16 + (blk_i / 2) * 8;
+                let predictor = grid4.predict_block(mb_col, mb_row, blk, &cur);
+                let mv =
+                    estimate_block_motion(frame, reference, bx, by, predictor, search_half, lambda);
+                cur[blk_i] = mv;
+                mvds[blk_i] = mvd_for(mv, predictor);
+            }
+            grid4.set(mb_col, mb_row, cur);
+            field.push(cur);
+            mvds_field.push(mvds);
+        }
+    }
+
+    // ---- Pass 2: §F.3 OBMC prediction + residual coding through the
+    // arithmetic coder. ----------------------------------------------
+    let mut w = BitWriter::new();
+    write_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ true,
+        PtypeFlags {
+            sac: true,
+            advanced_prediction: true,
+            ..PtypeFlags::default()
+        },
+        None,
+    );
+
+    let y_ref = crate::motion::RefPlane::new(&reference.y, lw, lh);
+    let cw = frame.chroma_width();
+    let ch = frame.chroma_height();
+
+    {
+        // §E.5 — the header tail is PQUANT's trailing zeros + CPM = 0
+        // + PEI = 0.
+        let mut enc = SacEncoder::with_zero_run(&mut w, 2 + quant.trailing_zeros());
+        for mb_row in 0..mb_rows {
+            for mb_col in 0..mb_cols {
+                let idx = mb_row * mb_cols + mb_col;
+                let cur = field[idx];
+                let mvds = mvds_field[idx];
+                let above = (mb_row > 0).then(|| field[idx - mb_cols]);
+                let left = (mb_col > 0).then(|| field[idx - 1]);
+                let right = (mb_col + 1 < mb_cols).then(|| field[idx + 1]);
+
+                // §F.3 remote-vector tags per block (every macroblock
+                // in this stream is coded INTER).
+                let remote = |nb: Option<Mb4Mv>, cell: LumaBlockIndex| -> RemoteMv {
+                    match nb {
+                        Some(m) => RemoteMv::Vector(m[cell.index()]),
+                        None => RemoteMv::Current,
+                    }
+                };
+                let tags = |blk: LumaBlockIndex| -> (RemoteMv, RemoteMv, RemoteMv, RemoteMv) {
+                    match blk {
+                        LumaBlockIndex::B1 => (
+                            remote(above, LumaBlockIndex::B3),
+                            RemoteMv::Vector(cur[LumaBlockIndex::B3.index()]),
+                            remote(left, LumaBlockIndex::B2),
+                            RemoteMv::Vector(cur[LumaBlockIndex::B2.index()]),
+                        ),
+                        LumaBlockIndex::B2 => (
+                            remote(above, LumaBlockIndex::B4),
+                            RemoteMv::Vector(cur[LumaBlockIndex::B4.index()]),
+                            RemoteMv::Vector(cur[LumaBlockIndex::B1.index()]),
+                            remote(right, LumaBlockIndex::B1),
+                        ),
+                        LumaBlockIndex::B3 => (
+                            RemoteMv::Vector(cur[LumaBlockIndex::B1.index()]),
+                            RemoteMv::Current,
+                            remote(left, LumaBlockIndex::B4),
+                            RemoteMv::Vector(cur[LumaBlockIndex::B4.index()]),
+                        ),
+                        LumaBlockIndex::B4 => (
+                            RemoteMv::Vector(cur[LumaBlockIndex::B2.index()]),
+                            RemoteMv::Current,
+                            RemoteMv::Vector(cur[LumaBlockIndex::B3.index()]),
+                            remote(right, LumaBlockIndex::B3),
+                        ),
+                    }
+                };
+
+                let src = extract_macroblock(frame, mb_col, mb_row);
+                let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> =
+                    Vec::with_capacity(4);
+                for &blk in &LumaBlockIndex::ALL {
+                    let blk_i = blk.index();
+                    let bx = mb_col * 16 + (blk_i % 2) * 8;
+                    let by = mb_row * 16 + (blk_i / 2) * 8;
+                    let (r_top, r_bot, s_left, s_right) = tags(blk);
+                    let pred = crate::motion::obmc_predict_block(
+                        &y_ref,
+                        bx,
+                        by,
+                        cur[blk_i],
+                        r_top,
+                        r_bot,
+                        s_left,
+                        s_right,
+                        crate::motion::RCONTROL_DEFAULT,
+                    );
+                    let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
+                    for (d, &p) in pred_i16.iter_mut().zip(pred.iter()) {
+                        *d = p as i16;
+                    }
+                    let residual = residual_of(&src.luma[blk_i], &pred_i16);
+                    luma_enc.push(crate::encoder_block::encode_inter_block(&residual, quant));
+                }
+
+                // §F.2 chroma: sum-of-four / Table F.1 vector, plain
+                // half-pel motion compensation (no OBMC).
+                let chroma_vec = chroma_mv_4mv(&cur);
+                let c_x = mb_col * 8;
+                let c_y = mb_row * 8;
+                let cb_pred = motion_compensated_block(&reference.cb, cw, ch, c_x, c_y, chroma_vec);
+                let cr_pred = motion_compensated_block(&reference.cr, cw, ch, c_x, c_y, chroma_vec);
+                let mut cb_pred_i = [0i16; COEFFS_PER_BLOCK];
+                let mut cr_pred_i = [0i16; COEFFS_PER_BLOCK];
+                for i in 0..COEFFS_PER_BLOCK {
+                    cb_pred_i[i] = cb_pred[i] as i16;
+                    cr_pred_i[i] = cr_pred[i] as i16;
+                }
+                let cb_enc = crate::encoder_block::encode_inter_block(
+                    &residual_of(&src.cb, &cb_pred_i),
+                    quant,
+                );
+                let cr_enc = crate::encoder_block::encode_inter_block(
+                    &residual_of(&src.cr, &cr_pred_i),
+                    quant,
+                );
+
+                let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
+                    luma_enc[0].clone(),
+                    luma_enc[1].clone(),
+                    luma_enc[2].clone(),
+                    luma_enc[3].clone(),
+                ];
+                encode_inter4v_macroblock_sac(&mut enc, &luma_arr, &cb_enc, &cr_enc, &mvds)?;
+            }
+        }
+        enc.flush();
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+/// Encode an Annex G **PB-frame** through the **Annex E arithmetic
+/// coder** — the SAC mirror of [`encode_pb_picture`]: PTYPE signals
+/// both SAC (bit 11) and PB-frames (bit 13), and every §5.3 /
+/// Figure 10 field (COD, MCBPC, MODB, CBPB, CBPY, MVD, MVDB) plus the
+/// twelve block payloads is an §E.7-modelled arithmetic symbol.
+///
+/// The P-part motion estimation, PREC reconstruction (§G.5) and the
+/// §G.4 bidirectional B-prediction are byte-for-byte the VLC PB
+/// encoder's, so the SAC and VLC PB-frames of the same sources
+/// reconstruct **identically** in both parts. Decodes through
+/// [`crate::picture::decode_pb_picture_sac`] and — inside an
+/// elementary stream — [`crate::picture::decode_sequence`].
+pub fn encode_pb_picture_sac(
+    p_source: &YuvFrame,
+    b_source: &YuvFrame,
+    reference: &YuvFrame,
+    tr_p: u8,
+    prev_tr: u8,
+    cfg: &PbConfig,
+) -> Result<Vec<u8>> {
+    use crate::pb_layer::{pb_b_predict_macroblock, pb_bquant, ModbPresence, PbBReferencePlanes};
+    use crate::sac::{
+        encode_cbpb_sac, encode_cbpy_sac, encode_cod, encode_mcbpc_p_sac, encode_modb_sac,
+        encode_mvd_component_sac, encode_skipped_macroblock_sac, write_block_sac, SacEncoder,
+    };
+
+    if cfg.quant == 0 || cfg.quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if cfg.trb == 0 || cfg.trb > 7 || cfg.dbquant > 3 {
+        return Err(Error::BadPbTemporalReference);
+    }
+    let trd = i32::from(tr_p.wrapping_sub(prev_tr));
+    if trd == 0 || i32::from(cfg.trb) >= trd {
+        return Err(Error::BadPbTemporalReference);
+    }
+    if p_source.luma_width != reference.luma_width
+        || p_source.luma_height != reference.luma_height
+        || b_source.luma_width != reference.luma_width
+        || b_source.luma_height != reference.luma_height
+    {
+        return Err(Error::NotImplemented);
+    }
+    let fmt = source_format_for(p_source.luma_width, p_source.luma_height)
+        .ok_or(Error::NotImplemented)?;
+
+    let quant = cfg.quant;
+    let bquant = pb_bquant(cfg.dbquant, quant);
+    let trb = i32::from(cfg.trb);
+
+    let mut w = BitWriter::new();
+    write_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr_p,
+        /* is_inter */ true,
+        PtypeFlags {
+            sac: true,
+            ..PtypeFlags::default()
+        },
+        Some((cfg.trb, cfg.dbquant)),
+    );
+
+    let lw = p_source.luma_width;
+    let lh = p_source.luma_height;
+    let cw = p_source.chroma_width();
+    let ch = p_source.chroma_height();
+    let mb_cols = lw / 16;
+    let mb_rows = lh / 16;
+    let mut grid = crate::encoder_motion::MvGrid::new(mb_cols, mb_rows);
+    let lambda = 2 * quant as u32;
+
+    let prev_y = crate::motion::RefPlane::new(&reference.y, lw, lh);
+    let prev_cb = crate::motion::RefPlane::new(&reference.cb, cw, ch);
+    let prev_cr = crate::motion::RefPlane::new(&reference.cr, cw, ch);
+
+    {
+        // §E.5 — the PB header tail is PQUANT + CPM = 0 + TRB +
+        // DBQUANT + PEI = 0 (§E.6 string 1).
+        let seed = header_tail_zero_run(&[
+            (quant as u32, 5),
+            (0, 1),
+            (cfg.trb as u32, 3),
+            (cfg.dbquant as u32, 2),
+            (0, 1),
+        ]);
+        let mut enc = SacEncoder::with_zero_run(&mut w, seed);
+
+        for mb_row in 0..mb_rows {
+            for mb_col in 0..mb_cols {
+                let mb_x = mb_col * 16;
+                let mb_y = mb_row * 16;
+                let c_x = mb_col * 8;
+                let c_y = mb_row * 8;
+
+                // ---- P-part: motion estimation + residual coding
+                // (identical to the VLC PB encoder). ------------------
+                let predictor = grid.predict(mb_col, mb_row);
+                let mv = crate::encoder_motion::estimate_motion(
+                    p_source,
+                    reference,
+                    mb_col,
+                    mb_row,
+                    predictor,
+                    cfg.search_half,
+                    lambda,
+                );
+                let chroma_mv = crate::motion::chroma_mv(mv);
+                let src = extract_macroblock(p_source, mb_col, mb_row);
+
+                let mut luma_pred: Vec<[u8; COEFFS_PER_BLOCK]> = Vec::with_capacity(4);
+                let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> =
+                    Vec::with_capacity(4);
+                for blk in 0..4 {
+                    let bx = mb_x + (blk % 2) * 8;
+                    let by = mb_y + (blk / 2) * 8;
+                    let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
+                    let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
+                    for (d, &pv) in pred_i16.iter_mut().zip(pred.iter()) {
+                        *d = pv as i16;
+                    }
+                    luma_enc.push(crate::encoder_block::encode_inter_block(
+                        &residual_of(&src.luma[blk], &pred_i16),
+                        quant,
+                    ));
+                    luma_pred.push(pred);
+                }
+                let cb_pred = motion_compensated_block(&reference.cb, cw, ch, c_x, c_y, chroma_mv);
+                let cr_pred = motion_compensated_block(&reference.cr, cw, ch, c_x, c_y, chroma_mv);
+                let mut cb_pred_i = [0i16; COEFFS_PER_BLOCK];
+                let mut cr_pred_i = [0i16; COEFFS_PER_BLOCK];
+                for i in 0..COEFFS_PER_BLOCK {
+                    cb_pred_i[i] = cb_pred[i] as i16;
+                    cr_pred_i[i] = cr_pred[i] as i16;
+                }
+                let cb_enc = crate::encoder_block::encode_inter_block(
+                    &residual_of(&src.cb, &cb_pred_i),
+                    quant,
+                );
+                let cr_enc = crate::encoder_block::encode_inter_block(
+                    &residual_of(&src.cr, &cr_pred_i),
+                    quant,
+                );
+
+                let any_p =
+                    luma_enc.iter().any(|e| e.has_coeffs) || cb_enc.has_coeffs || cr_enc.has_coeffs;
+                let is_zero_mv = mv.dx_half == 0 && mv.dy_half == 0;
+
+                // ---- PREC (§G.5). -----------------------------------
+                let recon_block = |enc: &crate::encoder_block::EncodedInterBlock,
+                                   pred: &[u8; COEFFS_PER_BLOCK],
+                                   q: u8|
+                 -> [u8; COEFFS_PER_BLOCK] {
+                    if enc.has_coeffs {
+                        let block = crate::block::H263Block {
+                            coefficients: enc.scan,
+                            tcoef_event_count: 0,
+                            had_intradc: false,
+                        };
+                        crate::reconstruct_inter_block_with_prediction(&block, q, pred)
+                    } else {
+                        *pred
+                    }
+                };
+                let mut prec_y = [0u8; 256];
+                for blk in 0..4 {
+                    let samples = recon_block(&luma_enc[blk], &luma_pred[blk], quant);
+                    let ox = (blk % 2) * 8;
+                    let oy = (blk / 2) * 8;
+                    for j in 0..8 {
+                        prec_y[(oy + j) * 16 + ox..(oy + j) * 16 + ox + 8]
+                            .copy_from_slice(&samples[j * 8..j * 8 + 8]);
+                    }
+                }
+                let prec_cb = recon_block(&cb_enc, &cb_pred, quant);
+                let prec_cr = recon_block(&cr_enc, &cr_pred, quant);
+
+                // ---- B-part: §G.4 + §G.5 prediction, MVDB = 0. ------
+                let planes = PbBReferencePlanes {
+                    prev_y,
+                    prev_cb,
+                    prev_cr,
+                    prec_y: crate::motion::RefPlane::new(&prec_y, 16, 16),
+                    prec_cb: crate::motion::RefPlane::new(&prec_cb, 8, 8),
+                    prec_cr: crate::motion::RefPlane::new(&prec_cr, 8, 8),
+                };
+                let b_pred = pb_b_predict_macroblock(
+                    &planes,
+                    mb_x,
+                    mb_y,
+                    &[mv; 4],
+                    None,
+                    trb,
+                    trd,
+                    crate::motion::RCONTROL_DEFAULT,
+                );
+
+                let b_src = extract_macroblock(b_source, mb_col, mb_row);
+                let mut b_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(6);
+                for blk in 0..4 {
+                    let ox = (blk % 2) * 8;
+                    let oy = (blk / 2) * 8;
+                    let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
+                    for j in 0..8 {
+                        for i in 0..8 {
+                            pred_i16[j * 8 + i] = b_pred.luma[oy + j][ox + i] as i16;
+                        }
+                    }
+                    b_enc.push(crate::encoder_block::encode_inter_block(
+                        &residual_of(&b_src.luma[blk], &pred_i16),
+                        bquant,
+                    ));
+                }
+                let mut b_cb_pred = [0i16; COEFFS_PER_BLOCK];
+                let mut b_cr_pred = [0i16; COEFFS_PER_BLOCK];
+                for j in 0..8 {
+                    for i in 0..8 {
+                        b_cb_pred[j * 8 + i] = b_pred.cb[j][i] as i16;
+                        b_cr_pred[j * 8 + i] = b_pred.cr[j][i] as i16;
+                    }
+                }
+                b_enc.push(crate::encoder_block::encode_inter_block(
+                    &residual_of(&b_src.cb, &b_cb_pred),
+                    bquant,
+                ));
+                b_enc.push(crate::encoder_block::encode_inter_block(
+                    &residual_of(&b_src.cr, &b_cr_pred),
+                    bquant,
+                ));
+                let any_b = b_enc.iter().any(|e| e.has_coeffs);
+
+                // ---- Skip / emit. -----------------------------------
+                if !any_p && !any_b && is_zero_mv {
+                    encode_skipped_macroblock_sac(&mut enc);
+                    grid.set_zero_candidate(mb_col, mb_row);
+                    continue;
+                }
+
+                // COD = 0; MCBPC (Table 8, INTER type 0).
+                encode_cod(&mut enc, true);
+                let mut cbpc = 0u8;
+                if cb_enc.has_coeffs {
+                    cbpc |= 0b10;
+                }
+                if cr_enc.has_coeffs {
+                    cbpc |= 0b01;
+                }
+                encode_mcbpc_p_sac(&mut enc, crate::macroblock::MbType::Inter, cbpc)?;
+
+                // §5.3.3 MODB + §5.3.4 CBPB.
+                if any_b {
+                    encode_modb_sac(&mut enc, ModbPresence::CbpbAndMvdb);
+                    let mut cbpb = 0u8;
+                    for (blk, e) in b_enc.iter().enumerate() {
+                        if e.has_coeffs {
+                            cbpb |= 1 << (6 - (blk + 1));
+                        }
+                    }
+                    encode_cbpb_sac(&mut enc, cbpb);
+                } else {
+                    encode_modb_sac(&mut enc, ModbPresence::None);
+                }
+
+                // §5.3.5 CBPY (INTER complement).
+                let mut cbpy_intra = 0u8;
+                for (blk, e) in luma_enc.iter().enumerate() {
+                    if e.has_coeffs {
+                        cbpy_intra |= 1 << (3 - blk);
+                    }
+                }
+                encode_cbpy_sac(&mut enc, cbpy_intra ^ 0b1111, false)?;
+
+                // §5.3.7 MVD.
+                let mvd = crate::encoder_motion::mvd_for(mv, predictor);
+                encode_mvd_component_sac(&mut enc, mvd.dx_half)?;
+                encode_mvd_component_sac(&mut enc, mvd.dy_half)?;
+
+                // §5.3.9 MVDB = (0, 0) when MODB carries it.
+                if any_b {
+                    encode_mvd_component_sac(&mut enc, 0)?;
+                    encode_mvd_component_sac(&mut enc, 0)?;
+                }
+
+                // §G.3 — six P-blocks, then six B-blocks.
+                for e in luma_enc.iter() {
+                    if e.has_coeffs {
+                        write_block_sac(&mut enc, None, &e.scan, true, false)?;
+                    }
+                }
+                if cb_enc.has_coeffs {
+                    write_block_sac(&mut enc, None, &cb_enc.scan, true, false)?;
+                }
+                if cr_enc.has_coeffs {
+                    write_block_sac(&mut enc, None, &cr_enc.scan, true, false)?;
+                }
+                for e in b_enc.iter() {
+                    if e.has_coeffs {
+                        write_block_sac(&mut enc, None, &e.scan, true, false)?;
+                    }
+                }
+
+                grid.set_inter(mb_col, mb_row, mv);
+            }
+        }
+        enc.flush();
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
 /// Encode a planar 4:2:0 [`YuvFrame`] as an **extended-PTYPE (H.263+)
 /// INTRA** picture: the §5.1.4 PLUSPTYPE header (UFEP `"001"`, no
 /// optional modes) followed by the same single-segment §5.2.2
