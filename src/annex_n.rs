@@ -20,13 +20,18 @@
 //!
 //! This module implements the **forward-channel** decoder behaviour: the
 //! [`RpsReferenceStore`] picture memory keyed by 10-bit Temporal
-//! Reference, and the §N.4.1.4 / §N.5 reference-selection rule. It does
-//! **not** implement the §N.3 / §N.4.2 back-channel (BCM) messages —
-//! those carry ACK / NACK status from decoder to encoder over a separate
-//! logical channel (or the videomux submode) and do not affect the
-//! pixels a conformant forward-channel decoder produces. The §5.1.16 BCI
-//! codeword is framed (and a present BCM refused) by
-//! [`crate::plus_ptype`].
+//! Reference, and the §N.4.1.4 / §N.5 reference-selection rule. It also
+//! stages the §N.4.2 **Back-Channel Message** (BCM) syntax itself —
+//! [`parse_bcm`] / [`write_bcm`] over [`BackChannelMessage`] — the
+//! ACK / NACK record a decoder returns to the encoder. BCM flows on a
+//! separate logical channel (or the §N.4.2.8 videomux submode) and does
+//! not affect the pixels a conformant forward-channel decoder produces;
+//! the §5.1.16 BCI codeword inside a *forward* picture header is still
+//! framed (and a present in-header BCM refused) by
+//! [`crate::plus_ptype`], because the in-header BCM's GN/MBA width is a
+//! property of the *other* video bitstream the message applies to
+//! (§N.4.2.9 NOTE) — knowledge only the negotiating caller has, which
+//! is exactly what [`BcmContext`] carries.
 //!
 //! The §N.4.1 GOB / slice-layer TRI / TR / TRPI / TRP fields (which let
 //! the reference be re-selected mid-picture) are a further refinement;
@@ -35,7 +40,7 @@
 
 use crate::picture::YuvFrame;
 use crate::{Error, Result};
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 
 /// Length in bits of the §N.4.1.4 GOB/slice-layer TRP field (always 10
 /// bits, unlike the picture-layer TR which is 8 or 10 bits per the
@@ -313,6 +318,207 @@ pub fn compose_tr(tr: u8, etr: Option<u8>) -> u16 {
     }
 }
 
+/// §N.4.2.1 — the Back-channel message Type (BT) field's two defined
+/// code points. The `"00"` / `"01"` patterns are reserved and rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BcmType {
+    /// `"10"` — NACK: the corresponding forward-channel data decoded
+    /// erroneously. Carries the §N.4.2.11 RTR field.
+    Nack,
+    /// `"11"` — ACK: the corresponding forward-channel data decoded
+    /// correctly.
+    Ack,
+}
+
+/// Externally-negotiated framing knowledge for a §N.4.2 Back-Channel
+/// Message: whether the videomux submode is in use (the §N.4.2.8 /
+/// §N.4.2.10 BEPB emulation-prevention bits are present only then) and
+/// the §N.4.2.9 GN/MBA field width — the GN width (5 bits, §5.2.3)
+/// when the *forward* bitstream the message applies to uses the GOB
+/// layer, or the Table-K.2 MBA width when it is Slice Structured
+/// (per the §N.4.2.9 NOTE, this is a property of the applied-to
+/// bitstream, not of the channel transporting the BCM).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BcmContext {
+    /// Videomux submode: BEPB1 / BEPB2 present.
+    pub videomux: bool,
+    /// Width in bits of the GN/MBA field (5 for the GOB layer;
+    /// 5/6/7/9/11/12/13/14 per Table K.2 for Slice Structured).
+    pub gn_mba_bits: u32,
+}
+
+/// One parsed §N.4.2 Back-Channel Message (Figure N.4), minus the
+/// §N.4.2.12 BSTUF tail (external-framing concern left to the caller).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackChannelMessage {
+    /// §N.4.2.1 BT — ACK or NACK.
+    pub message_type: BcmType,
+    /// §N.4.2.2 URF — `true` when no reliable TR / GN/MBA was
+    /// available to the reporting decoder.
+    pub unreliable: bool,
+    /// §N.4.2.3 TR — 10-bit temporal reference of the video picture
+    /// segment the message refers to (ETR ∥ TR under a custom picture
+    /// clock frequency; two zero MSBs otherwise).
+    pub tr: u16,
+    /// §N.4.2.4 / §N.4.2.5 — `Some(layer)` iff ELNUMI = "1" (the
+    /// message refers to an Annex O enhancement layer).
+    pub elnum: Option<u8>,
+    /// §N.4.2.6 / §N.4.2.7 — `Some(sub_bitstream)` iff BCPM = "1"
+    /// (CPM in use on the forward channel).
+    pub bsbi: Option<u8>,
+    /// §N.4.2.9 — GOB number (GOB layer) or macroblock address
+    /// (Slice Structured) of the segment's first macroblock.
+    pub gn_mba: u32,
+    /// §N.4.2.11 RTR — requested temporal reference; present iff
+    /// [`BcmType::Nack`].
+    pub rtr: Option<u16>,
+}
+
+/// Parse one §N.4.2 Back-Channel Message at the reader's position.
+///
+/// The §N.4.2.12 BSTUF zero-stuffing (present only when the separate
+/// logical channel mode ends an external frame here) is not consumed —
+/// framing is the caller's concern.
+///
+/// # Errors
+///
+/// * [`Error::BadBackChannelMessage`] — a reserved BT code point
+///   (`"00"` / `"01"`), a zero BEPB1 / BEPB2 in videomux mode, or a
+///   NACK whose RTR is truncated.
+/// * [`Error::UnexpectedEof`] — the buffer ended mid-message.
+pub fn parse_bcm(reader: &mut BitReader<'_>, ctx: BcmContext) -> Result<BackChannelMessage> {
+    // §N.4.2.1 — BT.
+    let bt = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)?;
+    let message_type = match bt {
+        0b10 => BcmType::Nack,
+        0b11 => BcmType::Ack,
+        _ => return Err(Error::BadBackChannelMessage),
+    };
+    // §N.4.2.2 — URF.
+    let unreliable = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    // §N.4.2.3 — TR (10 bits).
+    let tr = reader.read_u32(10).map_err(|_| Error::UnexpectedEof)? as u16;
+    // §N.4.2.4 / §N.4.2.5 — ELNUMI + ELNUM.
+    let elnumi = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    let elnum = if elnumi {
+        Some(reader.read_u32(4).map_err(|_| Error::UnexpectedEof)? as u8)
+    } else {
+        None
+    };
+    // §N.4.2.6 / §N.4.2.7 — BCPM + BSBI.
+    let bcpm = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    let bsbi = if bcpm {
+        Some(reader.read_u32(2).map_err(|_| Error::UnexpectedEof)? as u8)
+    } else {
+        None
+    };
+    // §N.4.2.8 — BEPB1 (videomux only, always "1").
+    if ctx.videomux && !reader.read_bit().map_err(|_| Error::UnexpectedEof)? {
+        return Err(Error::BadBackChannelMessage);
+    }
+    // §N.4.2.9 — GN / MBA.
+    let gn_mba = reader
+        .read_u32(ctx.gn_mba_bits)
+        .map_err(|_| Error::UnexpectedEof)?;
+    // §N.4.2.10 — BEPB2 (videomux only, always "1").
+    if ctx.videomux && !reader.read_bit().map_err(|_| Error::UnexpectedEof)? {
+        return Err(Error::BadBackChannelMessage);
+    }
+    // §N.4.2.11 — RTR, present iff NACK.
+    let rtr = if matches!(message_type, BcmType::Nack) {
+        Some(reader.read_u32(10).map_err(|_| Error::UnexpectedEof)? as u16)
+    } else {
+        None
+    };
+    Ok(BackChannelMessage {
+        message_type,
+        unreliable,
+        tr,
+        elnum,
+        bsbi,
+        gn_mba,
+        rtr,
+    })
+}
+
+/// Write one §N.4.2 Back-Channel Message — the exact inverse of
+/// [`parse_bcm`] (BSTUF excluded; the caller appends any
+/// external-frame zero-stuffing).
+///
+/// # Errors
+///
+/// [`Error::BadBackChannelMessage`] — field/value mismatches: an
+/// out-of-range ELNUM / BSBI / TR / RTR / GN-MBA for the context's
+/// widths, or an RTR present on an ACK (RTR is a NACK-only field).
+pub fn write_bcm(w: &mut BitWriter, ctx: BcmContext, msg: &BackChannelMessage) -> Result<()> {
+    if msg.tr > 0x3FF {
+        return Err(Error::BadBackChannelMessage);
+    }
+    if msg.elnum.is_some_and(|e| e > 0xF) || msg.bsbi.is_some_and(|b| b > 0b11) {
+        return Err(Error::BadBackChannelMessage);
+    }
+    if ctx.gn_mba_bits < 32 && msg.gn_mba >= (1u32 << ctx.gn_mba_bits) {
+        return Err(Error::BadBackChannelMessage);
+    }
+    match msg.message_type {
+        BcmType::Nack => {
+            let rtr = msg.rtr.ok_or(Error::BadBackChannelMessage)?;
+            if rtr > 0x3FF {
+                return Err(Error::BadBackChannelMessage);
+            }
+        }
+        BcmType::Ack => {
+            if msg.rtr.is_some() {
+                return Err(Error::BadBackChannelMessage);
+            }
+        }
+    }
+
+    // §N.4.2.1 — BT.
+    w.write_bits(
+        match msg.message_type {
+            BcmType::Nack => 0b10,
+            BcmType::Ack => 0b11,
+        },
+        2,
+    );
+    // §N.4.2.2 — URF.
+    w.write_bit(msg.unreliable);
+    // §N.4.2.3 — TR.
+    w.write_bits(msg.tr as u32, 10);
+    // §N.4.2.4 / §N.4.2.5 — ELNUMI + ELNUM.
+    match msg.elnum {
+        Some(layer) => {
+            w.write_bit(true);
+            w.write_bits(layer as u32, 4);
+        }
+        None => w.write_bit(false),
+    }
+    // §N.4.2.6 / §N.4.2.7 — BCPM + BSBI.
+    match msg.bsbi {
+        Some(sub) => {
+            w.write_bit(true);
+            w.write_bits(sub as u32, 2);
+        }
+        None => w.write_bit(false),
+    }
+    // §N.4.2.8 — BEPB1.
+    if ctx.videomux {
+        w.write_bit(true);
+    }
+    // §N.4.2.9 — GN / MBA.
+    w.write_bits(msg.gn_mba, ctx.gn_mba_bits);
+    // §N.4.2.10 — BEPB2.
+    if ctx.videomux {
+        w.write_bit(true);
+    }
+    // §N.4.2.11 — RTR.
+    if let Some(rtr) = msg.rtr {
+        w.write_bits(rtr as u32, 10);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +729,132 @@ mod tests {
         let store = RpsReferenceStore::new();
         assert!(store.select_reference(Some(false), None).is_none());
         assert!(store.most_recent().is_none());
+    }
+    fn bcm_ctx(videomux: bool, bits: u32) -> BcmContext {
+        BcmContext {
+            videomux,
+            gn_mba_bits: bits,
+        }
+    }
+
+    /// Every field-presence combination of the §N.4.2 BCM round-trips
+    /// bit-exactly through `write_bcm` / `parse_bcm`.
+    #[test]
+    fn bcm_round_trips_field_matrix() {
+        let messages = [
+            BackChannelMessage {
+                message_type: BcmType::Ack,
+                unreliable: false,
+                tr: 5,
+                elnum: None,
+                bsbi: None,
+                gn_mba: 3,
+                rtr: None,
+            },
+            BackChannelMessage {
+                message_type: BcmType::Nack,
+                unreliable: true,
+                tr: 0x3FF,
+                elnum: Some(0xF),
+                bsbi: Some(0b11),
+                gn_mba: 17,
+                rtr: Some(0x2AB),
+            },
+            BackChannelMessage {
+                message_type: BcmType::Nack,
+                unreliable: false,
+                tr: 0,
+                elnum: None,
+                bsbi: Some(1),
+                gn_mba: 0,
+                rtr: Some(0),
+            },
+        ];
+        for videomux in [false, true] {
+            for bits in [5u32, 7, 9] {
+                let ctx = bcm_ctx(videomux, bits);
+                for msg in &messages {
+                    let mut w = BitWriter::new();
+                    write_bcm(&mut w, ctx, msg).expect("write");
+                    w.write_bits(0b1010, 4); // sentinel
+                    let bytes = w.finish();
+                    let mut r = BitReader::new(&bytes);
+                    let got = parse_bcm(&mut r, ctx).expect("parse");
+                    assert_eq!(&got, msg, "videomux={videomux} bits={bits}");
+                    assert_eq!(r.read_u32(4).unwrap(), 0b1010, "position");
+                }
+            }
+        }
+    }
+
+    /// Reserved BT code points and zero emulation-prevention bits are
+    /// refused; an ACK with an RTR (or a NACK without one) is refused
+    /// on the write side.
+    #[test]
+    fn bcm_rejects_malformed_shapes() {
+        // BT = "00" (reserved).
+        let mut w = BitWriter::new();
+        w.write_bits(0b00, 2);
+        w.write_bits(0, 20);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_bcm(&mut r, bcm_ctx(false, 5)).unwrap_err(),
+            Error::BadBackChannelMessage
+        );
+
+        // Videomux BEPB1 = 0: BT=11 URF=0 TR(10)=0 ELNUMI=0 BCPM=0
+        // then BEPB1=0.
+        let mut w = BitWriter::new();
+        w.write_bits(0b11, 2);
+        w.write_bit(false);
+        w.write_bits(0, 10);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(false); // BEPB1 = 0
+        w.write_bits(0, 8);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_bcm(&mut r, bcm_ctx(true, 5)).unwrap_err(),
+            Error::BadBackChannelMessage
+        );
+
+        // ACK carrying an RTR.
+        let mut w = BitWriter::new();
+        let bad_ack = BackChannelMessage {
+            message_type: BcmType::Ack,
+            unreliable: false,
+            tr: 1,
+            elnum: None,
+            bsbi: None,
+            gn_mba: 1,
+            rtr: Some(2),
+        };
+        assert_eq!(
+            write_bcm(&mut w, bcm_ctx(false, 5), &bad_ack).unwrap_err(),
+            Error::BadBackChannelMessage
+        );
+        // NACK without an RTR.
+        let bad_nack = BackChannelMessage {
+            message_type: BcmType::Nack,
+            rtr: None,
+            ..bad_ack
+        };
+        assert_eq!(
+            write_bcm(&mut w, bcm_ctx(false, 5), &bad_nack).unwrap_err(),
+            Error::BadBackChannelMessage
+        );
+        // GN out of range for a 5-bit field.
+        let bad_gn = BackChannelMessage {
+            message_type: BcmType::Ack,
+            gn_mba: 32,
+            rtr: None,
+            ..bad_ack
+        };
+        assert_eq!(
+            write_bcm(&mut w, bcm_ctx(false, 5), &bad_gn).unwrap_err(),
+            Error::BadBackChannelMessage
+        );
     }
 }

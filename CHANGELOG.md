@@ -8,6 +8,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§N.4.2 Back-Channel Message syntax** (round 443):
+  `annex_n::parse_bcm` / `write_bcm` stage the Figure-N.4 BCM record
+  a decoder returns to the encoder — BT (ACK `"11"` / NACK `"10"`,
+  reserved code points refused), URF, the 10-bit TR, ELNUMI + ELNUM,
+  BCPM + BSBI, the videomux-only BEPB1/BEPB2 emulation-prevention
+  bits, the GN/MBA field at a caller-supplied width, and the
+  NACK-only 10-bit RTR — under a `BcmContext` carrying the
+  externally-negotiated framing (videomux + GN/MBA width, properties
+  of the bitstream the message applies to per the §N.4.2.9 NOTE).
+  Field-matrix round-trips and malformed-shape refusals (reserved BT,
+  zero BEPB, ACK-with-RTR / NACK-without-RTR, out-of-range GN) are
+  pinned; the §N.4.2.12 BSTUF external-frame stuffing stays
+  caller-side.
+
 - **Annex Q Reduced-Resolution Update end-to-end, both directions**
   (round 443): the extended-PTYPE routing detects the §5.1.4.3
   MPPTYPE RRU bit and decodes through the new dedicated driver —

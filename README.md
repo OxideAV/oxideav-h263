@@ -349,9 +349,14 @@ planar 4:2:0 `YuvFrame`:
   reference, while the first reduced-header slice keeps the picture-layer
   reference (parallel to GOB 0). A per-segment TRP not in the store
   surfaces the §N.5 forced-INTRA-update case as
-  `Error::NotImplemented`. The §N.4.2 back-channel BCM is out of scope
-  (decoder → encoder; no forward-channel pixel effect; a present
-  GOB-layer BCI of `"1"` is refused with `Error::BadBackChannelMessage`).
+  `Error::NotImplemented`. The §N.4.2 **Back-Channel Message syntax**
+  is staged (round 443): `annex_n::parse_bcm` / `write_bcm` frame the
+  Figure-N.4 ACK / NACK record (BT / URF / TR / ELNUMI-ELNUM /
+  BCPM-BSBI / videomux BEPBs / GN-MBA / NACK-only RTR) under a
+  caller-supplied `BcmContext` (videomux + GN/MBA width — per the
+  §N.4.2.9 NOTE these are properties of the bitstream the message
+  applies to, so an in-picture-header BCM stays refused at the
+  `plus_ptype` layer where that knowledge is absent).
 * **Annex P §P.2 / §P.3** — Reference Picture Resampling: the §P.3 /
   §P.4.2 integer bilinear warp engine (`resample_yuv`) resamples the
   reference picture before motion compensation, driven from the §P.3
@@ -499,12 +504,13 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   drivers (`decode_picture` / PB / Annex-K-slice) — those stay
   caller-side. The `decode_sequence` driver handles both baseline-PTYPE
   and extended-PTYPE (PLUSPTYPE / H.263+) INTRA / INTER picture streams.
-* Annex N (Reference Picture Selection) **back-channel**: the
-  §5.1.17 / §N.4.2 Back-Channel Message (videomux BCM ACK/NACK) is not
-  staged — it flows decoder → encoder on a separate logical channel and
-  does not affect forward-channel pixels (a present BCM is refused). The
-  §N.4.1 per-segment TRP re-selection now decodes to pixels on both the
-  GOB-layer and the Annex K slice-layer paths (see the supported list).
+* Annex N back-channel **transport**: the §N.4.2 BCM record itself
+  parses and writes (see the supported list), but the §5.1.17
+  in-picture-header (videomux) placement stays refused — the BCM's
+  GN/MBA width belongs to the *other* bitstream the message applies
+  to (§N.4.2.9 NOTE), which the picture-header parser cannot know.
+  The §N.4.1 per-segment TRP re-selection decodes to pixels on both
+  the GOB-layer and the Annex K slice-layer paths.
 * Slice-boundary / Independent-Segment-Decoding deblock skip rules.
 * Annex G PB-frames and Annex M Improved PB-frames now both decode
   end-to-end through `decode_sequence` (see the supported list). Still
