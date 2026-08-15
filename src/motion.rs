@@ -528,13 +528,9 @@ pub struct Mb4MvNeighbourhood {
     /// picture / GOB border or INTRA / not coded.
     pub above: Option<Mb4Mv>,
     /// The macroblock **above-right** of the current one. `None` if at
-    /// the picture border, or INTRA / not coded.
+    /// the picture border, or INTRA / not coded. Supplies the MV3
+    /// candidate of blocks B1 and B2 (Figure F.1 upper sub-figures).
     pub above_right: Option<Mb4Mv>,
-    /// The macroblock to the **right** of the current one. `None` if
-    /// at the right picture border or INTRA / not coded. Used only for
-    /// the block-4 case (Figure F.1 lower-right sub-figure), where the
-    /// "above-right" of block 4 reads block 1 of the right neighbour.
-    pub right: Option<Mb4Mv>,
 }
 
 impl Mb4MvNeighbourhood {
@@ -547,7 +543,6 @@ impl Mb4MvNeighbourhood {
             left: None,
             above: None,
             above_right: None,
-            right: None,
         }
     }
 }
@@ -562,10 +557,10 @@ impl Mb4MvNeighbourhood {
 ///
 /// | block | MV1 = left of block        | MV2 = above block            | MV3 = above-right of block         |
 /// |-------|----------------------------|------------------------------|------------------------------------|
-/// | B1    | `left.B2` else 0           | `above.B3` else 0            | `above.B4` else 0                  |
+/// | B1    | `left.B2` else 0           | `above.B3` else 0            | `above_right.B3` else 0            |
 /// | B2    | `current.B1`               | `above.B4` else 0            | `above_right.B3` else 0            |
 /// | B3    | `left.B4` else 0           | `current.B1`                 | `current.B2`                       |
-/// | B4    | `current.B3`               | `current.B2`                 | `right.B1` else 0                  |
+/// | B4    | `current.B3`               | `current.B1`                 | `current.B2`                       |
 ///
 /// The "else 0" entries are the §6.1.1 default — when the requested
 /// neighbour is not available the candidate is zero. The §6.1.1 rule-3
@@ -585,8 +580,9 @@ pub fn select_4mv_candidates(
     let zero = MotionVector::default();
     match block {
         // B1 (top-left): left of B1 is B2 of MB-left; above is B3 of
-        // MB-above; above-right is B4 of MB-above (the upper-right
-        // 8×8 of the row of blocks above current).
+        // MB-above; MV3 is B3 of MB-above-right (Figure F.1 upper-left
+        // sub-figure — the candidate cell sits past the macroblock's
+        // right edge, one empty cell after MV2).
         LumaBlockIndex::B1 => {
             let mv1 = n
                 .left
@@ -597,8 +593,8 @@ pub fn select_4mv_candidates(
                 .map(|m| m[LumaBlockIndex::B3.index()])
                 .unwrap_or(zero);
             let mv3 = n
-                .above
-                .map(|m| m[LumaBlockIndex::B4.index()])
+                .above_right
+                .map(|m| m[LumaBlockIndex::B3.index()])
                 .unwrap_or(zero);
             (mv1, mv2, mv3)
         }
@@ -627,15 +623,14 @@ pub fn select_4mv_candidates(
             let mv3 = n.current[LumaBlockIndex::B2.index()];
             (mv1, mv2, mv3)
         }
-        // B4 (bottom-right): left of B4 is B3 of current; above is B2
-        // of current; above-right is B1 of MB-right.
+        // B4 (bottom-right): every candidate is inside the current
+        // macroblock (Figure F.1 lower-right sub-figure): MV1 = B3
+        // (left of B4), MV2 = B1 (above-left), MV3 = B2 (directly
+        // above).
         LumaBlockIndex::B4 => {
             let mv1 = n.current[LumaBlockIndex::B3.index()];
-            let mv2 = n.current[LumaBlockIndex::B2.index()];
-            let mv3 = n
-                .right
-                .map(|m| m[LumaBlockIndex::B1.index()])
-                .unwrap_or(zero);
+            let mv2 = n.current[LumaBlockIndex::B1.index()];
+            let mv3 = n.current[LumaBlockIndex::B2.index()];
             (mv1, mv2, mv3)
         }
     }
@@ -1400,7 +1395,6 @@ mod tests {
             left: Some(distinctive_mb(2)),
             above: None,
             above_right: None,
-            right: None,
         };
         let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B1, &n);
         // B2 of MB-left has tag*10+2 = 22.
@@ -1418,13 +1412,13 @@ mod tests {
             left: None,
             above: Some(distinctive_mb(3)),
             above_right: None,
-            right: None,
         };
         let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B1, &n);
         assert_eq!(mv1, MotionVector::default());
-        // B3 of MB-above (tag 3) = 33; B4 of MB-above = 34.
+        // B3 of MB-above (tag 3) = 33; MV3 reads MB-above-right,
+        // absent here (Figure F.1 upper-left sub-figure).
         assert_eq!(mv2, MotionVector::new(33, 33));
-        assert_eq!(mv3, MotionVector::new(34, 34));
+        assert_eq!(mv3, MotionVector::default());
     }
 
     /// B2 with every neighbour present: MV1 = B1 of current, MV2 = B4
@@ -1436,7 +1430,6 @@ mod tests {
             left: Some(distinctive_mb(2)),
             above: Some(distinctive_mb(3)),
             above_right: Some(distinctive_mb(4)),
-            right: Some(distinctive_mb(5)),
         };
         let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B2, &n);
         // B1 of current = 11; B4 of MB-above = 34; B3 of above-right = 43.
@@ -1454,7 +1447,6 @@ mod tests {
             left: Some(distinctive_mb(2)),
             above: Some(distinctive_mb(3)),
             above_right: Some(distinctive_mb(4)),
-            right: Some(distinctive_mb(5)),
         };
         let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B3, &n);
         // B4 of MB-left = 24; B1 of current = 11; B2 of current = 12.
@@ -1473,16 +1465,18 @@ mod tests {
             left: Some(distinctive_mb(2)),
             above: Some(distinctive_mb(3)),
             above_right: Some(distinctive_mb(4)),
-            right: None,
         };
         let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B4, &n);
-        // B3 of current = 13; B2 of current = 12; MV3 = zero.
+        // Figure F.1 lower-right sub-figure: B3 of current = 13,
+        // B1 of current = 11 (MV2, above-left), B2 of current = 12
+        // (MV3, directly above) — no cell outside the macroblock.
         assert_eq!(mv1, MotionVector::new(13, 13));
-        assert_eq!(mv2, MotionVector::new(12, 12));
-        assert_eq!(mv3, MotionVector::default());
+        assert_eq!(mv2, MotionVector::new(11, 11));
+        assert_eq!(mv3, MotionVector::new(12, 12));
     }
 
-    /// B4 with MB-right present: MV3 = B1 of MB-right.
+    /// B4 with no external neighbours at all: identical — every B4
+    /// candidate is inside the current macroblock.
     #[test]
     fn select_4mv_b4_right_present() {
         let n = Mb4MvNeighbourhood {
@@ -1490,13 +1484,11 @@ mod tests {
             left: None,
             above: None,
             above_right: None,
-            right: Some(distinctive_mb(5)),
         };
         let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B4, &n);
-        // B3 of current = 13; B2 of current = 12; B1 of MB-right = 51.
         assert_eq!(mv1, MotionVector::new(13, 13));
-        assert_eq!(mv2, MotionVector::new(12, 12));
-        assert_eq!(mv3, MotionVector::new(51, 51));
+        assert_eq!(mv2, MotionVector::new(11, 11));
+        assert_eq!(mv3, MotionVector::new(12, 12));
     }
 
     /// §F.2 last paragraph: "if only one motion vector per macroblock
@@ -1511,20 +1503,19 @@ mod tests {
         let single_left = MotionVector::new(-2, 4);
         let single_above = MotionVector::new(7, 7);
         let single_above_right = MotionVector::new(-9, 0);
-        let single_right = MotionVector::new(1, 1);
         let n = Mb4MvNeighbourhood {
             current: [single_current; 4],
             left: Some([single_left; 4]),
             above: Some([single_above; 4]),
             above_right: Some([single_above_right; 4]),
-            right: Some([single_right; 4]),
         };
-        // B1: MV1 should equal the single MV of MB-left, MV2/MV3 the
-        // single MV of MB-above (Figure-12 single-MV layout).
+        // B1: MV1 should equal the single MV of MB-left, MV2 the
+        // single MV of MB-above and MV3 the single MV of
+        // MB-above-right (the Figure-12 single-MV layout).
         let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B1, &n);
         assert_eq!(mv1, single_left);
         assert_eq!(mv2, single_above);
-        assert_eq!(mv3, single_above);
+        assert_eq!(mv3, single_above_right);
         // B2: MV1 = single of current, MV2 = single of above, MV3 =
         // single of above-right (= Figure-12 for the MB's single MV).
         let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B2, &n);
@@ -1537,11 +1528,11 @@ mod tests {
         assert_eq!(mv1, single_left);
         assert_eq!(mv2, single_current);
         assert_eq!(mv3, single_current);
-        // B4: same — MV3 picks up MB-right's single vector.
+        // B4: every candidate is inside the current MB.
         let (mv1, mv2, mv3) = select_4mv_candidates(LumaBlockIndex::B4, &n);
         assert_eq!(mv1, single_current);
         assert_eq!(mv2, single_current);
-        assert_eq!(mv3, single_right);
+        assert_eq!(mv3, single_current);
     }
 
     /// End-to-end: the §F.2 median predictor is just
@@ -1556,7 +1547,6 @@ mod tests {
             left: Some([v; 4]),
             above: Some([v; 4]),
             above_right: Some([v; 4]),
-            right: Some([v; 4]),
         };
         for blk in LumaBlockIndex::ALL {
             let (mv1, mv2, mv3) = select_4mv_candidates(blk, &n);

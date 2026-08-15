@@ -755,14 +755,16 @@ pub fn write_first_slice_header(
 /// SEPB1 (`"1"`), the Table-K.2-width MBA, SEPB2 (`"1"`, iff
 /// [`SliceHeaderContext::sepb2_present`]), the 5-bit SQUANT, SWI (iff
 /// the Rectangular Slice submode is in use), SEPB3 (`"1"`) and the
-/// 2-bit GFID. SSBI is not emitted (CPM = "1" contexts are rejected —
-/// the crate's decoder refuses CPM streams).
+/// 2-bit GFID. SSBI is not emitted — a CPM = "1" context is rejected
+/// here; use [`write_slice_layer_cpm`], which places the §K.2.4 SSBI
+/// codeword between SEPB1 and MBA.
 ///
 /// # Errors
 ///
 /// The union of [`write_first_slice_header`]'s, plus
 /// [`Error::InvalidQuantiser`] for `squant` outside `1..=31` and
-/// [`Error::NotImplemented`] for a CPM context (SSBI unstaged).
+/// [`Error::NotImplemented`] for a CPM context (routed to
+/// [`write_slice_layer_cpm`]).
 pub fn write_slice_layer(
     w: &mut BitWriter,
     ctx: &SliceHeaderContext,
@@ -801,6 +803,75 @@ pub fn write_slice_layer(
     // §5.2.5 — GFID.
     w.write_bits(gfid as u32 & 0b11, GFID_BITS);
     Ok(())
+}
+
+/// Write a non-first §K.2 slice-layer header for a **CPM = "1"**
+/// picture — the [`write_slice_layer`] form with the §K.2.4 SSBI field
+/// between SEPB1 and MBA. `sub_bitstream` is the Continuous Presence
+/// Multipoint Sub-Bitstream number (`0..=3`), emitted as its Table K.1
+/// codeword.
+///
+/// # Errors
+///
+/// The union of [`write_slice_layer`]'s (except that a CPM context is
+/// required here — [`Error::NotImplemented`] when [`SliceHeaderContext::cpm`]
+/// is clear), plus [`Error::BadSliceSsbiCode`] for a `sub_bitstream`
+/// outside `0..=3`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_slice_layer_cpm(
+    w: &mut BitWriter,
+    ctx: &SliceHeaderContext,
+    sub_bitstream: u8,
+    mba: u32,
+    squant: u8,
+    gfid: u8,
+    swi_actual_width: Option<u32>,
+) -> Result<()> {
+    if !ctx.cpm {
+        return Err(Error::NotImplemented);
+    }
+    let ssbi = subbitstream_to_ssbi(sub_bitstream).ok_or(Error::BadSliceSsbiCode)?;
+    if squant == 0 || squant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let (mba_width, swi) = check_writer_fields(ctx, mba, swi_actual_width)?;
+    // §K.2.1 — SSTUF.
+    w.align_to_byte_zero();
+    // §K.2.2 — SSC.
+    w.write_bits(SSC_VALUE, SSC_BITS);
+    // §K.2.3 — SEPB1.
+    w.write_bit(true);
+    // §K.2.4 — SSBI (Table K.1 codeword).
+    w.write_bits(ssbi as u32, SSBI_BITS);
+    // §K.2.5 — MBA.
+    w.write_bits(mba, mba_width);
+    // §K.2.6 — SEPB2, conditionally present (CPM branch of the rule).
+    if ctx.sepb2_present() {
+        w.write_bit(true);
+    }
+    // §K.2.7 — SQUANT.
+    w.write_bits(squant as u32, SQUANT_BITS);
+    // §K.2.8 — SWI.
+    if let Some((swi_width, raw)) = swi {
+        w.write_bits(raw, swi_width);
+    }
+    // §K.2.9 — SEPB3.
+    w.write_bit(true);
+    // §5.2.5 — GFID.
+    w.write_bits(gfid as u32 & 0b11, GFID_BITS);
+    Ok(())
+}
+
+/// Mapping from a Sub-Bitstream number (`0..=3`) to its Table K.1 SSBI
+/// codeword — the inverse of [`ssbi_to_subbitstream`].
+pub fn subbitstream_to_ssbi(sub_bitstream: u8) -> Option<u8> {
+    match sub_bitstream {
+        0 => Some(0b1001),
+        1 => Some(0b1010),
+        2 => Some(0b1011),
+        3 => Some(0b1101),
+        _ => None,
+    }
 }
 
 /// `true` iff `raw` is one of the four Table K.1 legal SSBI codewords.

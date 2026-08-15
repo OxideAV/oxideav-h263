@@ -202,7 +202,7 @@ fn slice_structured_mode_within_idct_tolerance() {
 fn advanced_intra_coding_within_idct_tolerance() {
     // H.263+ Annex I (Advanced Intra Coding) keyframe with Annex T
     // Modified Quantization implicitly enabled and Annex K slice-structured
-    // layout (FFmpeg's H.263+ encoder pairs these). Exercises the AIC
+    // layout (the reference encoder pairs these). Exercises the AIC
     // DC/AC prediction + AIC dc-scale table + §T.3 QUANT_C dequant threaded
     // through the slice driver. Single QCIF keyframe.
     let (input, expected) = fixture!("advanced-intra-coding");
@@ -231,6 +231,100 @@ fn alt_inter_vlc_within_idct_tolerance() {
     let got = decode_all(input);
     assert_within_idct_tolerance("alt-inter-vlc", &got, expected);
     assert_eq!(got.len(), 3 * (176 * 144 + 2 * (88 * 72)));
+}
+
+#[test]
+fn advanced_prediction_mode_within_idct_tolerance() {
+    // Baseline-PTYPE Annex F (Advanced Prediction: 4MV + §F.3 OBMC)
+    // QCIF I+P+P. Exercises the §F.2 / Figure-F.1 per-block candidate
+    // predictors (including the single-MV "defined as for block 1"
+    // redefinition next to INTER4V neighbours), the deferred-OBMC
+    // right-remote reconstruction, and the §5.3.1-NOTE OBMC of
+    // COD = 1 macroblocks.
+    //
+    // The reference encoder makes its COD decision under a one-pass
+    // model in which a skipped macroblock's right-half remotes are
+    // zero; the [`DecodeOptions::obmc_skip_zero_right`]
+    // ecosystem-compatibility flag reproduces that (§F.3 itself makes
+    // no COD distinction — the spec-default decode differs only in
+    // those skipped-macroblock right halves).
+    let (input, expected) = fixture!("advanced-prediction-mode");
+    let options = DecodeOptions {
+        obmc_skip_zero_right: true,
+        ..DecodeOptions::default()
+    };
+    let frames = decode_sequence(input, options).expect("decode_sequence advanced-prediction");
+    assert_eq!(frames.len(), 3, "advanced-prediction-mode is I + P + P");
+    let mut got = Vec::new();
+    for f in &frames {
+        got.extend_from_slice(&frame_bytes(f));
+    }
+    assert_within_idct_tolerance("advanced-prediction-mode", &got, expected);
+    assert_eq!(got.len(), 3 * (176 * 144 + 2 * (88 * 72)));
+
+    // The spec-default decode (actual right remotes for skipped
+    // macroblocks) reconstructs everything else identically: bound the
+    // divergence to a handful of skipped-macroblock half-blocks.
+    let spec_frames =
+        decode_sequence(input, DecodeOptions::default()).expect("decode_sequence spec-default");
+    let mut spec = Vec::new();
+    for f in &spec_frames {
+        spec.extend_from_slice(&frame_bytes(f));
+    }
+    let over: usize = spec
+        .iter()
+        .zip(expected.iter())
+        .filter(|(a, b)| (**a as i32 - **b as i32).abs() > 1)
+        .count();
+    assert!(
+        over < 100,
+        "spec-default vs reference divergence {over} samples (expected only the \
+         skipped-macroblock right-half remotes)"
+    );
+}
+
+#[test]
+fn deblocking_filter_mode_within_tolerance() {
+    // H.263+ Annex J (Deblocking Filter mode) QCIF I+P+P: the OPPTYPE
+    // bit auto-enables the §J.3 in-loop filter (no caller-side option),
+    // exercising the filter arithmetic, the Table J.2 STRENGTH lookup,
+    // the §J.3 coded-macroblock edge condition and the
+    // horizontal-before-vertical ordering across a real stream.
+    //
+    // Tolerance note: the Annex A.7 ±1 IDCT bound applies to the
+    // reconstruction *before* the in-loop filter. The §J.3 filter's
+    // `d = (A − 4B + 4C − D) / 8` can turn a legal ±1 pre-filter
+    // difference into a ±1 change of `d1`, so two conforming decoders
+    // may differ by up to ~±3 on isolated filtered samples — and the
+    // filtered picture is the next frame's prediction source. Assert a
+    // small bounded divergence instead of the plain ±1.
+    let (input, expected) = fixture!("deblocking-filter");
+    let frames =
+        decode_sequence(input, DecodeOptions::default()).expect("decode_sequence deblocking");
+    assert_eq!(frames.len(), 3, "deblocking-filter is I + P + P");
+    let mut got = Vec::new();
+    for f in &frames {
+        got.extend_from_slice(&frame_bytes(f));
+    }
+    assert_eq!(got.len(), 3 * (176 * 144 + 2 * (88 * 72)));
+    assert_eq!(got.len(), expected.len());
+    let mut max_err = 0i32;
+    let mut over_one = 0usize;
+    for (g, e) in got.iter().zip(expected.iter()) {
+        let d = (*g as i32 - *e as i32).abs();
+        max_err = max_err.max(d);
+        if d > 1 {
+            over_one += 1;
+        }
+    }
+    assert!(
+        max_err <= 3,
+        "deblocking-filter max per-sample error {max_err}"
+    );
+    assert!(
+        over_one <= 100,
+        "deblocking-filter samples beyond the IDCT ±1 bound: {over_one}"
+    );
 }
 
 // --- minimal SHA-256 (FIPS 180-4), test-only, no external crate ---
@@ -366,6 +460,14 @@ fn vendored_fixture_expected_yuv_sha256() {
             "alt-inter-vlc",
             "7989d00f44949eb5e5dfd19774f569b7a1c32ad931a4efc1127a6a74208c76c0",
         ),
+        (
+            "advanced-prediction-mode",
+            "2be573789863f4b7eec47fa5551c33922d2e72966c68b725db1d0df4f80631d3",
+        ),
+        (
+            "deblocking-filter",
+            "59ee29e472c6849e9d4b86f70f5c3d12939a1fe177ba19a0fc6283b4b8d531ad",
+        ),
     ] {
         let expected: &[u8] = match name {
             "qp-high" => fixture!("qp-high").1,
@@ -374,6 +476,8 @@ fn vendored_fixture_expected_yuv_sha256() {
             "slice-structured-mode" => fixture!("slice-structured-mode").1,
             "advanced-intra-coding" => fixture!("advanced-intra-coding").1,
             "alt-inter-vlc" => fixture!("alt-inter-vlc").1,
+            "advanced-prediction-mode" => fixture!("advanced-prediction-mode").1,
+            "deblocking-filter" => fixture!("deblocking-filter").1,
             _ => unreachable!(),
         };
         assert_eq!(

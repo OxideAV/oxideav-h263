@@ -186,6 +186,12 @@ impl MvGrid {
 pub struct Mv4Grid {
     entries: Vec<Mb4Mv>,
     cols: usize,
+    /// `Some(rows)` when the picture is emitted as row-aligned
+    /// segments `rows` macroblock rows tall (Annex K slices): every
+    /// row divisible by `rows` opens a fresh §6.1.1 video picture
+    /// segment, so the rule-3 "outside the slice at the top" border
+    /// applies there in addition to the picture's top row.
+    segment_rows: Option<usize>,
 }
 
 impl Mv4Grid {
@@ -194,6 +200,21 @@ impl Mv4Grid {
         Mv4Grid {
             entries: vec![[MotionVector::new(0, 0); 4]; mb_cols * mb_rows],
             cols: mb_cols,
+            segment_rows: None,
+        }
+    }
+
+    /// A grid for a picture emitted as **row-aligned segments** every
+    /// `rows_per_segment` macroblock rows (the Annex K free-running
+    /// uniform-slice framing): the §6.1.1 rule-3 top border — and the
+    /// §K.1 rule-1 out-of-slice unavailability it implies for the
+    /// §F.2 candidates — applies at the top row of every segment,
+    /// replaying the decoder's per-segment grid checks.
+    pub fn with_row_segments(mb_cols: usize, mb_rows: usize, rows_per_segment: usize) -> Self {
+        Mv4Grid {
+            entries: vec![[MotionVector::new(0, 0); 4]; mb_cols * mb_rows],
+            cols: mb_cols,
+            segment_rows: Some(rows_per_segment.max(1)),
         }
     }
 
@@ -228,18 +249,20 @@ impl Mv4Grid {
             left: (col > 0).then(|| self.get(col - 1, row)),
             above: (row > 0).then(|| self.get(col, row - 1)),
             above_right: (row > 0 && col + 1 < self.cols).then(|| self.get(col + 1, row - 1)),
-            // MB-right is later in raster order — never a candidate.
-            right: None,
         };
         let (mv1, mut mv2, mut mv3) = select_4mv_candidates(blk, &n);
-        // §6.1.1 rule 3 at the picture top row (single segment: no
-        // GOB-header borders).
-        if matches!(blk, LumaBlockIndex::B1 | LumaBlockIndex::B2) && row == 0 {
+        // §6.1.1 rule 3 at the picture top row, and — under row-aligned
+        // segment framing — at every segment's top row (the above /
+        // above-right macroblocks belong to the previous slice).
+        let segment_top = row == 0 || self.segment_rows.is_some_and(|r| row % r == 0);
+        if matches!(blk, LumaBlockIndex::B1 | LumaBlockIndex::B2) && segment_top {
             mv2 = mv1;
             mv3 = mv1;
         }
-        // §6.1.1 rule 4 at the right picture edge.
-        if col + 1 >= self.cols && matches!(blk, LumaBlockIndex::B2 | LumaBlockIndex::B4) {
+        // §6.1.1 rule 4 at the right picture edge — the MV3 candidate
+        // of B1 / B2 comes from the above-right macroblock (Figure
+        // F.1), off-picture for the right-edge column.
+        if col + 1 >= self.cols && matches!(blk, LumaBlockIndex::B1 | LumaBlockIndex::B2) {
             mv3 = MotionVector::new(0, 0);
         }
         predict_mv_median(mv1, mv2, mv3)

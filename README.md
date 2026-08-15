@@ -59,7 +59,12 @@ under ASO — accepts slices in any bitstream order (coverage-driven
 completion, per-segment predictor rules already order-independent);
 `encode_intra_picture_slices_rect` / `encode_inter_picture_slices_rect`
 emit full-height vertical stripes (SWI on the wire, optional
-right-to-left ASO emission).
+right-to-left ASO emission). Round 443 adds
+`encode_inter_picture_ap_slices` (Annex K + Annex F: free-running
+slices whose macroblocks carry four §F.2 vectors predicted through
+the slice-confined §F.3 OBMC blend) and
+`encode_intra_picture_slices_cpm` (Annex K + CPM: §5.1.21 PSBI +
+per-slice §K.2.4 SSBI for one Sub-Bitstream).
 
 **Annex E Syntax-based Arithmetic Coding** is implemented in both
 directions (round 438): the `sac` module stages the §E.2/§E.3
@@ -210,18 +215,25 @@ planar 4:2:0 `YuvFrame`:
   mid-picture GOB headers stay refused. Reconstruction is
   byte-identical to the VLC path at equal quantised coefficients.
 * **Annex F §F.2 / §F.3** — Advanced Prediction: four-motion-vector
-  candidate-predictor redefinition (Figure F.1, threading each
-  just-reconstructed vector back in as an intra-macroblock candidate),
-  Table F.1 sixteenth-pixel chroma derivation, and overlapped block
-  motion compensation (OBMC) over the Figures F.2 / F.3 / F.4 weight
+  candidate-predictor redefinition (Figure F.1 — B1's MV3 reads the
+  above-right macroblock's B3, B4's candidates are entirely
+  intra-macroblock, each just-reconstructed vector threads back in as
+  an intra-macroblock candidate, and a **single-MV** macroblock's
+  predictor uses the block-1 derivation so an INTER4V neighbour
+  contributes the exact 8×8 cell Figure F.1 names), Table F.1
+  sixteenth-pixel chroma derivation, and overlapped block motion
+  compensation (OBMC) over the Figures F.2 / F.3 / F.4 weight
   matrices with the `Zero` / `Current` / `Vector` remote-MV
-  substitution rules. OBMC covers **every** coded INTER macroblock of
-  an AP picture (a one-vector macroblock is "four vectors with the
-  same value"), and the B2/B4 right-half remotes read the **actual**
-  vector of the macroblock to the right — the luminance reconstruction
-  is deferred one macroblock so the later-parsed right neighbour is
-  known. INTER4V / INTER4V+Q macroblocks reconstruct end-to-end when
-  Advanced Prediction is signalled.
+  substitution rules. OBMC covers **every** INTER macroblock of an AP
+  picture — including COD = 1 skipped macroblocks (§5.3.1 NOTE) and
+  one-vector macroblocks ("four vectors with the same value") — and
+  the B2/B4 right-half remotes read the **actual** vector of the
+  macroblock to the right (deferred one macroblock). The vendored
+  `advanced-prediction-mode` conformance fixture decodes within the
+  Annex A.7 tolerance; `DecodeOptions::obmc_skip_zero_right` is an
+  opt-in ecosystem-compatibility deviation (zero right-half remotes
+  for skipped macroblocks) the fixture's producing encoder family
+  requires — the spec-default differs only there.
 * **Annex I §I.2 / §I.3** — Advanced INTRA Coding: the INTRA_MODE VLC
   (Table I.1), the two alternate DCT scans (Figure I.2) and scan
   selection, the separate INTRA-coefficient VLC (Table I.2), the
@@ -229,7 +241,11 @@ planar 4:2:0 `YuvFrame`:
   `oddifyclipDC` clips, and the DC/AC prediction reconstruction.
 * **Annex J §J.3** — in-loop deblocking edge filter (four-tap formula
   + full Table J.2 STRENGTH lookup + horizontal-before-vertical
-  ordering + picture-edge skip), opt-in via `DecodeOptions::deblock`.
+  ordering + picture-edge skip), opt-in via `DecodeOptions::deblock`
+  and auto-enabled from the PLUSPTYPE OPPTYPE bit (the vendored
+  `deblocking-filter` conformance fixture decodes within a small
+  bounded tolerance — the Annex A.7 ±1 IDCT bound applies before the
+  in-loop filter, which can amplify it slightly).
   Deblocking-Filter mode also turns on the §5.3.8 / Table J.1 **four
   motion vectors per macroblock** element *without* the §F.3 OBMC
   element: when `deblock` is set, an INTER4V / INTER4V+Q macroblock
@@ -249,7 +265,15 @@ planar 4:2:0 `YuvFrame`:
   rectangle; overhanging rectangles refused) and **Arbitrary Slice
   Ordering** (slices land by MBA in any bitstream order; the
   strictly-increasing rule applies only with ASO off; completion is
-  the §K.1 exactly-once coverage invariant). The
+  the §K.1 exactly-once coverage invariant). **Advanced Prediction
+  composes** (round 443): §K.1 rule 1 confines the §6.1.1/§F.2
+  candidate predictors and rule 3 the §F.3 OBMC remote vectors to the
+  current slice (an out-of-slice remote substitutes the current
+  vector), with the deferred-OBMC flush segment-filtered per slice.
+  **CPM composes** (round 443): a CPM = "1" picture's §5.1.21 PSBI
+  and per-slice §K.2.4 SSBI (Table K.1) parse, with the
+  single-Sub-Bitstream decode validating every slice's SSBI against
+  PSBI (a true Annex C multiplex is refused). The
   `slice-structured-mode` QCIF I+P+P conformance fixture decodes
   byte-exact within the Annex A.7 tolerance.
 * **Annex S §S.2 / §S.3** — Alternative INTER VLC mode: each INTER
@@ -476,9 +500,12 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   unstaged within those modes: Advanced Prediction / INTER4V B-blocks, UMV
   over-boundary forward vectors (Annex M), AIC, SAC, and the Annex K
   Slice-Structured + Improved-PB combination.
-* Annex K with Advanced Prediction / CPM (the Rectangular Slice and
-  Arbitrary Slice Ordering submodes decode and encode — see the
-  supported list).
+* Annex K + Advanced Prediction under the Rectangular Slice /
+  Arbitrary Slice Ordering submodes on the encode side (the decoder
+  composes them — §K.1 rules 1/3 confine the predictors and OBMC
+  remotes per slice — but the encoders emit only free-running AP
+  slices); CPM on the GOB path (the §5.2.4 GSBI field — the Annex K
+  SSBI path decodes and encodes, see the supported list).
 * Annex E SAC combined with mid-picture GOB headers (the §E.5
   start-code resynchronisation inside a picture), or with Advanced
   Prediction **and** PB-frames simultaneously (each composes with SAC
@@ -549,9 +576,12 @@ against `enumerate_mb_boundaries`, and bit-granular reassembly.
 `tests/fixture_decode.rs` adds end-to-end **conformance** tests against
 real H.263 elementary streams (the reference encoder) vendored under
 `tests/fixtures/`: sub-QCIF / QCIF / CIF I-only, a QCIF I+P+P sequence,
-the QP=2 / QP=31 quantiser-boundary keyframes, and an H.263+ (PLUSPTYPE)
+the QP=2 / QP=31 quantiser-boundary keyframes, an H.263+ (PLUSPTYPE)
 QCIF I+P+P stream (`h263p-modern`) that exercises the `decode_sequence`
-extended-PTYPE dispatch + custom-PCF framing + GOB-0 elision.
+extended-PTYPE dispatch + custom-PCF framing + GOB-0 elision, a
+baseline Annex F stream (`advanced-prediction-mode` — 4MV + OBMC,
+including OBMC of skipped macroblocks) and an H.263+ Annex J stream
+(`deblocking-filter`).
 Because §6.2 leaves the inverse-transform arithmetic undefined
 and Annex A.7 only bounds the per-pixel peak error at 1, AC-bearing
 output is asserted within that ±1 tolerance; the flat sub-QCIF keyframe

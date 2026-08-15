@@ -196,6 +196,10 @@ pub struct PlusModes {
     pub alt_inter_vlc: bool,
     /// OPPTYPE bit 14 — Annex T Modified Quantization mode.
     pub modified_quant: bool,
+    /// §5.1.20 / §5.1.21 — `Some(psbi)` emits CPM = "1" followed by
+    /// the 2-bit Picture Sub-Bitstream Indicator (`0..=3`, Annex C
+    /// Continuous Presence Multipoint). `None` emits CPM = "0".
+    pub cpm_psbi: Option<u8>,
 }
 
 /// Write an extended-PTYPE (PLUSPTYPE, §5.1.4) picture header: PSC, TR,
@@ -288,8 +292,18 @@ pub fn write_plus_picture_header(
     }
     mpptype |= 1; // bit 9 — start-code-emulation guard
     w.write_bits(mpptype, 9);
-    // §5.1.4.7 / §5.1.20 — CPM = 0 (no PSBI follows).
-    w.write_bit(false);
+    // §5.1.4.7 / §5.1.20 — CPM, immediately after PLUSPTYPE; §5.1.21 —
+    // PSBI (2 bits) follows a set CPM bit.
+    match modes.cpm_psbi {
+        Some(psbi) => {
+            if psbi > 3 {
+                return Err(Error::BadSliceSsbiCode);
+            }
+            w.write_bit(true);
+            w.write_bits(psbi as u32, 2);
+        }
+        None => w.write_bit(false),
+    }
     // §5.1.9 — UUI, present iff UMV mode on (UFEP = "001"): "1" =
     // motion-vector range per Tables D.1/D.2 (the crate's §D.2 range).
     if modes.umv {
@@ -462,6 +476,100 @@ where
             }
             let mba = (mb_row * mb_cols) as u32;
             write_slice_layer(&mut w, &ctx, mba, quant, gfid, None)?;
+        }
+        for mb_col in 0..mb_cols {
+            let mb = extract_macroblock(frame, mb_col, mb_row);
+            encode_intra_macroblock(
+                &mut w, &mb, quant, /* write_cod */ false, /* picture_is_inter */ false,
+            )?;
+        }
+    }
+
+    // §5.1.28 — PSTUF.
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+/// Encode an Annex K Slice-Structured H.263+ INTRA picture inside a
+/// **Continuous Presence Multipoint Sub-Bitstream** (CPM = "1",
+/// §5.1.20 / Annex C): the picture header carries the §5.1.21 PSBI
+/// for `sub_bitstream` (`0..=3`) and every non-first slice header
+/// carries the matching §K.2.4 SSBI Table-K.1 codeword. The slice
+/// layout matches [`encode_intra_picture_slices`] (free-running,
+/// row-aligned, per-slice SQUANT via `slice_quant`).
+///
+/// Self-describing: decodes through
+/// [`crate::picture::decode_picture_layer`] / `decode_sequence` with
+/// `DecodeOptions::default()` (the decoder stages the
+/// single-Sub-Bitstream CPM case — every SSBI must match PSBI, which
+/// this encoder guarantees).
+pub fn encode_intra_picture_slices_cpm<F>(
+    frame: &YuvFrame,
+    tr: u8,
+    mb_rows_per_slice: usize,
+    sub_bitstream: u8,
+    mut slice_quant: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(usize) -> u8,
+{
+    use crate::plus_ptype::SliceStructuredSubmode;
+    use crate::slice_header::{
+        write_first_slice_header, write_slice_layer_cpm, SliceHeaderContext,
+    };
+
+    if sub_bitstream > 3 {
+        return Err(Error::BadSliceSsbiCode);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let layout =
+        crate::picture::PictureLayout::for_source_format(fmt).ok_or(Error::NotImplemented)?;
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+    if mb_rows_per_slice == 0 || mb_rows_per_slice > mb_rows {
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+
+    let pquant = slice_quant(0);
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+
+    let sss = SliceStructuredSubmode {
+        rectangular: false,
+        arbitrary_order: false,
+    };
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        fmt,
+        pquant,
+        tr,
+        /* is_inter */ false,
+        PlusModes {
+            slice_structured: Some(sss),
+            cpm_psbi: Some(sub_bitstream),
+            ..PlusModes::default()
+        },
+    )?;
+
+    // §K.2 slice-header context with CPM on (SSBI on every non-first
+    // slice header).
+    let ctx = SliceHeaderContext::from_picture_layout(&layout, Some(sss), true, false);
+    let gfid = tr & 0b11;
+    write_first_slice_header(&mut w, &ctx, 0, None)?;
+
+    let mut quant = pquant;
+    for mb_row in 0..mb_rows {
+        if mb_row > 0 && mb_row % mb_rows_per_slice == 0 {
+            let slice_index = mb_row / mb_rows_per_slice;
+            quant = slice_quant(slice_index);
+            if quant == 0 || quant > 31 {
+                return Err(Error::InvalidQuantiser);
+            }
+            let mba = (mb_row * mb_cols) as u32;
+            write_slice_layer_cpm(&mut w, &ctx, sub_bitstream, mba, quant, gfid, None)?;
         }
         for mb_col in 0..mb_cols {
             let mb = extract_macroblock(frame, mb_col, mb_row);
@@ -2827,6 +2935,227 @@ pub fn encode_inter_picture_ap(
 
             // §F.2 chroma: sum-of-four / Table F.1 vector, plain
             // half-pel motion compensation (no OBMC).
+            let chroma_vec = chroma_mv_4mv(&cur);
+            let c_x = mb_col * 8;
+            let c_y = mb_row * 8;
+            let cb_pred = motion_compensated_block(&reference.cb, cw, ch, c_x, c_y, chroma_vec);
+            let cr_pred = motion_compensated_block(&reference.cr, cw, ch, c_x, c_y, chroma_vec);
+            let mut cb_pred_i = [0i16; COEFFS_PER_BLOCK];
+            let mut cr_pred_i = [0i16; COEFFS_PER_BLOCK];
+            for i in 0..COEFFS_PER_BLOCK {
+                cb_pred_i[i] = cb_pred[i] as i16;
+                cr_pred_i[i] = cr_pred[i] as i16;
+            }
+            let cb_enc =
+                crate::encoder_block::encode_inter_block(&residual_of(&src.cb, &cb_pred_i), quant);
+            let cr_enc =
+                crate::encoder_block::encode_inter_block(&residual_of(&src.cr, &cr_pred_i), quant);
+
+            let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
+                luma_enc[0].clone(),
+                luma_enc[1].clone(),
+                luma_enc[2].clone(),
+                luma_enc[3].clone(),
+            ];
+            crate::encoder_mb::encode_inter4v_macroblock(
+                &mut w, &luma_arr, &cb_enc, &cr_enc, &mvds,
+            )?;
+        }
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an **Annex K Slice-Structured
+/// plus Annex F Advanced Prediction** H.263+ P-picture: the PLUSPTYPE
+/// header signals both modes, the picture body is §K.2 free-running
+/// slices every `mb_rows_per_slice` macroblock rows, and every
+/// macroblock carries four §F.2 motion vectors predicted through the
+/// §F.3 OBMC blend.
+///
+/// Both §K.1 confinement rules are replayed on the encode side: the
+/// §6.1.1 / §F.2 candidate predictors treat the slice top row as a
+/// rule-3 border ([`crate::encoder_motion::Mv4Grid::with_row_segments`])
+/// and the §F.3 remote vectors of blocks in a different slice are
+/// substituted with the current block's vector — exactly what the
+/// slice decode driver reconstructs with, so the round-trip is exact
+/// at the prediction level.
+///
+/// Self-describing: decodes through
+/// [`crate::picture::decode_picture_layer`] / `decode_sequence` with
+/// `DecodeOptions::default()`.
+pub fn encode_inter_picture_ap_slices(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+    mb_rows_per_slice: usize,
+) -> Result<Vec<u8>> {
+    use crate::encoder_motion::{estimate_block_motion, mvd_for, Mv4Grid};
+    use crate::motion::{chroma_mv_4mv, LumaBlockIndex, Mb4Mv, MotionVector, RemoteMv};
+    use crate::plus_ptype::SliceStructuredSubmode;
+    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if frame.luma_width != reference.luma_width || frame.luma_height != reference.luma_height {
+        return Err(Error::NotImplemented);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let layout =
+        crate::picture::PictureLayout::for_source_format(fmt).ok_or(Error::NotImplemented)?;
+
+    let lw = frame.luma_width;
+    let lh = frame.luma_height;
+    let mb_cols = lw / 16;
+    let mb_rows = lh / 16;
+    if mb_rows_per_slice == 0 || mb_rows_per_slice > mb_rows {
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+    let lambda = 2 * quant as u32;
+
+    // ---- Pass 1: per-block motion estimation with §F.2 predictor
+    // replay under the per-slice §6.1.1 segmentation. -----------------
+    let mut grid4 = Mv4Grid::with_row_segments(mb_cols, mb_rows, mb_rows_per_slice);
+    let mut field: Vec<Mb4Mv> = Vec::with_capacity(mb_cols * mb_rows);
+    let mut mvds_field: Vec<[crate::macroblock::Mvd; 4]> = Vec::with_capacity(mb_cols * mb_rows);
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let mut cur: Mb4Mv = [MotionVector::new(0, 0); 4];
+            let mut mvds = [crate::macroblock::Mvd {
+                dx_half: 0,
+                dy_half: 0,
+            }; 4];
+            for &blk in &LumaBlockIndex::ALL {
+                let blk_i = blk.index();
+                let bx = mb_col * 16 + (blk_i % 2) * 8;
+                let by = mb_row * 16 + (blk_i / 2) * 8;
+                let predictor = grid4.predict_block(mb_col, mb_row, blk, &cur);
+                let mv =
+                    estimate_block_motion(frame, reference, bx, by, predictor, search_half, lambda);
+                cur[blk_i] = mv;
+                mvds[blk_i] = mvd_for(mv, predictor);
+            }
+            grid4.set(mb_col, mb_row, cur);
+            field.push(cur);
+            mvds_field.push(mvds);
+        }
+    }
+
+    // ---- Pass 2: §F.3 OBMC prediction (slice-confined remotes) +
+    // residual coding under the §K.2 slice framing. -------------------
+    let sss = SliceStructuredSubmode {
+        rectangular: false,
+        arbitrary_order: false,
+    };
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ true,
+        PlusModes {
+            advanced_prediction: true,
+            slice_structured: Some(sss),
+            ..PlusModes::default()
+        },
+    )?;
+    let ctx = SliceHeaderContext::from_picture_layout(&layout, Some(sss), false, false);
+    write_first_slice_header(&mut w, &ctx, 0, None)?;
+    let gfid = tr & 0b11;
+
+    let y_ref = crate::motion::RefPlane::new(&reference.y, lw, lh);
+    let cw = frame.chroma_width();
+    let ch = frame.chroma_height();
+
+    for mb_row in 0..mb_rows {
+        if mb_row > 0 && mb_row % mb_rows_per_slice == 0 {
+            let mba = (mb_row * mb_cols) as u32;
+            write_slice_layer(&mut w, &ctx, mba, quant, gfid, None)?;
+        }
+        // §F.3 slice rule — an above / below neighbour in a different
+        // slice substitutes the current vector; with row-aligned
+        // slices the left / right neighbours are always same-slice.
+        let above_in_slice = mb_row % mb_rows_per_slice != 0;
+        let below_in_slice = (mb_row + 1) % mb_rows_per_slice != 0;
+        for mb_col in 0..mb_cols {
+            let idx = mb_row * mb_cols + mb_col;
+            let cur = field[idx];
+            let mvds = mvds_field[idx];
+            let above = (mb_row > 0 && above_in_slice).then(|| field[idx - mb_cols]);
+            let left = (mb_col > 0).then(|| field[idx - 1]);
+            let right = (mb_col + 1 < mb_cols).then(|| field[idx + 1]);
+            // §F.3 last-sentence rule makes the B3/B4 bottom remotes
+            // Current regardless, so `below_in_slice` only documents
+            // that no additional case arises for row-aligned slices.
+            let _ = below_in_slice;
+
+            let remote = |nb: Option<Mb4Mv>, cell: LumaBlockIndex| -> RemoteMv {
+                match nb {
+                    Some(m) => RemoteMv::Vector(m[cell.index()]),
+                    None => RemoteMv::Current,
+                }
+            };
+            let tags = |blk: LumaBlockIndex| -> (RemoteMv, RemoteMv, RemoteMv, RemoteMv) {
+                match blk {
+                    LumaBlockIndex::B1 => (
+                        remote(above, LumaBlockIndex::B3),
+                        RemoteMv::Vector(cur[LumaBlockIndex::B3.index()]),
+                        remote(left, LumaBlockIndex::B2),
+                        RemoteMv::Vector(cur[LumaBlockIndex::B2.index()]),
+                    ),
+                    LumaBlockIndex::B2 => (
+                        remote(above, LumaBlockIndex::B4),
+                        RemoteMv::Vector(cur[LumaBlockIndex::B4.index()]),
+                        RemoteMv::Vector(cur[LumaBlockIndex::B1.index()]),
+                        remote(right, LumaBlockIndex::B1),
+                    ),
+                    LumaBlockIndex::B3 => (
+                        RemoteMv::Vector(cur[LumaBlockIndex::B1.index()]),
+                        RemoteMv::Current,
+                        remote(left, LumaBlockIndex::B4),
+                        RemoteMv::Vector(cur[LumaBlockIndex::B4.index()]),
+                    ),
+                    LumaBlockIndex::B4 => (
+                        RemoteMv::Vector(cur[LumaBlockIndex::B2.index()]),
+                        RemoteMv::Current,
+                        RemoteMv::Vector(cur[LumaBlockIndex::B3.index()]),
+                        remote(right, LumaBlockIndex::B3),
+                    ),
+                }
+            };
+
+            let src = extract_macroblock(frame, mb_col, mb_row);
+            let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(4);
+            for &blk in &LumaBlockIndex::ALL {
+                let blk_i = blk.index();
+                let bx = mb_col * 16 + (blk_i % 2) * 8;
+                let by = mb_row * 16 + (blk_i / 2) * 8;
+                let (r_top, r_bot, s_left, s_right) = tags(blk);
+                let pred = crate::motion::obmc_predict_block(
+                    &y_ref,
+                    bx,
+                    by,
+                    cur[blk_i],
+                    r_top,
+                    r_bot,
+                    s_left,
+                    s_right,
+                    crate::motion::RCONTROL_DEFAULT,
+                );
+                let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
+                for (d, &p) in pred_i16.iter_mut().zip(pred.iter()) {
+                    *d = p as i16;
+                }
+                let residual = residual_of(&src.luma[blk_i], &pred_i16);
+                luma_enc.push(crate::encoder_block::encode_inter_block(&residual, quant));
+            }
+
             let chroma_vec = chroma_mv_4mv(&cur);
             let c_x = mb_col * 8;
             let c_y = mb_row * 8;

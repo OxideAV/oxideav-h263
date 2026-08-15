@@ -6,7 +6,97 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **§F.2 / Figure F.1 candidate-predictor cells corrected** (round
+  443): the four-vector candidate table read two cells wrong — B1's
+  MV3 now reads the **above-right macroblock's B3** (previously the
+  above macroblock's B4) and B4's MV2 / MV3 now read the current
+  macroblock's **B1 / B2** (previously B2 / a right-neighbour cell
+  that is never a candidate). The Figure-F.1 sub-figures pin both
+  (the B1 MV3 cell sits past the macroblock's right edge; every B4
+  candidate is intra-macroblock). The §6.1.1 rule-3 / rule-4 border
+  rewrites follow the corrected cells (B1's MV3 now takes the
+  right-edge zero and the above-right-unavailable → MV1 collapse),
+  and `Mb4MvNeighbourhood` loses its never-consulted `right` field.
+  Encoder (`Mv4Grid::predict_block`) and decoder moved together, so
+  crate round-trips were unaffected — the vendored
+  `advanced-prediction-mode` conformance fixture is what caught the
+  deviation (frame 2 INTER4V macroblocks mispredicted their
+  single-MV neighbours below).
+
+- **Single-MV macroblocks in AP / DF-4MV pictures predict per
+  Figure F.1** (round 443): §F.2 — "if only one vector per macroblock
+  is present, MV1, MV2 and MV3 are defined as for the 8 × 8 block
+  numbered 1". The single-MV path used the macroblock-level Figure-12
+  predictor, which reads an INTER4V neighbour's B1 vector where
+  Figure F.1 names its B3 / B2 cells. New `predict_mv_ap_single`
+  (shared by the VLC, SAC and slice drivers) applies the block-1
+  derivation whenever four-vector macroblocks are possible.
+
+- **COD = 1 macroblocks in AP pictures are OBMC-blended** (round
+  443): §5.3.1 NOTE — "in Advanced Prediction mode, overlapped block
+  motion compensation is also performed if COD is set to '1'". The
+  skipped-macroblock path plain-copied the co-located reference;
+  it now defers a zero-vector `PendingApLuma` like every other AP
+  macroblock, so the luminance is the §F.3 blend of the zero vector
+  with the neighbours' remote vectors (chroma stays the co-located
+  copy — the §F.2 sum-of-four vector of four zeros).
+
 ### Added
+
+- **`DecodeOptions::obmc_skip_zero_right`** (round 443): opt-in
+  ecosystem-compatibility deviation for AP pictures — a skipped
+  macroblock's §F.3 right-half remote vectors are taken as zero
+  instead of the right neighbour's actual vector, matching encoders
+  whose COD decision is made under a one-pass model (their paired
+  decoders reconstruct the same way). Spec default (`false`) keeps
+  the §F.3 actual-vector reading; the divergence is bounded to the
+  skipped-macroblock right halves and pinned by the fixture test.
+
+- **Conformance fixtures: `advanced-prediction-mode` +
+  `deblocking-filter` vendored** (round 443): the staged Annex F
+  (baseline 4MV + OBMC QCIF I+P+P) and Annex J (H.263+ in-loop
+  deblocking QCIF I+P+P) reference streams now decode under
+  `tests/fixture_decode.rs` with SHA-256 corruption guards. The AP
+  fixture is byte-exact within the Annex A.7 tolerance under
+  `obmc_skip_zero_right` (and within 100 samples of it without); the
+  DF fixture asserts a small bounded divergence (max ±3, ≤ 100
+  samples) because the ±1 IDCT bound applies before the in-loop
+  filter, which can amplify it and feed it forward through the
+  prediction loop.
+
+- **Annex K + Annex F: Advanced Prediction composes with the
+  Slice-Structured mode** (round 443): the slice decode driver now
+  accepts AP pictures — §K.1 rule 1 (motion-vector prediction "as if
+  a GOB header were present") rides the per-segment grid checks now
+  threaded through `reconstruct_inter4v_mvs` / `predict_mv_ap_single`,
+  and §K.1 rule 3 / §F.3 ("remote motion vectors corresponding to
+  blocks from other video picture segments are set to the motion
+  vector of the current block") is applied by a segment-filtered
+  deferred-OBMC flush (each slice's pending macroblock resolves
+  within its own walk — under RS / ASO every out-of-slice remote
+  substitutes Current, so one-macroblock deferral still suffices).
+  The encoder arm `encode_inter_picture_ap_slices` emits free-running
+  AP slices with the slice-confined estimation
+  (`Mv4Grid::with_row_segments`) and OBMC remotes; a static picture
+  is lossless, the single-slice form reconstructs byte-identically to
+  the baseline-PTYPE AP encode, and an I + AP-slice-P stream decodes
+  through `decode_sequence`.
+
+- **Annex K + CPM: Continuous Presence Multipoint composes with the
+  Slice-Structured mode** (round 443): the PLUSPTYPE shim accepts
+  CPM = "1" when Annex K is signalled (GOB-path CPM stays refused —
+  GSBI is not framed), threading the §5.1.21 PSBI to the slice
+  driver, which parses the §K.2.4 SSBI on every non-first slice
+  header and stages the **single-Sub-Bitstream** decode: every
+  slice's SSBI must name the PSBI Sub-Bitstream (a true Annex C
+  multiplex is refused). Encoder: `write_slice_layer_cpm` /
+  `subbitstream_to_ssbi` emit the Table-K.1 codeword and
+  `encode_intra_picture_slices_cpm` produces a self-describing CPM
+  slice picture; reconstruction is byte-identical to the CPM-off
+  slice encode across all four Sub-Bitstream numbers, and an SSBI /
+  PSBI mismatch is refused.
 
 - **Annex E SAC composed with Annex F Advanced Prediction** (round
   443): `parse_macroblock_sac` now decodes the Table-8 INTER4V /

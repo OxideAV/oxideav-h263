@@ -898,3 +898,175 @@ fn slice_structured_gop_decodes_end_to_end() {
         assert!(mae < 6.0, "slice GOP frame {i} MAE {mae}");
     }
 }
+
+/// A static Annex K + Annex F (Slice-Structured + Advanced Prediction)
+/// P-picture round-trips losslessly through the slice decode driver:
+/// every INTER4V macroblock estimates zero vectors and codes no
+/// residual, and the slice-confined OBMC blend of all-equal vectors is
+/// the plain reference copy. Self-describing (PLUSPTYPE signals both
+/// modes).
+#[test]
+fn ap_slices_static_picture_is_lossless() {
+    use oxideav_h263::encoder::encode_inter_picture_ap_slices;
+    use oxideav_h263::picture::decode_picture_layer;
+
+    let i_bytes = encode_intra_picture(&gradient(176, 144, 3), 7, 0).unwrap();
+    let recon = decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+    for &rows in &[1usize, 3, 9] {
+        let p = encode_inter_picture_ap_slices(&recon, &recon, 7, 1, 3, rows).unwrap();
+        let dec = decode_picture_layer(&p, Some(&recon), DecodeOptions::default()).unwrap();
+        assert_eq!(dec.y, recon.y, "rows={rows} luma");
+        assert_eq!(dec.cb, recon.cb, "rows={rows} cb");
+        assert_eq!(dec.cr, recon.cr, "rows={rows} cr");
+    }
+}
+
+/// Sheared content through the AP + Slice-Structured encoder
+/// round-trips within tolerance at several slice heights, and the
+/// whole-picture single-slice form reconstructs **byte-identically**
+/// to the baseline-PTYPE AP encoder of the same inputs (one §6.1.1
+/// segment either way; only the header layer differs).
+#[test]
+fn ap_slices_roundtrip_and_single_slice_parity() {
+    use oxideav_h263::encoder::encode_inter_picture_ap_slices;
+    use oxideav_h263::picture::decode_picture_layer;
+
+    let i_bytes = encode_intra_picture(&gradient(176, 144, 0), 6, 0).unwrap();
+    let recon = decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+    let mut sheared = translated(&recon, 2);
+    for row in 72..144 {
+        for col in 0..176 {
+            sheared.y[row * 176 + col] = recon.y[row * 176 + (col + 4).min(175)];
+        }
+    }
+
+    for &rows in &[1usize, 3, 4] {
+        let p = encode_inter_picture_ap_slices(&sheared, &recon, 6, 1, 3, rows).unwrap();
+        let dec = decode_picture_layer(&p, Some(&recon), DecodeOptions::default()).unwrap();
+        let mae = luma_mae(&sheared, &dec);
+        assert!(mae < 6.0, "rows={rows} luma MAE {mae}");
+    }
+
+    // Single slice == single segment: byte-identical reconstruction
+    // with the baseline-PTYPE AP form.
+    let slices = encode_inter_picture_ap_slices(&sheared, &recon, 6, 1, 3, 9).unwrap();
+    let base = encode_inter_picture_ap(&sheared, &recon, 6, 1, 3).unwrap();
+    let dec_s = decode_picture_layer(&slices, Some(&recon), DecodeOptions::default()).unwrap();
+    let dec_b =
+        decode_picture_no_gob0_header(&base, Some(&recon), DecodeOptions::default()).unwrap();
+    assert_eq!(dec_s.y, dec_b.y);
+    assert_eq!(dec_s.cb, dec_b.cb);
+    assert_eq!(dec_s.cr, dec_b.cr);
+}
+
+/// The §K.1 slice confinement is measurable: with a two-slice AP
+/// picture, cross-checking that the multi-slice and single-slice
+/// encodes *differ* in reconstruction near the slice boundary would be
+/// content-dependent — instead pin the structural invariant: an AP
+/// slice stream decodes through `decode_sequence` (I + AP-slice-P) in
+/// order with per-frame fidelity.
+#[test]
+fn ap_slices_stream_decodes_through_decode_sequence() {
+    use oxideav_h263::encoder::encode_inter_picture_ap_slices;
+
+    let f0 = gradient(176, 144, 0);
+    let i_bytes = encode_intra_picture(&f0, 5, 0).unwrap();
+    let r0 = decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+    let f1 = translated(&r0, 2);
+    let p1 = encode_inter_picture_ap_slices(&f1, &r0, 5, 1, 3, 3).unwrap();
+
+    let mut stream = i_bytes.clone();
+    stream.extend_from_slice(&p1);
+    let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.len(), 2);
+    assert_eq!(decoded[0].y, r0.y);
+    let mae = luma_mae(&f1, &decoded[1]);
+    assert!(mae < 6.0, "AP-slice P luma MAE {mae}");
+}
+
+/// An Annex K + CPM (Continuous Presence Multipoint) slice-structured
+/// I-picture — CPM = "1" + §5.1.21 PSBI in the picture header, the
+/// §K.2.4 SSBI Table-K.1 codeword on every non-first slice header —
+/// decodes through the default-options driver and reconstructs
+/// **byte-identically** to the CPM-off slice encode of the same source
+/// (the macroblock layer is untouched by the sub-bitstream framing),
+/// across every legal sub-bitstream number and several slice heights.
+#[test]
+fn cpm_slices_reconstruct_identically_to_cpm_off() {
+    use oxideav_h263::encoder::{encode_intra_picture_slices, encode_intra_picture_slices_cpm};
+    use oxideav_h263::picture::decode_picture_layer;
+
+    let src = gradient(176, 144, 5);
+    for &rows in &[1usize, 3, 9] {
+        let plain = encode_intra_picture_slices(&src, 0, rows, |_| 7).unwrap();
+        let plain_rec = decode_picture_layer(&plain, None, DecodeOptions::default()).unwrap();
+        for sub in 0u8..=3 {
+            let cpm = encode_intra_picture_slices_cpm(&src, 0, rows, sub, |_| 7).unwrap();
+            let cpm_rec = decode_picture_layer(&cpm, None, DecodeOptions::default()).unwrap();
+            assert_eq!(cpm_rec.y, plain_rec.y, "rows={rows} sub={sub} luma");
+            assert_eq!(cpm_rec.cb, plain_rec.cb, "rows={rows} sub={sub} cb");
+            assert_eq!(cpm_rec.cr, plain_rec.cr, "rows={rows} sub={sub} cr");
+        }
+    }
+}
+
+/// A CPM slice whose SSBI names a different Sub-Bitstream than the
+/// picture header's PSBI is a true Annex C multiplex — the
+/// single-Sub-Bitstream decode refuses it rather than splicing a
+/// foreign slice into the picture.
+#[test]
+fn cpm_slice_subbitstream_mismatch_is_refused() {
+    use oxideav_core::bits::BitWriter;
+    use oxideav_h263::encoder::{write_plus_picture_header, PlusModes};
+    use oxideav_h263::encoder_mb::{encode_intra_macroblock, MacroblockSamples};
+    use oxideav_h263::picture::{decode_picture_layer, PictureLayout};
+    use oxideav_h263::plus_ptype::SliceStructuredSubmode;
+    use oxideav_h263::slice_header::{
+        write_first_slice_header, write_slice_layer_cpm, SliceHeaderContext,
+    };
+    use oxideav_h263::{Error, H263SourceFormat};
+
+    let sss = SliceStructuredSubmode {
+        rectangular: false,
+        arbitrary_order: false,
+    };
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        H263SourceFormat::Qcif,
+        8,
+        0,
+        /* is_inter */ false,
+        PlusModes {
+            slice_structured: Some(sss),
+            cpm_psbi: Some(1),
+            ..PlusModes::default()
+        },
+    )
+    .unwrap();
+    let layout = PictureLayout::for_source_format(H263SourceFormat::Qcif).unwrap();
+    let ctx = SliceHeaderContext::from_picture_layout(&layout, Some(sss), true, false);
+    write_first_slice_header(&mut w, &ctx, 0, None).unwrap();
+
+    let flat = MacroblockSamples {
+        luma: [[128i16; 64]; 4],
+        cb: [128i16; 64],
+        cr: [128i16; 64],
+    };
+    // First slice: rows 0..3 (3 rows of 11 MBs).
+    for _ in 0..(3 * 11) {
+        encode_intra_macroblock(&mut w, &flat, 8, false, false).unwrap();
+    }
+    // Second slice claims Sub-Bitstream 2 while the header said 1.
+    write_slice_layer_cpm(&mut w, &ctx, 2, 3 * 11, 8, 0, None).unwrap();
+    for _ in 0..(6 * 11) {
+        encode_intra_macroblock(&mut w, &flat, 8, false, false).unwrap();
+    }
+    w.align_to_byte_zero();
+    let bytes = w.finish();
+
+    assert_eq!(
+        decode_picture_layer(&bytes, None, DecodeOptions::default()).unwrap_err(),
+        Error::NotImplemented
+    );
+}

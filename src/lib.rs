@@ -266,17 +266,18 @@ pub use deblock::{
 pub use dequant::{dequantise_ac, scatter_into_block, AC_REC_MAX, AC_REC_MIN};
 pub use encoder::{
     encode_inter_picture, encode_inter_picture_ap, encode_inter_picture_ap_sac,
-    encode_inter_picture_gobs, encode_inter_picture_motion, encode_inter_picture_motion_sac,
-    encode_inter_picture_plus, encode_inter_picture_sac, encode_inter_picture_slices,
-    encode_inter_picture_slices_rect, encode_inter_picture_umv, encode_inter_picture_umv_plus,
-    encode_intra_picture, encode_intra_picture_aic, encode_intra_picture_aic_auto,
-    encode_intra_picture_aic_mq, encode_intra_picture_aic_mq_plus, encode_intra_picture_aic_plus,
-    encode_intra_picture_dquant, encode_intra_picture_gobs, encode_intra_picture_plus,
-    encode_intra_picture_sac, encode_intra_picture_slices, encode_intra_picture_slices_aic,
-    encode_intra_picture_slices_aic_mq, encode_intra_picture_slices_rect, encode_intra_sequence,
-    encode_intra_sequence_aic, encode_pb_picture, encode_pb_picture_sac, encode_sequence,
-    encode_sequence_rate_controlled, write_plus_picture_header, GopConfig, PbConfig, PlusModes,
-    RateControlConfig, RateControlledStream, EOS_BYTES,
+    encode_inter_picture_ap_slices, encode_inter_picture_gobs, encode_inter_picture_motion,
+    encode_inter_picture_motion_sac, encode_inter_picture_plus, encode_inter_picture_sac,
+    encode_inter_picture_slices, encode_inter_picture_slices_rect, encode_inter_picture_umv,
+    encode_inter_picture_umv_plus, encode_intra_picture, encode_intra_picture_aic,
+    encode_intra_picture_aic_auto, encode_intra_picture_aic_mq, encode_intra_picture_aic_mq_plus,
+    encode_intra_picture_aic_plus, encode_intra_picture_dquant, encode_intra_picture_gobs,
+    encode_intra_picture_plus, encode_intra_picture_sac, encode_intra_picture_slices,
+    encode_intra_picture_slices_aic, encode_intra_picture_slices_aic_mq,
+    encode_intra_picture_slices_rect, encode_intra_sequence, encode_intra_sequence_aic,
+    encode_pb_picture, encode_pb_picture_sac, encode_sequence, encode_sequence_rate_controlled,
+    write_plus_picture_header, GopConfig, PbConfig, PlusModes, RateControlConfig,
+    RateControlledStream, EOS_BYTES,
 };
 pub use encoder_aic::{plan_intra_block_aic, write_intra_block_aic, AicBlockPlan};
 pub use encoder_block::{
@@ -367,8 +368,9 @@ pub use scal_upsample::{
 };
 pub use slice_header::{
     parse_first_slice_header, parse_slice_layer, skip_sstuf, skip_sstuf_at, ssbi_to_subbitstream,
-    write_first_slice_header, write_slice_layer, FirstSliceLayer, SliceHeaderContext, SliceLayer,
-    SEPB_BITS, SQUANT_BITS, SSBI_BITS, SSC_BITS, SSC_VALUE, SSTUF_MAX_BITS,
+    subbitstream_to_ssbi, write_first_slice_header, write_slice_layer, write_slice_layer_cpm,
+    FirstSliceLayer, SliceHeaderContext, SliceLayer, SEPB_BITS, SQUANT_BITS, SSBI_BITS, SSC_BITS,
+    SSC_VALUE, SSTUF_MAX_BITS,
 };
 
 /// Crate-local error type. The orphan-rebuild scaffold returns

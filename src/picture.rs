@@ -216,6 +216,23 @@ pub struct DecodeOptions {
     /// the wire, but [`decode_picture_layer`] sets it from the PLUSPTYPE
     /// OPPTYPE Alternative-INTER-VLC bit (§5.1.4.4 bit 13).
     pub alt_inter_vlc: bool,
+    /// **Ecosystem-compatibility deviation** for Advanced-Prediction
+    /// pictures: when set, the §F.3 right-half remote vectors of a
+    /// **not-coded** (COD = 1) macroblock are taken as zero instead of
+    /// the right neighbour's actual motion vector.
+    ///
+    /// §F.3 itself makes no COD distinction — the spec-default
+    /// behaviour (`false`) reads the actual vector of the macroblock
+    /// to the right, exactly as for coded macroblocks (§5.3.1 NOTE:
+    /// "overlapped block motion compensation is also performed if COD
+    /// is set to '1'"). Widely deployed encoders, however, make their
+    /// COD decision under a one-pass model in which the not-yet-parsed
+    /// right neighbour contributes a zero remote, and their paired
+    /// decoders reconstruct accordingly; enabling this flag reproduces
+    /// those streams bit-faithfully (the vendored
+    /// `advanced-prediction-mode` conformance fixture decodes
+    /// byte-exactly only with it).
+    pub obmc_skip_zero_right: bool,
 }
 
 /// Picture-level layout the §4.2.1 GOB walker needs: total luma
@@ -1094,6 +1111,7 @@ fn decode_sac_macroblock_stream(
                 header.umv_mode,
                 advanced_prediction,
                 pb_mode,
+                options.obmc_skip_zero_right,
                 &mut current_quant,
             )?;
 
@@ -1139,7 +1157,7 @@ fn decode_sac_macroblock_stream(
             // recorded; flush its deferred luminance.
             if let Some(p) = pending_ap.take() {
                 let r = reference.ok_or(Error::NotImplemented)?;
-                reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total);
+                reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total, None);
             }
             pending_ap = pending_new;
         }
@@ -1147,7 +1165,7 @@ fn decode_sac_macroblock_stream(
         // right neighbour is outside the picture.
         if let Some(p) = pending_ap.take() {
             let r = reference.ok_or(Error::NotImplemented)?;
-            reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total);
+            reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total, None);
         }
     }
 
@@ -1182,6 +1200,7 @@ fn decode_one_macroblock_sac(
     umv_mode: bool,
     advanced_prediction: bool,
     pb_mode: bool,
+    obmc_skip_zero_right: bool,
     current_quant: &mut u8,
 ) -> Result<(MotionVector, Mb4Mv, Option<PendingApLuma>)> {
     use crate::sac::parse_block_sac;
@@ -1194,6 +1213,9 @@ fn decode_one_macroblock_sac(
     let c_y = row * 8;
 
     // Skipped macroblock (COD = 1): reference copy with a zero MV.
+    // Under Advanced Prediction the luminance is §F.3 OBMC-blended
+    // even for COD = 1 (§5.3.1 NOTE) — defer it like every other AP
+    // macroblock (the plain copy is overwritten at flush time).
     if !mb.coded {
         let reference = reference.ok_or(Error::NotImplemented)?;
         copy_inter_macroblock(
@@ -1206,7 +1228,15 @@ fn decode_one_macroblock_sac(
             MotionVector::new(0, 0),
         );
         let zero = MotionVector::new(0, 0);
-        return Ok((zero, [zero; 4], None));
+        let pending = (advanced_prediction && !pb_mode).then_some(PendingApLuma {
+            col,
+            row,
+            quant: *current_quant,
+            mvs4: [zero; 4],
+            blocks: [None, None, None, None],
+            zero_right_remote: obmc_skip_zero_right,
+        });
+        return Ok((zero, [zero; 4], pending));
     }
 
     let mb_type = mb.mb_type.ok_or(Error::NotImplemented)?;
@@ -1260,7 +1290,7 @@ fn decode_one_macroblock_sac(
     if matches!(mb_type, MbType::Inter4V | MbType::Inter4VQ) {
         let mvs4 = reconstruct_inter4v_mvs(
             mb, grid, mb_cols, col, row, /* gob_top_row */ 0,
-            /* gob_header_present */ true, umv_mode,
+            /* gob_header_present */ true, umv_mode, /* segment */ 0,
         )?;
         let chroma_vec = chroma_mv_4mv(&mvs4);
         let inter_cbpy = cbpy ^ 0b1111;
@@ -1279,6 +1309,7 @@ fn decode_one_macroblock_sac(
             quant,
             mvs4,
             blocks,
+            zero_right_remote: false,
         });
 
         // Chroma: no OBMC (§F.2) — immediate reconstruction.
@@ -1286,11 +1317,20 @@ fn decode_one_macroblock_sac(
         return Ok((mvs4[LumaBlockIndex::B1.index()], mvs4, pending));
     }
 
-    // INTER / INTER+Q (single MV).
-    let predictor = predict_mv(
-        grid, mb_cols, col, row, /* gob_top_row */ 0, /* gob_header_present */ true,
-        pb_mode, /* segment */ 0,
-    );
+    // INTER / INTER+Q (single MV). §F.2 — under Advanced Prediction
+    // the candidates are "defined as for the 8 × 8 block numbered 1"
+    // (Figure F.1).
+    let predictor = if advanced_prediction && !pb_mode {
+        predict_mv_ap_single(
+            grid, mb_cols, col, row, /* gob_top_row */ 0, /* gob_header_present */ true,
+            /* segment */ 0,
+        )
+    } else {
+        predict_mv(
+            grid, mb_cols, col, row, /* gob_top_row */ 0, /* gob_header_present */ true,
+            pb_mode, /* segment */ 0,
+        )
+    };
     let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
     let luma_mv = if umv_mode {
         reconstruct_mv_umv(predictor, mvd)
@@ -1321,6 +1361,7 @@ fn decode_one_macroblock_sac(
             quant,
             mvs4: [luma_mv; 4],
             blocks,
+            zero_right_remote: false,
         });
     } else {
         let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
@@ -2107,6 +2148,7 @@ pub fn decode_picture_layer_with_inherited(
                 options: shim_options,
                 slice_structured,
                 improved_pb,
+                cpm_psbi,
             } = plus_ptype_to_baseline_shim(
                 &extended, options, inherited, /* allow_rps */ false,
             )?;
@@ -2155,6 +2197,7 @@ pub fn decode_picture_layer_with_inherited(
                     sss,
                     effective_ref,
                     shim_options,
+                    cpm_psbi,
                 )?,
                 None => {
                     // §5.1.19 — PQUANT (5 bits). With PLUSPTYPE present the
@@ -2264,6 +2307,7 @@ pub fn decode_picture_layer_rps(
         options: shim_options,
         slice_structured,
         improved_pb,
+        cpm_psbi,
     } = plus_ptype_to_baseline_shim(
         &extended,
         options,
@@ -2299,6 +2343,7 @@ pub fn decode_picture_layer_rps(
                 sss,
                 reference,
                 shim_options,
+                cpm_psbi,
                 rps_slice,
             )?
         }
@@ -2741,6 +2786,7 @@ pub fn decode_improved_pb_picture_with_inherited(
         options: shim_options,
         slice_structured,
         improved_pb,
+        cpm_psbi: _,
     } = plus_ptype_to_baseline_shim(&extended, options, inherited, /* allow_rps */ false)?;
     if !improved_pb {
         // Not an Improved PB-frame — the caller should use
@@ -3173,6 +3219,11 @@ struct PlusShimOutcome {
     options: DecodeOptions,
     slice_structured: SliceStructuredRouting,
     improved_pb: bool,
+    /// `Some(psbi)` when the picture header carries CPM = "1" — the
+    /// §5.1.21 Picture Sub-Bitstream Indicator, threaded to the Annex K
+    /// slice driver so each slice's §K.2.4 SSBI can be validated
+    /// against it (single-Sub-Bitstream decode).
+    cpm_psbi: Option<u8>,
 }
 
 /// Annex P §P.1 — apply implicit Reference Picture Resampling to the
@@ -3363,10 +3414,15 @@ fn plus_ptype_to_baseline_shim(
     // feeds §G.4 PB-frame scaling and the Annex N reference selection,
     // neither of which is reachable on this GOB / slice decode path. So a
     // custom-PCF picture decodes to the same pixels as a standard-PCF one.
+    // §5.1.20 / §5.1.21 — Continuous Presence Multipoint (CPM = "1" +
+    // PSBI) is staged only on the Annex K Slice-Structured path, where
+    // the §K.2.4 SSBI codeword identifies each slice's Sub-Bitstream
+    // (the GOB path's §5.2.4 GSBI is not framed by the GOB driver, so
+    // CPM without SS stays refused).
     let rps_in_use = extended.plus.trpi.is_some();
     if opptype_sac
         || opptype_independent_segment_decoding
-        || extended.plus.cpm
+        || (extended.plus.cpm && !opptype_slice_structured)
         || extended.plus.mpptype.reduced_resolution_update
         || (rps_in_use && !allow_rps)
     {
@@ -3545,6 +3601,8 @@ fn plus_ptype_to_baseline_shim(
         aic: options.aic || advanced_intra_effective,
         modified_quant: options.modified_quant || modified_quant_effective,
         alt_inter_vlc: options.alt_inter_vlc || alt_inter_vlc_effective,
+        // Caller-only compatibility deviation — no wire signal exists.
+        obmc_skip_zero_right: options.obmc_skip_zero_right,
     };
 
     Ok(PlusShimOutcome {
@@ -3553,6 +3611,7 @@ fn plus_ptype_to_baseline_shim(
         options,
         slice_structured,
         improved_pb,
+        cpm_psbi: extended.plus.cpm.then(|| extended.plus.psbi.unwrap_or(0)),
     })
 }
 
@@ -3891,7 +3950,15 @@ fn decode_after_picture_header_inner(
                 // recorded; flush its deferred luminance.
                 if let Some(p) = pending_ap.take() {
                     let r = active_reference.ok_or(Error::NotImplemented)?;
-                    reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total);
+                    reconstruct_pending_ap_luma(
+                        &p,
+                        r,
+                        &mut frame,
+                        &grid,
+                        mb_cols,
+                        mb_rows_total,
+                        None,
+                    );
                 }
                 pending_ap = pending_new;
             }
@@ -3902,7 +3969,7 @@ fn decode_after_picture_header_inner(
             // header / reference re-selection applies to the next row.
             if let Some(p) = pending_ap.take() {
                 let r = active_reference.ok_or(Error::NotImplemented)?;
-                reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total);
+                reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total, None);
             }
             // §5.2 carry-over: a header-less GOB inherits the QUANT in
             // force at the end of the previous GOB (the last macroblock's
@@ -5770,12 +5837,13 @@ fn at_slice_boundary(reader: &BitReader<'_>) -> Result<bool> {
 ///
 /// # Errors
 ///
-/// * [`Error::NotImplemented`] — the Rectangular Slice submode (the
-///   SWI field is present), an Advanced Prediction picture (the §F.3
-///   OBMC remote-vector slice-boundary exclusion is not staged by
-///   this driver), CPM (Annex C sub-bitstreams), Reduced-Resolution
-///   Update mode, a PB-frames picture, or an INTER picture with a
-///   `reference` of mismatched geometry.
+/// * [`Error::NotImplemented`] — Reduced-Resolution Update mode, a
+///   PB-frames / SAC picture, a CPM slice whose §K.2.4 SSBI selects a
+///   different Sub-Bitstream than the picture header's §5.1.21 PSBI
+///   (a true Annex C multiplex — only the single-Sub-Bitstream decode
+///   is staged), or an INTER picture with a `reference` of mismatched
+///   geometry. Advanced Prediction is supported (§K.1 rules 1 and 3
+///   confine the predictors and the §F.3 OBMC remotes to the slice).
 /// * [`Error::BadSliceCoverage`] — the slices overlapped, were not in
 ///   strictly-increasing MBA order, or left a macroblock undecoded.
 /// * the union of the §K.2 slice-header and §5.3 macroblock-layer
@@ -5788,9 +5856,10 @@ fn decode_slice_structured_after_header(
     sss: SliceStructuredSubmode,
     reference: Option<&YuvFrame>,
     options: DecodeOptions,
+    cpm_psbi: Option<u8>,
 ) -> Result<YuvFrame> {
     decode_slice_structured_after_header_inner(
-        reader, header, layout, sss, reference, options, None,
+        reader, header, layout, sss, reference, options, cpm_psbi, None,
     )
 }
 
@@ -5811,13 +5880,18 @@ fn decode_slice_structured_after_header_inner(
     sss: SliceStructuredSubmode,
     reference: Option<&YuvFrame>,
     options: DecodeOptions,
+    cpm_psbi: Option<u8>,
     rps_slice: Option<RpsGobContext<'_>>,
 ) -> Result<YuvFrame> {
     // Header-signalled modes the slice driver does not stage. PB-frames
     // and SAC never reach here (the slice routing in
     // `decode_picture_layer_with_inherited` only fires for a non-PB
-    // PLUSPTYPE picture), but keep the guard explicit.
-    if header.sac_mode || header.pb_frames || header.advanced_prediction {
+    // PLUSPTYPE picture), but keep the guard explicit. Advanced
+    // Prediction composes: §K.1 rules 1 and 3 confine the §6.1.1
+    // vector prediction and the §F.3 OBMC remote vectors to the
+    // current slice, which the per-segment grid checks and the
+    // segment-filtered deferred-OBMC flush below implement.
+    if header.sac_mode || header.pb_frames {
         return Err(Error::NotImplemented);
     }
 
@@ -5859,9 +5933,9 @@ fn decode_slice_structured_after_header_inner(
     // order (Figure 6, part 1) places the 5-bit PQUANT immediately
     // before the first video-segment layer (the optional scalability /
     // RPS / RPR fields between PLUSPTYPE and PQUANT are absent for the
-    // INTRA / INTER baseline subset this driver decodes — CPM, RRU,
-    // PB-frames, AP and the Rectangular Slice submode are all refused
-    // above or by the routing layer). The slice that follows the
+    // INTRA / INTER baseline subset this driver decodes — RRU and
+    // PB-frames are refused above or by the routing layer). The slice
+    // that follows the
     // Picture Start Code carries no SQUANT (§K.2.7), so PQUANT is the
     // QUANT in force for its macroblocks until the first DQUANT.
     let pquant = reader
@@ -5878,9 +5952,10 @@ fn decode_slice_structured_after_header_inner(
     // (§K.2.2: SEPB1 + MBA + …) rather than reading the PEI bit as SEPB1.
     skip_pei_psupp(reader)?;
 
-    // Build the §K.2 slice-header context (free-running, CPM / RRU off
-    // — both refused by the routing layer).
-    let ctx = SliceHeaderContext::from_picture_layout(layout, Some(sss), false, false);
+    // Build the §K.2 slice-header context (RRU off — refused by the
+    // routing layer). CPM = "1" puts the §K.2.4 SSBI field on every
+    // non-first slice header.
+    let ctx = SliceHeaderContext::from_picture_layout(layout, Some(sss), cpm_psbi.is_some(), false);
 
     let mut slice_index: u32 = 0;
     // §K.1 (ASO off): MBA strictly increases from slice to slice. Track
@@ -5949,6 +6024,12 @@ fn decode_slice_structured_after_header_inner(
         let mut current_quant = slice_quant;
         // Macroblock ordinal within the slice's scan order.
         let mut k: usize = 0;
+        // §F.3 — Advanced-Prediction macroblock whose deferred OBMC
+        // luminance awaits its slice-scan successor (the raster-right
+        // neighbour when one exists inside the slice; every
+        // out-of-slice remote substitutes the current vector, so the
+        // successor's grid entry is always the last dependency).
+        let mut pending_ap: Option<PendingApLuma> = None;
 
         // Walk macroblocks in the slice's scanning order until the next
         // SSC or the end of the slice's region.
@@ -6004,7 +6085,7 @@ fn decode_slice_structured_after_header_inner(
             // above neighbour inside the slice is still consulted and
             // `gob_header_present = false` to leave the border decision
             // entirely to the segment id.
-            let (mv, mvs4, pending_ap) = decode_one_macroblock(
+            let (mv, mvs4, pending_new) = decode_one_macroblock(
                 reader,
                 &mb,
                 active_reference,
@@ -6023,12 +6104,6 @@ fn decode_slice_structured_after_header_inner(
                 &mut aic_state,
                 segment,
             )?;
-            // The slice-structured driver refuses Advanced Prediction
-            // upstream, so a deferred-OBMC macroblock cannot appear
-            // here; refuse defensively rather than drop luminance.
-            if pending_ap.is_some() {
-                return Err(Error::NotImplemented);
-            }
             record_grid(
                 &mut grid,
                 &mut mb_quant,
@@ -6043,6 +6118,24 @@ fn decode_slice_structured_after_header_inner(
             );
             decoded[mb_addr] = true;
             decoded_count += 1;
+            // §F.3 — the previous macroblock's only in-slice remote
+            // dependency (its slice-scan successor, which is its
+            // raster-right neighbour whenever that neighbour is in
+            // this slice) is now recorded; flush its deferred
+            // luminance with the §F.3 slice-segment remote filter.
+            if let Some(p) = pending_ap.take() {
+                let r = active_reference.ok_or(Error::NotImplemented)?;
+                reconstruct_pending_ap_luma(
+                    &p,
+                    r,
+                    &mut frame,
+                    &grid,
+                    mb_cols,
+                    mb_rows_total,
+                    Some(segment),
+                );
+            }
+            pending_ap = pending_new;
 
             k += 1;
             // Does the slice's scan order have a next position? A
@@ -6062,6 +6155,23 @@ fn decode_slice_structured_after_header_inner(
             }
         }
 
+        // §F.3 — a macroblock still pending at the end of its slice
+        // has no in-slice successor: every unresolved remote is
+        // outside the slice and substitutes the current vector, which
+        // the segment filter applies.
+        if let Some(p) = pending_ap.take() {
+            let r = active_reference.ok_or(Error::NotImplemented)?;
+            reconstruct_pending_ap_luma(
+                &p,
+                r,
+                &mut frame,
+                &grid,
+                mb_cols,
+                mb_rows_total,
+                Some(segment),
+            );
+        }
+
         // §K.1 — the picture is complete when every macroblock has been
         // decoded (under ASO / RS the raster-final slice need not be
         // the bitstream's last, so completion is coverage-driven). Any
@@ -6071,11 +6181,24 @@ fn decode_slice_structured_after_header_inner(
         }
 
         // Consume the next slice header. Discard SSTUF, read the full
-        // §K.2 slice header (SSC + SEPB1 + MBA + (SEPB2?) + SQUANT +
-        // (SWI iff RS) + SEPB3 + GFID — SSBI absent because CPM is
-        // off).
+        // §K.2 slice header (SSC + SEPB1 + (SSBI iff CPM) + MBA +
+        // (SEPB2?) + SQUANT + (SWI iff RS) + SEPB3 + GFID).
         skip_sstuf(reader)?;
         let next = parse_slice_layer(reader, &ctx)?;
+        // §K.2.4 / Annex C — under CPM each slice names its
+        // Sub-Bitstream. This driver stages the single-Sub-Bitstream
+        // decode: every slice must belong to the picture header's
+        // §5.1.21 PSBI Sub-Bitstream (an interleaved multiplex would
+        // splice foreign slices into this picture's coverage).
+        if let Some(psbi) = cpm_psbi {
+            let sub = next
+                .ssbi
+                .and_then(crate::slice_header::ssbi_to_subbitstream)
+                .ok_or(Error::BadSliceSsbiCode)?;
+            if sub != psbi {
+                return Err(Error::NotImplemented);
+            }
+        }
         slice_index += 1;
         slice_mba = next.mba;
         slice_quant = next.squant;
@@ -6188,8 +6311,11 @@ fn decode_one_macroblock(
     let c_x = col * 8;
     let c_y = row * 8;
 
-    // Skipped macroblock (COD = 1): copy from the reference with a
-    // zero motion vector (§5.3.1).
+    // Skipped macroblock (COD = 1): "the decoder shall treat the
+    // macroblock as an INTER macroblock with motion vector for the
+    // whole block equal to zero and with no coefficient data"
+    // (§5.3.1). Chrominance — and, outside Advanced Prediction mode,
+    // luminance — is the plain co-located reference copy.
     if !mb.coded {
         let reference = reference.ok_or(Error::NotImplemented)?;
         copy_inter_macroblock(
@@ -6205,7 +6331,23 @@ fn decode_one_macroblock(
             aic_state.record_non_intra_macroblock(col, row, aic_segment);
         }
         let zero = MotionVector::new(0, 0);
-        return Ok((zero, [zero; 4], None));
+        // §5.3.1 NOTE — "in Advanced Prediction mode, overlapped
+        // block motion compensation is also performed if COD is set
+        // to '1'": the luminance is the §F.3 OBMC blend of the zero
+        // vector with the neighbours' remote vectors, deferred like
+        // every other AP macroblock (the plain copy above is
+        // overwritten at flush time). Neighbour classification is
+        // unaffected: this macroblock stays a not-coded → zero-remote
+        // / zero-candidate entry on the grid.
+        let pending = (advanced_prediction && !pb_mode).then_some(PendingApLuma {
+            col,
+            row,
+            quant: *current_quant,
+            mvs4: [zero; 4],
+            blocks: [None, None, None, None],
+            zero_right_remote: options.obmc_skip_zero_right,
+        });
+        return Ok((zero, [zero; 4], pending));
     }
 
     let mb_type = mb.mb_type.ok_or(Error::NotImplemented)?;
@@ -6352,16 +6494,35 @@ fn decode_one_macroblock(
     // §6.1.1 / Figure-12 predictor + Table-14 MVD. In the Annex D
     // Unrestricted Motion Vector mode (non-PLUSPTYPE) the §D.2
     // extended-range reconstruction replaces the default wrap.
-    let predictor = predict_mv(
-        grid,
-        mb_cols,
-        col,
-        row,
-        gob_top_row,
-        gob_header_present,
-        pb_mode,
-        aic_segment,
-    );
+    //
+    // §F.2 — when four vectors per macroblock are possible (Advanced
+    // Prediction or Deblocking Filter mode), the candidates of a
+    // single-MV macroblock are "defined as for the 8 × 8 block
+    // numbered 1" (Figure F.1): an INTER4V neighbour contributes the
+    // vector of the specific 8×8 block Figure F.1 names, not its
+    // macroblock-level vector.
+    let predictor = if (advanced_prediction || options.deblock) && !pb_mode {
+        predict_mv_ap_single(
+            grid,
+            mb_cols,
+            col,
+            row,
+            gob_top_row,
+            gob_header_present,
+            aic_segment,
+        )
+    } else {
+        predict_mv(
+            grid,
+            mb_cols,
+            col,
+            row,
+            gob_top_row,
+            gob_header_present,
+            pb_mode,
+            aic_segment,
+        )
+    };
     let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
     let luma_mv = if umv_mode {
         reconstruct_mv_umv(predictor, mvd)
@@ -6424,6 +6585,7 @@ fn decode_one_macroblock(
             quant,
             mvs4: [luma_mv; 4],
             blocks,
+            zero_right_remote: false,
         });
     } else {
         let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
@@ -6794,6 +6956,10 @@ struct PendingApLuma {
     /// Parsed coefficient blocks in Figure-5 order; `None` = the CBPY
     /// bit was clear (prediction only).
     blocks: [Option<H263Block>; 4],
+    /// [`DecodeOptions::obmc_skip_zero_right`] fired for this (skipped)
+    /// macroblock: its right-half remote vectors are zero instead of
+    /// the right neighbour's actual vector.
+    zero_right_remote: bool,
 }
 
 /// Reconstruct the luminance of a deferred Advanced-Prediction INTER
@@ -6806,6 +6972,17 @@ struct PendingApLuma {
 /// by [`classify_remote_mvs`]; the not-coded → zero / INTRA → current
 /// classifications for the left and above neighbours read the same
 /// final grid entries the parse-time pass saw.
+///
+/// `slice_segment` is `Some(id)` when the picture is Annex K
+/// Slice-Structured: per §F.3, "if either the Slice Structured mode or
+/// the Independent Segment Decoding mode are in use, the remote motion
+/// vectors corresponding to blocks from other video picture segments
+/// are set to the motion vector of the current block, regardless of
+/// the other conditions" — a neighbour recorded under a different
+/// segment id is treated exactly like an off-picture neighbour
+/// (remote = Current). The GOB drivers pass `None` (remote vectors
+/// from other GOBs "are used in the same way as remote motion vectors
+/// inside the current GOB").
 fn reconstruct_pending_ap_luma(
     pending: &PendingApLuma,
     reference: &YuvFrame,
@@ -6813,6 +6990,7 @@ fn reconstruct_pending_ap_luma(
     grid: &[MbGridEntry],
     mb_cols: usize,
     mb_rows_total: usize,
+    slice_segment: Option<u32>,
 ) {
     let col = pending.col;
     let row = pending.row;
@@ -6822,9 +7000,9 @@ fn reconstruct_pending_ap_luma(
     let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
 
     let mb_below_outside = row + 1 >= mb_rows_total;
-    let mb_above_outside = row == 0;
-    let mb_left_outside = col == 0;
-    let mb_right_outside = col + 1 >= mb_cols;
+    let mut mb_above_outside = row == 0;
+    let mut mb_left_outside = col == 0;
+    let mut mb_right_outside = col + 1 >= mb_cols;
 
     let nb_above = if mb_above_outside {
         None
@@ -6842,6 +7020,34 @@ fn reconstruct_pending_ap_luma(
         Some(grid[row * mb_cols + (col + 1)])
     };
 
+    // [`DecodeOptions::obmc_skip_zero_right`] — a skipped macroblock
+    // under the ecosystem-compatibility deviation takes zero right-half
+    // remotes; since its own vector is zero (§5.3.1), substituting the
+    // "current" vector (the off-picture treatment) is exactly that.
+    if pending.zero_right_remote {
+        mb_right_outside = true;
+    }
+
+    // §F.3 slice rule — a different-segment neighbour behaves like an
+    // off-picture one (remote = Current). A not-yet-decoded neighbour
+    // (the [`MbGridEntry::OUTSIDE`] sentinel, reachable under the
+    // Arbitrary Slice Ordering submode) carries segment `u32::MAX` and
+    // therefore also collapses to Current — it necessarily belongs to
+    // a different slice, every same-slice macroblock being decoded
+    // within the current walk.
+    if let Some(seg) = slice_segment {
+        let other = |nb: Option<MbGridEntry>| nb.is_some_and(|e| e.segment != seg);
+        if other(nb_above) {
+            mb_above_outside = true;
+        }
+        if other(nb_left) {
+            mb_left_outside = true;
+        }
+        if other(nb_right) {
+            mb_right_outside = true;
+        }
+    }
+
     for &blk in &LumaBlockIndex::ALL {
         let blk_i = blk.index();
         let (bx, by) = luma_block_origin(mb_x, mb_y, blk_i);
@@ -6857,6 +7063,9 @@ fn reconstruct_pending_ap_luma(
             mb_right_outside,
             mb_below_outside,
         );
+        if std::env::var("H263_DBG").is_ok() && row == 6 && col == 6 {
+            eprintln!("FLUSH mb({row},{col}) blk{blk_i} q={q_mv:?} top={r_top:?} bot={r_bot:?} left={s_left:?} right={s_right:?}");
+        }
         let prediction = obmc_predict_block(
             &y_ref,
             bx,
@@ -6939,6 +7148,7 @@ fn decode_inter4v_macroblock(
         gob_top_row,
         gob_header_present,
         umv_mode,
+        aic_segment,
     )?;
 
     // Chroma vector per §F.2 / Table F.1: sum of the four luma vectors
@@ -6976,6 +7186,7 @@ fn decode_inter4v_macroblock(
             quant,
             mvs4,
             blocks,
+            zero_right_remote: false,
         });
     } else {
         // Deblocking-Filter-mode four vectors (Table J.1: OBMC OFF):
@@ -7069,6 +7280,18 @@ fn decode_inter4v_macroblock(
 /// candidate), applies the §6.1.1 rule-3 top-border and rule-4
 /// right-edge rewrites per block, and reconstructs each vector with
 /// the §D.2 UMV extension when `umv_mode` is set.
+///
+/// `current_segment` is the §6.1.1 video-picture-segment id of the
+/// macroblock (the GOB segment for the GOB drivers, the slice index
+/// for the Annex K driver): a candidate-supplying neighbour recorded
+/// under a different segment is "outside the slice" — the left
+/// neighbour's candidates fall to zero (rule 2) and the above /
+/// above-right neighbours' candidates are replaced by MV1 (rule 3) —
+/// exactly the [`predict_mv`] treatment, which the §K.1 rule-1
+/// "prediction … the same as if a GOB header were present" mandates
+/// for slices. For the GOB drivers the segment check coincides with
+/// the classic `gob_top_row` border test (segments are GOB-aligned),
+/// so their behaviour is unchanged.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_inter4v_mvs(
     mb: &H263Macroblock,
@@ -7079,6 +7302,7 @@ fn reconstruct_inter4v_mvs(
     gob_top_row: usize,
     gob_header_present: bool,
     umv_mode: bool,
+    current_segment: u32,
 ) -> Result<Mb4Mv> {
     // §5.3.7 / §5.3.8 — the parser already pulled the four MVDs for an
     // INTER4V macroblock in AP mode. Block order is Figure 5
@@ -7098,31 +7322,61 @@ fn reconstruct_inter4v_mvs(
     // MV2/MV3 are B1's/B2's, B4's MV1/MV2 are B3's/B2's).
     let mut neighbourhood = build_4mv_neighbourhood(grid, mb_cols, col, row);
 
+    // Per-neighbour segment membership: an off-picture or
+    // different-segment neighbour is "outside the slice". For the GOB
+    // drivers this reproduces the classic border tests (segments are
+    // GOB-aligned there, so a same-segment above neighbour exists
+    // exactly when the GOB continues above the current row).
+    let in_seg = |c: isize, r: isize| -> bool {
+        if c < 0 || r < 0 || c as usize >= mb_cols {
+            return false;
+        }
+        let idx = r as usize * mb_cols + c as usize;
+        idx < grid.len() && grid[idx].segment == current_segment
+    };
+    let above_outside_picture = row == 0;
+    let above_outside_gob = gob_header_present && row == gob_top_row;
+    let top_border = above_outside_picture || above_outside_gob;
+    let above_unavail = top_border || !in_seg(col as isize, row as isize - 1);
+    let above_right_unavail = top_border || !in_seg(col as isize + 1, row as isize - 1);
+    // §6.1.1 rule 2 — a left neighbour outside the picture / slice
+    // contributes zero candidates (`None` collapses to zero in
+    // `select_4mv_candidates`).
+    if !in_seg(col as isize - 1, row as isize) {
+        neighbourhood.left = None;
+    }
+
     // Reconstruct each per-block luma MV from its (MV1, MV2, MV3)
     // candidates, with the §6.1.1 rule-3 "above unavailable → MV2 =
     // MV3 = MV1" rewrite applied per block, and §D.2 UMV extension
     // when the picture header enables it.
-    let above_outside_picture = row == 0;
-    let above_outside_gob = gob_header_present && row == gob_top_row;
-    let top_border = above_outside_picture || above_outside_gob;
     let mut mvs4: Mb4Mv = [MotionVector::default(); 4];
     for &blk in &LumaBlockIndex::ALL {
         let (mv1, mut mv2, mut mv3) = select_4mv_candidates(blk, &neighbourhood);
 
         // §6.1.1 rule-3 applies to the top row of the *macroblock*: the
-        // upper blocks (B1, B2) read their MV2/MV3 from MB-above. When
-        // MB-above is unavailable, fold MV2/MV3 into MV1 per the rule.
-        if matches!(blk, LumaBlockIndex::B1 | LumaBlockIndex::B2) && top_border {
-            mv2 = mv1;
-            mv3 = mv1;
+        // upper blocks (B1, B2) read their MV2 from MB-above and MV3
+        // from MB-above-right (Figure F.1). When that neighbour is
+        // unavailable (picture top, GOB-header border, or a different
+        // §6.1.1 segment), fold the candidate into MV1 per the rule.
+        // B3 / B4 read only current-macroblock and MB-left cells.
+        match blk {
+            LumaBlockIndex::B1 | LumaBlockIndex::B2 => {
+                if above_unavail {
+                    mv2 = mv1;
+                }
+                if above_right_unavail {
+                    mv3 = mv1;
+                }
+            }
+            LumaBlockIndex::B3 | LumaBlockIndex::B4 => {}
         }
-        // §6.1.1 rule-4: right-edge macroblock's B2 / B4 have MV3
-        // coming from MB-above-right / MB-right; when that neighbour is
-        // off-picture, force MV3 = 0. `select_4mv_candidates` already
-        // returns zero for the missing neighbour, but a top-border
-        // collapse above could have rewritten it to MV1 — undo that.
+        // §6.1.1 rule-4: the right-edge macroblock's B1 / B2 MV3 comes
+        // from MB-above-right, off-picture at the right edge — force
+        // MV3 = 0 (the rule-3 collapse above could have rewritten it
+        // to MV1).
         let outside_right = col + 1 >= mb_cols;
-        if outside_right && matches!(blk, LumaBlockIndex::B2 | LumaBlockIndex::B4) {
+        if outside_right && matches!(blk, LumaBlockIndex::B1 | LumaBlockIndex::B2) {
             mv3 = MotionVector::new(0, 0);
         }
 
@@ -7139,6 +7393,60 @@ fn reconstruct_inter4v_mvs(
         neighbourhood.current[blk.index()] = mv;
     }
     Ok(mvs4)
+}
+
+/// §F.2 candidate-predictor derivation for a **single-MV** macroblock
+/// of an Advanced-Prediction / Deblocking-Filter-4MV picture: "if only
+/// one vector per macroblock is present, MV1, MV2 and MV3 are defined
+/// as for the 8 × 8 block numbered 1" (Figure F.1, upper-left
+/// sub-figure) — so an INTER4V neighbour contributes the vector of
+/// the specific 8×8 block Figure F.1 names (left MB's B2, above MB's
+/// B3 / B4), not its macroblock-level representative. When every
+/// neighbour carries one vector this reduces exactly to the baseline
+/// Figure-12 predictor.
+///
+/// The §6.1.1 border / segment rules are applied as in
+/// [`reconstruct_inter4v_mvs`]'s B1 arm.
+fn predict_mv_ap_single(
+    grid: &[MbGridEntry],
+    mb_cols: usize,
+    col: usize,
+    row: usize,
+    gob_top_row: usize,
+    gob_header_present: bool,
+    current_segment: u32,
+) -> MotionVector {
+    let mut neighbourhood = build_4mv_neighbourhood(grid, mb_cols, col, row);
+
+    let in_seg = |c: isize, r: isize| -> bool {
+        if c < 0 || r < 0 || c as usize >= mb_cols {
+            return false;
+        }
+        let idx = r as usize * mb_cols + c as usize;
+        idx < grid.len() && grid[idx].segment == current_segment
+    };
+    let above_outside_picture = row == 0;
+    let above_outside_gob = gob_header_present && row == gob_top_row;
+    let top_border = above_outside_picture || above_outside_gob;
+    let above_unavail = top_border || !in_seg(col as isize, row as isize - 1);
+    let above_right_unavail = top_border || !in_seg(col as isize + 1, row as isize - 1);
+    if !in_seg(col as isize - 1, row as isize) {
+        neighbourhood.left = None;
+    }
+
+    let (mv1, mut mv2, mut mv3) = select_4mv_candidates(LumaBlockIndex::B1, &neighbourhood);
+    if above_unavail {
+        mv2 = mv1;
+    }
+    if above_right_unavail {
+        mv3 = mv1;
+    }
+    // §6.1.1 rule 4 — MV3 reads MB-above-right, off-picture at the
+    // right edge.
+    if col + 1 >= mb_cols {
+        mv3 = MotionVector::new(0, 0);
+    }
+    predict_mv_median(mv1, mv2, mv3)
 }
 
 /// Build the §F.2 / Figure-F.1 four-MV neighbourhood for a macroblock
@@ -7176,13 +7484,6 @@ fn build_4mv_neighbourhood(
     } else {
         take(grid[(row - 1) * mb_cols + (col + 1)])
     };
-    // MB-right has not been decoded yet at INTER4V time (scan is
-    // left-to-right within a row). For an INTER4V macroblock's B4
-    // block, MV3 reads B1 of MB-right; §F.2 last paragraph plus the
-    // §6.1.1 rule-4 "outside picture at the right" rule collapse this
-    // to zero, which is precisely the `None` branch behaviour. We
-    // therefore always pass `None` for MB-right.
-    let right = None;
     let current = MbGridEntry::OUTSIDE.mvs4; // unused — caller passes the actual current MB's MVs separately.
 
     Mb4MvNeighbourhood {
@@ -7190,7 +7491,6 @@ fn build_4mv_neighbourhood(
         left,
         above,
         above_right,
-        right,
     }
 }
 
@@ -7898,6 +8198,7 @@ mod tests {
                 aic: false,
                 modified_quant: false,
                 alt_inter_vlc: false,
+                obmc_skip_zero_right: false,
             },
         )
         .expect("decode");
@@ -9409,6 +9710,7 @@ mod tests {
                 aic: true,
                 modified_quant: false,
                 alt_inter_vlc: false,
+                obmc_skip_zero_right: false,
             },
         )
         .expect("AIC driver should decode the zero-residual picture");
@@ -9507,6 +9809,7 @@ mod tests {
                 aic: true,
                 modified_quant: false,
                 alt_inter_vlc: false,
+                obmc_skip_zero_right: false,
             },
         )
         .expect("AIC driver should decode the +1-DC picture");
@@ -9579,6 +9882,7 @@ mod tests {
                 aic: true,
                 modified_quant: false,
                 alt_inter_vlc: false,
+                obmc_skip_zero_right: false,
             },
         )
         .expect("decode");
@@ -11638,9 +11942,7 @@ mod tests {
             None,
             DecodeOptions {
                 aic: true,
-                deblock: false,
-                modified_quant: false,
-                alt_inter_vlc: false,
+                ..DecodeOptions::default()
             },
         )
         .expect("decode");
