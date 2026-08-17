@@ -592,6 +592,31 @@ fn umv_plus_slices_round_trips_with_large_motion() {
     }
 }
 
+/// UMV+ × Annex F: `encode_inter_picture_ap_umv_plus` emits an H.263+
+/// AP + UMV P-picture whose four per-block vectors are coded as §D.2
+/// Table D.3 pairs over the extended range, reconstructed through the
+/// decoder's §F.2 predictors + §F.3 OBMC. A 25-pixel shift is beyond
+/// the zero-predictor reach of the Table 14 window, so the round-trip
+/// proves the extended-range leg end-to-end.
+#[test]
+fn umv_plus_ap_round_trips_with_large_motion() {
+    use oxideav_h263::encoder::{encode_inter_picture_ap_umv_plus, encode_intra_picture_plus};
+
+    let f0 = gradient(176, 144, 0);
+    let f1 = gradient(176, 144, 25);
+
+    let q = 6;
+    let i0 = encode_intra_picture_plus(&f0, q, 0).expect("I");
+    let r0 = decode_sequence(&i0, DecodeOptions::default()).expect("dec I")[0].clone();
+    let p1 = encode_inter_picture_ap_umv_plus(&f1, &r0, q, 1, 30).expect("AP UMV P");
+    let mut stream = i0.clone();
+    stream.extend_from_slice(&p1);
+    let frames = decode_sequence(&stream, DecodeOptions::default()).expect("dec I+P");
+    assert_eq!(frames.len(), 2);
+    let mae = luma_mae(&f1, &frames[1]);
+    assert!(mae < 4.0, "UMV+ AP luma MAE {mae}");
+}
+
 /// An Annex K Slice-Structured INTRA picture at a constant quantiser
 /// reconstructs **byte-exactly** the same frame as the single-segment
 /// baseline encode: INTRA macroblock coding carries no cross-segment

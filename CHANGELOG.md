@@ -83,6 +83,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   round-tripped through `decode_sequence` at 25-pel motion across
   slice heights 1 / 3 / 9.
 
+- **`encode_inter_picture_ap_umv_plus`** (round 447; closes the
+  encoder "UMV + AP combined mode" gap in its H.263+ form): the
+  two-pass Annex F OBMC encoder on an extended-PTYPE header with
+  OPPTYPE AP + UMV — per-8×8-block estimation over the
+  Tables-D.1/D.2 range under the §D.1.1 border bound
+  (`estimate_block_motion_umv_plus`), all four MVD pairs emitted as
+  §5.3.7/§5.3.8/§D.2 Table D.3 codewords
+  (`encode_inter4v_macroblock_umv_plus`). Round-tripped through
+  `decode_sequence` at 25-pel motion (through the decoder's §F.2
+  predictors + §F.3 OBMC) and black-box-decoded externally at max
+  per-sample diff 1.
+
 - **Annex Q × Annex D: RRU + UMV end-to-end** (round 447; removes a
   round-443 refusal): §Q.4 — with UMV also in use the pseudo motion
   vector is `pseudo-PC + difference` with the difference read from

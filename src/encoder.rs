@@ -3196,7 +3196,41 @@ pub fn encode_inter_picture_ap(
     tr: u8,
     search_half: i32,
 ) -> Result<Vec<u8>> {
-    use crate::encoder_motion::{estimate_block_motion, mvd_for, Mv4Grid};
+    encode_inter_picture_ap_impl(frame, reference, quant, tr, search_half, false)
+}
+
+/// As [`encode_inter_picture_ap`], but combined with the **Annex D
+/// Unrestricted Motion Vector mode on an extended-PTYPE (H.263+)
+/// header**: OPPTYPE signals AP + UMV (+ §5.1.9 UUI `"1"`), each 8×8
+/// block's vector is searched over the Tables-D.1/D.2 range under the
+/// §D.1.1 border bound, and all four MVD pairs are written per §5.3.7
+/// / §5.3.8 / §D.2 as **Table D.3** reversible codewords (the plain
+/// single-valued `mv − predictor` per block — no reachability
+/// constraint, so far-flung blocks are codable directly). The §F.3
+/// OBMC prediction is unchanged. Self-describing: decodes through
+/// [`crate::picture::decode_picture_layer`] / `decode_sequence` with
+/// `DecodeOptions::default()`.
+pub fn encode_inter_picture_ap_umv_plus(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+) -> Result<Vec<u8>> {
+    encode_inter_picture_ap_impl(frame, reference, quant, tr, search_half, true)
+}
+
+fn encode_inter_picture_ap_impl(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+    umv_plus: bool,
+) -> Result<Vec<u8>> {
+    use crate::encoder_motion::{
+        estimate_block_motion, estimate_block_motion_umv_plus, mvd_for, Mv4Grid,
+    };
     use crate::motion::{chroma_mv_4mv, LumaBlockIndex, Mb4Mv, MotionVector, RemoteMv};
 
     if quant == 0 || quant > 31 {
@@ -3231,10 +3265,30 @@ pub fn encode_inter_picture_ap(
                 let bx = mb_col * 16 + (blk_i % 2) * 8;
                 let by = mb_row * 16 + (blk_i / 2) * 8;
                 let predictor = grid4.predict_block(mb_col, mb_row, blk, &cur);
-                let mv =
-                    estimate_block_motion(frame, reference, bx, by, predictor, search_half, lambda);
+                let mv = if umv_plus {
+                    estimate_block_motion_umv_plus(
+                        frame,
+                        reference,
+                        bx,
+                        by,
+                        predictor,
+                        search_half,
+                        lambda,
+                    )
+                } else {
+                    estimate_block_motion(frame, reference, bx, by, predictor, search_half, lambda)
+                };
                 cur[blk_i] = mv;
-                mvds[blk_i] = mvd_for(mv, predictor);
+                mvds[blk_i] = if umv_plus {
+                    // §D.2 with PLUSPTYPE: the Table D.3 difference is
+                    // the plain single-valued `mv − predictor`.
+                    crate::macroblock::Mvd {
+                        dx_half: (mv.dx_half - predictor.dx_half) as i16,
+                        dy_half: (mv.dy_half - predictor.dy_half) as i16,
+                    }
+                } else {
+                    mvd_for(mv, predictor)
+                };
             }
             grid4.set(mb_col, mb_row, cur);
             field.push(cur);
@@ -3244,18 +3298,34 @@ pub fn encode_inter_picture_ap(
 
     // ---- Pass 2: §F.3 OBMC prediction + residual coding. -------------
     let mut w = BitWriter::new();
-    write_picture_header(
-        &mut w,
-        fmt,
-        quant,
-        tr,
-        /* is_inter */ true,
-        PtypeFlags {
-            advanced_prediction: true,
-            ..PtypeFlags::default()
-        },
-        None,
-    );
+    if umv_plus {
+        // H.263+ header: OPPTYPE AP + UMV, §5.1.9 UUI = "1" (Limited).
+        write_plus_picture_header(
+            &mut w,
+            fmt,
+            quant,
+            tr,
+            /* is_inter */ true,
+            PlusModes {
+                advanced_prediction: true,
+                umv: true,
+                ..PlusModes::default()
+            },
+        )?;
+    } else {
+        write_picture_header(
+            &mut w,
+            fmt,
+            quant,
+            tr,
+            /* is_inter */ true,
+            PtypeFlags {
+                advanced_prediction: true,
+                ..PtypeFlags::default()
+            },
+            None,
+        );
+    }
 
     let y_ref = crate::motion::RefPlane::new(&reference.y, lw, lh);
     let cw = frame.chroma_width();
@@ -3360,9 +3430,15 @@ pub fn encode_inter_picture_ap(
                 luma_enc[2].clone(),
                 luma_enc[3].clone(),
             ];
-            crate::encoder_mb::encode_inter4v_macroblock(
-                &mut w, &luma_arr, &cb_enc, &cr_enc, &mvds,
-            )?;
+            if umv_plus {
+                crate::encoder_mb::encode_inter4v_macroblock_umv_plus(
+                    &mut w, &luma_arr, &cb_enc, &cr_enc, &mvds,
+                )?;
+            } else {
+                crate::encoder_mb::encode_inter4v_macroblock(
+                    &mut w, &luma_arr, &cb_enc, &cr_enc, &mvds,
+                )?;
+            }
         }
     }
 

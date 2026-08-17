@@ -285,6 +285,33 @@ pub fn encode_inter4v_macroblock(
     cr: &EncodedInterBlock,
     mvds: &[Mvd; 4],
 ) -> Result<()> {
+    encode_inter4v_macroblock_inner(w, luma, cb, cr, mvds, false)
+}
+
+/// As [`encode_inter4v_macroblock`], but for a picture in the
+/// **Unrestricted Motion Vector mode with PLUSPTYPE present**: per
+/// §5.3.7 / §5.3.8 / §D.2 all four MVD pairs are written as Table D.3
+/// reversible codewords (each pair with the six-zero
+/// emulation-prevention rule), the differences being the plain
+/// single-valued `mv − predictor` per block.
+pub fn encode_inter4v_macroblock_umv_plus(
+    w: &mut BitWriter,
+    luma: &[EncodedInterBlock; 4],
+    cb: &EncodedInterBlock,
+    cr: &EncodedInterBlock,
+    mvds: &[Mvd; 4],
+) -> Result<()> {
+    encode_inter4v_macroblock_inner(w, luma, cb, cr, mvds, true)
+}
+
+fn encode_inter4v_macroblock_inner(
+    w: &mut BitWriter,
+    luma: &[EncodedInterBlock; 4],
+    cb: &EncodedInterBlock,
+    cr: &EncodedInterBlock,
+    mvds: &[Mvd; 4],
+    umv_table_d3: bool,
+) -> Result<()> {
     // §5.3.1 — COD = 0 (coded).
     w.write_bit(false);
 
@@ -307,10 +334,16 @@ pub fn encode_inter4v_macroblock(
     }
     write_cbpy(w, cbpy_intra ^ 0b1111)?;
 
-    // §5.3.7 / §5.3.8 — MVD then MVD2-4, horizontal before vertical.
+    // §5.3.7 / §5.3.8 — MVD then MVD2-4, horizontal before vertical:
+    // Table 14, or the Table D.3 reversible pairs when UMV is on with
+    // PLUSPTYPE present (§D.2).
     for mvd in mvds {
-        write_mvd_component(w, mvd.dx_half)?;
-        write_mvd_component(w, mvd.dy_half)?;
+        if umv_table_d3 {
+            crate::encoder_vlc::write_mvd_pair_d3(w, *mvd)?;
+        } else {
+            write_mvd_component(w, mvd.dx_half)?;
+            write_mvd_component(w, mvd.dy_half)?;
+        }
     }
 
     // §5.4 — six blocks; only those with coefficients emit TCOEFs.

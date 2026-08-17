@@ -24,7 +24,9 @@ the PLUSPTYPE forms `encode_inter_picture_umv_plus` /
 reversible MVD codes under the §5.1.9 UUI Tables-D.1/D.2 range —
 round 447),
 `encode_inter_picture_ap` (**Annex F** INTER4V four vectors per
-macroblock with §F.3 OBMC-exact prediction, two-pass),
+macroblock with §F.3 OBMC-exact prediction, two-pass;
+`encode_inter_picture_ap_umv_plus` pairs it with UMV+ Table D.3
+extended-range block vectors on an H.263+ header — round 447),
 `encode_pb_picture` (**Annex G** PB-frames: P-part + §G.4/§G.5
 bidirectionally-predicted B-part with BQUANT residuals),
 `encode_intra_picture_dquant` (§5.3.6 per-macroblock DQUANT),
@@ -563,7 +565,9 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * Encoder: arbitrary (non-stripe) rectangular slice shapes and
   non-row-aligned free-running slices (the slice encoders emit
   row-aligned slices; the rect encoders emit full-height vertical
-  stripes); UMV + AP combined mode; PB-frames with non-zero MVDB /
+  stripes); UMV + AP on the *baseline-PTYPE* header (the H.263+ form
+  is landed — `encode_inter_picture_ap_umv_plus`); PB-frames with
+  non-zero MVDB /
   Annex M Improved-PB; INTRA-refresh inside the AP and PB paths; AIC
   INTRA macroblocks inside a P-picture (only whole AIC I-pictures
   encode so far); within-picture adaptive quantisation for rate
