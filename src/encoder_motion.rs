@@ -381,7 +381,7 @@ pub fn estimate_block_motion(
 /// them against the decoder's own reconstruction, so the round-trip is
 /// exact by construction (`reconstruct_mv_component_umv(predictor, d)
 /// == mv` for the returned `d`).
-pub fn umv_mvd_component_for(mv: i32, predictor: i32) -> Option<i8> {
+pub fn umv_mvd_component_for(mv: i32, predictor: i32) -> Option<i16> {
     if !(MV_UMV_HALF_MIN..=MV_UMV_HALF_MAX).contains(&mv) {
         return None;
     }
@@ -390,7 +390,7 @@ pub fn umv_mvd_component_for(mv: i32, predictor: i32) -> Option<i8> {
     if (MV_HALF_MIN..=MV_HALF_MAX).contains(&direct)
         && reconstruct_mv_component_umv(predictor, direct) == mv
     {
-        return Some(direct as i8);
+        return Some(direct as i16);
     }
     // Otherwise the codeword denotes the pair {d, d ± 64}; try the
     // member of the pair that lands in the Table-14 window.
@@ -402,7 +402,7 @@ pub fn umv_mvd_component_for(mv: i32, predictor: i32) -> Option<i8> {
     if (MV_HALF_MIN..=MV_HALF_MAX).contains(&paired)
         && reconstruct_mv_component_umv(predictor, paired) == mv
     {
-        return Some(paired as i8);
+        return Some(paired as i16);
     }
     None
 }
@@ -537,6 +537,65 @@ pub fn estimate_motion_umv(
     )
 }
 
+/// Annex D §D.2 variant of [`estimate_motion`] for the **Unrestricted
+/// Motion Vector mode with PLUSPTYPE present** (UUI = "1", Limited).
+///
+/// With PLUSPTYPE present every difference is codable as a
+/// single-valued Table D.3 codeword, so no reachability filter is
+/// needed; the candidate window is bounded by
+///
+/// * the Tables D.1 / D.2 component ranges for the picture's
+///   dimensions ([`crate::motion::umv_plus_horizontal_range_half`] /
+///   [`crate::motion::umv_plus_vertical_range_half`]), and
+/// * the §D.1.1 restriction that no sample of the selected 16×16
+///   region lie more than 15 pixels outside the coded picture area
+///   (a tighter extrapolation bound than the PLUSPTYPE-absent form).
+pub fn estimate_motion_umv_plus(
+    source: &YuvFrame,
+    reference: &YuvFrame,
+    mb_col: usize,
+    mb_row: usize,
+    predictor: MotionVector,
+    search_half: i32,
+    lambda: u32,
+) -> MotionVector {
+    let (h_min, h_max) = crate::motion::umv_plus_horizontal_range_half(source.luma_width as u32);
+    let (v_min, v_max) = crate::motion::umv_plus_vertical_range_half(source.luma_height as u32);
+    let clamp = move |mv: MotionVector| -> MotionVector {
+        MotionVector {
+            dx_half: mv.dx_half.clamp(h_min, h_max),
+            dy_half: mv.dy_half.clamp(v_min, v_max),
+        }
+    };
+    let w = source.luma_width as i32;
+    let h = source.luma_height as i32;
+    let mb_x = (mb_col * 16) as i32;
+    let mb_y = (mb_row * 16) as i32;
+    // §D.1.1 — every referenced sample (including the second tap of a
+    // half-pel interpolation) must lie within 15 pixels of the coded
+    // picture area. Leftmost sample: mb_x + floor(mv/2); rightmost:
+    // mb_x + 15 + ceil(mv/2).
+    let admit = move |mv: MotionVector| -> bool {
+        let floor_pel = |half: i32| half.div_euclid(2);
+        let ceil_pel = |half: i32| (half + 1).div_euclid(2);
+        mb_x + floor_pel(mv.dx_half) >= -15
+            && mb_x + 15 + ceil_pel(mv.dx_half) <= w - 1 + 15
+            && mb_y + floor_pel(mv.dy_half) >= -15
+            && mb_y + 15 + ceil_pel(mv.dy_half) <= h - 1 + 15
+    };
+    search_best(
+        source,
+        reference,
+        mb_col,
+        mb_row,
+        predictor,
+        search_half,
+        lambda,
+        &clamp,
+        &admit,
+    )
+}
+
 /// Shared integer-then-half-pel SAD search. `clamp` folds a raw
 /// candidate into the mode's component range; `admit` rejects
 /// candidates whose MVD is not representable from `predictor` (always
@@ -630,7 +689,7 @@ fn search_best(
 /// the search clamps `mv` into `[-32, 31]` so `mv − predictor` is within
 /// `[-63, 63]` and a single wrap suffices.
 pub fn mvd_for(mv: MotionVector, predictor: MotionVector) -> crate::macroblock::Mvd {
-    let reduce = |delta: i32| -> i8 {
+    let reduce = |delta: i32| -> i16 {
         let mut v = delta;
         while v < MV_HALF_MIN {
             v += crate::motion::MV_HALF_SPAN;
@@ -638,7 +697,7 @@ pub fn mvd_for(mv: MotionVector, predictor: MotionVector) -> crate::macroblock::
         while v > MV_HALF_MAX {
             v -= crate::motion::MV_HALF_SPAN;
         }
-        v as i8
+        v as i16
     };
     crate::macroblock::Mvd {
         dx_half: reduce(mv.dx_half - predictor.dx_half),

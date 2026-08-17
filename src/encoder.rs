@@ -3037,12 +3037,18 @@ pub fn encode_inter_picture_umv(
 /// As [`encode_inter_picture_umv`], but with an **extended-PTYPE
 /// (H.263+) picture header**: the OPPTYPE bit-5 UMV flag signals Annex
 /// D on the wire and the §5.1.9 UUI codeword `"1"` selects the
-/// Tables-D.1/D.2 limited range (the crate's §D.2 `[-31.5, 31.5]`
-/// extended range). Self-describing: decodes through
+/// Tables-D.1/D.2 limited range.
+///
+/// Per §5.3.7 / §D.2, with PLUSPTYPE present the motion vector
+/// differences are coded with the **Table D.3 reversible codes**
+/// (single-valued `mv − predictor`, six-zero emulation-prevention
+/// rule) instead of Table 14, and each component is bounded by the
+/// Tables-D.1/D.2 picture-size range and the §D.1.1 15-pixel border
+/// rule rather than the PLUSPTYPE-absent predictor-window rule — so
+/// the macroblock stream deliberately differs from
+/// [`encode_inter_picture_umv`]'s. Self-describing: decodes through
 /// [`crate::picture::decode_picture_layer`] /
-/// [`crate::picture::decode_sequence`] with `DecodeOptions::default()`;
-/// the macroblock stream is bit-identical to
-/// [`encode_inter_picture_umv`]'s.
+/// [`crate::picture::decode_sequence`] with `DecodeOptions::default()`.
 pub fn encode_inter_picture_umv_plus(
     frame: &YuvFrame,
     reference: &YuvFrame,
@@ -3644,7 +3650,20 @@ fn encode_inter_picture_motion_impl(
         }
         for mb_col in 0..mb_cols {
             let predictor = grid.predict(mb_col, mb_row);
-            let mv = if umv {
+            let mv = if umv && plus {
+                // §D.2 with PLUSPTYPE: single-valued Table D.3
+                // differences — every candidate in the Tables-D.1/D.2
+                // window (∩ the §D.1.1 border bound) is codable.
+                crate::encoder_motion::estimate_motion_umv_plus(
+                    frame,
+                    reference,
+                    mb_col,
+                    mb_row,
+                    predictor,
+                    search_half,
+                    lambda,
+                )
+            } else if umv {
                 crate::encoder_motion::estimate_motion_umv(
                     frame,
                     reference,
@@ -3757,7 +3776,15 @@ fn encode_inter_picture_motion_impl(
                 continue;
             }
 
-            let mvd = if umv {
+            let mvd = if umv && plus {
+                // §D.2 with PLUSPTYPE: the Table D.3 difference is the
+                // plain `mv − predictor` (single-valued, no pair
+                // selection).
+                crate::macroblock::Mvd {
+                    dx_half: (mv.dx_half - predictor.dx_half) as i16,
+                    dy_half: (mv.dy_half - predictor.dy_half) as i16,
+                }
+            } else if umv {
                 // The UMV estimator only returns §D.2-reachable vectors,
                 // so the inverse always exists.
                 crate::encoder_motion::umv_mvd_for(mv, predictor).ok_or(Error::BadMvdCode)?
@@ -3770,7 +3797,15 @@ fn encode_inter_picture_motion_impl(
                 luma_enc[2].clone(),
                 luma_enc[3].clone(),
             ];
-            crate::encoder_mb::encode_inter_macroblock(&mut w, &luma_arr, &cb_enc, &cr_enc, mvd)?;
+            if umv && plus {
+                crate::encoder_mb::encode_inter_macroblock_umv_plus(
+                    &mut w, &luma_arr, &cb_enc, &cr_enc, mvd,
+                )?;
+            } else {
+                crate::encoder_mb::encode_inter_macroblock(
+                    &mut w, &luma_arr, &cb_enc, &cr_enc, mvd,
+                )?;
+            }
             grid.set_inter(mb_col, mb_row, mv);
         }
     }

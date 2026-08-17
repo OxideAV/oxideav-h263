@@ -76,9 +76,10 @@
 //!   predictor-dependent selection of the Table-14 difference pair.
 //!   The driver applies it whenever the PTYPE bit-10 UMV flag is set;
 //!   §D.1 edge replication (already always-on) supplies the
-//!   out-of-picture samples. The PLUSPTYPE / UUI ranges of Tables
-//!   D.1 / D.2 and the Table-D.3 reversible VLC stay gated on the
-//!   not-yet-decoded extended-PTYPE header.
+//!   out-of-picture samples. With PLUSPTYPE present the mode instead
+//!   uses the Table-D.3 reversible VLC (single-valued differences)
+//!   under the §5.1.9 UUI-selected Tables-D.1/D.2 ranges — see
+//!   [`motion::reconstruct_mv_umv_plus`].
 //! * **Round 11** — Annex F §F.2 four-motion-vector candidate-predictor
 //!   redefinition (Figure F.1) and Table F.1 sixteenth-pixel chroma
 //!   derivation as pure transformations: [`LumaBlockIndex`] /

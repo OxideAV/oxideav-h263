@@ -170,16 +170,36 @@ pub fn write_intradc(w: &mut BitWriter, rec: i16) -> Result<()> {
 /// value `half` in the spec range `[-32, +31]` (i.e. vector `-16 .. +15.5`).
 ///
 /// Out-of-range values are rejected with [`Error::BadMvdCode`].
-pub fn write_mvd_component(w: &mut BitWriter, half: i8) -> Result<()> {
+pub fn write_mvd_component(w: &mut BitWriter, half: i16) -> Result<()> {
     let (bits, code) = mvd_codeword(half).ok_or(Error::BadMvdCode)?;
     w.write_bits(code, bits);
+    Ok(())
+}
+
+/// §5.3.7 / §D.2 — write one motion-vector-difference **pair**
+/// (horizontal then vertical, half-pel units) as two Table D.3
+/// reversible codewords, the form used when the Unrestricted Motion
+/// Vector mode is on and PLUSPTYPE is present.
+///
+/// "If a pair equals (0.5, 0.5) six consecutive zeros are produced. To
+/// prevent start code emulation, this occurrence shall be followed by
+/// one bit set to '1'" — the `(+1, +1)` half-pel pair (two `"000"`
+/// codewords) is followed by the emulation-prevention `"1"` (the
+/// zero-difference codeword). Exact inverse of
+/// [`crate::macroblock::read_mvd_pair`] in its Table D.3 form.
+pub fn write_mvd_pair_d3(w: &mut BitWriter, mvd: crate::macroblock::Mvd) -> Result<()> {
+    crate::annex_p::write_table_d3(w, mvd.dx_half as i32)?;
+    crate::annex_p::write_table_d3(w, mvd.dy_half as i32)?;
+    if mvd.dx_half == 1 && mvd.dy_half == 1 {
+        w.write_bit(true);
+    }
     Ok(())
 }
 
 /// Table 14 codeword `(bits, code)` for a half-pel MVD value, or `None`
 /// if out of range. The inventory is the verbatim Table 14 transcription
 /// (the same data as [`crate::macroblock::decode_mvd_component`]).
-fn mvd_codeword(half: i8) -> Option<(u32, u32)> {
+fn mvd_codeword(half: i16) -> Option<(u32, u32)> {
     let row: (u32, u32) = match half {
         -32 => (13, 0b0_0000_0000_0010_1),
         -31 => (13, 0b0_0000_0000_0011_1),
@@ -541,12 +561,48 @@ mod tests {
 
     #[test]
     fn mvd_round_trips_full_range() {
-        for half in -32i8..=31 {
+        for half in -32i16..=31 {
             let mut w = BitWriter::new();
             write_mvd_component(&mut w, half).unwrap();
             let bytes = w.finish();
             let mut r = BitReader::new(&bytes);
-            assert_eq!(decode_mvd_component(&mut r).unwrap(), half);
+            assert_eq!(decode_mvd_component(&mut r).unwrap() as i16, half);
+        }
+    }
+
+    /// §5.3.7 / §D.2 — the Table D.3 pair writer is the exact inverse
+    /// of the Table D.3 arm of `read_mvd_pair`, including the
+    /// (+0.5, +0.5) emulation-prevention bit.
+    #[test]
+    fn mvd_pair_d3_round_trips_including_epb() {
+        use crate::macroblock::{read_mvd_pair, Mvd};
+        let pairs = [
+            (0i16, 0i16),
+            (1, 1), // the six-zero EPB case
+            (1, -1),
+            (-1, 1),
+            (64, -64),
+            (-127, 128),
+            (255, -256),
+            (4095, -4095),
+        ];
+        for &(dx, dy) in &pairs {
+            let mut w = BitWriter::new();
+            write_mvd_pair_d3(
+                &mut w,
+                Mvd {
+                    dx_half: dx,
+                    dy_half: dy,
+                },
+            )
+            .unwrap();
+            // Trailing sentinel so a mis-consumed EPB shifts the pad.
+            w.write_bit(true);
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            let got = read_mvd_pair(&mut r, true).unwrap();
+            assert_eq!((got.dx_half, got.dy_half), (dx, dy));
+            assert!(r.read_bit().unwrap(), "sentinel after ({dx}, {dy})");
         }
     }
 

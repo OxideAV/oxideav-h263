@@ -174,6 +174,36 @@ pub fn encode_inter_macroblock_dq(
     mvd: Mvd,
     dquant: Option<i8>,
 ) -> Result<()> {
+    encode_inter_macroblock_inner(w, luma, cb, cr, mvd, dquant, false)
+}
+
+/// As [`encode_inter_macroblock`], but for a picture in the
+/// **Unrestricted Motion Vector mode with PLUSPTYPE present**: the MVD
+/// pair is written as two §D.2 / Table D.3 reversible codewords (with
+/// the six-zero emulation-prevention rule) instead of Table 14, per
+/// §5.3.7 — "if the Unrestricted Motion Vector mode is used and
+/// PLUSPTYPE is present, motion vectors are coded using Table D.3
+/// instead of Table 14". `mvd` is the plain single-valued difference
+/// `mv − predictor` (no §D.2 pair selection exists on this path).
+pub fn encode_inter_macroblock_umv_plus(
+    w: &mut BitWriter,
+    luma: &[EncodedInterBlock; 4],
+    cb: &EncodedInterBlock,
+    cr: &EncodedInterBlock,
+    mvd: Mvd,
+) -> Result<()> {
+    encode_inter_macroblock_inner(w, luma, cb, cr, mvd, None, true)
+}
+
+fn encode_inter_macroblock_inner(
+    w: &mut BitWriter,
+    luma: &[EncodedInterBlock; 4],
+    cb: &EncodedInterBlock,
+    cr: &EncodedInterBlock,
+    mvd: Mvd,
+    dquant: Option<i8>,
+    umv_table_d3: bool,
+) -> Result<()> {
     // §5.3.1 — COD = 0 (coded). INTER macroblocks always appear in
     // P-pictures, which carry COD.
     w.write_bit(false);
@@ -210,9 +240,14 @@ pub fn encode_inter_macroblock_dq(
         write_dquant(w, diff)?;
     }
 
-    // §5.3.7 — MVD (horizontal then vertical).
-    write_mvd_component(w, mvd.dx_half)?;
-    write_mvd_component(w, mvd.dy_half)?;
+    // §5.3.7 — MVD (horizontal then vertical): Table 14, or the
+    // Table D.3 reversible pair when UMV is on with PLUSPTYPE present.
+    if umv_table_d3 {
+        crate::encoder_vlc::write_mvd_pair_d3(w, mvd)?;
+    } else {
+        write_mvd_component(w, mvd.dx_half)?;
+        write_mvd_component(w, mvd.dy_half)?;
+    }
 
     // §5.4 — six blocks, only those with coefficients emit TCOEFs.
     for e in luma.iter() {
@@ -361,6 +396,7 @@ mod tests {
                 pb_annex_m: false,
                 quantiser_before: 8,
                 modified_quant: false,
+                umv_table_d3: false,
             },
         )
         .unwrap();
@@ -403,6 +439,7 @@ mod tests {
                 pb_annex_m: false,
                 quantiser_before: 5,
                 modified_quant: false,
+                umv_table_d3: false,
             },
         )
         .unwrap();
@@ -442,6 +479,7 @@ mod tests {
                 pb_annex_m: false,
                 quantiser_before: 10,
                 modified_quant: false,
+                umv_table_d3: false,
             },
         )
         .unwrap();
@@ -497,6 +535,7 @@ mod tests {
                 pb_annex_m: false,
                 quantiser_before: 7,
                 modified_quant: false,
+                umv_table_d3: false,
             },
         )
         .unwrap();
@@ -523,6 +562,7 @@ mod tests {
                 pb_annex_m: false,
                 quantiser_before: 8,
                 modified_quant: false,
+                umv_table_d3: false,
             },
         )
         .unwrap();

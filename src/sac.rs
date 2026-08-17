@@ -747,12 +747,12 @@ pub fn encode_cbpb_sac(enc: &mut SacEncoder<'_>, cbpb: u8) {
 
 /// Decode one MVD component (Table 14 indexing: index 32 = 0). The
 /// returned value is in half-pel units, range `[-32, +31]`.
-pub fn decode_mvd_component_sac(dec: &mut SacDecoder<'_, '_>) -> i8 {
-    (dec.decode_symbol(&CUMF_MVD) as i32 - 32) as i8
+pub fn decode_mvd_component_sac(dec: &mut SacDecoder<'_, '_>) -> i16 {
+    (dec.decode_symbol(&CUMF_MVD) as i32 - 32) as i16
 }
 
 /// Encode one MVD component (half-pel units, `[-32, +31]`).
-pub fn encode_mvd_component_sac(enc: &mut SacEncoder<'_>, half: i8) -> Result<()> {
+pub fn encode_mvd_component_sac(enc: &mut SacEncoder<'_>, half: i16) -> Result<()> {
     if !(-32..=31).contains(&(half as i32)) {
         return Err(Error::BadMvdCode);
     }

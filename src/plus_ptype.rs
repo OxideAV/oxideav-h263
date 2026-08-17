@@ -174,6 +174,13 @@ pub struct InheritedExtendedState {
     /// the §5.1.13–§5.1.16 RPS picture-header fields (RPSMF / TRPI / TRP
     /// / BCI), whose presence depends on the mode being in use.
     pub reference_picture_selection: bool,
+    /// §5.1.9 — the UUI codeword from the last UFEP=001 picture that
+    /// had UMV on. UUI is on the wire only when UMV is indicated in
+    /// PLUSPTYPE **and** UFEP is `"001"`; a UFEP=000 picture inheriting
+    /// UMV keeps the last-sent range selection in effect (parallel to
+    /// the §5.1.10 SSS rule). `None` when the prior UFEP=001 picture
+    /// had UMV off (no UUI was sent) or no UFEP=001 has been seen.
+    pub uui: Option<Uui>,
 }
 
 impl InheritedExtendedState {
@@ -195,6 +202,10 @@ impl InheritedExtendedState {
             advanced_intra: opptype.advanced_intra,
             deblocking: opptype.deblocking,
             reference_picture_selection: opptype.reference_picture_selection,
+            // §5.1.9 — UUI is parsed outside OPPTYPE; the picture
+            // drivers overwrite this from the parsed header when UMV
+            // is on (see `decode_picture_layer_with_inherited`).
+            uui: None,
         }
     }
 
@@ -1386,8 +1397,10 @@ mod tests {
     fn rpr_mode_inter_parses_rprp_field() {
         // §P.2 — an INTER-picture with the RPR mode bit set now carries
         // and parses the §5.1.18 RPRP field (WDA + eight all-zero warping
-        // parameters with their pair emulation-prevention bits + fill
-        // mode), rather than being refused.
+        // parameters + fill mode), rather than being refused. A zero
+        // warping parameter is the Table-D.3 codeword "1"; per §P.2.2
+        // the emulation-prevention bit follows only a pair of *value-+1*
+        // ("000") codewords, so no EPB is written here.
         let mut w = BitWriter::new();
         w.write_u32(UFEP_FULL, 3);
         write_opptype(
@@ -1398,10 +1411,8 @@ mod tests {
         w.write_bit(false); // CPM
                             // RPRP: WDA = "11" (1/16-pixel).
         w.write_u32(0b11, 2);
-        // Eight all-zero warping parameters: four pairs of (zero, zero,
-        // emulation-prevention "1").
+        // Eight all-zero warping parameters: four pairs of (zero, zero).
         for _pair in 0..4 {
-            w.write_bit(true);
             w.write_bit(true);
             w.write_bit(true);
         }

@@ -1362,6 +1362,7 @@ mod tests {
                 pb_annex_m: false,
                 quantiser_before: gob.quantiser,
                 modified_quant: false,
+                umv_table_d3: false,
             },
         )
         .expect("mb");

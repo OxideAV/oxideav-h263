@@ -694,6 +694,7 @@ pub fn decode_picture(
         options,
         None,
         None,
+        UmvCoding::from_baseline(header.umv_mode),
     )
 }
 
@@ -775,6 +776,7 @@ pub fn decode_picture_no_gob0_header(
         options,
         None,
         Some(pquant),
+        UmvCoding::from_baseline(header.umv_mode),
     )
 }
 
@@ -1091,6 +1093,7 @@ fn decode_sac_macroblock_stream(
                         pb_annex_m: false,
                         quantiser_before: current_quant,
                         modified_quant: false,
+                        umv_table_d3: false,
                     },
                 )?;
                 if matches!(mb.mb_type, Some(MbType::Stuffing)) {
@@ -1289,8 +1292,15 @@ fn decode_one_macroblock_sac(
     // MCBPC decoder only emits these types when AP is signalled).
     if matches!(mb_type, MbType::Inter4V | MbType::Inter4VQ) {
         let mvs4 = reconstruct_inter4v_mvs(
-            mb, grid, mb_cols, col, row, /* gob_top_row */ 0,
-            /* gob_header_present */ true, umv_mode, /* segment */ 0,
+            mb,
+            grid,
+            mb_cols,
+            col,
+            row,
+            /* gob_top_row */ 0,
+            /* gob_header_present */ true,
+            UmvCoding::from_baseline(umv_mode),
+            /* segment */ 0,
         )?;
         let chroma_vec = chroma_mv_4mv(&mvs4);
         let inter_cbpy = cbpy ^ 0b1111;
@@ -1753,6 +1763,7 @@ fn decode_rru_picture_body(
                         pb_annex_m: false,
                         quantiser_before: current_quant,
                         modified_quant: false,
+                        umv_table_d3: false,
                     },
                 )?;
                 if matches!(mb.mb_type, Some(MbType::Stuffing)) {
@@ -2130,6 +2141,7 @@ pub fn enumerate_mb_boundaries(data: &[u8]) -> Result<Vec<MbBoundaryInfo>> {
                             pb_annex_m: false,
                             quantiser_before: current_quant,
                             modified_quant: false,
+                            umv_table_d3: false,
                         },
                     )?;
                     if matches!(mb.mb_type, Some(MbType::Stuffing)) {
@@ -2666,6 +2678,7 @@ pub fn decode_picture_layer_with_inherited(
                 options,
                 None,
                 None,
+                UmvCoding::from_baseline(header.umv_mode),
             )?;
             // §5.1.4.5 rule 3 — a picture without PLUSPTYPE clears all
             // inferred mode state.
@@ -2679,7 +2692,15 @@ pub fn decode_picture_layer_with_inherited(
                 // §5.1.4.4 rule — UFEP=001 establishes the inherited
                 // state. We snapshot the OPPTYPE (plus its CPFMT for
                 // the Custom source-format case) for the next picture.
-                Some(o) => InheritedExtendedState::from_opptype_with_cpfmt(o, extended.plus.cpfmt),
+                // §5.1.9 — a UFEP=001 picture with UMV on also carries
+                // UUI; the last-sent value stays in effect for UFEP=000
+                // followers.
+                Some(o) => {
+                    let mut snap =
+                        InheritedExtendedState::from_opptype_with_cpfmt(o, extended.plus.cpfmt);
+                    snap.uui = extended.plus.uui;
+                    snap
+                }
                 // UFEP=000 picture: inherited state passes through
                 // unchanged (the spec keeps the snapshot until the next
                 // UFEP=001 or non-PLUSPTYPE picture).
@@ -2726,6 +2747,7 @@ pub fn decode_picture_layer_with_inherited(
                 slice_structured,
                 improved_pb,
                 cpm_psbi,
+                umv,
             } = plus_ptype_to_baseline_shim(
                 &extended, options, inherited, /* allow_rps */ false,
             )?;
@@ -2775,6 +2797,7 @@ pub fn decode_picture_layer_with_inherited(
                     effective_ref,
                     shim_options,
                     cpm_psbi,
+                    umv,
                 )?,
                 None => {
                     // §5.1.19 — PQUANT (5 bits). With PLUSPTYPE present the
@@ -2802,6 +2825,7 @@ pub fn decode_picture_layer_with_inherited(
                         shim_options,
                         None,
                         Some(pquant),
+                        umv,
                     )?
                 }
             };
@@ -2885,6 +2909,7 @@ pub fn decode_picture_layer_rps(
         slice_structured,
         improved_pb,
         cpm_psbi,
+        umv,
     } = plus_ptype_to_baseline_shim(
         &extended,
         options,
@@ -2922,6 +2947,7 @@ pub fn decode_picture_layer_rps(
                 shim_options,
                 cpm_psbi,
                 rps_slice,
+                umv,
             )?
         }
         None => {
@@ -2960,6 +2986,7 @@ pub fn decode_picture_layer_rps(
                 None,
                 Some(pquant),
                 rps_gob,
+                umv,
             )?
         }
     };
@@ -3140,6 +3167,7 @@ pub fn decode_pb_picture(
             b_frame: &mut b_frame,
         }),
         None,
+        UmvCoding::from_baseline(header.umv_mode),
     )?;
     Ok(PbFramePair { p_frame, b_frame })
 }
@@ -3253,6 +3281,7 @@ pub fn decode_pb_picture_no_gob0_header(
             b_frame: &mut b_frame,
         }),
         Some(pquant),
+        UmvCoding::from_baseline(header.umv_mode),
     )?;
     Ok(PbFramePair { p_frame, b_frame })
 }
@@ -3354,7 +3383,11 @@ pub fn decode_improved_pb_picture_with_inherited(
     // the next picture; a UFEP=000 picture passes the incoming state
     // through unchanged.
     let next_inherited = match extended.plus.opptype {
-        Some(o) => InheritedExtendedState::from_opptype_with_cpfmt(o, extended.plus.cpfmt),
+        Some(o) => {
+            let mut snap = InheritedExtendedState::from_opptype_with_cpfmt(o, extended.plus.cpfmt);
+            snap.uui = extended.plus.uui;
+            snap
+        }
         None => inherited,
     };
     let PlusShimOutcome {
@@ -3364,6 +3397,7 @@ pub fn decode_improved_pb_picture_with_inherited(
         slice_structured,
         improved_pb,
         cpm_psbi: _,
+        umv: _,
     } = plus_ptype_to_baseline_shim(&extended, options, inherited, /* allow_rps */ false)?;
     if !improved_pb {
         // Not an Improved PB-frame — the caller should use
@@ -3433,6 +3467,9 @@ pub fn decode_improved_pb_picture_with_inherited(
             b_frame: &mut b_frame,
         }),
         None,
+        // UMV + Improved-PB is refused above, so the P-part never
+        // carries Annex D vectors here.
+        UmvCoding::Off,
     )?;
     Ok((PbFramePair { p_frame, b_frame }, next_inherited))
 }
@@ -3801,6 +3838,10 @@ struct PlusShimOutcome {
     /// slice driver so each slice's §K.2.4 SSBI can be validated
     /// against it (single-Sub-Bitstream decode).
     cpm_psbi: Option<u8>,
+    /// §5.3.7 / §D.2 — the motion-vector coding in force. PLUSPTYPE
+    /// pictures with UMV on use the Table D.3 reversible codes with
+    /// the UUI-selected range; otherwise [`UmvCoding::Off`].
+    umv: UmvCoding,
 }
 
 /// Annex P §P.1 — apply implicit Reference Picture Resampling to the
@@ -4135,18 +4176,47 @@ fn plus_ptype_to_baseline_shim(
         }
     };
 
-    // §5.1.9 — when UMV is on, only the `"1"` (Limited) UUI form maps
-    // onto the existing [`reconstruct_mv_umv`] extended range. UUI is
-    // present iff UMV is on AND UFEP=001 (parse_plus_ptype gate); on a
-    // UFEP=000 inheritance path the parser already consumed no UUI and
-    // we trust the prior UFEP=001 to have established a `Limited` range
-    // for that to have decoded successfully.
-    if umv_effective && extended.plus.opptype.is_some() {
-        match extended.plus.uui {
-            Some(Uui::Limited) => {}
-            _ => return Err(Error::NotImplemented),
+    // §5.3.7 / §D.2 — with PLUSPTYPE present, UMV motion vectors are
+    // coded with the Table D.3 reversible codes and "the motion vector
+    // range does not depend on the motion vector prediction value":
+    // UUI = "1" bounds each component by Tables D.1 / D.2 (keyed on
+    // the picture dimensions), UUI = "01" leaves it unlimited except
+    // by the §D.1.1 border distance (motion compensation applies the
+    // §D.1 edge replication). UUI is on the wire iff UMV is on AND
+    // UFEP=001; a UFEP=000 picture keeps the last-sent UUI from the
+    // inherited snapshot.
+    let umv_coding = if umv_effective {
+        let uui = match extended.plus.opptype {
+            Some(_) => extended.plus.uui,
+            None => inherited.uui,
         }
-    }
+        .ok_or(Error::NotImplemented)?;
+        match uui {
+            Uui::Limited => {
+                let (h_min, h_max) =
+                    crate::motion::umv_plus_horizontal_range_half(layout.luma_width);
+                let (v_min, v_max) =
+                    crate::motion::umv_plus_vertical_range_half(layout.luma_height);
+                UmvCoding::TableD3 {
+                    h_min,
+                    h_max,
+                    v_min,
+                    v_max,
+                }
+            }
+            Uui::Unlimited => {
+                let (lo, hi) = crate::motion::MV_UMV_PLUS_UNLIMITED_HALF;
+                UmvCoding::TableD3 {
+                    h_min: lo,
+                    h_max: hi,
+                    v_min: lo,
+                    v_max: hi,
+                }
+            }
+        }
+    } else {
+        UmvCoding::Off
+    };
 
     let header = H263PictureHeader {
         temporal_reference: extended.prefix.temporal_reference,
@@ -4189,6 +4259,7 @@ fn plus_ptype_to_baseline_shim(
         slice_structured,
         improved_pb,
         cpm_psbi: extended.plus.cpm.then(|| extended.plus.psbi.unwrap_or(0)),
+        umv: umv_coding,
     })
 }
 
@@ -4222,6 +4293,75 @@ struct RpsGobContext<'a> {
 /// shared so the PLUSPTYPE entry point can reuse the baseline driver
 /// after [`plus_ptype_to_baseline_shim`] has translated PLUSPTYPE
 /// fields into a baseline-equivalent header.
+/// Which Annex D motion-vector entropy/reconstruction form is in
+/// force for a picture (§5.3.7 / §D.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UmvCoding {
+    /// UMV off — Table 14 MVDs with the default §6.1.1 wrap into
+    /// `[-16, 15.5]` pel.
+    Off,
+    /// UMV on, PLUSPTYPE **absent** — Table 14 MVDs with the §D.2
+    /// predictor-dependent pair selection over `[-31.5, 31.5]` pel.
+    Wrap,
+    /// UMV on, PLUSPTYPE **present** — Table D.3 reversible MVDs; the
+    /// component is `predictor + difference` with no wrap, bounded by
+    /// the given ranges (half-pel): Tables D.1 / D.2 under UUI = "1",
+    /// the Table D.3 codomain under UUI = "01" (§D.1.1 limits apply
+    /// through the §D.1 edge replication, not a wire bound).
+    TableD3 {
+        h_min: i32,
+        h_max: i32,
+        v_min: i32,
+        v_max: i32,
+    },
+}
+
+impl UmvCoding {
+    /// The coding for a baseline-PTYPE picture (PLUSPTYPE absent):
+    /// PTYPE bit 10 selects between the default wrap and the §D.2
+    /// extended-range pair selection, both over Table 14.
+    pub(crate) fn from_baseline(umv_mode: bool) -> Self {
+        if umv_mode {
+            UmvCoding::Wrap
+        } else {
+            UmvCoding::Off
+        }
+    }
+
+    /// Whether the §5.3.7 / §D.2 Table D.3 parse applies
+    /// ([`MbContext::umv_table_d3`]).
+    pub(crate) fn table_d3(self) -> bool {
+        matches!(self, UmvCoding::TableD3 { .. })
+    }
+}
+
+/// Reconstruct one motion vector from its predictor and parsed MVD
+/// under the picture's [`UmvCoding`] (§6.1.1 / §D.2). The Table D.3
+/// arm validates the reconstructed components against the mode's
+/// range (Tables D.1 / D.2, or the Table D.3 codomain for UUI = "01");
+/// a component outside it is a malformed stream
+/// ([`Error::BadMvdCode`]).
+fn reconstruct_mv_coded(umv: UmvCoding, predictor: MotionVector, mvd: Mvd) -> Result<MotionVector> {
+    match umv {
+        UmvCoding::Off => Ok(reconstruct_mv(predictor, mvd)),
+        UmvCoding::Wrap => Ok(reconstruct_mv_umv(predictor, mvd)),
+        UmvCoding::TableD3 {
+            h_min,
+            h_max,
+            v_min,
+            v_max,
+        } => {
+            let mv = crate::motion::reconstruct_mv_umv_plus(predictor, mvd);
+            if mv.dx_half < h_min || mv.dx_half > h_max || mv.dy_half < v_min || mv.dy_half > v_max
+            {
+                return Err(Error::BadMvdCode);
+            }
+            Ok(mv)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn decode_after_picture_header(
     reader: &mut BitReader<'_>,
     header: &H263PictureHeader,
@@ -4230,6 +4370,7 @@ fn decode_after_picture_header(
     options: DecodeOptions,
     pb: Option<PbPictureCtx<'_>>,
     gob0_pquant: Option<u8>,
+    umv: UmvCoding,
 ) -> Result<YuvFrame> {
     decode_after_picture_header_inner(
         reader,
@@ -4240,6 +4381,7 @@ fn decode_after_picture_header(
         pb,
         gob0_pquant,
         None,
+        umv,
     )
 }
 
@@ -4260,6 +4402,7 @@ fn decode_after_picture_header_inner(
     mut pb: Option<PbPictureCtx<'_>>,
     gob0_pquant: Option<u8>,
     rps_gob: Option<RpsGobContext<'_>>,
+    umv: UmvCoding,
 ) -> Result<YuvFrame> {
     // Unsupported header-signalled modes — refuse rather than guess.
     // SAC is refused outright. A PB-frames picture must arrive through
@@ -4459,6 +4602,7 @@ fn decode_after_picture_header_inner(
                             pb_annex_m: pb.as_ref().is_some_and(|p| p.annex_m),
                             quantiser_before: current_quant,
                             modified_quant: options.modified_quant,
+                            umv_table_d3: umv.table_d3(),
                         },
                     )?;
                     if matches!(mb.mb_type, Some(MbType::Stuffing)) {
@@ -4478,7 +4622,7 @@ fn decode_after_picture_header_inner(
                     row,
                     gob_top_row,
                     gob_header_present,
-                    header.umv_mode,
+                    umv,
                     header.advanced_prediction,
                     pb_mode,
                     &mut current_quant,
@@ -5516,8 +5660,8 @@ fn decode_ep_macroblock(
     // the row carries it. EP-pictures never carry MVDBW.
     let forward_mv = if header.has_mvdfw {
         let mvd = Mvd {
-            dx_half: decode_mvd_component(reader)?,
-            dy_half: decode_mvd_component(reader)?,
+            dx_half: decode_mvd_component(reader)? as i16,
+            dy_half: decode_mvd_component(reader)? as i16,
         };
         let predictor = predict_forward_mv(fwd_grid, mb_cols, col, row, gob_top_row, segment);
         reconstruct_mv(predictor, mvd)
@@ -6110,8 +6254,8 @@ fn decode_b_macroblock(
     // independent §O.5.1 predictors.
     let forward_mv = if header.has_mvdfw {
         let mvd = Mvd {
-            dx_half: decode_mvd_component(reader)?,
-            dy_half: decode_mvd_component(reader)?,
+            dx_half: decode_mvd_component(reader)? as i16,
+            dy_half: decode_mvd_component(reader)? as i16,
         };
         let predictor = predict_forward_mv(fwd_grid, mb_cols, col, row, gob_top_row, segment);
         reconstruct_mv(predictor, mvd)
@@ -6120,8 +6264,8 @@ fn decode_b_macroblock(
     };
     let backward_mv = if header.has_mvdbw {
         let mvd = Mvd {
-            dx_half: decode_mvd_component(reader)?,
-            dy_half: decode_mvd_component(reader)?,
+            dx_half: decode_mvd_component(reader)? as i16,
+            dy_half: decode_mvd_component(reader)? as i16,
         };
         let predictor = predict_forward_mv(bwd_grid, mb_cols, col, row, gob_top_row, segment);
         reconstruct_mv(predictor, mvd)
@@ -6434,9 +6578,10 @@ fn decode_slice_structured_after_header(
     reference: Option<&YuvFrame>,
     options: DecodeOptions,
     cpm_psbi: Option<u8>,
+    umv: UmvCoding,
 ) -> Result<YuvFrame> {
     decode_slice_structured_after_header_inner(
-        reader, header, layout, sss, reference, options, cpm_psbi, None,
+        reader, header, layout, sss, reference, options, cpm_psbi, None, umv,
     )
 }
 
@@ -6459,6 +6604,7 @@ fn decode_slice_structured_after_header_inner(
     options: DecodeOptions,
     cpm_psbi: Option<u8>,
     rps_slice: Option<RpsGobContext<'_>>,
+    umv: UmvCoding,
 ) -> Result<YuvFrame> {
     // Header-signalled modes the slice driver does not stage. PB-frames
     // and SAC never reach here (the slice routing in
@@ -6647,6 +6793,7 @@ fn decode_slice_structured_after_header_inner(
                         // are applied in `decode_one_macroblock` via the
                         // shared `options`).
                         modified_quant: options.modified_quant,
+                        umv_table_d3: umv.table_d3(),
                     },
                 )?;
                 if matches!(mb.mb_type, Some(MbType::Stuffing)) {
@@ -6673,7 +6820,7 @@ fn decode_slice_structured_after_header_inner(
                 row,
                 row,
                 false,
-                header.umv_mode,
+                umv,
                 header.advanced_prediction,
                 false,
                 &mut current_quant,
@@ -6871,7 +7018,7 @@ fn decode_one_macroblock(
     row: usize,
     gob_top_row: usize,
     gob_header_present: bool,
-    umv_mode: bool,
+    umv: UmvCoding,
     advanced_prediction: bool,
     pb_mode: bool,
     current_quant: &mut u8,
@@ -6945,7 +7092,7 @@ fn decode_one_macroblock(
             row,
             gob_top_row,
             gob_header_present,
-            umv_mode,
+            umv,
             advanced_prediction,
             current_quant,
             options,
@@ -7054,11 +7201,7 @@ fn decode_one_macroblock(
                 aic_segment,
             );
             let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
-            if umv_mode {
-                reconstruct_mv_umv(predictor, mvd)
-            } else {
-                reconstruct_mv(predictor, mvd)
-            }
+            reconstruct_mv_coded(umv, predictor, mvd)?
         } else {
             MotionVector::new(0, 0)
         };
@@ -7101,11 +7244,7 @@ fn decode_one_macroblock(
         )
     };
     let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
-    let luma_mv = if umv_mode {
-        reconstruct_mv_umv(predictor, mvd)
-    } else {
-        reconstruct_mv(predictor, mvd)
-    };
+    let luma_mv = reconstruct_mv_coded(umv, predictor, mvd)?;
     let chroma_vec = chroma_mv(luma_mv);
 
     // INTER macroblocks: CBPY is normally the *complement* on the
@@ -7686,7 +7825,7 @@ fn decode_inter4v_macroblock(
     row: usize,
     gob_top_row: usize,
     gob_header_present: bool,
-    umv_mode: bool,
+    umv: UmvCoding,
     advanced_prediction: bool,
     current_quant: &mut u8,
     options: DecodeOptions,
@@ -7724,7 +7863,7 @@ fn decode_inter4v_macroblock(
         row,
         gob_top_row,
         gob_header_present,
-        umv_mode,
+        umv,
         aic_segment,
     )?;
 
@@ -7878,7 +8017,7 @@ fn reconstruct_inter4v_mvs(
     row: usize,
     gob_top_row: usize,
     gob_header_present: bool,
-    umv_mode: bool,
+    umv: UmvCoding,
     current_segment: u32,
 ) -> Result<Mb4Mv> {
     // §5.3.7 / §5.3.8 — the parser already pulled the four MVDs for an
@@ -7959,11 +8098,7 @@ fn reconstruct_inter4v_mvs(
 
         let predictor = predict_mv_median(mv1, mv2, mv3);
         let mvd = mvds[blk.index()];
-        let mv = if umv_mode {
-            reconstruct_mv_umv(predictor, mvd)
-        } else {
-            reconstruct_mv(predictor, mvd)
-        };
+        let mv = reconstruct_mv_coded(umv, predictor, mvd)?;
         mvs4[blk.index()] = mv;
         // §F.2 — later blocks of this macroblock use the reconstructed
         // vector as an intra-macroblock candidate predictor.
@@ -9190,6 +9325,203 @@ mod tests {
         // integer 15, phase 1 -> b = (ref[15] + ref[16] + 1)/2 =
         // (15 + 16 + 1)/2 = 16.
         assert_eq!(frame.y[0], 16, "MB(0,0) +31 half-pel phase");
+    }
+
+    /// Write a QCIF PLUSPTYPE INTER-picture header with the OPPTYPE UMV
+    /// bit set, the §5.1.9 UUI codeword (`"1"` Limited or `"01"`
+    /// Unlimited), PQUANT = 8 and PEI = 0 — positioned at the first bit
+    /// of the (header-less, §5.2.2) GOB-0 macroblock data.
+    fn write_plus_qcif_inter_umv_header(w: &mut BitWriter, unlimited_uui: bool) {
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true); // PTYPE bit 1
+        w.write_bit(false); // PTYPE bit 2
+        w.write_u32(0b000, 3); // PTYPE bits 3-5
+        w.write_u32(0b111, 3); // PTYPE bits 6-8 → extended
+        w.write_u32(0b001, 3); // UFEP = 001
+                               // OPPTYPE (18 bits).
+        w.write_u32(0b010, 3); // source format = QCIF
+        w.write_bit(false); // custom_pcf
+        w.write_bit(true); // UMV = ON
+        w.write_bit(false); // SAC
+        w.write_bit(false); // AP
+        w.write_bit(false); // AIC
+        w.write_bit(false); // DF
+        w.write_bit(false); // SS
+        w.write_bit(false); // RPS
+        w.write_bit(false); // IS
+        w.write_bit(false); // AIV
+        w.write_bit(false); // MQ
+        w.write_bit(true); // SCE-guard
+        w.write_u32(0b000, 3); // reserved
+                               // MPPTYPE (9 bits).
+        w.write_u32(0b001, 3); // picture type INTER
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false); // reserved
+        w.write_bit(false); // reserved
+        w.write_bit(true); // SCE-guard
+        w.write_bit(false); // CPM = 0
+                            // §5.1.9 UUI: "1" = Limited (Tables D.1/D.2), "01" = Unlimited.
+        if unlimited_uui {
+            w.write_bit(false);
+            w.write_bit(true);
+        } else {
+            w.write_bit(true);
+        }
+        write_plus_pquant_pei(w, 8);
+    }
+
+    /// §5.3.7 / §D.2 — a PLUSPTYPE picture with UMV on carries its MVDs
+    /// as **Table D.3** reversible codewords: a difference of +50
+    /// half-pel (+25 pixels, unreachable from a zero predictor under
+    /// the Table 14 first column) reconstructs directly as
+    /// `predictor + difference` with no pair selection.
+    #[test]
+    fn decode_plus_umv_reads_table_d3_mvd() {
+        // Reference: a horizontal ramp value == column (mod 256).
+        let mut reference = YuvFrame::grey(176, 144);
+        for y in 0..144 {
+            for x in 0..176 {
+                reference.y[y * 176 + x] = (x % 256) as u8;
+            }
+        }
+
+        let mut w = BitWriter::new();
+        write_plus_qcif_inter_umv_header(&mut w, /* unlimited */ false);
+        // MB(0,0): coded INTER, no coefficients, MVD = (+50, 0).
+        w.write_bit(false); // COD = 0
+        w.write_bit(true); // MCBPC "1" (INTER, cbpc 00)
+        w.write_u32(0b11, 2); // CBPY idx 15 → INTER pattern 0000
+        crate::annex_p::write_table_d3(&mut w, 50).unwrap();
+        crate::annex_p::write_table_d3(&mut w, 0).unwrap();
+        // Remaining 98 macroblocks skipped; GOB headers are optional on
+        // the PLUSPTYPE path and omitted here.
+        for _ in 0..98 {
+            w.write_bit(true);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let frame = decode_picture_layer(&data, Some(&reference), DecodeOptions::default())
+            .expect("decode UMV+ picture");
+        // Pixel (0, y): source half-pel x = 0 + 50 → integer 25,
+        // phase 0 → ramp value 25.
+        for y in 0..16 {
+            assert_eq!(frame.y[y * 176], 25, "UMV+ MB(0,0) pixel (0,{y})");
+        }
+        // The skipped macroblocks copy the reference.
+        assert_eq!(frame.y[176 * 32 + 40], reference.y[176 * 32 + 40]);
+    }
+
+    /// §5.1.9 UUI = "01" — the Unlimited form is accepted, and a vector
+    /// beyond the Tables-D.1/D.2 Limited window (here +35 pixels on a
+    /// QCIF picture, past the ±32-pel Table D.1 row) reconstructs.
+    #[test]
+    fn decode_plus_umv_uui_unlimited_accepts_beyond_limited_range() {
+        let mut reference = YuvFrame::grey(176, 144);
+        for y in 0..144 {
+            for x in 0..176 {
+                reference.y[y * 176 + x] = (x % 256) as u8;
+            }
+        }
+
+        let mut w = BitWriter::new();
+        write_plus_qcif_inter_umv_header(&mut w, /* unlimited */ true);
+        w.write_bit(false); // COD
+        w.write_bit(true); // MCBPC "1"
+        w.write_u32(0b11, 2); // CBPY → INTER pattern 0000
+        crate::annex_p::write_table_d3(&mut w, 70).unwrap();
+        crate::annex_p::write_table_d3(&mut w, 0).unwrap();
+        for _ in 0..98 {
+            w.write_bit(true);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let frame = decode_picture_layer(&data, Some(&reference), DecodeOptions::default())
+            .expect("decode UMV+ Unlimited picture");
+        // Half-pel 70 → integer 35, phase 0.
+        for y in 0..16 {
+            assert_eq!(frame.y[y * 176], 35, "UMV+ Unlimited MB(0,0) (0,{y})");
+        }
+    }
+
+    /// §D.2 / Table D.1 — under UUI = "1" a QCIF component is bounded
+    /// by ±32 pixels; a reconstructed vector outside it is a malformed
+    /// stream.
+    #[test]
+    fn decode_plus_umv_limited_range_violation_refused() {
+        let reference = YuvFrame::grey(176, 144);
+        let mut w = BitWriter::new();
+        write_plus_qcif_inter_umv_header(&mut w, /* unlimited */ false);
+        w.write_bit(false); // COD
+        w.write_bit(true); // MCBPC "1"
+        w.write_u32(0b11, 2); // CBPY
+        crate::annex_p::write_table_d3(&mut w, 70).unwrap(); // +35 px > +31.5 px
+        crate::annex_p::write_table_d3(&mut w, 0).unwrap();
+        for _ in 0..98 {
+            w.write_bit(true);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        assert_eq!(
+            decode_picture_layer(&data, Some(&reference), DecodeOptions::default()).unwrap_err(),
+            Error::BadMvdCode
+        );
+    }
+
+    /// §D.2 emulation prevention end-to-end: an MVD pair of
+    /// (+0.5, +0.5) — six consecutive zeros — is followed by the "1"
+    /// bit, and the next macroblock parses from the very next bit.
+    #[test]
+    fn decode_plus_umv_pair_epb_keeps_alignment() {
+        let mut reference = YuvFrame::grey(176, 144);
+        for y in 0..144 {
+            for x in 0..176 {
+                reference.y[y * 176 + x] = ((x + y) % 256) as u8;
+            }
+        }
+        let mut w = BitWriter::new();
+        write_plus_qcif_inter_umv_header(&mut w, /* unlimited */ false);
+        // MB(0,0): MVD (+1, +1) with the mandatory EPB.
+        w.write_bit(false);
+        w.write_bit(true);
+        w.write_u32(0b11, 2);
+        crate::annex_p::write_table_d3(&mut w, 1).unwrap();
+        crate::annex_p::write_table_d3(&mut w, 1).unwrap();
+        w.write_bit(true); // §D.2 EPB
+                           // MB(1,0): MVD (−4, 0) — parses only if the EPB was consumed.
+        w.write_bit(false);
+        w.write_bit(true);
+        w.write_u32(0b11, 2);
+        crate::annex_p::write_table_d3(&mut w, -4).unwrap();
+        crate::annex_p::write_table_d3(&mut w, 0).unwrap();
+        for _ in 0..97 {
+            w.write_bit(true);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let frame = decode_picture_layer(&data, Some(&reference), DecodeOptions::default())
+            .expect("decode UMV+ EPB stream");
+        // MB(0,0) pixel (0,0): half-pel (+1,+1) → 2-D phase-1 bilinear
+        // average of ramp values at (0,0),(1,0),(0,1),(1,1) = (0+1+1+2+2)/4 = 1.
+        assert_eq!(frame.y[0], 1);
+        // MB(1,0) predictor is MV1 = (+1,+1) (left neighbour, top-row
+        // rule 3 collapse); MVD (−4, 0) → MV = (−3, +1).
+        // Pixel (16, 0): x half-pel = 32 − 3 = 29 → integer 14 phase 1,
+        // y half-pel = +1 → integer 0 phase 1: average of ramp at
+        // (14,0),(15,0),(14,1),(15,1) = (14+15+15+16+2)/4 = 15.
+        assert_eq!(frame.y[16], 15);
     }
 
     // ---- Annex F §F.2 / §F.3 INTER4V four-vector + OBMC driver wiring
@@ -11821,13 +12153,12 @@ mod tests {
         w.write_bit(false); // CPM = 0
                             // §5.1.18 RPRP — WDA (2 bits).
         w.write_u32(wda_bits, 2);
-        // Eight warping parameters as four pairs of zero codewords; each
-        // all-zero pair is followed by the §P.2.2 emulation-prevention
-        // bit "1".
+        // Eight warping parameters as four pairs of zero codewords.
+        // §P.2.2 — the emulation-prevention bit follows only a pair of
+        // value-+1 ("000") codewords, not the zero codeword "1".
         for _pair in 0..4 {
             w.write_bit(true); // Table-D.3 zero codeword
             w.write_bit(true); // Table-D.3 zero codeword
-            w.write_bit(true); // pair emulation-prevention bit
         }
         // §P.2.3 FILL_MODE (2 bits).
         w.write_u32(fill_bits, 2);
@@ -13568,6 +13899,7 @@ mod tests {
             advanced_intra: false,
             deblocking: false,
             reference_picture_selection: false,
+            uui: None,
         };
         let outcome =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited)
@@ -13604,6 +13936,7 @@ mod tests {
             advanced_intra: false,
             deblocking: false,
             reference_picture_selection: false,
+            uui: None,
         };
         let r =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited);
@@ -13744,6 +14077,7 @@ mod tests {
             advanced_intra: true,
             deblocking: false,
             reference_picture_selection: false,
+            uui: None,
         };
         let outcome =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited)
@@ -13811,6 +14145,7 @@ mod tests {
                 advanced_intra: true,
                 deblocking: true,
                 reference_picture_selection: false,
+                uui: None,
             },
             "UFEP=001 OPPTYPE snapshot captured into outcome.inherited"
         );
@@ -13831,6 +14166,7 @@ mod tests {
             advanced_intra: true,
             deblocking: true,
             reference_picture_selection: false,
+            uui: None,
         };
         let outcome =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), primed)
@@ -13886,6 +14222,7 @@ mod tests {
             advanced_intra: true,
             deblocking: false,
             reference_picture_selection: false,
+            uui: None,
         };
         let outcome =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited)
@@ -13937,6 +14274,7 @@ mod tests {
                 advanced_intra: true,
                 deblocking: true,
                 reference_picture_selection: false,
+                uui: None,
             }
         );
     }

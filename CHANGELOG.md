@@ -6,6 +6,59 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **UMV + PLUSPTYPE motion vectors are Table D.3, both directions**
+  (round 447; closes the round-443 self-found nonconformance): §5.3.7 —
+  "if the Unrestricted Motion Vector mode is used and PLUSPTYPE is
+  present, motion vectors are coded using Table D.3 instead of
+  Table 14". Both sides previously used the Table 14 codes with the
+  PLUSPTYPE-absent §D.2 pair-selection reconstruction on the UMV+
+  path, so crate round-trips agreed while the wire disagreed with the
+  Recommendation. Now: the macroblock parser reads every MVD /
+  MVD2-4 / MVDB pair as two §D.3 reversible codewords when
+  [`MbContext::umv_table_d3`] is set (with the §D.2 six-zero
+  emulation-prevention bit after a `(+0.5, +0.5)` pair), the
+  reconstruction is the single-valued `predictor + difference` (no
+  wrap, no dependence on the predictor window), and each component is
+  bounded by the §5.1.9 UUI selection — the Tables D.1 / D.2
+  picture-size ranges under UUI = `"1"`, the Table D.3 codomain under
+  UUI = `"01"` (previously refused, now decoded; §D.1.1 is enforced
+  through the §D.1 edge replication). The last-sent UUI is inherited
+  by UFEP=000 pictures (`InheritedExtendedState::uui`, parallel to
+  the SSS rule). Encoder: `encode_inter_picture_umv_plus` now emits
+  Table D.3 pairs (direct differences) under a Tables-D.1/D.2 +
+  §D.1.1 candidate window (`estimate_motion_umv_plus`), so its wire
+  deliberately differs from the baseline-PTYPE
+  `encode_inter_picture_umv`. Validated in both directions: the
+  staged H.263+ UMV conformance fixture (real-encoder QCIF I+P+P,
+  slice-structured + custom-PCF) decodes with zero samples beyond the
+  Annex A.7 ±1 bound, and a crate-encoded UMV+ I+P stream (25-pel
+  motion) black-box-decodes through an external decoder binary with
+  max per-sample diff 1. The PLUSPTYPE-absent Annex D form (Table 14
+  + §D.2 pair selection) is unchanged.
+
+- **§P.2.2 warping-parameter emulation-prevention condition** (round
+  447): the RPRP parser inserted/required the emulation-prevention
+  bit after a pair of *zero-value* (`"1"`) Table D.3 codewords; §P.2.2
+  places it after a pair of **value-+1** (`"000"`) codewords — the
+  only pair that emits six consecutive zero bits. Zero-value pairs now
+  read no EPB, `(+1, +1)` pairs require it.
+
+### Added
+
+- **Table D.3 write primitive + §D.2 MVD pair codecs** (round 447):
+  `annex_p::write_table_d3` (exact inverse of `read_table_d3`,
+  full-codomain round-trip pinned against the §D.3 worked `-13`
+  example), `encoder_vlc::write_mvd_pair_d3` /
+  `macroblock::read_mvd_pair` (pair form with the §D.2
+  emulation-prevention rule), `motion::reconstruct_mv_umv_plus` and
+  the Tables D.1 / D.2 half-pel range helpers
+  (`umv_plus_horizontal_range_half` / `umv_plus_vertical_range_half`).
+  `Mvd` components widen from `i8` to `i16` to carry the §D.3
+  `[-4095, 4095]` difference range (the Table 14 form is unchanged on
+  the wire).
+
 ### Added
 
 - **§N.4.2 Back-Channel Message syntax** (round 443):

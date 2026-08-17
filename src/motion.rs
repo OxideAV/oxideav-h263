@@ -36,9 +36,11 @@
 //! [`reconstruct_mv_component_umv`] / [`reconstruct_mv_umv`]: the
 //! per-component range is widened from the default `[-32, 31]` to
 //! `[-63, 63]` half-pel, with the §D.2 predictor-dependent selection of
-//! the Table-14 difference pair. The wider PLUSPTYPE / UUI ranges of
-//! Tables D.1 / D.2 and the Table-D.3 reversible VLC remain gated on
-//! the not-yet-decoded extended-PTYPE header.
+//! the Table-14 difference pair. With PLUSPTYPE present the mode uses
+//! the single-valued Table-D.3 reversible differences instead —
+//! [`reconstruct_mv_component_umv_plus`] / [`reconstruct_mv_umv_plus`]
+//! under the §5.1.9 UUI-selected [`umv_plus_horizontal_range_half`] /
+//! [`umv_plus_vertical_range_half`] Tables-D.1/D.2 ranges.
 //!
 //! Annex F §F.2 — the **Advanced Prediction mode** four-motion-vector
 //! candidate-predictor redefinition (Figure F.1) and the Table F.1
@@ -279,6 +281,73 @@ pub fn reconstruct_mv_umv(predictor: MotionVector, mvd: Mvd) -> MotionVector {
         dy_half: reconstruct_mv_component_umv(predictor.dy_half, mvd.dy_half as i32),
     }
 }
+
+// ---- Annex D §D.2 Unrestricted Motion Vector mode (PLUSPTYPE) -------
+
+/// Annex D §D.2 reconstruction of one motion-vector component in the
+/// **Unrestricted Motion Vector mode with PLUSPTYPE present**.
+///
+/// "If PLUSPTYPE is present, the motion vector range does not depend
+/// on the motion vector prediction value" — the Table D.3 codeword
+/// carries a single-valued difference (no pair selection, no wrap),
+/// so the component is simply `predictor + difference`. Range
+/// enforcement (Tables D.1 / D.2 under UUI = "1", the picture-size
+/// bound under UUI = "01") is the caller's responsibility — see
+/// [`umv_plus_horizontal_range_half`] / [`umv_plus_vertical_range_half`].
+///
+/// Both arguments and the result are in half-pel units.
+pub fn reconstruct_mv_component_umv_plus(predictor: i32, difference: i32) -> i32 {
+    predictor + difference
+}
+
+/// Annex D §D.2 reconstruction of a full motion vector in the
+/// Unrestricted Motion Vector mode with PLUSPTYPE present, applying
+/// [`reconstruct_mv_component_umv_plus`] per component.
+pub fn reconstruct_mv_umv_plus(predictor: MotionVector, mvd: Mvd) -> MotionVector {
+    MotionVector {
+        dx_half: reconstruct_mv_component_umv_plus(predictor.dx_half, mvd.dx_half as i32),
+        dy_half: reconstruct_mv_component_umv_plus(predictor.dy_half, mvd.dy_half as i32),
+    }
+}
+
+/// Table D.1 — horizontal motion-vector component range when
+/// PLUSPTYPE is present and UUI = "1", in **half-pel units**, keyed by
+/// the picture width in luminance pixels:
+///
+/// * width `4..=352` → `[-32, 31.5]` pel = `[-64, 63]` half-pel,
+/// * width `356..=704` → `[-64, 63.5]` pel,
+/// * width `708..=1408` → `[-128, 127.5]` pel,
+/// * width `1412..=2048` → `[-256, 255.5]` pel.
+pub fn umv_plus_horizontal_range_half(picture_width: u32) -> (i32, i32) {
+    match picture_width {
+        0..=352 => (-64, 63),
+        353..=704 => (-128, 127),
+        705..=1408 => (-256, 255),
+        _ => (-512, 511),
+    }
+}
+
+/// Table D.2 — vertical motion-vector component range when PLUSPTYPE
+/// is present and UUI = "1", in **half-pel units**, keyed by the
+/// picture height in luminance pixels:
+///
+/// * height `4..=288` → `[-32, 31.5]` pel = `[-64, 63]` half-pel,
+/// * height `292..=576` → `[-64, 63.5]` pel,
+/// * height `580..=1152` → `[-128, 127.5]` pel.
+pub fn umv_plus_vertical_range_half(picture_height: u32) -> (i32, i32) {
+    match picture_height {
+        0..=288 => (-64, 63),
+        289..=576 => (-128, 127),
+        _ => (-256, 255),
+    }
+}
+
+/// §5.1.9 UUI = "01" — "the motion vectors are not limited except by
+/// their distance to the coded area border" (§D.1.1). The per-component
+/// wire bound is then only the Table D.3 codomain, `[-4095, 4095]`
+/// half-pel; motion compensation applies the §D.1 edge replication for
+/// any vector inside it.
+pub const MV_UMV_PLUS_UNLIMITED_HALF: (i32, i32) = (-4095, 4095);
 
 /// §6.1.1 median predictor for one component.
 ///
@@ -1122,6 +1191,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// §D.2 with PLUSPTYPE — the component is `predictor + difference`
+    /// with no wrap and no dependence on the predictor's window.
+    #[test]
+    fn umv_plus_component_is_plain_sum() {
+        assert_eq!(reconstruct_mv_component_umv_plus(0, 0), 0);
+        assert_eq!(reconstruct_mv_component_umv_plus(10, -74), -64);
+        assert_eq!(reconstruct_mv_component_umv_plus(-64, 127), 63);
+        // Beyond the PLUSPTYPE-absent ±63 window: no pair selection.
+        assert_eq!(reconstruct_mv_component_umv_plus(60, 60), 120);
+        assert_eq!(reconstruct_mv_component_umv_plus(-200, -55), -255);
+    }
+
+    /// Tables D.1 / D.2 — the UUI = "1" component ranges keyed on the
+    /// picture dimensions, in half-pel units.
+    #[test]
+    fn umv_plus_ranges_follow_tables_d1_d2() {
+        // Table D.1 (horizontal, by width).
+        assert_eq!(umv_plus_horizontal_range_half(128), (-64, 63)); // sub-QCIF
+        assert_eq!(umv_plus_horizontal_range_half(176), (-64, 63)); // QCIF
+        assert_eq!(umv_plus_horizontal_range_half(352), (-64, 63)); // CIF
+        assert_eq!(umv_plus_horizontal_range_half(356), (-128, 127));
+        assert_eq!(umv_plus_horizontal_range_half(704), (-128, 127)); // 4CIF
+        assert_eq!(umv_plus_horizontal_range_half(708), (-256, 255));
+        assert_eq!(umv_plus_horizontal_range_half(1408), (-256, 255)); // 16CIF
+        assert_eq!(umv_plus_horizontal_range_half(1412), (-512, 511));
+        assert_eq!(umv_plus_horizontal_range_half(2048), (-512, 511));
+        // Table D.2 (vertical, by height).
+        assert_eq!(umv_plus_vertical_range_half(96), (-64, 63)); // sub-QCIF
+        assert_eq!(umv_plus_vertical_range_half(288), (-64, 63)); // CIF
+        assert_eq!(umv_plus_vertical_range_half(292), (-128, 127));
+        assert_eq!(umv_plus_vertical_range_half(576), (-128, 127)); // 4CIF
+        assert_eq!(umv_plus_vertical_range_half(580), (-256, 255));
+        assert_eq!(umv_plus_vertical_range_half(1152), (-256, 255)); // 16CIF
     }
 
     /// `reconstruct_mv_umv` applies the §D.2 rule per component.

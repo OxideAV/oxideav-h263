@@ -45,7 +45,7 @@
 //! `RPRP` field is parsed by [`crate::plus_ptype`] and threaded through
 //! as [`RprParams`].
 
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 
 use crate::{Error, Result};
 
@@ -211,6 +211,37 @@ pub fn read_table_d3(reader: &mut BitReader<'_>) -> Result<i32> {
     })
 }
 
+/// §D.3 — write one Table D.3 reversible motion-vector codeword for a
+/// **signed** half-pixel value in `-4095..=4095`. Exact inverse of
+/// [`read_table_d3`].
+///
+/// Construction (see the [`read_table_d3`] docs): value `0` is the
+/// single bit `1`; otherwise a leading `0`, then each binary-magnitude
+/// bit below the implicit leading `1` (most significant first)
+/// followed by a continue marker `1`, then the sign bit (`0` positive,
+/// `1` negative) followed by the terminating `0`.
+pub fn write_table_d3(w: &mut BitWriter, value: i32) -> Result<()> {
+    if !(-4095..=4095).contains(&value) {
+        return Err(Error::BadMvdCode);
+    }
+    if value == 0 {
+        w.write_bit(true);
+        return Ok(());
+    }
+    let magnitude = value.unsigned_abs();
+    w.write_bit(false);
+    // Position of the (implicit) leading 1; the bits below it are
+    // interleaved with continue markers.
+    let top = 31 - magnitude.leading_zeros();
+    for i in (0..top).rev() {
+        w.write_bit((magnitude >> i) & 1 == 1);
+        w.write_bit(true);
+    }
+    w.write_bit(value < 0);
+    w.write_bit(false);
+    Ok(())
+}
+
 /// §P.2 — parse the `RPRP` field of the picture header into
 /// [`RprParams`]. `size_changed` is true when the current picture has a
 /// different size than the reference (it does not affect parsing here
@@ -234,8 +265,8 @@ pub fn parse_rprp(reader: &mut BitReader<'_>, rcrpr: bool) -> Result<RprParams> 
     // §P.2.2 — eight warping parameters in the order
     //   w_x0, w_0y, w_xx, w_yx, w_xy, w_yy, w_xxy, w_yxy
     // sent like UMV MVD pairs (Table D.3), with an emulation-prevention
-    // "1" after a pair whose two codewords were both the all-zero (value
-    // +1 / magnitude 0) codeword.
+    // "1" after a pair whose two codewords were both the all-zero
+    // codeword "000" — "the value +1 in half-pixel units" (§P.2.2).
     let mut warp = [0i32; 8];
     let mut i = 0usize;
     while i < 8 {
@@ -243,11 +274,13 @@ pub fn parse_rprp(reader: &mut BitReader<'_>, rcrpr: bool) -> Result<RprParams> 
         let b = read_table_d3(reader)?;
         warp[i] = a;
         warp[i + 1] = b;
-        // The "value +1" all-zero codeword corresponds to magnitude 0
-        // here (read_table_d3 returns 0 for the "1" codeword). When both
-        // members of the pair were the zero codeword, a single "1"
-        // emulation-prevention bit follows (§P.2.2 / §D.3).
-        if a == 0 && b == 0 {
+        // §P.2.2 — "if the all-zero codeword (the value +1 in
+        // half-pixel units) of Table D.3 is used for both warping
+        // parameters in the pair ... the pair of codewords is followed
+        // by a single bit equal to 1 to prevent start code emulation".
+        // The value-+1 codeword is "000" (magnitude 1, positive sign);
+        // two of them are six consecutive zero bits.
+        if a == 1 && b == 1 {
             let epb = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
             if !epb {
                 return Err(Error::PlusPtypeReservedField);
@@ -570,6 +603,90 @@ pub fn resample_yuv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn d3_write_round_trips_full_range() {
+        // §D.3 — the writer is the exact inverse of the reader over the
+        // whole Table D.3 codomain.
+        for value in -4095i32..=4095 {
+            let mut w = BitWriter::new();
+            write_table_d3(&mut w, value).unwrap();
+            w.write_bit(true); // flush padding distinct from data
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(read_table_d3(&mut r).unwrap(), value, "value {value}");
+        }
+    }
+
+    #[test]
+    fn d3_write_matches_worked_example() {
+        // §D.3 worked example — −13 encodes as "0 11 01 11 10".
+        let mut w = BitWriter::new();
+        write_table_d3(&mut w, -13).unwrap();
+        w.write_bit(true); // pad marker
+        let bytes = w.finish();
+        // Bits "0 11 01 11 1" packed MSB-first.
+        assert_eq!(bytes[0], 0b0110_1111u8);
+        assert_eq!(bytes[1] & 0b1100_0000, 0b0100_0000); // "0" then pad "1"
+    }
+
+    #[test]
+    fn d3_write_rejects_out_of_range() {
+        for value in [4096, -4096, i32::MAX, i32::MIN] {
+            let mut w = BitWriter::new();
+            assert_eq!(
+                write_table_d3(&mut w, value).unwrap_err(),
+                Error::BadMvdCode
+            );
+        }
+    }
+
+    #[test]
+    fn rprp_epb_follows_plus_one_pair() {
+        // §P.2.2 — the emulation-prevention bit follows a pair of
+        // value-+1 ("000") codewords; a pair of zero codewords ("1")
+        // takes none.
+        let mut w = BitWriter::new();
+        w.write_u32(0b11, 2); // WDA = 1/16
+                              // Pair 1: (+1, +1) => "000000" + EPB "1".
+        write_table_d3(&mut w, 1).unwrap();
+        write_table_d3(&mut w, 1).unwrap();
+        w.write_bit(true);
+        // Pair 2: (0, 0) => "11", no EPB.
+        write_table_d3(&mut w, 0).unwrap();
+        write_table_d3(&mut w, 0).unwrap();
+        // Pair 3: (+1, 0) => "000" "1", no EPB (not both +1).
+        write_table_d3(&mut w, 1).unwrap();
+        write_table_d3(&mut w, 0).unwrap();
+        // Pair 4: (-13, +2).
+        write_table_d3(&mut w, -13).unwrap();
+        write_table_d3(&mut w, 2).unwrap();
+        w.write_u32(0b11, 2); // FILL_MODE = clip
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let rprp = parse_rprp(&mut r, false).unwrap();
+        assert_eq!(rprp.warp, [1, 1, 0, 0, 1, 0, -13, 2]);
+        assert_eq!(rprp.fill, FillMode::Clip);
+    }
+
+    #[test]
+    fn rprp_missing_epb_after_plus_one_pair_is_refused() {
+        let mut w = BitWriter::new();
+        w.write_u32(0b11, 2); // WDA
+        write_table_d3(&mut w, 1).unwrap();
+        write_table_d3(&mut w, 1).unwrap();
+        w.write_bit(false); // EPB must be "1"
+        for _ in 0..6 {
+            write_table_d3(&mut w, 0).unwrap();
+        }
+        w.write_u32(0b11, 2);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_rprp(&mut r, false).unwrap_err(),
+            Error::PlusPtypeReservedField
+        );
+    }
 
     #[test]
     fn d3_zero_codeword() {

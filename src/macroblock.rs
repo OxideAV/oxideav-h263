@@ -31,14 +31,17 @@
 //!   `1`, `4`, `5`. The Modified Quantization mode (Annex T)
 //!   replaces this with a variable-length code; round 3 does not
 //!   handle the Annex-T form.
-//! * §5.3.7 — **MVD** (variable length, Table 14). The horizontal
-//!   component is decoded, then the vertical component. Each
-//!   component is reported in **half-pel units** as a signed
-//!   integer in `[-32, +31]` (i.e. spec value `× 2`, exact and
-//!   integer). For MB types that carry MVD only (`0`, `1`, `3` in
-//!   PB-INTRA), one `Mvd` is returned. The Advanced Prediction /
-//!   Deblocking-Filter MVD2-4 follow-on vectors (§5.3.8) are
-//!   decoded when the MB type is `2` or `5`.
+//! * §5.3.7 — **MVD** (variable length). The horizontal component is
+//!   decoded, then the vertical component, each reported in
+//!   **half-pel units** as a signed integer. The default form is the
+//!   Table 14 VLC (`[-32, +31]`, spec value `× 2`); when the
+//!   Unrestricted Motion Vector mode is used with PLUSPTYPE present
+//!   ([`MbContext::umv_table_d3`]) each pair is instead two §D.2 /
+//!   Table D.3 reversible codewords (`[-4095, +4095]`) with the
+//!   six-zero emulation-prevention rule. For MB types that carry MVD
+//!   only (`0`, `1`, `3` in PB-INTRA), one `Mvd` is returned. The
+//!   Advanced Prediction / Deblocking-Filter MVD2-4 follow-on vectors
+//!   (§5.3.8) are decoded when the MB type is `2` or `5`.
 //!
 //! ## PB-frames mode (Annex G)
 //!
@@ -56,8 +59,6 @@
 //! ## Deliberately deferred
 //!
 //! * Annex-T variable-length DQUANT.
-//! * Annex-D Unrestricted Motion Vector mode's PLUSPTYPE-only
-//!   alternate Table D.3 for MVD; round 3 always uses Table 14.
 //! * Annex-O B/EI/EP picture macroblocks.
 //! * Block Data (§5.4) and everything after the macroblock header.
 //!
@@ -165,6 +166,18 @@ pub struct MbContext {
     /// ([`crate::annex_t::quant_c_from_quant`]) is applied by the
     /// dequant stage, not the parser.
     pub modified_quant: bool,
+    /// §5.3.7 / §D.2 — Unrestricted Motion Vector mode with
+    /// **PLUSPTYPE present**: "motion vectors are coded using
+    /// Table D.3 instead of Table 14". When `true`, every motion
+    /// vector difference pair (MVD, each of MVD2-4, MVDB) is read as
+    /// two Table D.3 reversible codewords (horizontal then vertical),
+    /// and per §D.2 a pair equal to `(+0.5, +0.5)` — six consecutive
+    /// zero bits on the wire — is followed by one emulation-prevention
+    /// bit that shall be `"1"` (the zero-difference codeword). When
+    /// `false`, MVDs are the §5.3.7 Table 14 codewords (both the
+    /// default prediction mode and the PLUSPTYPE-absent Annex D form —
+    /// those differ only in reconstruction, not parsing).
+    pub umv_table_d3: bool,
 }
 
 /// Macroblock type from MCBPC (§5.3.2, Tables 7-9).
@@ -237,14 +250,17 @@ impl MbType {
 ///
 /// Components are in **half-pel units**: the spec's "Vector
 /// Differences" column scaled by 2 to keep the type integral.
-/// Range is `[-32, +31]` (i.e. spec range `-16 .. +15.5` in
-/// half-pel quanta of `0.5`).
+/// The Table 14 form spans `[-32, +31]` (i.e. spec range
+/// `-16 .. +15.5` in half-pel quanta of `0.5`); the Table D.3
+/// reversible form read when the Unrestricted Motion Vector mode is
+/// used with PLUSPTYPE present (§5.3.7 / §D.2,
+/// [`MbContext::umv_table_d3`]) spans `[-4095, +4095]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mvd {
     /// Horizontal component, half-pel units, signed.
-    pub dx_half: i8,
+    pub dx_half: i16,
     /// Vertical component, half-pel units, signed.
-    pub dy_half: i8,
+    pub dy_half: i16,
 }
 
 /// Parsed H.263 macroblock-layer header (round-3 baseline subset).
@@ -454,15 +470,15 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
         (None, ctx.quantiser_before)
     };
 
-    // §5.3.7 — MVD (variable length, Table 14). Horizontal first,
-    // then vertical. "MVD is included for all INTER macroblocks (in
-    // PB-frames mode also for INTRA macroblocks)" — the PB-mode
-    // INTRA vector is used only for predicting B-blocks (§G.2).
+    // §5.3.7 — MVD (variable length). Horizontal first, then
+    // vertical: Table 14 codewords, or the Table D.3 reversible
+    // codewords when the Unrestricted Motion Vector mode is used with
+    // PLUSPTYPE present (§D.2, `ctx.umv_table_d3`). "MVD is included
+    // for all INTER macroblocks (in PB-frames mode also for INTRA
+    // macroblocks)" — the PB-mode INTRA vector is used only for
+    // predicting B-blocks (§G.2).
     let mvd = if mb_type.has_mvd() || (ctx.pb_frames && mb_type.is_intra()) {
-        Some(Mvd {
-            dx_half: decode_mvd_component(reader)?,
-            dy_half: decode_mvd_component(reader)?,
-        })
+        Some(read_mvd_pair(reader, ctx.umv_table_d3)?)
     } else {
         None
     };
@@ -473,21 +489,23 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
     let mut mvd234 = [None; 3];
     if mb_type.has_mvd2_4(ctx.advanced_prediction, ctx.deblocking_filter) {
         for slot in mvd234.iter_mut() {
-            *slot = Some(Mvd {
-                dx_half: decode_mvd_component(reader)?,
-                dy_half: decode_mvd_component(reader)?,
-            });
+            *slot = Some(read_mvd_pair(reader, ctx.umv_table_d3)?);
         }
     }
 
     // §5.3.9 — MVDB, last header field per Figure 10, only when
     // MODB indicates it. Under Annex M MVDB is a forward motion
     // vector (§M.2.2) rather than the Annex G bidirectional-vector
-    // enhancement, but its on-wire form is identical (two Table 14
-    // VLCs); the §M.2.2 interpretation is applied by the decoder, not
-    // the parser.
+    // enhancement, but its on-wire form is identical (two MVD
+    // codewords); the §M.2.2 interpretation is applied by the
+    // decoder, not the parser. §D.2 — with PLUSPTYPE present, UMV
+    // mode switches MVDB to Table D.3 like every other MV pair.
     let mvdb = if modb.is_some_and(|m| m.has_mvdb()) || annex_m_modb.is_some_and(|m| m.has_mvdb()) {
-        Some(parse_mvdb(reader)?)
+        if ctx.umv_table_d3 {
+            Some(read_mvd_pair(reader, true)?)
+        } else {
+            Some(parse_mvdb(reader)?)
+        }
     } else {
         None
     };
@@ -816,6 +834,45 @@ pub(crate) fn decode_cbpy(reader: &mut BitReader<'_>) -> Result<u8> {
 /// motion-vector predictor). Round 3 returns the natural-range
 /// half-pel `Vector` column; mapping to the wrap-around branch is
 /// deferred to the (future) MV-reconstruction stage.
+/// Read one motion-vector-difference **pair** (horizontal component
+/// then vertical component, §5.3.7) in the entropy form the picture
+/// header selects:
+///
+/// * `table_d3 == false` — two Table 14 codewords
+///   ([`decode_mvd_component`]), each in `[-32, +31]` half-pel.
+/// * `table_d3 == true` — §D.2, Unrestricted Motion Vector mode with
+///   PLUSPTYPE present: two Table D.3 reversible codewords
+///   ([`crate::annex_p::read_table_d3`]), each in `[-4095, +4095]`
+///   half-pel. "If a pair equals (0.5, 0.5) six consecutive zeros
+///   are produced. To prevent start code emulation, this occurrence
+///   shall be followed by one bit set to '1'" — the pair `(+1, +1)`
+///   (half-pel units, two `"000"` codewords) is followed by an
+///   emulation-prevention bit that must read `"1"` (the
+///   zero-difference codeword); a `"0"` there is a malformed stream.
+pub(crate) fn read_mvd_pair(reader: &mut BitReader<'_>, table_d3: bool) -> Result<Mvd> {
+    if !table_d3 {
+        return Ok(Mvd {
+            dx_half: decode_mvd_component(reader)? as i16,
+            dy_half: decode_mvd_component(reader)? as i16,
+        });
+    }
+    let dx = crate::annex_p::read_table_d3(reader)?;
+    let dy = crate::annex_p::read_table_d3(reader)?;
+    // §D.2 emulation prevention: the (+0.5, +0.5) pair — value +1 in
+    // half-pel units for both components, codeword "000" twice — is
+    // followed by one bit set to "1".
+    if dx == 1 && dy == 1 {
+        let epb = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+        if !epb {
+            return Err(Error::BadMvdCode);
+        }
+    }
+    Ok(Mvd {
+        dx_half: dx as i16,
+        dy_half: dy as i16,
+    })
+}
+
 /// §5.3.6 — read the baseline 2-bit DQUANT differential (Table 13) and
 /// apply it to `quant_before`, clipping the result to `1..=31`. Shared
 /// by the baseline driver and the Annex O scalability driver (the
@@ -945,6 +1002,7 @@ mod tests {
             pb_annex_m: false,
             quantiser_before: q,
             modified_quant: false,
+            umv_table_d3: false,
         }
     }
 
@@ -958,6 +1016,7 @@ mod tests {
             pb_annex_m: false,
             quantiser_before: q,
             modified_quant: false,
+            umv_table_d3: false,
         }
     }
 
@@ -966,6 +1025,132 @@ mod tests {
             w.write_bit(false);
         }
         w.finish()
+    }
+
+    /// §5.3.7 / §D.2 — an INTER macroblock in a UMV + PLUSPTYPE
+    /// picture carries its MVD as two Table D.3 reversible codewords;
+    /// differences far outside the Table 14 window parse exactly.
+    #[test]
+    fn umv_plus_mvd_reads_table_d3() {
+        for (dx, dy) in [
+            (0i16, 0i16),
+            (127, -128),
+            (-255, 254),
+            (63, -1),
+            (-4095, 4095),
+        ] {
+            let mut w = BitWriter::new();
+            w.write_bit(false); // COD
+            w.write_bit(true); // MCBPC "1" (INTER, cbpc 00)
+            w.write_u32(0b0011, 4); // CBPY pattern 0000
+            crate::annex_p::write_table_d3(&mut w, dx as i32).unwrap();
+            crate::annex_p::write_table_d3(&mut w, dy as i32).unwrap();
+            if dx == 1 && dy == 1 {
+                w.write_bit(true);
+            }
+            let bytes = finish_aligned(w);
+            let mut r = BitReader::new(&bytes);
+            let ctx = MbContext {
+                umv_table_d3: true,
+                ..inter_picture_ctx(8, false)
+            };
+            let mb = parse_macroblock(&mut r, ctx).expect("parse");
+            assert_eq!(
+                mb.mvd,
+                Some(Mvd {
+                    dx_half: dx,
+                    dy_half: dy
+                }),
+                "({dx}, {dy})"
+            );
+        }
+    }
+
+    /// §D.2 — the (+0.5, +0.5) pair (six consecutive zeros) carries a
+    /// mandatory emulation-prevention "1"; its absence is a malformed
+    /// stream, and the bit is consumed so following fields stay
+    /// aligned.
+    #[test]
+    fn umv_plus_mvd_pair_of_plus_ones_needs_emulation_prevention_bit() {
+        let ctx = MbContext {
+            umv_table_d3: true,
+            ..inter_picture_ctx(8, false)
+        };
+
+        // Well-formed: EPB "1" after the pair; a Table-14-style trailing
+        // pattern must still parse from the very next bit.
+        let mut w = BitWriter::new();
+        w.write_bit(false); // COD
+        w.write_bit(true); // MCBPC "1"
+        w.write_u32(0b0011, 4); // CBPY 0000
+        w.write_u32(0b000_000, 6); // (+1, +1) pair
+        w.write_bit(true); // EPB
+        let bytes = finish_aligned(w);
+        let mut r = BitReader::new(&bytes);
+        let mb = parse_macroblock(&mut r, ctx).expect("parse");
+        assert_eq!(
+            mb.mvd,
+            Some(Mvd {
+                dx_half: 1,
+                dy_half: 1
+            })
+        );
+
+        // Malformed: EPB "0".
+        let mut w = BitWriter::new();
+        w.write_bit(false);
+        w.write_bit(true);
+        w.write_u32(0b0011, 4);
+        w.write_u32(0b000_000, 6);
+        w.write_bit(false); // EPB must be "1"
+        let bytes = finish_aligned(w);
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_macroblock(&mut r, ctx).unwrap_err(),
+            Error::BadMvdCode
+        );
+    }
+
+    /// §5.3.8 + §D.2 — MVD2-4 of an INTER4V macroblock also switch to
+    /// Table D.3 when UMV is on with PLUSPTYPE present.
+    #[test]
+    fn umv_plus_mvd234_read_table_d3() {
+        // MCBPC for INTER4V (type 2), cbpc 00 — Table 8 code "010".
+        let mut w = BitWriter::new();
+        w.write_bit(false); // COD
+        w.write_u32(0b010, 3); // MCBPC INTER4V
+        w.write_u32(0b0011, 4); // CBPY 0000
+        let pairs = [(70i32, -3i32), (1, 1), (-100, 200), (0, -4095)];
+        for &(dx, dy) in &pairs {
+            crate::annex_p::write_table_d3(&mut w, dx).unwrap();
+            crate::annex_p::write_table_d3(&mut w, dy).unwrap();
+            if dx == 1 && dy == 1 {
+                w.write_bit(true); // §D.2 EPB
+            }
+        }
+        let bytes = finish_aligned(w);
+        let mut r = BitReader::new(&bytes);
+        let ctx = MbContext {
+            umv_table_d3: true,
+            ..inter_picture_ctx(8, true)
+        };
+        let mb = parse_macroblock(&mut r, ctx).expect("parse");
+        assert_eq!(
+            mb.mvd,
+            Some(Mvd {
+                dx_half: 70,
+                dy_half: -3
+            })
+        );
+        let got: Vec<(i16, i16)> = mb
+            .mvd234
+            .iter()
+            .map(|m| {
+                let m = m.expect("MVD2-4 present");
+                (m.dx_half, m.dy_half)
+            })
+            .collect();
+        assert_eq!(got, vec![(1, 1), (-100, 200), (0, -4095)]);
     }
 
     /// I-picture, INTRA MB, all-zero block patterns, no DQUANT.
@@ -1365,7 +1550,7 @@ mod tests {
             assert_eq!(
                 mb.mvd,
                 Some(Mvd {
-                    dx_half: half,
+                    dx_half: half as i16,
                     dy_half: 0,
                 }),
                 "code {:b} bits {} half {}",
@@ -1650,6 +1835,7 @@ mod tests {
                 pb_annex_m: false,
                 quantiser_before: gob.quantiser,
                 modified_quant: false,
+                umv_table_d3: false,
             },
         )
         .expect("mb");
@@ -1670,6 +1856,7 @@ mod tests {
             pb_annex_m: false,
             quantiser_before: q,
             modified_quant: false,
+            umv_table_d3: false,
         }
     }
 
@@ -1685,6 +1872,7 @@ mod tests {
             pb_annex_m: true,
             quantiser_before: q,
             modified_quant: false,
+            umv_table_d3: false,
         }
     }
 

@@ -476,8 +476,8 @@ pub fn cbpb_block_present(cbpb: u8, block_number: u32) -> bool {
 /// (the read MVD VLC machinery scans the full 13-bit codeword domain
 /// before giving up).
 pub fn parse_mvdb(reader: &mut BitReader<'_>) -> Result<Mvd> {
-    let dx_half = decode_mvd_component(reader)?;
-    let dy_half = decode_mvd_component(reader)?;
+    let dx_half = decode_mvd_component(reader)? as i16;
+    let dy_half = decode_mvd_component(reader)? as i16;
     Ok(Mvd { dx_half, dy_half })
 }
 
