@@ -727,6 +727,36 @@ pub fn encode_inter_picture_rru(
     tr: u8,
     search_pseudo_half: i32,
 ) -> Result<Vec<u8>> {
+    encode_inter_picture_rru_impl(frame, reference, quant, tr, search_pseudo_half, false)
+}
+
+/// As [`encode_inter_picture_rru`], but with the **Annex D
+/// Unrestricted Motion Vector mode** signalled alongside RRU: §Q.4 —
+/// the pseudo motion vector is `pseudo-PC + difference` with the
+/// difference coded per §D.2 as a **Table D.3** reversible pair, and
+/// the §5.1.9 UUI `"1"` (Limited) selection bounds the *pseudo*
+/// vectors by the Tables-D.1/D.2 picture-format range ("in the
+/// Reduced-Resolution Update mode, the specified range applies to the
+/// pseudo motion vectors" — so the actual motion reach is roughly
+/// doubled). Self-describing; decodes with `DecodeOptions::default()`.
+pub fn encode_inter_picture_rru_umv(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_pseudo_half: i32,
+) -> Result<Vec<u8>> {
+    encode_inter_picture_rru_impl(frame, reference, quant, tr, search_pseudo_half, true)
+}
+
+fn encode_inter_picture_rru_impl(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_pseudo_half: i32,
+    umv: bool,
+) -> Result<Vec<u8>> {
     use crate::motion::{rru_actual_mv, rru_pseudo_mv, MotionVector};
 
     if quant == 0 || quant > 31 {
@@ -752,6 +782,7 @@ pub fn encode_inter_picture_rru(
         /* is_inter */ true,
         PlusModes {
             rru: true,
+            umv,
             ..PlusModes::default()
         },
     )?;
@@ -796,15 +827,29 @@ pub fn encode_inter_picture_rru(
             let mut best_pseudo = MotionVector::new(0, 0);
             let mut best_cost = sad_for(MotionVector::new(0, 0));
             let lambda = 2 * quant as u32;
+            // Pseudo-domain candidate window: the baseline [-32, 31]
+            // half-pel window (§Q.4 item 2), widened to the
+            // Tables-D.1/D.2 range under UMV (§D.2 — the range applies
+            // to the pseudo vectors; UUI = "1" is emitted).
+            let (px_min, px_max) = if umv {
+                crate::motion::umv_plus_horizontal_range_half(frame.luma_width as u32)
+            } else {
+                (-32, 31)
+            };
+            let (py_min, py_max) = if umv {
+                crate::motion::umv_plus_vertical_range_half(frame.luma_height as u32)
+            } else {
+                (-32, 31)
+            };
             for dy in -search_pseudo_half..=search_pseudo_half {
                 for dx in -search_pseudo_half..=search_pseudo_half {
                     let cand = MotionVector {
                         dx_half: pseudo_pc.dx_half + dx,
                         dy_half: pseudo_pc.dy_half + dy,
                     };
-                    // Pseudo range is the baseline [-32, 31] half-pel
-                    // window (§Q.4 item 2).
-                    if !(-32..=31).contains(&cand.dx_half) || !(-32..=31).contains(&cand.dy_half) {
+                    if !(px_min..=px_max).contains(&cand.dx_half)
+                        || !(py_min..=py_max).contains(&cand.dy_half)
+                    {
                         continue;
                     }
                     let actual = rru_actual_mv(cand);
@@ -872,14 +917,30 @@ pub fn encode_inter_picture_rru(
                 luma_enc[2].clone(),
                 luma_enc[3].clone(),
             ];
-            let mvd = crate::encoder_motion::mvd_for(pseudo_mv, pseudo_pc);
-            crate::encoder_mb::encode_inter_macroblock(
-                &mut w,
-                &luma_arr,
-                &chroma_enc[0],
-                &chroma_enc[1],
-                mvd,
-            )?;
+            if umv {
+                // §Q.4 / §D.2 — the Table D.3 difference is the plain
+                // pseudo-domain `pseudo_mv − pseudo_pc`.
+                let mvd = crate::macroblock::Mvd {
+                    dx_half: (pseudo_mv.dx_half - pseudo_pc.dx_half) as i16,
+                    dy_half: (pseudo_mv.dy_half - pseudo_pc.dy_half) as i16,
+                };
+                crate::encoder_mb::encode_inter_macroblock_umv_plus(
+                    &mut w,
+                    &luma_arr,
+                    &chroma_enc[0],
+                    &chroma_enc[1],
+                    mvd,
+                )?;
+            } else {
+                let mvd = crate::encoder_motion::mvd_for(pseudo_mv, pseudo_pc);
+                crate::encoder_mb::encode_inter_macroblock(
+                    &mut w,
+                    &luma_arr,
+                    &chroma_enc[0],
+                    &chroma_enc[1],
+                    mvd,
+                )?;
+            }
             grid.set_inter(mb_col, mb_row, mv);
         }
     }

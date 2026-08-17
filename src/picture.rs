@@ -1618,6 +1618,13 @@ pub(crate) fn rru_motion_compensate_16_pub(
     rru_motion_compensate_16(plane, x0, y0, mv, rcontrol)
 }
 
+/// Display-size lookup for the RRU UMV range tables. §Q.4 / §D.2:
+/// Tables D.1 / D.2 are keyed on the picture format, and in RRU "the
+/// specified range applies to the pseudo motion vectors".
+fn layout_dims_for_rru(fmt: PlusSourceFormat) -> Result<(u32, u32)> {
+    fmt.luma_dimensions().ok_or(Error::NotImplemented)
+}
+
 /// Decode the body of an **Annex Q Reduced-Resolution Update**
 /// picture — an extended-PTYPE I- or P-picture whose §5.1.4.3 MPPTYPE
 /// RRU bit is set. `reader` is positioned right after the parsed
@@ -1626,9 +1633,11 @@ pub(crate) fn rru_motion_compensate_16_pub(
 /// The staged subset is the single-video-picture-segment stream shape
 /// the crate's own RRU encoders emit: §5.2.2 GOB-0 header elision with
 /// no later GOB headers, one of the five standard source formats, and
-/// none of the optional modes (UMV / AP / DF / AIC / SAC / AIV / MQ /
-/// Annex K — each is either unstaged in RRU semantics or alters the
-/// pseudo-vector/OBMC/filter layers; all are refused). Per §Q:
+/// — besides UMV, which composes per §Q.4 (Table D.3 pseudo-vector
+/// differences under the UUI-selected range) — none of the optional
+/// modes (AP / DF / AIC / SAC / AIV / MQ / Annex K — each is either
+/// unstaged in RRU semantics or alters the OBMC/filter layers; all
+/// are refused). Per §Q:
 ///
 /// 1. §Q.1 geometry: display `(H, V)`, reference `(HR, VR)`, coded
 ///    `(HC, VC)`; the picture is tiled by 32 × 32 macroblocks.
@@ -1636,8 +1645,9 @@ pub(crate) fn rru_motion_compensate_16_pub(
 ///    extended to `(HC, VC)` by edge replication.
 /// 3. §Q.2.2 — standard §5.3/§5.4 macroblock syntax; §Q.4
 ///    pseudo-vector reconstruction (the §6.1.1 predictor over the
-///    **actual** vectors, converted to the pseudo domain, the Table-14
-///    MVD applied there, and the result expanded back to the
+///    **actual** vectors, converted to the pseudo domain, the MVD —
+///    Table 14 wrap by default, Table D.3 sum under UMV — applied
+///    there, and the result expanded back to the
 ///    half-integer-or-zero actual lattice); four 16 × 16 luminance
 ///    prediction blocks + two 16 × 16 chrominance prediction blocks;
 ///    §Q.2.2.2 texture decode + §Q.6 up-sampling; §Q.2.2.3 summation
@@ -1668,10 +1678,13 @@ fn decode_rru_picture_body(
         // Improved-PB / B / EI / EP under RRU are unstaged.
         _ => return Err(Error::NotImplemented),
     };
-    // Unstaged mode combinations (each changes the RRU pseudo-vector,
-    // OBMC or filter layers).
-    if opptype.umv
-        || opptype.sac
+    // Unstaged mode combinations (each changes the RRU OBMC or filter
+    // layers). UMV composes (round 447): §Q.4 — "if the Unrestricted
+    // Motion Vector mode is also used with the Reduced-Resolution
+    // Update mode, pseudo-MVC is obtained by adding the motion vector
+    // differences MVD ... from Table D.3", with the §D.2 range
+    // applying to the pseudo vectors.
+    if opptype.sac
         || opptype.advanced_prediction
         || opptype.advanced_intra
         || opptype.deblocking
@@ -1689,6 +1702,42 @@ fn decode_rru_picture_body(
     {
         return Err(Error::NotImplemented);
     }
+    // §Q.4 / §D.2 — with UMV on, MVDs are Table D.3 and the pseudo
+    // vector is `pseudo-PC + difference` bounded by the UUI-selected
+    // range ("the specified range applies to the pseudo motion
+    // vectors"). UFEP=001 is mandated above, so UUI is on the wire
+    // whenever UMV is.
+    let umv = if opptype.umv {
+        let uui = plus.uui.ok_or(Error::NotImplemented)?;
+        match uui {
+            crate::plus_ptype::Uui::Limited => {
+                let (h_min, h_max) = crate::motion::umv_plus_horizontal_range_half(
+                    layout_dims_for_rru(opptype.source_format)?.0,
+                );
+                let (v_min, v_max) = crate::motion::umv_plus_vertical_range_half(
+                    layout_dims_for_rru(opptype.source_format)?.1,
+                );
+                UmvCoding::TableD3 {
+                    h_min,
+                    h_max,
+                    v_min,
+                    v_max,
+                }
+            }
+            crate::plus_ptype::Uui::Unlimited => {
+                let (lo, hi) = crate::motion::MV_UMV_PLUS_UNLIMITED_HALF;
+                UmvCoding::TableD3 {
+                    h_min: lo,
+                    h_max: hi,
+                    v_min: lo,
+                    v_max: hi,
+                }
+            }
+        }
+    } else {
+        UmvCoding::Off
+    };
+
     // Standard source formats only (custom CPFMT geometry unstaged).
     let source_format = match opptype.source_format {
         PlusSourceFormat::SubQcif => H263SourceFormat::SubQcif,
@@ -1763,7 +1812,7 @@ fn decode_rru_picture_body(
                         pb_annex_m: false,
                         quantiser_before: current_quant,
                         modified_quant: false,
-                        umv_table_d3: false,
+                        umv_table_d3: umv.table_d3(),
                     },
                 )?;
                 if matches!(mb.mb_type, Some(MbType::Stuffing)) {
@@ -1877,7 +1926,11 @@ fn decode_rru_picture_body(
             );
             let pseudo_pc = rru_pseudo_mv(pc);
             let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
-            let pseudo_mv = reconstruct_mv(pseudo_pc, mvd);
+            // §Q.4 item 2 — default mode: Table-14 wrap in the
+            // [-16, 15.5]-pel pseudo window. With UMV (Table D.3) the
+            // pseudo vector is the plain sum, range-checked against
+            // the UUI selection.
+            let pseudo_mv = reconstruct_mv_coded(umv, pseudo_pc, mvd)?;
             let mv = rru_actual_mv(pseudo_mv);
             let chroma_vec = chroma_mv(mv);
 
@@ -4878,13 +4931,16 @@ fn decode_upward_predicted_picture(
 
     // Refuse the enhancement-layer optional modes this path does not
     // stage (CPM multiplex, Advanced Prediction, SAC, Annex-K slice
-    // structure). The §O.6 spatial-scalability upsample is gated below
+    // structure, and UMV — §O.4.6 codes MVDFW / MVDBW with Table D.3
+    // when the Unrestricted Motion Vector mode is in use, which this
+    // path does not stage; refusing beats misparsing them as
+    // Table 14). The §O.6 spatial-scalability upsample is gated below
     // on geometry.
     let plus = &extended.plus;
     if plus.cpm
         || plus
             .opptype
-            .is_some_and(|o| o.advanced_prediction || o.sac || o.slice_structured)
+            .is_some_and(|o| o.advanced_prediction || o.sac || o.slice_structured || o.umv)
     {
         return Err(Error::NotImplemented);
     }
@@ -5483,7 +5539,7 @@ pub fn decode_ep_picture(
     if plus.cpm
         || plus
             .opptype
-            .is_some_and(|o| o.advanced_prediction || o.sac || o.slice_structured)
+            .is_some_and(|o| o.advanced_prediction || o.sac || o.slice_structured || o.umv)
     {
         return Err(Error::NotImplemented);
     }
@@ -5976,12 +6032,14 @@ pub fn decode_b_picture(
     _options: DecodeOptions,
 ) -> Result<YuvFrame> {
     // Refuse the optional modes this baseline B-picture path does not
-    // stage (§O.3 inherits the §5.1.4 PLUSPTYPE option flags).
+    // stage (§O.3 inherits the §5.1.4 PLUSPTYPE option flags; UMV is
+    // refused because §O.4.6 switches MVDFW / MVDBW to Table D.3 in
+    // that mode — refusing beats misparsing them as Table 14).
     let plus = &extended.plus;
     if plus.cpm
         || plus
             .opptype
-            .is_some_and(|o| o.advanced_prediction || o.sac || o.slice_structured)
+            .is_some_and(|o| o.advanced_prediction || o.sac || o.slice_structured || o.umv)
     {
         return Err(Error::NotImplemented);
     }
@@ -11700,6 +11758,64 @@ mod tests {
     /// §G.4 scaling is trivially zero regardless of the spans.
     fn unit_temporal() -> BPictureTemporal {
         BPictureTemporal { trb: 1, trd: 2 }
+    }
+
+    /// §O.4.6 — with the Unrestricted Motion Vector mode in use,
+    /// MVDFW / MVDBW are coded with Table D.3, which the B / EI / EP
+    /// paths do not stage: a B-picture whose OPPTYPE signals UMV is
+    /// refused rather than misparsed as Table 14.
+    #[test]
+    fn b_picture_with_umv_signalled_is_refused() {
+        let mut w = BitWriter::new();
+        // Same layout as `write_plus_qcif_b_header` but with the
+        // OPPTYPE UMV bit (bit 5) set and the §5.1.9 UUI ("1") after
+        // CPM.
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_u32(0b000, 3);
+        w.write_u32(0b111, 3); // extended
+        w.write_u32(0b001, 3); // UFEP = 001
+        w.write_u32(0b010, 3); // QCIF
+        w.write_bit(false); // custom_pcf
+        w.write_bit(true); // UMV = ON
+        for _ in 0..9 {
+            w.write_bit(false); // remaining OPPTYPE mode bits off
+        }
+        w.write_bit(true); // SCE-guard
+        w.write_u32(0b000, 3); // reserved
+        w.write_u32(0b011, 3); // picture type = B
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(true); // SCE-guard
+        w.write_u32(2, 4); // ELNUM
+        w.write_u32(1, 4); // RLNUM
+        w.write_bit(false); // CPM = 0
+        w.write_bit(true); // UUI = "1" (Limited)
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+        let forward = synthetic_qcif_forward();
+        let backward = synthetic_qcif_reference();
+        assert_eq!(
+            decode_b_picture_layer(
+                &data,
+                &forward,
+                &backward,
+                &zero_subsequent_mvs(),
+                unit_temporal(),
+                DecodeOptions::default(),
+                InheritedExtendedState::default(),
+            )
+            .unwrap_err(),
+            Error::NotImplemented
+        );
     }
 
     /// An all-Direct-skipped B-picture (every macroblock COD=1) with a

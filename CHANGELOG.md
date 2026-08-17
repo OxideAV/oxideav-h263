@@ -83,6 +83,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   round-tripped through `decode_sequence` at 25-pel motion across
   slice heights 1 / 3 / 9.
 
+- **Annex Q × Annex D: RRU + UMV end-to-end** (round 447; removes a
+  round-443 refusal): §Q.4 — with UMV also in use the pseudo motion
+  vector is `pseudo-PC + difference` with the difference read from
+  **Table D.3**, and the §D.2 range ("the specified range applies to
+  the pseudo motion vectors") bounds the pseudo domain per the UUI
+  selection — so the actual motion reach roughly doubles. Decoder:
+  the RRU driver accepts the OPPTYPE UMV bit, parses UUI, and routes
+  the pseudo reconstruction through the Table D.3 no-wrap path.
+  Encoder: `encode_inter_picture_rru_umv` widens the pseudo-domain
+  candidate window to the Tables-D.1/D.2 range and emits Table D.3
+  pairs. Pinned: static RRU+UMV P lossless, a 40-pixel translation
+  (pseudo ≈ 20 pel, outside the default `[-16, 15.5]` window)
+  round-trips within the RRU low-pass budget and beats the
+  default-window encoder on both size and error, and RRU+UMV I+P
+  streams decode through `decode_sequence`.
+
+### Fixed
+
+- **B / EI / EP pictures refuse a UMV-signalled header** (round 447):
+  §O.4.6 codes MVDFW / MVDBW "in Table 14, or in Table D.3 if the
+  Unrestricted Motion Vector mode is used" — the scalability paths do
+  not stage the Table D.3 form, and previously ignored the OPPTYPE
+  UMV bit entirely, so a conformant UMV B-picture would have had its
+  vector data misparsed as Table 14. The unstaged mode is now refused
+  like AP / SAC / slice-structured on the same paths.
+
 ### Added
 
 - **§N.4.2 Back-Channel Message syntax** (round 443):

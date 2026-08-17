@@ -100,7 +100,9 @@ down-sampled to the reduced 8×8 block, standard INTRA stage over the
 32×32 macroblock grid) and `encode_inter_picture_rru` (pseudo-domain
 motion search so every candidate expands to a legal §Q.4
 half-integer-or-zero vector, per-16×16-sub-block residuals
-down-sampled to 8×8) — both self-describing (MPPTYPE RRU bit) and
+down-sampled to 8×8; `encode_inter_picture_rru_umv` widens the
+pseudo window to the Tables-D.1/D.2 UMV range with Table D.3
+difference coding — round 447) — both self-describing (MPPTYPE RRU bit) and
 round-tripped through the RRU decode driver (static P lossless,
 translated content within tolerance, I + P streams through
 `decode_sequence`).
@@ -339,8 +341,11 @@ planar 4:2:0 `YuvFrame`:
   block boundary filter (coded-MB condition, §J.3 edge ordering) and
   the §Q.2.3/§Q.2.4 crop back to the reference size. The staged
   subset is the single-segment I/P stream shape at the five standard
-  formats; UMV / AP / DF / AIC / SAC / AIV / MQ / Annex K / B-EI-EP
-  combinations inside RRU are refused. The §Q.7.2 Deblocking-Filter
+  formats. **UMV composes** (round 447): §Q.4 — the pseudo vector is
+  `pseudo-PC + difference` with the difference read from Table D.3,
+  the UUI-selected Tables-D.1/D.2 range applying to the *pseudo*
+  vectors (actual motion reach roughly doubled). AP / DF / AIC / SAC
+  / AIV / MQ / Annex K / B-EI-EP combinations inside RRU are refused. The §Q.7.2 Deblocking-Filter
   variant and §Q.5 enlarged OBMC stay as primitives
   (`rru_filter_plane`, `STRENGTH_RRU_INFINITE`).
 * **Annex N §N.4.1 / §N.5** — Reference Picture Selection mode (forward
@@ -421,7 +426,9 @@ planar 4:2:0 `YuvFrame`:
   reconstruct end-to-end (`decode_ei_picture` / `decode_ep_picture` —
   upward, forward, bidirectional and INTRA prediction). The §N.4.2
   back-channel and the B-picture INTER4V / Advanced-Prediction submodes
-  are out of scope.
+  are out of scope, and a B / EI / EP picture signalling UMV is refused
+  (§O.4.6 switches MVDFW / MVDBW to Table D.3 in that mode, which this
+  path does not stage — round 447).
 * **Annex O §O.6** — spatial-scalability reference up-sampling: the
   Figure O.8 / O.9 2-D and Figure O.10 / O.11 1-D (horizontal / vertical)
   interpolation filters (`upsample_plane_2d` /
@@ -545,12 +552,12 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   Annex P explicit-warp resampling engine (see the supported list) is
   not yet threaded into the EP / spatial-scalability path (only the §O.6
   factor-of-two upsample is wired there).
-* Annex Q Reduced-Resolution Update combined with UMV (the Table D.3
-  pseudo-vector coding), Advanced Prediction (§Q.5 enlarged OBMC),
-  Deblocking Filter (§Q.7.2 filter variant), Annex K slices, custom
-  source formats or mid-picture GOB headers — the single-segment
-  standard-format I/P subset decodes and encodes end-to-end (see the
-  supported list).
+* Annex Q Reduced-Resolution Update combined with Advanced
+  Prediction (§Q.5 enlarged OBMC), Deblocking Filter (§Q.7.2 filter
+  variant), Annex K slices, custom source formats or mid-picture GOB
+  headers — the single-segment standard-format I/P subset (including
+  the §Q.4 UMV Table-D.3 pseudo-vector coding, both directions)
+  decodes and encodes end-to-end (see the supported list).
 * GSBI (CPM = "1"); the EOSBS end marker (the §5.1.27 EOS is emitted
   by the encoder and transparently skipped by `decode_sequence`).
 * Encoder: arbitrary (non-stripe) rectangular slice shapes and

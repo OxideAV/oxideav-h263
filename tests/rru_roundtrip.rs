@@ -3,7 +3,9 @@
 //! PLUSPTYPE decode path (`decode_picture_layer` / `decode_sequence`),
 //! plus the §Q.4 pseudo-motion-vector lattice pins.
 
-use oxideav_h263::encoder::{encode_inter_picture_rru, encode_intra_picture_rru};
+use oxideav_h263::encoder::{
+    encode_inter_picture_rru, encode_inter_picture_rru_umv, encode_intra_picture_rru,
+};
 use oxideav_h263::motion::{rru_actual_component, rru_pseudo_component};
 use oxideav_h263::picture::{decode_picture_layer, decode_sequence, DecodeOptions, YuvFrame};
 
@@ -153,10 +155,85 @@ fn rru_stream_decodes_through_decode_sequence() {
     assert!(mae < 6.0, "sequence RRU P luma MAE {mae}");
 }
 
+/// RRU × UMV (§Q.4 / §D.2): a static RRU + UMV P-picture is lossless —
+/// every macroblock skips exactly as in the default mode, and the
+/// UMV-signalled header (OPPTYPE UMV + §5.1.9 UUI) round-trips through
+/// the Table D.3 macroblock parser.
+#[test]
+fn rru_umv_static_p_is_lossless() {
+    let src = gradient(176, 144, 9);
+    let i_bytes = encode_intra_picture_rru(&src, 7, 0).expect("encode I");
+    let recon = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).expect("decode I");
+    let p_bytes = encode_inter_picture_rru_umv(&recon, &recon, 7, 1, 2).expect("encode P");
+    let dec =
+        decode_picture_layer(&p_bytes, Some(&recon), DecodeOptions::default()).expect("decode P");
+    assert_eq!(dec.y, recon.y);
+    assert_eq!(dec.cb, recon.cb);
+    assert_eq!(dec.cr, recon.cr);
+}
+
+/// RRU × UMV big motion: a 40-pixel translation needs a pseudo vector
+/// of ≈ 20 pixels — outside the default RRU pseudo window
+/// (`[-16, 15.5]` pel) but inside the UMV Tables-D.1/D.2 pseudo range
+/// (±32 pel at sub-QCIF width). The Table D.3 pseudo differences carry
+/// it; the §Q.4 half-integer-or-zero actual lattice plus the residual
+/// layer reconstruct within the RRU low-pass budget.
+#[test]
+fn rru_umv_large_translation_round_trips() {
+    let src = gradient(128, 96, 0);
+    let i_bytes = encode_intra_picture_rru(&src, 5, 0).expect("encode I");
+    let recon = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).expect("decode I");
+    let moved = translated(&recon, 40);
+    let p_bytes = encode_inter_picture_rru_umv(&moved, &recon, 5, 1, 44).expect("encode P");
+    let dec =
+        decode_picture_layer(&p_bytes, Some(&recon), DecodeOptions::default()).expect("decode P");
+    let mae = luma_mae(&moved, &dec);
+    assert!(mae < 6.0, "RRU+UMV P luma MAE {mae}");
+
+    // The same translation through the default-window encoder cannot
+    // reach a ≈20-pel pseudo vector; its best reconstruction is
+    // measurably worse, proving the UMV leg actually used the extended
+    // range rather than the residual layer alone.
+    let p_default = encode_inter_picture_rru(&moved, &recon, 5, 1, 44).expect("encode P default");
+    let dec_default = decode_picture_layer(&p_default, Some(&recon), DecodeOptions::default())
+        .expect("decode P default");
+    let mae_default = luma_mae(&moved, &dec_default);
+    assert!(
+        p_bytes.len() < p_default.len(),
+        "UMV RRU stream should be smaller: {} vs {}",
+        p_bytes.len(),
+        p_default.len()
+    );
+    assert!(
+        mae <= mae_default + 0.5,
+        "UMV RRU should not reconstruct worse: {mae} vs {mae_default}"
+    );
+}
+
+/// An RRU + UMV I + P elementary stream decodes through
+/// `decode_sequence` (extended-PTYPE dispatch → RRU routing with the
+/// Table D.3 motion path).
+#[test]
+fn rru_umv_stream_decodes_through_decode_sequence() {
+    let src = gradient(176, 144, 4);
+    let i_bytes = encode_intra_picture_rru(&src, 6, 0).unwrap();
+    let recon = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).unwrap();
+    let moved = translated(&recon, 2);
+    let p_bytes = encode_inter_picture_rru_umv(&moved, &recon, 6, 1, 3).unwrap();
+
+    let mut stream = i_bytes.clone();
+    stream.extend_from_slice(&p_bytes);
+    let frames = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].y, recon.y);
+    let mae = luma_mae(&moved, &frames[1]);
+    assert!(mae < 6.0, "sequence RRU+UMV P luma MAE {mae}");
+}
+
 /// RRU pictures refuse the unstaged mode combinations (the OPPTYPE
-/// UMV / AP / DF / AIC bits alter the pseudo-vector / OBMC / filter
-/// layers): a caller-forced deblock option on an RRU stream is
-/// refused rather than mis-filtered.
+/// AP / DF / AIC bits alter the OBMC / filter layers): a caller-forced
+/// deblock option on an RRU stream is refused rather than
+/// mis-filtered.
 #[test]
 fn rru_refuses_deblock_option() {
     use oxideav_h263::Error;
