@@ -327,6 +327,29 @@ fn deblocking_filter_mode_within_tolerance() {
     );
 }
 
+#[test]
+fn unrestricted_mv_mode_within_idct_tolerance() {
+    // H.263+ Annex D in its PLUSPTYPE form ("UMV+") QCIF I+P+P, from a
+    // real encoder: OPPTYPE UMV bit + per-picture §5.1.9 UUI, motion
+    // vector differences coded with the §D.2 / Table D.3 reversible
+    // codes (single-valued `mv − predictor`, no Table 14 pair
+    // selection), composed with Annex K slice-structured framing and a
+    // custom PCF. This is the conformance stream for the round-443
+    // self-found nonconformance (Table 14 emitted where §D.2 wants
+    // Table D.3): a decoder still reading Table 14 misparses every
+    // P-picture macroblock layer here.
+    let (input, expected) = fixture!("unrestricted-mv-mode");
+    let frames = decode_sequence(input, DecodeOptions::default())
+        .expect("decode_sequence unrestricted-mv-mode");
+    assert_eq!(frames.len(), 3, "unrestricted-mv-mode is I + P + P");
+    let mut got = Vec::new();
+    for f in &frames {
+        got.extend_from_slice(&frame_bytes(f));
+    }
+    assert_within_idct_tolerance("unrestricted-mv-mode", &got, expected);
+    assert_eq!(got.len(), 3 * (176 * 144 + 2 * (88 * 72)));
+}
+
 // --- minimal SHA-256 (FIPS 180-4), test-only, no external crate ---
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -468,6 +491,10 @@ fn vendored_fixture_expected_yuv_sha256() {
             "deblocking-filter",
             "59ee29e472c6849e9d4b86f70f5c3d12939a1fe177ba19a0fc6283b4b8d531ad",
         ),
+        (
+            "unrestricted-mv-mode",
+            "81458b7846c4e7740f91c5c79d764fa9e9a60eca79b41b9321f5bb3b6d29f68f",
+        ),
     ] {
         let expected: &[u8] = match name {
             "qp-high" => fixture!("qp-high").1,
@@ -478,6 +505,7 @@ fn vendored_fixture_expected_yuv_sha256() {
             "alt-inter-vlc" => fixture!("alt-inter-vlc").1,
             "advanced-prediction-mode" => fixture!("advanced-prediction-mode").1,
             "deblocking-filter" => fixture!("deblocking-filter").1,
+            "unrestricted-mv-mode" => fixture!("unrestricted-mv-mode").1,
             _ => unreachable!(),
         };
         assert_eq!(

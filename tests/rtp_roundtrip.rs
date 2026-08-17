@@ -213,6 +213,7 @@ fn conformance_fixtures_round_trip() {
         include_bytes!("fixtures/h263p-modern/input.h263"),
         include_bytes!("fixtures/slice-structured-mode/input.h263"),
         include_bytes!("fixtures/advanced-intra-coding/input.h263"),
+        include_bytes!("fixtures/unrestricted-mv-mode/input.h263"),
     ];
     for (i, stream) in fixtures.iter().enumerate() {
         for budget in [48usize, 256, 1440] {

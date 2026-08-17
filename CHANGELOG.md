@@ -59,6 +59,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `[-4095, 4095]` difference range (the Table 14 form is unchanged on
   the wire).
 
+- **Conformance fixture: `unrestricted-mv-mode` vendored** (round
+  447): the staged H.263+ Annex D reference stream (QCIF I+P+P — UMV+
+  Table D.3 motion, Annex K slice-structured framing, custom PCF)
+  decodes under `tests/fixture_decode.rs` with **zero** samples beyond
+  the Annex A.7 ±1 bound, with a SHA-256 corruption guard, and joins
+  the RFC 4629 packetize/depacketize round-trip battery.
+
+- **UMV+ interaction matrix, decode side** (round 447): end-to-end
+  driver tests pin Table D.3 MVDs composing with **Advanced
+  Prediction** (a uniform INTER4V motion field beyond the Table 14
+  window reconstructs as a pure translation through the §F.2
+  predictors + §F.3 OBMC), **Modified Quantization** (§T.2
+  variable-length DQUANT followed by a Table D.3 pair in the same
+  macroblock header), the §D.2 emulation-prevention alignment across
+  consecutive macroblocks, the UUI = "01" Unlimited acceptance and
+  the Tables-D.1/D.2 range refusal. Slice-structured composition is
+  pinned by the vendored fixture.
+
+- **`encode_inter_picture_umv_slices`** (round 447): UMV+ × Annex K on
+  the encode side — H.263+ slice-structured P-pictures with Table D.3
+  motion vector coding (the staged conformance stream's mode pairing),
+  round-tripped through `decode_sequence` at 25-pel motion across
+  slice heights 1 / 3 / 9.
+
 ### Added
 
 - **§N.4.2 Back-Channel Message syntax** (round 443):

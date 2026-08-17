@@ -560,6 +560,38 @@ fn plus_inter_sequence_round_trips() {
     }
 }
 
+/// UMV+ × Annex K: `encode_inter_picture_umv_slices` emits the staged
+/// conformance stream's mode pairing — H.263+ slice-structured framing
+/// with the Annex D UMV mode and §5.3.7 / §D.2 Table D.3 motion vector
+/// differences — and it round-trips through `decode_sequence` with
+/// default options, including motion beyond the ±16-pel Table 14
+/// window.
+#[test]
+fn umv_plus_slices_round_trips_with_large_motion() {
+    use oxideav_h263::encoder::encode_inter_picture_umv_slices;
+    use oxideav_h263::encoder::encode_intra_picture_plus;
+
+    let f0 = gradient(176, 144, 0);
+    let f1 = gradient(176, 144, 25); // 25-pel shift: needs the extended range
+
+    let q = 6;
+    let i0 = encode_intra_picture_plus(&f0, q, 0).expect("I");
+    let r0 = decode_sequence(&i0, DecodeOptions::default()).expect("dec I")[0].clone();
+    for rows_per_slice in [1usize, 3, 9] {
+        let p1 = encode_inter_picture_umv_slices(&f1, &r0, q, 1, 30, rows_per_slice)
+            .expect("UMV slice P");
+        let mut stream = i0.clone();
+        stream.extend_from_slice(&p1);
+        let frames = decode_sequence(&stream, DecodeOptions::default()).expect("dec I+P");
+        assert_eq!(frames.len(), 2);
+        let mae = luma_mae(&f1, &frames[1]);
+        assert!(
+            mae < 4.0,
+            "UMV+ slices rows_per_slice {rows_per_slice}: luma MAE {mae}"
+        );
+    }
+}
+
 /// An Annex K Slice-Structured INTRA picture at a constant quantiser
 /// reconstructs **byte-exactly** the same frame as the single-segment
 /// baseline encode: INTRA macroblock coding carries no cross-segment

@@ -9332,6 +9332,18 @@ mod tests {
     /// Unlimited), PQUANT = 8 and PEI = 0 — positioned at the first bit
     /// of the (header-less, §5.2.2) GOB-0 macroblock data.
     fn write_plus_qcif_inter_umv_header(w: &mut BitWriter, unlimited_uui: bool) {
+        write_plus_qcif_inter_umv_header_modes(w, unlimited_uui, false, false);
+    }
+
+    /// As [`write_plus_qcif_inter_umv_header`], optionally raising the
+    /// OPPTYPE Advanced Prediction (Annex F) and Modified Quantization
+    /// (Annex T) bits alongside UMV.
+    fn write_plus_qcif_inter_umv_header_modes(
+        w: &mut BitWriter,
+        unlimited_uui: bool,
+        ap: bool,
+        mq: bool,
+    ) {
         w.write_u32(PSC_VALUE, PSC_BITS);
         w.write_u32(0, 8); // TR
         w.write_bit(true); // PTYPE bit 1
@@ -9344,14 +9356,14 @@ mod tests {
         w.write_bit(false); // custom_pcf
         w.write_bit(true); // UMV = ON
         w.write_bit(false); // SAC
-        w.write_bit(false); // AP
+        w.write_bit(ap); // AP
         w.write_bit(false); // AIC
         w.write_bit(false); // DF
         w.write_bit(false); // SS
         w.write_bit(false); // RPS
         w.write_bit(false); // IS
         w.write_bit(false); // AIV
-        w.write_bit(false); // MQ
+        w.write_bit(mq); // MQ
         w.write_bit(true); // SCE-guard
         w.write_u32(0b000, 3); // reserved
                                // MPPTYPE (9 bits).
@@ -9522,6 +9534,98 @@ mod tests {
         // y half-pel = +1 → integer 0 phase 1: average of ramp at
         // (14,0),(15,0),(14,1),(15,1) = (14+15+15+16+2)/4 = 15.
         assert_eq!(frame.y[16], 15);
+    }
+
+    /// UMV+ × Annex F (Advanced Prediction): the MVD2-4 of INTER4V
+    /// macroblocks are also Table D.3 codewords, reconstructed with no
+    /// wrap through the §F.2 per-block predictors and §F.3 OBMC. A
+    /// uniform +20-pixel motion field (every block vector +40 half-pel,
+    /// beyond the Table 14 window) makes the OBMC blend a pure
+    /// translation, so the output is the edge-replicated shifted ramp.
+    #[test]
+    fn decode_plus_umv_ap_inter4v_table_d3_uniform_field() {
+        let mut reference = YuvFrame::grey(176, 144);
+        for y in 0..144 {
+            for x in 0..176 {
+                reference.y[y * 176 + x] = (x % 256) as u8;
+            }
+        }
+
+        let mut w = BitWriter::new();
+        write_plus_qcif_inter_umv_header_modes(
+            &mut w, false, /* ap */ true, /* mq */ false,
+        );
+        // Every macroblock: coded INTER4V, no coefficients, four
+        // Table D.3 MVD pairs. With a uniform +40 half-pel horizontal
+        // field, the §F.2 predictors make every difference zero except
+        // MB(0,0)'s block-1 horizontal (+40).
+        for mb in 0..99 {
+            w.write_bit(false); // COD = 0
+            w.write_u32(0b010, 3); // MCBPC INTER4V, cbpc 00
+            w.write_u32(0b11, 2); // CBPY idx 15 → INTER pattern 0000
+            for blk in 0..4 {
+                let dx = if mb == 0 && blk == 0 { 40 } else { 0 };
+                crate::annex_p::write_table_d3(&mut w, dx).unwrap();
+                crate::annex_p::write_table_d3(&mut w, 0).unwrap();
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let frame = decode_picture_layer(&data, Some(&reference), DecodeOptions::default())
+            .expect("decode UMV+ AP picture");
+        // Uniform-field OBMC == plain translation by +20 px with §D.1
+        // edge replication on the right.
+        for y in 0..144 {
+            for x in 0..176 {
+                let sx = (x + 20).min(175);
+                assert_eq!(frame.y[y * 176 + x], (sx % 256) as u8, "pixel ({x},{y})");
+            }
+        }
+    }
+
+    /// UMV+ × Annex T (Modified Quantization): the §T.2 variable-length
+    /// DQUANT and the Table D.3 MVD coexist in the same macroblock
+    /// header — a mis-sized DQUANT would desynchronise the D.3 pair and
+    /// move the block.
+    #[test]
+    fn decode_plus_umv_mq_dquant_then_table_d3_mvd() {
+        let mut reference = YuvFrame::grey(176, 144);
+        for y in 0..144 {
+            for x in 0..176 {
+                reference.y[y * 176 + x] = (x % 256) as u8;
+            }
+        }
+
+        let mut w = BitWriter::new();
+        write_plus_qcif_inter_umv_header_modes(
+            &mut w, false, /* ap */ false, /* mq */ true,
+        );
+        // MB(0,0): coded INTER+Q, §T.2.2 six-bit DQUANT (new QUANT =
+        // 13), no coefficients, MVD = (+44, 0) via Table D.3.
+        w.write_bit(false); // COD
+        w.write_u32(0b011, 3); // MCBPC INTER+Q, cbpc 00
+        w.write_u32(0b11, 2); // CBPY → INTER pattern 0000
+        w.write_bit(false); // §T.2.2 arbitrary-selection form
+        w.write_u32(13, 5); // new QUANT
+        crate::annex_p::write_table_d3(&mut w, 44).unwrap();
+        crate::annex_p::write_table_d3(&mut w, 0).unwrap();
+        for _ in 0..98 {
+            w.write_bit(true); // skipped
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let frame = decode_picture_layer(&data, Some(&reference), DecodeOptions::default())
+            .expect("decode UMV+ MQ picture");
+        // Half-pel +44 → integer 22, phase 0.
+        for y in 0..16 {
+            assert_eq!(frame.y[y * 176], 22, "UMV+ MQ MB(0,0) pixel (0,{y})");
+        }
     }
 
     // ---- Annex F §F.2 / §F.3 INTER4V four-vector + OBMC driver wiring

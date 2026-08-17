@@ -18,7 +18,11 @@ The encoder (round 376 onward) produces baseline **INTRA (I-)** and
 `encoder::encode_intra_picture` / `encode_inter_picture` /
 `encode_inter_picture_motion` (SAD search + half-pel refinement with
 §6.1.1 predictor replay), `encode_inter_picture_umv` (**Annex D**
-extended-range motion with the exact §D.2 pair-selection inverse),
+extended-range motion with the exact §D.2 pair-selection inverse;
+the PLUSPTYPE forms `encode_inter_picture_umv_plus` /
+`encode_inter_picture_umv_slices` emit the §D.2 **Table D.3**
+reversible MVD codes under the §5.1.9 UUI Tables-D.1/D.2 range —
+round 447),
 `encode_inter_picture_ap` (**Annex F** INTER4V four vectors per
 macroblock with §F.3 OBMC-exact prediction, two-pass),
 `encode_pb_picture` (**Annex G** PB-frames: P-part + §G.4/§G.5
@@ -209,9 +213,17 @@ planar 4:2:0 `YuvFrame`:
   half-pixel bilinear interpolation (Figure 13) with §D.1 edge
   replication, and residual summation + clip. Skipped macroblocks
   (COD = 1) copy the reference with a zero MV.
-* **Annex D §D.2** — Unrestricted Motion Vector mode (PLUSPTYPE-absent
-  extended `[-63, 63]` half-pel range with predictor-dependent
-  difference-pair selection).
+* **Annex D §D.2** — Unrestricted Motion Vector mode, both header
+  forms: PLUSPTYPE-absent (extended `[-63, 63]` half-pel range with
+  predictor-dependent Table-14 difference-pair selection) and
+  PLUSPTYPE-present ("UMV+", round 447 — **Table D.3** reversible MVD
+  codes for MVD / MVD2-4 with the §D.2 six-zero emulation-prevention
+  bit, single-valued `predictor + difference` reconstruction, the
+  §5.1.9 UUI range selection: Tables D.1 / D.2 under UUI = "1",
+  unlimited-but-for-§D.1.1 under UUI = "01", last-sent UUI inherited
+  by UFEP=000 pictures). Composes with Advanced Prediction (Table D.3
+  MVD2-4 through the §F.2/§F.3 path), Modified Quantization and the
+  Annex K slice drivers.
 * **Annex E** — Syntax-based Arithmetic Coding mode end-to-end:
   the §E.2 / §E.3 arithmetic coders, the §E.5 stuffing rule and the
   §E.8 models under §E.7 indexing, decoded through
@@ -597,8 +609,10 @@ the QP=2 / QP=31 quantiser-boundary keyframes, an H.263+ (PLUSPTYPE)
 QCIF I+P+P stream (`h263p-modern`) that exercises the `decode_sequence`
 extended-PTYPE dispatch + custom-PCF framing + GOB-0 elision, a
 baseline Annex F stream (`advanced-prediction-mode` — 4MV + OBMC,
-including OBMC of skipped macroblocks) and an H.263+ Annex J stream
-(`deblocking-filter`).
+including OBMC of skipped macroblocks), an H.263+ Annex J stream
+(`deblocking-filter`) and an H.263+ Annex D stream
+(`unrestricted-mv-mode` — UMV+ Table D.3 motion + slice-structured +
+custom PCF, round 447).
 Because §6.2 leaves the inverse-transform arithmetic undefined
 and Annex A.7 only bounds the per-pixel peak error at 1, AC-bearing
 output is asserted within that ±1 tolerance; the flat sub-QCIF keyframe

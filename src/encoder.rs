@@ -3068,6 +3068,38 @@ pub fn encode_inter_picture_umv_plus(
     )
 }
 
+/// As [`encode_inter_picture_umv_plus`], but in Annex K **Slice
+/// Structured** framing: §K.2 slices every `mb_rows_per_slice`
+/// macroblock rows, each its own §6.1.1 video picture segment (the
+/// per-slice rule-3 predictor treatment is replayed by the estimator),
+/// with the Annex D UMV mode signalled in OPPTYPE + §5.1.9 UUI and the
+/// motion vector differences coded per §5.3.7 / §D.2 with the
+/// **Table D.3** reversible codes — the mode pairing of the staged
+/// UMV+ conformance stream. Self-describing: decodes through
+/// [`crate::picture::decode_picture_layer`] /
+/// [`crate::picture::decode_sequence`] with `DecodeOptions::default()`.
+pub fn encode_inter_picture_umv_slices(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+    mb_rows_per_slice: usize,
+) -> Result<Vec<u8>> {
+    encode_inter_picture_motion_impl(
+        frame,
+        reference,
+        quant,
+        tr,
+        search_half,
+        /* umv */ true,
+        InterFraming::Slices {
+            rows: mb_rows_per_slice,
+        },
+        /* plus */ true,
+    )
+}
+
 /// Encode a planar 4:2:0 [`YuvFrame`] as an H.263 **INTER** (P-)
 /// picture in the **Annex F Advanced Prediction mode**: the PTYPE
 /// bit-12 AP flag is raised and every macroblock is coded **INTER4V**
