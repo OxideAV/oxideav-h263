@@ -75,7 +75,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   macroblock header), the §D.2 emulation-prevention alignment across
   consecutive macroblocks, the UUI = "01" Unlimited acceptance and
   the Tables-D.1/D.2 range refusal. Slice-structured composition is
-  pinned by the vendored fixture.
+  pinned by the vendored fixture. Also pinned: the **Deblocking
+  Filter four-vector** cell (Table J.1 DF-4MV INTER4V macroblocks
+  read Table D.3 MVD2-4; a uniform extended-range field is
+  §J.3-invariant on a linear ramp) and **UFEP=000 UUI inheritance**
+  (a follow-up P-picture keeps the last-sent UUI in effect per the
+  §5.1.4.4 pattern; a snapshot without one is refused).
 
 - **`encode_inter_picture_umv_slices`** (round 447): UMV+ × Annex K on
   the encode side — H.263+ slice-structured P-pictures with Table D.3

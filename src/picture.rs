@@ -9686,6 +9686,173 @@ mod tests {
         }
     }
 
+    /// UMV+ × Annex J (Deblocking Filter four-vector element, OBMC
+    /// off): the Table J.1 DF-4MV INTER4V macroblocks also read their
+    /// MVD2-4 as Table D.3 codewords. A uniform +20-pixel field over a
+    /// linear ramp is invariant under the §J.3 filter in the interior
+    /// (the four-tap `d = (A − 4B + 4C − D)/8` is zero on constant
+    /// slopes), so interior pixels equal the shifted ramp exactly.
+    #[test]
+    fn decode_plus_umv_df_inter4v_table_d3_uniform_field() {
+        let mut reference = YuvFrame::grey(176, 144);
+        for y in 0..144 {
+            for x in 0..176 {
+                reference.y[y * 176 + x] = (x % 256) as u8;
+            }
+        }
+
+        let mut w = BitWriter::new();
+        // Plus header with UMV + DF (no AP): OPPTYPE bits 5 + 11.
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_u32(0b000, 3);
+        w.write_u32(0b111, 3); // extended
+        w.write_u32(0b001, 3); // UFEP = 001
+        w.write_u32(0b010, 3); // QCIF
+        w.write_bit(false); // custom_pcf
+        w.write_bit(true); // UMV = ON
+        w.write_bit(false); // SAC
+        w.write_bit(false); // AP
+        w.write_bit(false); // AIC
+        w.write_bit(true); // DF = ON
+        w.write_bit(false); // SS
+        w.write_bit(false); // RPS
+        w.write_bit(false); // IS
+        w.write_bit(false); // AIV
+        w.write_bit(false); // MQ
+        w.write_bit(true); // SCE-guard
+        w.write_u32(0b000, 3); // reserved
+        w.write_u32(0b001, 3); // INTER
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(true); // SCE-guard
+        w.write_bit(false); // CPM = 0
+        w.write_bit(true); // UUI = "1"
+        write_plus_pquant_pei(&mut w, 8);
+        for mb in 0..99 {
+            w.write_bit(false); // COD = 0
+            w.write_u32(0b010, 3); // MCBPC INTER4V, cbpc 00
+            w.write_u32(0b11, 2); // CBPY → INTER pattern 0000
+            for blk in 0..4 {
+                let dx = if mb == 0 && blk == 0 { 40 } else { 0 };
+                crate::annex_p::write_table_d3(&mut w, dx).unwrap();
+                crate::annex_p::write_table_d3(&mut w, 0).unwrap();
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let frame = decode_picture_layer(&data, Some(&reference), DecodeOptions::default())
+            .expect("decode UMV+ DF picture");
+        // Interior (away from the §D.1 replication knee at x = 155 and
+        // the picture edges the filter skips anyway): exact +20 shift.
+        for y in 8..136 {
+            for x in 8..144 {
+                assert_eq!(
+                    frame.y[y * 176 + x],
+                    ((x + 20) % 256) as u8,
+                    "pixel ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// §5.1.9 / §5.1.4.4 — a UFEP=000 P-picture inheriting UMV keeps
+    /// the last-sent UUI in effect: its MVDs are Table D.3 under the
+    /// inherited Limited range. Without a UUI in the snapshot the
+    /// picture is undecodable and refused.
+    #[test]
+    fn decode_plus_umv_ufep0_inherits_uui() {
+        use crate::plus_ptype::Uui;
+
+        let mut reference = YuvFrame::grey(176, 144);
+        for y in 0..144 {
+            for x in 0..176 {
+                reference.y[y * 176 + x] = (x % 256) as u8;
+            }
+        }
+
+        // UFEP=000 INTER picture: no OPPTYPE, no UUI on the wire.
+        let mut w = BitWriter::new();
+        w.write_u32(PSC_VALUE, PSC_BITS);
+        w.write_u32(0, 8); // TR
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_u32(0b000, 3);
+        w.write_u32(0b111, 3); // extended
+        w.write_u32(0b000, 3); // UFEP = 000
+        w.write_u32(0b001, 3); // MPPTYPE: INTER
+        w.write_bit(false); // RPR
+        w.write_bit(false); // RRU
+        w.write_bit(false); // RTYPE
+        w.write_bit(false);
+        w.write_bit(false);
+        w.write_bit(true); // SCE-guard
+        w.write_bit(false); // CPM = 0
+        write_plus_pquant_pei(&mut w, 8);
+        // MB(0,0): Table D.3 MVD (+50, 0); 98 skips.
+        w.write_bit(false); // COD
+        w.write_bit(true); // MCBPC "1"
+        w.write_u32(0b11, 2); // CBPY
+        crate::annex_p::write_table_d3(&mut w, 50).unwrap();
+        crate::annex_p::write_table_d3(&mut w, 0).unwrap();
+        for _ in 0..98 {
+            w.write_bit(true);
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let data = w.finish();
+
+        let snapshot = InheritedExtendedState {
+            custom_pcf: false,
+            source_format: Some(PlusSourceFormat::Qcif),
+            custom_dimensions: None,
+            umv: true,
+            advanced_prediction: false,
+            advanced_intra: false,
+            deblocking: false,
+            reference_picture_selection: false,
+            uui: Some(Uui::Limited),
+        };
+        let outcome = decode_picture_layer_with_inherited(
+            &data,
+            Some(&reference),
+            DecodeOptions::default(),
+            snapshot,
+        )
+        .expect("UFEP=000 UMV picture with inherited UUI");
+        for y in 0..16 {
+            assert_eq!(outcome.frame.y[y * 176], 25, "inherited-UUI MB(0,0)");
+        }
+        // The snapshot passes through unchanged on UFEP=000.
+        assert_eq!(outcome.inherited.uui, Some(Uui::Limited));
+
+        // No UUI in the snapshot → the UMV picture cannot resolve its
+        // range → refused.
+        let without_uui = InheritedExtendedState {
+            uui: None,
+            ..snapshot
+        };
+        assert_eq!(
+            decode_picture_layer_with_inherited(
+                &data,
+                Some(&reference),
+                DecodeOptions::default(),
+                without_uui,
+            )
+            .unwrap_err(),
+            Error::NotImplemented
+        );
+    }
+
     // ---- Annex F §F.2 / §F.3 INTER4V four-vector + OBMC driver wiring
 
     /// Build a QCIF P-picture header with Advanced Prediction on, plus
