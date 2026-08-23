@@ -40,6 +40,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex W §W.5.3 reference fixed-point IDCT 0 + companion FDCT**
+  (round 450): `w_idct::idct_w0` / `w_idct::fdct_w0`, transcribed
+  statement-for-statement from the C listing embedded in the staged
+  Recommendation text (the ratified in-spec-listing rule), verified
+  bit-identical to a local oracle build of that listing over 20k+
+  random/edge blocks each; CI keeps pinned oracle vectors, Annex A
+  ±1 agreement with the f64 reference kernel on realistic coefficient
+  blocks, range-clip and round-trip tests. Enables bit-exact
+  reconstruction of streams announcing `FixedPointIdct(0)` via the
+  Annex L SEI layer (§W.5.2 forced-updating removal).
+
 - **Fuzz harness** (round 450): `fuzz/` sub-crate with four
   `cargo fuzz` targets — `decode_sequence`, `registry_decoder`
   (fuzzer-chosen packetisation + reset-recovery), `psupp` (Annex L/W

@@ -245,6 +245,7 @@ pub mod sac;
 pub mod scal_upsample;
 pub mod scalability;
 pub mod slice_header;
+pub mod w_idct;
 
 pub use aic::{
     decode_intra_mode, scan_for_intra_mode, write_intra_mode, IntraMode,
@@ -385,6 +386,7 @@ pub use slice_header::{
     FirstSliceLayer, SliceHeaderContext, SliceLayer, SEPB_BITS, SQUANT_BITS, SSBI_BITS, SSC_BITS,
     SSC_VALUE, SSTUF_MAX_BITS,
 };
+pub use w_idct::{fdct_w0, idct_w0};
 
 /// Crate-local error type. The orphan-rebuild scaffold returns
 /// [`Error::NotImplemented`] for any decode path that is not yet wired

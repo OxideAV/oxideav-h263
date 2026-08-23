@@ -442,6 +442,18 @@ planar 4:2:0 `YuvFrame`:
   are out of scope, and a B / EI / EP picture signalling UMV is refused
   (§O.4.6 switches MVDFW / MVDBW to Table D.3 in that mode, which this
   path does not stage — round 447).
+* **Annex W §W.5** — the **reference fixed-point IDCT 0** and its
+  informative companion FDCT (round 450): the `w_idct` module is a
+  statement-for-statement transcription of the §W.5.3 C listing
+  (16-bit storage / 32-bit intermediates, the saturating
+  Multiply/Rotate/Round primitives, the two-pass butterfly and the
+  HalfSwap∘Transpose∘HalfSwap output permutation), verified
+  **bit-identical** to an oracle build of the listing itself over
+  20 006 IDCT + 20 005 FDCT random and edge blocks (a pinned subset
+  rides in CI). A bitstream announcing `FixedPointIdct(0)` through the
+  Annex L PSUPP layer can thus be reconstructed drift-free
+  (`idct_w0` / `fdct_w0`); wiring the alternate kernel through the
+  per-block reconstruction paths as a decode option is future work.
 * **Annex R** — Independent Segment Decoding mode on the GOB
   segmentation (round 450): an extended-PTYPE picture whose OPPTYPE
   bit 12 is set (inherited by UFEP=000 followers) treats each video
