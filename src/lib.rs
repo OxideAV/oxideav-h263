@@ -208,7 +208,6 @@
 #![warn(missing_debug_implementations)]
 
 use oxideav_core::bits::BitReader;
-use oxideav_core::RuntimeContext;
 
 pub mod aic;
 pub mod aic_dequant;
@@ -218,6 +217,7 @@ pub mod annex_p;
 pub mod annex_t;
 pub mod block;
 pub mod block_aic;
+pub mod codec;
 pub mod deblock;
 pub mod dequant;
 pub mod encoder;
@@ -260,6 +260,10 @@ pub use aic_predict::{
 pub use annex_t::{parse_modified_dquant, quant_c_from_quant, ModifiedDquant};
 pub use block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
 pub use block_aic::parse_intra_block_aic;
+pub use codec::{
+    make_decoder, make_encoder, register, H263DecoderOptions, H263EncoderOptions,
+    H263StreamDecoder, H263StreamEncoder, CODEC_ID,
+};
 pub use deblock::{
     apply_edge_samples, clipd1, deblock_plane, filter_edge_samples, strength_for_quant,
     up_down_ramp, EdgeCondition, STRENGTH_RRU_INFINITE,
@@ -683,12 +687,6 @@ impl std::error::Error for Error {}
 
 /// Convenience alias for results returned from the parser surface.
 pub type Result<T> = core::result::Result<T, Error>;
-
-/// No-op codec registration — the round-1 scaffold parses headers but
-/// has no decoder to register into the runtime context. The full
-/// `Decoder` impl will land in a later round once macroblock decode
-/// exists.
-pub fn register(_ctx: &mut RuntimeContext) {}
 
 oxideav_core::register!("h263", register);
 

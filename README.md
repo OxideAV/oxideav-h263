@@ -152,10 +152,21 @@ over-budget segments at MB boundaries with SBIT/EBIT bit-granular
 cuts, and the depacketizer reassembles any mode mix at bit
 granularity.
 
-`register()` is currently a no-op pending a frame-yielding
-`oxideav_core::Decoder` adapter — callers drive the decoder through the
-free `decode_picture` entry point and the encoder through
-`encode_intra_picture`.
+The crate is wired into the **`oxideav_core` registry** (round 450):
+`register()` installs a real codec entry — the streaming
+`H263StreamDecoder` (packetised `Decoder` over the elementary-stream
+drivers: byte-aligned PSC re-framing, so one-picture-per-packet and
+arbitrarily-split raw streams both decode; PB pairs yield two display-
+order frames; `reset()` clears the cross-picture state for seeks) and
+the closed-loop `H263StreamEncoder` (`Encoder`; per-frame form of
+`encode_sequence` with `quant` / `gop` / `search` / `umv` / `eos`
+option knobs), plus the direct `make_decoder` / `make_encoder`
+factories, the `H263` / `S263` FourCC tag claims and the `00 00 8x`
+Picture-Start-Code payload magics for raw-stream identification.
+Callers can equally drive the decoder through the free
+`decode_picture` / `decode_sequence` entry points (the streaming
+per-picture form is `decode_sequence_step` + `SequenceState`) and the
+encoder through `encode_intra_picture` and friends.
 
 Any path that is not yet wired returns `Error::NotImplemented` rather
 than silently guessing.
@@ -578,8 +589,11 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   pictures (no macroblock-aligned bit boundaries / no 4MV predictor
   side channel); RTP transport-header (RFC 3550) concerns
   (sequencing, timestamps, marker bit) stay caller-side.
-* `oxideav_core::Decoder` registration; `register()` is a no-op
-  pending a frame-yielding decoder adapter.
+* Registry adapter subsets: the `H263StreamDecoder` covers every
+  stream shape `decode_sequence` covers (scalability / CPM streams
+  still take their dedicated drivers), and the `H263StreamEncoder`
+  drives the baseline I + P GOP loop (the Annex-mode and
+  rate-controlled encoders remain direct-call entry points).
 
 ## Testing
 

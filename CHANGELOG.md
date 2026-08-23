@@ -8,6 +8,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`register()` installs a real codec entry** (round 450; closes the
+  cross-crate finding that the registry path was a no-op stub):
+  registry resolution through an `oxideav_core::RuntimeContext` now
+  constructs working codecs honouring `CodecParameters`. New `codec`
+  module: `H263StreamDecoder` (streaming `Decoder` over the
+  elementary-stream drivers — byte-aligned §5.1.1/§5.1.28 PSC
+  re-framing so one-picture-per-packet and arbitrarily-split raw
+  streams both decode, eager tail decode for zero-latency container
+  delivery, PB / Improved-PB pairs in display order, per-packet PTS
+  threading, `reset()` for seeks, `DecoderLimits` pixel cap),
+  `H263StreamEncoder` (closed-loop per-frame form of
+  `encode_sequence`; `quant` / `gop` / `search` / `umv` / `eos`
+  codec-options knobs, keyframe-flagged packets), the direct
+  `make_decoder` / `make_encoder` factories (dual-API convention),
+  `H263` / `S263` FourCC tag claims and the `00 00 8x` PSC payload
+  magics. `tests/registry.rs` resolves the codec through a fresh
+  `RuntimeContext` and pins registry output byte-identical to
+  `decode_sequence` / `encode_sequence` across whole-stream, 7-byte
+  shred and one-picture-per-packet deliveries.
+
+### Added
+
+- **Streaming sequence-decode API**: `picture::SequenceState` +
+  `picture::decode_sequence_step` expose the per-picture step of
+  `decode_sequence` (inherited §5.1.4.4 mode state, §G.4 reference-TR
+  threading, display-order PB output — the last returned frame is the
+  next prediction reference), and `picture::next_picture_start_code`
+  exposes the byte-aligned PSC scanner. `decode_sequence` is now a
+  thin loop over them (behaviour unchanged).
+
+### Fixed
+
 - **UMV + PLUSPTYPE motion vectors are Table D.3, both directions**
   (round 447; closes the round-443 self-found nonconformance): §5.3.7 —
   "if the Unrestricted Motion Vector mode is used and PLUSPTYPE is

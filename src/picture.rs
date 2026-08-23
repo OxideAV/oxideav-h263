@@ -2360,18 +2360,7 @@ fn find_next_psc(data: &[u8], from: usize) -> Option<usize> {
 pub fn decode_sequence(data: &[u8], options: DecodeOptions) -> Result<Vec<YuvFrame>> {
     let first = find_next_psc(data, 0).ok_or(Error::BadPictureStartCode)?;
     let mut frames: Vec<YuvFrame> = Vec::new();
-    // §5.1.4.4 / §5.1.4.5 — the inherited extended-mode state threaded from
-    // one PLUSPTYPE picture to the next so a UFEP="000" picture can inherit
-    // its OPPTYPE mode set + source-format from the prior UFEP="001"
-    // picture. A baseline-PTYPE picture resets this to the spec default
-    // (rule 3), which the extended driver already returns on its outcome.
-    let mut inherited = InheritedExtendedState::default();
-    // §5.1.2 / §G.4 — the Temporal Reference of the most recent decoded
-    // *reference* picture (an I- or P-picture, or the P-part of a
-    // PB-frame). A PB-frame's §G.4 TRD scales its B-vectors against this
-    // value, so it tracks the prediction-reference picture (never a
-    // display-only B-frame). `None` until the first picture decodes.
-    let mut prev_tr: Option<u8> = None;
+    let mut state = SequenceState::default();
     let mut start = first;
     loop {
         // The picture spans from its PSC to the next PSC (exclusive), or
@@ -2379,93 +2368,186 @@ pub fn decode_sequence(data: &[u8], options: DecodeOptions) -> Result<Vec<YuvFra
         let next = find_next_psc(data, start + 1);
         let end = next.unwrap_or(data.len());
         let picture = &data[start..end];
-        let reference = frames.last();
-        // §5.1.3 PTYPE bits 6-8 = "111" selects the extended (PLUSPTYPE)
-        // header form. Baseline-PTYPE pictures take the §5.2.2 GOB-0-elided
-        // path; extended-PTYPE pictures route through the full PLUSPTYPE
-        // driver (which handles the H.263+ Annex modes, slice-structured
-        // layout, and reference resampling) and thread the §5.1.4.4
-        // inherited-state snapshot forward.
-        if picture_header_is_extended(picture)? {
-            // The §5.1.2 prefix TR (8 bits after the PSC) records this
-            // picture as a potential §G.4 reference for a following
-            // PB / Improved-PB frame (peeked before the borrow-conflicting
-            // push below).
-            let ext_tr = {
-                let mut r = BitReader::new(picture);
-                r.skip(PSC_BITS).map_err(|_| Error::UnexpectedEof)?;
-                r.read_u32(8).map_err(|_| Error::UnexpectedEof)? as u8
-            };
-            // §5.1.4.3 MPPTYPE picture-type = "010" selects an Annex M
-            // Improved PB-frame, which decodes into a (P, BPB) pair the
-            // single-frame `decode_picture_layer_with_inherited` refuses.
-            // Route it to the dedicated pair driver instead, splicing the
-            // BPB-picture in *before* the P-picture in display order
-            // (§5.1.22) — only the P-part advances the reference / §G.4 TR.
-            if extended_is_improved_pb(picture, inherited)? {
-                let prev = prev_tr.ok_or(Error::BadPbTemporalReference)?;
-                let anchor = reference.ok_or(Error::BadPbTemporalReference)?;
-                let (pair, next_inherited) = decode_improved_pb_picture_with_inherited(
-                    picture, anchor, prev, options, inherited,
-                )?;
-                let PbFramePair { p_frame, b_frame } = pair;
-                inherited = next_inherited;
-                frames.push(b_frame);
-                prev_tr = Some(ext_tr);
-                frames.push(p_frame);
-            } else {
-                let outcome =
-                    decode_picture_layer_with_inherited(picture, reference, options, inherited)?;
-                inherited = outcome.inherited;
-                prev_tr = Some(ext_tr);
-                frames.push(outcome.frame);
-            }
-        } else {
-            // A non-PLUSPTYPE picture clears the inherited mode state
-            // (§5.1.4.5 rule 3) for any following UFEP="000" picture.
-            inherited = InheritedExtendedState::default();
-            let (tr, pb_frames) = baseline_tr_and_pb(picture)?;
-            if pb_frames {
-                // §G.1 / Annex G PB-frame: decode the (B, P) pair. The
-                // B-picture is displayed *before* the P-picture (it sits
-                // temporally between the reference and the P-part,
-                // §5.1.22) but is never a prediction source, so only the
-                // P-part advances `prev_tr` / becomes the next reference.
-                let prev = prev_tr.ok_or(Error::BadPbTemporalReference)?;
-                let anchor = reference.ok_or(Error::BadPbTemporalReference)?;
-                // Annex E — a PB-frame whose PTYPE also signals SAC
-                // (bit 11) decodes through the arithmetic PB driver.
-                let pair = if baseline_is_sac(picture)? {
-                    decode_pb_picture_sac(picture, anchor, prev, options)?
-                } else {
-                    decode_pb_picture_no_gob0_header(picture, anchor, prev, options)?
-                };
-                let PbFramePair { p_frame, b_frame } = pair;
-                // Splice the B-frame in *before* the P-frame in display
-                // order. `reference` borrowed `frames`; it is dropped
-                // above, so the push is sound.
-                frames.push(b_frame);
-                prev_tr = Some(tr);
-                frames.push(p_frame);
-            } else if baseline_is_sac(picture)? {
-                // Annex E — PTYPE bit 11: the picture's macroblock and
-                // block layers are arithmetic-coded; route to the SAC
-                // driver (same reference threading as the VLC path).
-                let frame = decode_picture_sac(picture, reference, options)?;
-                prev_tr = Some(tr);
-                frames.push(frame);
-            } else {
-                let frame = decode_picture_no_gob0_header(picture, reference, options)?;
-                prev_tr = Some(tr);
-                frames.push(frame);
-            }
-        }
+        let decoded = decode_sequence_step(picture, frames.last(), options, &mut state)?;
+        // `frames.last()` borrowed `frames`; the borrow ends with the
+        // call above, so the extension is sound.
+        frames.extend(decoded);
         match next {
             Some(n) => start = n,
             None => break,
         }
     }
     Ok(frames)
+}
+
+/// Cross-picture state [`decode_sequence_step`] threads from one
+/// picture of an elementary stream to the next.
+///
+/// Two pieces of stream-scoped memory outlive any single picture:
+///
+/// * the §5.1.4.4 / §5.1.4.5 **inherited extended-mode state** — the
+///   OPPTYPE mode set + source format a UFEP="000" PLUSPTYPE picture
+///   inherits from the prior UFEP="001" picture (a baseline-PTYPE
+///   picture resets it to the spec default, rule 3);
+/// * the §5.1.2 / §G.4 **Temporal Reference of the most recent decoded
+///   reference picture** (an I- or P-picture, or the P-part of a
+///   PB-frame) — a PB-frame's §G.4 TRD scales its B-vectors against
+///   this value.
+///
+/// Construct with `SequenceState::default()` before the first picture
+/// of a stream, and reset to the default after a seek / bitstream
+/// discontinuity.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SequenceState {
+    /// §5.1.4.4 / §5.1.4.5 inherited extended-mode snapshot.
+    inherited: InheritedExtendedState,
+    /// §5.1.2 TR of the most recent decoded *reference* picture;
+    /// `None` until the first picture decodes.
+    prev_tr: Option<u8>,
+}
+
+/// Decode **one picture** of an H.263 elementary stream and advance the
+/// cross-picture [`SequenceState`] — the streaming, per-picture form of
+/// [`decode_sequence`].
+///
+/// `picture` must begin at a byte-aligned Picture Start Code and span
+/// one whole coded picture (everything up to — exclusive — the next
+/// byte-aligned PSC, or to the end of the stream for the final
+/// picture; trailing §5.1.27 EOS bytes are tolerated). Use
+/// [`next_picture_start_code`] to locate the byte-aligned picture
+/// boundaries in a buffered stream. `reference` is the prediction
+/// reference: the **last** frame returned by the previous call (or
+/// `None` before the first I-picture).
+///
+/// Returns the decoded frames in display order. A plain I / P picture
+/// yields one frame; an Annex G PB-frame or Annex M Improved PB-frame
+/// yields two (the B/BPB-picture *before* the P-picture, §5.1.22).
+/// **The last returned frame is always the new prediction reference**
+/// the caller must thread into the next call — only the P-part of a
+/// PB pair advances the reference / §G.4 TR, and it is returned last.
+///
+/// Routing matches [`decode_sequence`]: baseline-PTYPE pictures take
+/// the §5.2.2 GOB-0-elided path (SAC-routed from PTYPE bit 11,
+/// PB-routed from PTYPE bit 13), extended-PTYPE pictures the full
+/// PLUSPTYPE driver (Improved-PB detected from MPPTYPE), with the
+/// §5.1.4.4 inherited-state snapshot threading through `state`.
+///
+/// # Errors
+///
+/// * [`Error::BadPictureStartCode`] if `picture` does not begin with a
+///   PSC.
+/// * The union of the per-shape drivers' errors —
+///   [`decode_picture_no_gob0_header`], [`decode_picture_sac`],
+///   [`decode_pb_picture_no_gob0_header`], [`decode_pb_picture_sac`],
+///   [`decode_improved_pb_picture_with_inherited`] and
+///   [`decode_picture_layer_with_inherited`].
+///
+/// On error `state` is left unchanged (the failed picture neither
+/// advances the inherited mode set nor the reference TR).
+pub fn decode_sequence_step(
+    picture: &[u8],
+    reference: Option<&YuvFrame>,
+    options: DecodeOptions,
+    state: &mut SequenceState,
+) -> Result<Vec<YuvFrame>> {
+    let mut frames: Vec<YuvFrame> = Vec::with_capacity(2);
+    // §5.1.3 PTYPE bits 6-8 = "111" selects the extended (PLUSPTYPE)
+    // header form. Baseline-PTYPE pictures take the §5.2.2 GOB-0-elided
+    // path; extended-PTYPE pictures route through the full PLUSPTYPE
+    // driver (which handles the H.263+ Annex modes, slice-structured
+    // layout, and reference resampling) and thread the §5.1.4.4
+    // inherited-state snapshot forward.
+    if picture_header_is_extended(picture)? {
+        // The §5.1.2 prefix TR (8 bits after the PSC) records this
+        // picture as a potential §G.4 reference for a following
+        // PB / Improved-PB frame.
+        let ext_tr = {
+            let mut r = BitReader::new(picture);
+            r.skip(PSC_BITS).map_err(|_| Error::UnexpectedEof)?;
+            r.read_u32(8).map_err(|_| Error::UnexpectedEof)? as u8
+        };
+        // §5.1.4.3 MPPTYPE picture-type = "010" selects an Annex M
+        // Improved PB-frame, which decodes into a (P, BPB) pair the
+        // single-frame `decode_picture_layer_with_inherited` refuses.
+        // Route it to the dedicated pair driver instead, splicing the
+        // BPB-picture in *before* the P-picture in display order
+        // (§5.1.22) — only the P-part advances the reference / §G.4 TR.
+        if extended_is_improved_pb(picture, state.inherited)? {
+            let prev = state.prev_tr.ok_or(Error::BadPbTemporalReference)?;
+            let anchor = reference.ok_or(Error::BadPbTemporalReference)?;
+            let (pair, next_inherited) = decode_improved_pb_picture_with_inherited(
+                picture,
+                anchor,
+                prev,
+                options,
+                state.inherited,
+            )?;
+            let PbFramePair { p_frame, b_frame } = pair;
+            state.inherited = next_inherited;
+            frames.push(b_frame);
+            state.prev_tr = Some(ext_tr);
+            frames.push(p_frame);
+        } else {
+            let outcome =
+                decode_picture_layer_with_inherited(picture, reference, options, state.inherited)?;
+            state.inherited = outcome.inherited;
+            state.prev_tr = Some(ext_tr);
+            frames.push(outcome.frame);
+        }
+    } else {
+        // A non-PLUSPTYPE picture clears the inherited mode state
+        // (§5.1.4.5 rule 3) for any following UFEP="000" picture.
+        let (tr, pb_frames) = baseline_tr_and_pb(picture)?;
+        if pb_frames {
+            // §G.1 / Annex G PB-frame: decode the (B, P) pair. The
+            // B-picture is displayed *before* the P-picture (it sits
+            // temporally between the reference and the P-part,
+            // §5.1.22) but is never a prediction source, so only the
+            // P-part advances `prev_tr` / becomes the next reference.
+            let prev = state.prev_tr.ok_or(Error::BadPbTemporalReference)?;
+            let anchor = reference.ok_or(Error::BadPbTemporalReference)?;
+            // Annex E — a PB-frame whose PTYPE also signals SAC
+            // (bit 11) decodes through the arithmetic PB driver.
+            let pair = if baseline_is_sac(picture)? {
+                decode_pb_picture_sac(picture, anchor, prev, options)?
+            } else {
+                decode_pb_picture_no_gob0_header(picture, anchor, prev, options)?
+            };
+            let PbFramePair { p_frame, b_frame } = pair;
+            state.inherited = InheritedExtendedState::default();
+            frames.push(b_frame);
+            state.prev_tr = Some(tr);
+            frames.push(p_frame);
+        } else if baseline_is_sac(picture)? {
+            // Annex E — PTYPE bit 11: the picture's macroblock and
+            // block layers are arithmetic-coded; route to the SAC
+            // driver (same reference threading as the VLC path).
+            let frame = decode_picture_sac(picture, reference, options)?;
+            state.inherited = InheritedExtendedState::default();
+            state.prev_tr = Some(tr);
+            frames.push(frame);
+        } else {
+            let frame = decode_picture_no_gob0_header(picture, reference, options)?;
+            state.inherited = InheritedExtendedState::default();
+            state.prev_tr = Some(tr);
+            frames.push(frame);
+        }
+    }
+    Ok(frames)
+}
+
+/// Locate the byte offset of the next byte-aligned Picture Start Code
+/// in `data` at or after byte `from` — the public picture-boundary
+/// scanner callers of [`decode_sequence_step`] use to split a buffered
+/// elementary stream into per-picture slices.
+///
+/// §5.1.28 guarantees a decoder can find pictures on byte boundaries:
+/// encoders insert PSTUF so that every PSC after the first is
+/// byte-aligned. Returns `None` when no further PSC is present —
+/// which, for a stream still being received, may simply mean the next
+/// picture's start code has not arrived yet.
+pub fn next_picture_start_code(data: &[u8], from: usize) -> Option<usize> {
+    find_next_psc(data, from)
 }
 
 /// Peek whether the picture beginning at `data`'s Picture Start Code uses
