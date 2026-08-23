@@ -3090,6 +3090,7 @@ pub fn decode_picture_layer_with_inherited(
                 cpm_psbi,
                 umv,
                 isd,
+                dps,
             } = plus_ptype_to_baseline_shim(
                 &extended, options, inherited, /* allow_rps */ false,
             )?;
@@ -3141,6 +3142,17 @@ pub fn decode_picture_layer_with_inherited(
             // dedicated driver. Otherwise decode through the baseline GOB
             // driver.
             let frame = match slice_structured {
+                // Annex V — the Data-Partitioned Slice sub-mode
+                // replaces the interleaved slice macroblock layer
+                // with the §V.2 partitioned layout.
+                Some(sss) if dps => decode_dps_after_header(
+                    &mut reader,
+                    &header,
+                    &layout,
+                    sss,
+                    effective_ref,
+                    shim_options,
+                )?,
                 Some(sss) => decode_slice_structured_after_header(
                     &mut reader,
                     &header,
@@ -3268,13 +3280,14 @@ pub fn decode_picture_layer_rps(
         cpm_psbi,
         umv,
         isd,
+        dps,
     } = plus_ptype_to_baseline_shim(
         &extended,
         options,
         InheritedExtendedState::default(),
         /* allow_rps */ true,
     )?;
-    if improved_pb || isd {
+    if improved_pb || isd || dps {
         // Annex R + per-segment reference re-selection is unstaged
         // (defence-in-depth: the shim refuses ISD + RPS already).
         return Err(Error::NotImplemented);
@@ -3760,8 +3773,9 @@ pub fn decode_improved_pb_picture_with_inherited(
         cpm_psbi: _,
         umv: _,
         isd,
+        dps,
     } = plus_ptype_to_baseline_shim(&extended, options, inherited, /* allow_rps */ false)?;
-    if isd {
+    if isd || dps {
         // Annex R + Improved PB-frames is unstaged (the BPB part's
         // bidirectional prediction would need the segment banding).
         return Err(Error::NotImplemented);
@@ -4214,6 +4228,10 @@ struct PlusShimOutcome {
     /// treats video-picture-segment boundaries as picture boundaries
     /// when set; callers that cannot honour it must refuse.
     isd: bool,
+    /// Annex V — the OPPTYPE bit-17 Data-Partitioned Slice bit. The
+    /// slice routing dispatches to the DPS driver when set; callers
+    /// that cannot honour it must refuse.
+    dps: bool,
 }
 
 /// Annex P §P.1 — apply implicit Reference Picture Resampling to the
@@ -4416,6 +4434,32 @@ fn plus_ptype_to_baseline_shim(
         || (extended.plus.cpm && !opptype_slice_structured)
         || extended.plus.mpptype.reduced_resolution_update
         || (rps_in_use && !allow_rps)
+    {
+        return Err(Error::NotImplemented);
+    }
+
+    // Annex V — Data-Partitioned Slice mode (OPPTYPE bit 17). §V.3
+    // makes it a sub-mode of Annex K: SS must be on; SAC is
+    // forbidden. The staged subset covers the plain INTRA / INTER
+    // baseline layers, so the other Annex modes are refused with it
+    // rather than decoded with the wrong per-macroblock syntax. The
+    // inherited (UFEP=000) snapshot does not retain SS, so DPS is a
+    // UFEP=001-only route, matching the SS routing below.
+    let opptype_dps = extended
+        .plus
+        .opptype
+        .map(|o| o.data_partitioned_slices)
+        .unwrap_or(false);
+    if opptype_dps
+        && (!opptype_slice_structured
+            || opptype_umv
+            || opptype_advanced_prediction
+            || opptype_advanced_intra
+            || opptype_deblocking
+            || opptype_alternative_inter_vlc
+            || opptype_modified_quantization
+            || opptype_independent_segment_decoding
+            || extended.plus.cpm)
     {
         return Err(Error::NotImplemented);
     }
@@ -4653,6 +4697,7 @@ fn plus_ptype_to_baseline_shim(
         cpm_psbi: extended.plus.cpm.then(|| extended.plus.psbi.unwrap_or(0)),
         umv: umv_coding,
         isd: opptype_independent_segment_decoding,
+        dps: opptype_dps,
     })
 }
 
@@ -6968,6 +7013,376 @@ fn write_predicted_macroblock<P: BlockPredictor>(
 /// when the aligned 17-bit window is not [`SSC_VALUE`]. Returns
 /// [`Error::BadSliceStuffing`] if a non-zero SSTUF bit is encountered
 /// before the alignment boundary (a malformed stream).
+/// Decode an **Annex V Data-Partitioned Slice** picture given an
+/// already-parsed PLUSPTYPE header and a `reader` positioned
+/// immediately after it (at the §5.1.19 PQUANT that precedes the
+/// first slice's reduced header).
+///
+/// §V.2: each Annex K slice is one video picture segment whose data
+/// is partitioned — the Table V.1 / V.2 RVLC COD + MCBPC headers for
+/// every macroblock of the slice (HD), the §V.2.2 Header Marker, the
+/// motion vectors of every coded INTER macroblock as Table D.3
+/// codewords over the single §V.2.3.2 prediction thread (first
+/// predictor zero, then `MVi = MVi−1 + MVDi`), the redundant §V.2.4
+/// LMVV (validated against the thread's last vector), the §V.2.5
+/// Motion Vector Marker, and finally the coefficient layer (§V.2.6:
+/// CBPY, optional DQUANT, block data per macroblock in order).
+///
+/// Staged subset: INTRA / INTER pictures over **free-running
+/// sequential** slices (the Rectangular Slice and Arbitrary Slice
+/// Ordering submodes are refused, as are the INTER4V header classes —
+/// the Annex F combination is unstaged). The routing layer refuses
+/// SAC (§V.3 forbids it), UMV / AP / AIC / DF / AIV / MQ / CPM and
+/// the PB / RRU / scalability picture types.
+#[allow(clippy::too_many_arguments)]
+fn decode_dps_after_header(
+    reader: &mut BitReader<'_>,
+    header: &H263PictureHeader,
+    layout: &PictureLayout,
+    sss: SliceStructuredSubmode,
+    reference: Option<&YuvFrame>,
+    options: DecodeOptions,
+) -> Result<YuvFrame> {
+    use crate::annex_v::{
+        read_dps_mb_header, DpsMbHeader, MvdEmulationState, HEADER_MARKER, HEADER_MARKER_BITS,
+        MOTION_VECTOR_MARKER, MOTION_VECTOR_MARKER_BITS, TABLE_V1_INTRA, TABLE_V2_INTER,
+    };
+    use crate::macroblock::{decode_cbpy, read_dquant_baseline};
+
+    if header.sac_mode || header.pb_frames || header.advanced_prediction || header.umv_mode {
+        return Err(Error::NotImplemented);
+    }
+    if sss.rectangular || sss.arbitrary_order {
+        return Err(Error::NotImplemented);
+    }
+    if options.aic || options.modified_quant || options.alt_inter_vlc {
+        return Err(Error::NotImplemented);
+    }
+
+    let luma_w = layout.luma_width as usize;
+    let luma_h = layout.luma_height as usize;
+    let mb_cols = luma_w / 16;
+    let mb_rows_total = luma_h / 16;
+    let mb_count = mb_cols * mb_rows_total;
+    if mb_count == 0 {
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+    let chroma_w = luma_w / 2;
+    let chroma_h = luma_h / 2;
+
+    let is_inter_picture = matches!(header.coding_type, H263PictureCodingType::Inter);
+    if is_inter_picture {
+        match reference {
+            Some(r) if r.luma_width == luma_w && r.luma_height == luma_h => {}
+            _ => return Err(Error::NotImplemented),
+        }
+    }
+
+    let mut frame = YuvFrame {
+        y: vec![0u8; luma_w * luma_h],
+        cb: vec![0u8; chroma_w * chroma_h],
+        cr: vec![0u8; chroma_w * chroma_h],
+        luma_width: luma_w,
+        luma_height: luma_h,
+    };
+    let luma_stride = luma_w;
+    let chroma_stride = chroma_w;
+
+    let mut grid = vec![MbGridEntry::OUTSIDE; mb_count];
+    let mut mb_quant = vec![0u8; mb_count];
+
+    // §5.1.19 PQUANT + §5.1.24/§5.1.25 PEI/PSUPP, then the reduced
+    // first slice header — same picture-header tail as the plain
+    // Annex K driver.
+    let pquant = reader
+        .read_u32(SQUANT_BITS)
+        .map_err(|_| Error::UnexpectedEof)? as u8;
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    skip_pei_psupp(reader)?;
+
+    let ctx = SliceHeaderContext::from_picture_layout(layout, Some(sss), false, false);
+    let first = parse_first_slice_header(reader, &ctx)?;
+    let mut slice_mba = first.mba;
+    let mut slice_quant: u8 = pquant;
+
+    let table = if is_inter_picture {
+        TABLE_V2_INTER
+    } else {
+        TABLE_V1_INTRA
+    };
+
+    let mut slice_index: u32 = 0;
+    let mut decoded_count: usize = 0;
+    loop {
+        // Free-running sequential slices tile the raster exactly.
+        if slice_mba as usize != decoded_count {
+            return Err(Error::BadSliceCoverage);
+        }
+
+        // ── HD partition (§V.2.1): every macroblock's class, closed
+        // by the Header Marker (§V.2.2 — "this value cannot occur
+        // naturally in the HD field", so peeking it at codeword
+        // boundaries is unambiguous).
+        let mut entries: Vec<DpsMbHeader> = Vec::new();
+        loop {
+            if reader.bits_remaining() >= u64::from(HEADER_MARKER_BITS)
+                && reader
+                    .peek_u32(HEADER_MARKER_BITS)
+                    .map_err(|_| Error::UnexpectedEof)?
+                    == HEADER_MARKER
+            {
+                reader
+                    .skip(HEADER_MARKER_BITS)
+                    .map_err(|_| Error::UnexpectedEof)?;
+                break;
+            }
+            let entry = read_dps_mb_header(reader, table)?;
+            if matches!(entry, DpsMbHeader::Stuffing) {
+                continue;
+            }
+            if matches!(entry, DpsMbHeader::Inter4v { .. }) {
+                // Annex F four-vector macroblocks are unstaged on the
+                // DPS path.
+                return Err(Error::NotImplemented);
+            }
+            if is_inter_picture {
+                if matches!(entry, DpsMbHeader::Skipped) && reference.is_none() {
+                    return Err(Error::NotImplemented);
+                }
+            } else if !matches!(entry, DpsMbHeader::Intra { .. }) {
+                return Err(Error::BadDpsHeaderCode);
+            }
+            entries.push(entry);
+            if decoded_count + entries.len() > mb_count {
+                return Err(Error::BadSliceCoverage);
+            }
+        }
+        if entries.is_empty() {
+            return Err(Error::BadSliceCoverage);
+        }
+
+        // ── MV partition (§V.2.3–§V.2.5): the single prediction
+        // thread over every coded INTER macroblock's vector.
+        let mut thread_mvs: Vec<MotionVector> = Vec::new();
+        if is_inter_picture {
+            let mv_total: usize = entries.iter().map(|e| e.motion_vector_count()).sum();
+            if mv_total > 0 {
+                let mut emu = MvdEmulationState::new();
+                let mut prev = MotionVector::new(0, 0);
+                for _ in 0..mv_total {
+                    let dx = emu.read_component(reader)?;
+                    let dy = emu.read_component(reader)?;
+                    let mv = MotionVector::new(prev.dx_half + dx, prev.dy_half + dy);
+                    // Without Annex D the §6.1.1 default range applies
+                    // per component: [-16, 15.5] pel.
+                    if !(crate::motion::MV_HALF_MIN..=crate::motion::MV_HALF_MAX)
+                        .contains(&mv.dx_half)
+                        || !(crate::motion::MV_HALF_MIN..=crate::motion::MV_HALF_MAX)
+                            .contains(&mv.dy_half)
+                    {
+                        return Err(Error::BadMvdCode);
+                    }
+                    thread_mvs.push(mv);
+                    prev = mv;
+                }
+                if mv_total >= 2 {
+                    // §V.2.4 LMVV — the last vector again, zero
+                    // predictor; a mismatch means one of the
+                    // partitions is corrupt.
+                    let lx = emu.read_component(reader)?;
+                    let ly = emu.read_component(reader)?;
+                    let last = *thread_mvs.last().expect("mv_total >= 2");
+                    if lx != last.dx_half || ly != last.dy_half {
+                        return Err(Error::DpsPartitionMismatch);
+                    }
+                }
+                // §V.2.5 MVM.
+                let marker = reader
+                    .read_u32(MOTION_VECTOR_MARKER_BITS)
+                    .map_err(|_| Error::UnexpectedEof)?;
+                if marker != MOTION_VECTOR_MARKER {
+                    return Err(Error::BadDpsMarker);
+                }
+            }
+        }
+
+        // ── Coefficient partition (§V.2.6): CBPY + optional DQUANT +
+        // block layer per macroblock, in slice order.
+        let mut current_quant = slice_quant;
+        let mut mv_iter = thread_mvs.iter();
+        let segment = slice_index;
+        for (k, &entry) in entries.iter().enumerate() {
+            let mba = decoded_count + k;
+            let col = mba % mb_cols;
+            let row = mba / mb_cols;
+            let mb_x = col * 16;
+            let mb_y = row * 16;
+            let c_x = col * 8;
+            let c_y = row * 8;
+            let idx = row * mb_cols + col;
+
+            match entry {
+                DpsMbHeader::Skipped => {
+                    let reference = reference.expect("guarded at HD parse");
+                    copy_inter_macroblock(
+                        reference,
+                        &mut frame,
+                        mb_x,
+                        mb_y,
+                        c_x,
+                        c_y,
+                        MotionVector::new(0, 0),
+                    );
+                    grid[idx] = MbGridEntry {
+                        intra: false,
+                        not_coded: true,
+                        mv: MotionVector::new(0, 0),
+                        mvs4: [MotionVector::new(0, 0); 4],
+                        segment,
+                    };
+                    mb_quant[idx] = current_quant;
+                }
+                DpsMbHeader::Intra { cbpc, quant } => {
+                    let cbpy = decode_cbpy(reader)?;
+                    if quant {
+                        current_quant = read_dquant_baseline(reader, current_quant)?;
+                    }
+                    let q = current_quant;
+                    for blk in 0..4 {
+                        let has_ac = (cbpy >> (3 - blk)) & 1 == 1;
+                        let block = parse_block(
+                            reader,
+                            BlockContext {
+                                has_intradc: true,
+                                has_coefficients: has_ac,
+                                modified_quant: false,
+                            },
+                        )?;
+                        let samples = reconstruct_intra_block(&block, q);
+                        let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+                        blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+                    }
+                    for (plane_bit, is_cb) in [(0b10u8, true), (0b01u8, false)] {
+                        let block = parse_block(
+                            reader,
+                            BlockContext {
+                                has_intradc: true,
+                                has_coefficients: cbpc & plane_bit != 0,
+                                modified_quant: false,
+                            },
+                        )?;
+                        let samples = reconstruct_intra_block(&block, q);
+                        let plane = if is_cb { &mut frame.cb } else { &mut frame.cr };
+                        blit_block(plane, chroma_stride, c_x, c_y, &samples);
+                    }
+                    grid[idx] = MbGridEntry {
+                        intra: true,
+                        not_coded: false,
+                        mv: MotionVector::new(0, 0),
+                        mvs4: [MotionVector::new(0, 0); 4],
+                        segment,
+                    };
+                    mb_quant[idx] = q;
+                }
+                DpsMbHeader::Inter { cbpc, quant } => {
+                    let reference = reference.expect("INTER picture has a reference");
+                    let mv = *mv_iter.next().ok_or(Error::DpsPartitionMismatch)?;
+                    let cbpy_raw = decode_cbpy(reader)?;
+                    let inter_cbpy = cbpy_raw ^ 0b1111;
+                    if quant {
+                        current_quant = read_dquant_baseline(reader, current_quant)?;
+                    }
+                    let q = current_quant;
+                    let y_ref =
+                        RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
+                    for blk in 0..4 {
+                        let has_coef = (inter_cbpy >> (3 - blk)) & 1 == 1;
+                        let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+                        let prediction =
+                            motion_compensate_block(&y_ref, bx, by, mv, RCONTROL_DEFAULT);
+                        let samples = if has_coef {
+                            let block = parse_block(
+                                reader,
+                                BlockContext {
+                                    has_intradc: false,
+                                    has_coefficients: true,
+                                    modified_quant: false,
+                                },
+                            )?;
+                            reconstruct_inter_block_with_prediction(&block, q, &prediction)
+                        } else {
+                            prediction
+                        };
+                        blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+                    }
+                    let chroma_vec = chroma_mv(mv);
+                    for (plane_bit, is_cb) in [(0b10u8, true), (0b01u8, false)] {
+                        let plane_ref = if is_cb { &reference.cb } else { &reference.cr };
+                        let rp = RefPlane::new(
+                            plane_ref,
+                            reference.chroma_width(),
+                            reference.chroma_height(),
+                        );
+                        let pred =
+                            motion_compensate_block(&rp, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+                        let samples = if cbpc & plane_bit != 0 {
+                            let block = parse_block(
+                                reader,
+                                BlockContext {
+                                    has_intradc: false,
+                                    has_coefficients: true,
+                                    modified_quant: false,
+                                },
+                            )?;
+                            reconstruct_inter_block_with_prediction(&block, q, &pred)
+                        } else {
+                            pred
+                        };
+                        let plane = if is_cb { &mut frame.cb } else { &mut frame.cr };
+                        blit_block(plane, chroma_stride, c_x, c_y, &samples);
+                    }
+                    grid[idx] = MbGridEntry {
+                        intra: false,
+                        not_coded: false,
+                        mv,
+                        mvs4: [mv; 4],
+                        segment,
+                    };
+                    mb_quant[idx] = q;
+                }
+                DpsMbHeader::Inter4v { .. } | DpsMbHeader::Stuffing => {
+                    unreachable!("filtered at HD parse")
+                }
+            }
+        }
+        if mv_iter.next().is_some() {
+            return Err(Error::DpsPartitionMismatch);
+        }
+        decoded_count += entries.len();
+
+        if decoded_count == mb_count {
+            break;
+        }
+        // Another slice must follow: SSTUF + SSC + slice header.
+        if !at_slice_boundary(reader)? {
+            return Err(Error::BadSliceCoverage);
+        }
+        crate::slice_header::skip_sstuf(reader)?;
+        let next = parse_slice_layer(reader, &ctx)?;
+        slice_index += 1;
+        slice_mba = next.mba;
+        slice_quant = next.squant;
+    }
+
+    if options.deblock {
+        apply_deblocking(&mut frame, &grid, &mb_quant, mb_cols, mb_rows_total, false);
+    }
+
+    Ok(frame)
+}
+
 fn at_slice_boundary(reader: &BitReader<'_>) -> Result<bool> {
     // [`BitReader`] is `Copy` and owns no heap state, so a by-value copy
     // is a self-contained checkpoint: probing the clone leaves the
@@ -15091,6 +15506,7 @@ mod tests {
             independent_segment_decoding: false,
             alternative_inter_vlc: false,
             modified_quantization: false,
+            data_partitioned_slices: false,
         });
         assert_eq!(
             snap,

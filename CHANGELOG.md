@@ -40,6 +40,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex V Data-Partitioned Slice mode, both directions**
+  (round 450): OPPTYPE bit 17 accepted (`Opptype::data_partitioned_slices`)
+  and routed to a dedicated slice driver — Table V.1 / V.2 RVLC
+  COD + MCBPC inventories (prefix-free + reversal-closure pinned),
+  §V.2.2 HM / §V.2.5 MVM markers, the §V.2.3.2 single
+  motion-vector prediction thread with the §V.2.3.3 per-codeword
+  emulation rule, §V.2.4 LMVV redundancy validation, and the §V.2.6
+  coefficient layer. Encoders `encode_intra_picture_dps` /
+  `encode_inter_picture_dps` (free-running row slices;
+  `PlusModes::data_partitioned_slices`). Closed-loop byte-exact over
+  1/3/9-row slicings; DPS INTRA pinned byte-identical to the
+  interleaved Annex K coding; bit-corruption sweep surfaces
+  structural errors. New error variants `BadDpsHeaderCode` /
+  `BadDpsMarker` / `DpsPartitionMismatch`. Staged subset: I / P over
+  sequential free-running slices (Rect / ASO, INTER4V, PB forms and
+  other mode combinations refused).
+
 - **Annex W §W.5.3 reference fixed-point IDCT 0 + companion FDCT**
   (round 450): `w_idct::idct_w0` / `w_idct::fdct_w0`, transcribed
   statement-for-statement from the C listing embedded in the staged

@@ -11,7 +11,7 @@ clean-room against [ITU-T Recommendation H.263 (01/2005)][spec].
 Full baseline **decoder**, plus a growing **encoder**. The decoder
 implements the H.263 baseline picture / GOB / macroblock / block layers
 and reconstructs INTRA and INTER pictures end-to-end, plus a wide set of
-optional Annexes (D, E, F, I, J, K, L, M, N, O, P, Q, R, S, T, W).
+optional Annexes (D, E, F, I, J, K, L, M, N, O, P, Q, R, S, T, V, W).
 
 The encoder (round 376 onward) produces baseline **INTRA (I-)** and
 **INTER (P-)** pictures plus a growing set of optional modes:
@@ -442,6 +442,26 @@ planar 4:2:0 `YuvFrame`:
   are out of scope, and a B / EI / EP picture signalling UMV is refused
   (§O.4.6 switches MVDFW / MVDBW to Table D.3 in that mode, which this
   path does not stage — round 447).
+* **Annex V** — Data-Partitioned Slice mode, both directions
+  (round 450): an Annex K slice picture whose OPPTYPE bit 17 is set
+  decodes through the §V.2 partitioned layout — the Table V.1 / V.2
+  reversible COD + MCBPC codes for every macroblock of the slice (the
+  `annex_v` module carries the full RVLC inventories, verified
+  prefix-free and bit-reversal-closed), the §V.2.2 Header Marker
+  (peeked at codeword boundaries — it cannot occur naturally in HD),
+  the §V.2.3 motion-vector partition (Table D.3 codewords over the
+  single §V.2.3.2 prediction thread with first-predictor zero and the
+  §V.2.3.3 per-codeword emulation rule that replaces §D.2's pair
+  rule), the redundant §V.2.4 LMVV validated against the thread, the
+  §V.2.5 Motion Vector Marker, and the §V.2.6 coefficient layer
+  (CBPY / DQUANT / block data in slice order). The encoder pair
+  `encode_intra_picture_dps` / `encode_inter_picture_dps` emits the
+  same layout over free-running row slices; DPS INTRA reconstruction
+  is pinned byte-identical to the interleaved Annex K coding of the
+  same content. Staged subset: INTRA / INTER over free-running
+  sequential slices — Rect / ASO submodes, INTER4V classes, PB /
+  Improved-PB (Tables V.6 / V.7 are transcribed), Annex O tables and
+  the UMV / AP / AIC / DF / AIV / MQ / CPM combinations are refused.
 * **Annex W §W.5** — the **reference fixed-point IDCT 0** and its
   informative companion FDCT (round 450): the `w_idct` module is a
   statement-for-statement transcription of the §W.5.3 C listing

@@ -216,6 +216,7 @@ pub mod annex_l;
 pub mod annex_n;
 pub mod annex_p;
 pub mod annex_t;
+pub mod annex_v;
 pub mod block;
 pub mod block_aic;
 pub mod codec;
@@ -277,20 +278,20 @@ pub use deblock::{
 pub use dequant::{dequantise_ac, scatter_into_block, AC_REC_MAX, AC_REC_MIN};
 pub use encoder::{
     encode_inter_picture, encode_inter_picture_ap, encode_inter_picture_ap_sac,
-    encode_inter_picture_ap_slices, encode_inter_picture_ap_umv_plus, encode_inter_picture_gobs,
-    encode_inter_picture_isd, encode_inter_picture_motion, encode_inter_picture_motion_sac,
-    encode_inter_picture_plus, encode_inter_picture_rru, encode_inter_picture_rru_umv,
-    encode_inter_picture_sac, encode_inter_picture_slices, encode_inter_picture_slices_rect,
-    encode_inter_picture_umv, encode_inter_picture_umv_plus, encode_inter_picture_umv_slices,
-    encode_intra_picture, encode_intra_picture_aic, encode_intra_picture_aic_auto,
-    encode_intra_picture_aic_mq, encode_intra_picture_aic_mq_plus, encode_intra_picture_aic_plus,
-    encode_intra_picture_dquant, encode_intra_picture_gobs, encode_intra_picture_isd,
-    encode_intra_picture_plus, encode_intra_picture_sac, encode_intra_picture_slices,
-    encode_intra_picture_slices_aic, encode_intra_picture_slices_aic_mq,
-    encode_intra_picture_slices_rect, encode_intra_sequence, encode_intra_sequence_aic,
-    encode_pb_picture, encode_pb_picture_sac, encode_sequence, encode_sequence_rate_controlled,
-    write_plus_picture_header, GopConfig, PbConfig, PlusModes, RateControlConfig,
-    RateControlledStream, EOS_BYTES,
+    encode_inter_picture_ap_slices, encode_inter_picture_ap_umv_plus, encode_inter_picture_dps,
+    encode_inter_picture_gobs, encode_inter_picture_isd, encode_inter_picture_motion,
+    encode_inter_picture_motion_sac, encode_inter_picture_plus, encode_inter_picture_rru,
+    encode_inter_picture_rru_umv, encode_inter_picture_sac, encode_inter_picture_slices,
+    encode_inter_picture_slices_rect, encode_inter_picture_umv, encode_inter_picture_umv_plus,
+    encode_inter_picture_umv_slices, encode_intra_picture, encode_intra_picture_aic,
+    encode_intra_picture_aic_auto, encode_intra_picture_aic_mq, encode_intra_picture_aic_mq_plus,
+    encode_intra_picture_aic_plus, encode_intra_picture_dps, encode_intra_picture_dquant,
+    encode_intra_picture_gobs, encode_intra_picture_isd, encode_intra_picture_plus,
+    encode_intra_picture_sac, encode_intra_picture_slices, encode_intra_picture_slices_aic,
+    encode_intra_picture_slices_aic_mq, encode_intra_picture_slices_rect, encode_intra_sequence,
+    encode_intra_sequence_aic, encode_pb_picture, encode_pb_picture_sac, encode_sequence,
+    encode_sequence_rate_controlled, write_plus_picture_header, GopConfig, PbConfig, PlusModes,
+    RateControlConfig, RateControlledStream, EOS_BYTES,
 };
 pub use encoder_aic::{plan_intra_block_aic, write_intra_block_aic, AicBlockPlan};
 pub use encoder_block::{
@@ -555,6 +556,16 @@ pub enum Error {
     /// A §W.6 Picture Message violated its clause constraints (DSIZE /
     /// CONT / EBIT rules of §W.6.2, §W.6.3.11, §W.6.3.12).
     BadPictureMessage,
+    /// An Annex V HD-partition bit string matched no Table V.1 / V.2
+    /// reversible codeword.
+    BadDpsHeaderCode,
+    /// An Annex V partition marker (§V.2.2 HM / §V.2.5 MVM) was absent
+    /// where the partition structure requires it.
+    BadDpsMarker,
+    /// The Annex V redundant fields disagree: the §V.2.4 LMVV did not
+    /// reproduce the last motion vector of the §V.2.3.2 thread, or the
+    /// partition inventories are inconsistent with each other.
+    DpsPartitionMismatch,
 }
 
 impl core::fmt::Display for Error {
@@ -709,6 +720,18 @@ impl core::fmt::Display for Error {
             Error::BadPictureMessage => write!(
                 f,
                 "oxideav-h263: Annex W picture message violates its CONT/EBIT/DSIZE constraints"
+            ),
+            Error::BadDpsHeaderCode => write!(
+                f,
+                "oxideav-h263: Annex V header-partition code not found in Table V.1/V.2"
+            ),
+            Error::BadDpsMarker => write!(
+                f,
+                "oxideav-h263: Annex V partition marker (HM/MVM) missing or malformed"
+            ),
+            Error::DpsPartitionMismatch => write!(
+                f,
+                "oxideav-h263: Annex V partitions disagree (LMVV vs motion-vector thread)"
             ),
         }
     }

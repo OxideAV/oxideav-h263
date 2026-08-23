@@ -313,6 +313,9 @@ pub struct Opptype {
     pub alternative_inter_vlc: bool,
     /// Bit 14 — Modified Quantization mode (Annex T).
     pub modified_quantization: bool,
+    /// Bit 17 — Data-Partitioned Slice mode (Annex V; §V.1 assigns the
+    /// formerly-reserved bit).
+    pub data_partitioned_slices: bool,
 }
 
 /// The §5.1.4.3 mandatory part of PLUSPTYPE (MPPTYPE, 9 bits), always
@@ -519,12 +522,13 @@ fn parse_opptype(reader: &mut BitReader<'_>) -> Result<Opptype> {
         _ => unreachable!(),
     };
 
-    // Bit 15 must be "1" (start-code-emulation guard); bits 16-18
-    // reserved "0".
+    // Bit 15 must be "1" (start-code-emulation guard); bits 16 and 18
+    // reserved "0". Bit 17 is the Annex V Data-Partitioned Slice mode
+    // (§V.1 assigns the formerly-reserved bit).
     if !bit(15) {
         return Err(Error::PlusPtypeReservedField);
     }
-    if bit(16) || bit(17) || bit(18) {
+    if bit(16) || bit(18) {
         return Err(Error::PlusPtypeReservedField);
     }
 
@@ -541,6 +545,7 @@ fn parse_opptype(reader: &mut BitReader<'_>) -> Result<Opptype> {
         independent_segment_decoding: bit(12),
         alternative_inter_vlc: bit(13),
         modified_quantization: bit(14),
+        data_partitioned_slices: bit(17),
     })
 }
 

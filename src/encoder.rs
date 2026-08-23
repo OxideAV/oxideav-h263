@@ -204,6 +204,9 @@ pub struct PlusModes {
     pub rru: bool,
     /// OPPTYPE bit 12 — Annex R Independent Segment Decoding mode.
     pub independent_segment_decoding: bool,
+    /// OPPTYPE bit 17 — Annex V Data-Partitioned Slice mode (requires
+    /// [`Self::slice_structured`] per §V.3).
+    pub data_partitioned_slices: bool,
 }
 
 /// Write an extended-PTYPE (PLUSPTYPE, §5.1.4) picture header: PSC, TR,
@@ -282,6 +285,13 @@ pub fn write_plus_picture_header(
     }
     if modes.independent_segment_decoding {
         opptype |= 1 << 6; // bit 12 — Annex R
+    }
+    if modes.data_partitioned_slices {
+        if modes.slice_structured.is_none() {
+            // §V.3 — the SS mode shall be indicated whenever DPS is.
+            return Err(Error::NotImplemented);
+        }
+        opptype |= 1 << 1; // bit 17 — Annex V
     }
     if modes.alt_inter_vlc {
         opptype |= 1 << 5; // bit 13 — Annex S
@@ -3801,6 +3811,344 @@ pub fn encode_inter_picture_isd(
         /* plus */ true,
         /* isd */ true,
     )
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an **Annex V Data-Partitioned
+/// Slice** H.263+ **INTRA** picture: the PLUSPTYPE header raises the
+/// OPPTYPE bit-10 Slice Structured and bit-17 DPS flags, and each
+/// free-running slice of `mb_rows_per_slice` macroblock rows carries
+/// the §V.2 partitioned layout — the Table V.1 RVLC COD + MCBPC
+/// headers for the whole slice, the §V.2.2 Header Marker, and the
+/// coefficient layer (CBPY + INTRADC/TCOEF block data per §V.2.6; an
+/// INTRA picture has no motion-vector partition, so no §V.2.5 MVM is
+/// emitted).
+///
+/// Decodes through [`crate::picture::decode_picture_layer`] /
+/// [`crate::picture::decode_sequence`].
+pub fn encode_intra_picture_dps(
+    frame: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    mb_rows_per_slice: usize,
+) -> Result<Vec<u8>> {
+    use crate::annex_v::{
+        write_dps_mb_header, DpsMbHeader, HEADER_MARKER, HEADER_MARKER_BITS, TABLE_V1_INTRA,
+    };
+    use crate::encoder_vlc::write_cbpy;
+    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let layout =
+        crate::picture::PictureLayout::for_source_format(fmt).ok_or(Error::NotImplemented)?;
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+    if mb_rows_per_slice == 0 || mb_rows_per_slice > mb_rows {
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+    let sss = crate::plus_ptype::SliceStructuredSubmode {
+        rectangular: false,
+        arbitrary_order: false,
+    };
+
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ false,
+        PlusModes {
+            slice_structured: Some(sss),
+            data_partitioned_slices: true,
+            ..PlusModes::default()
+        },
+    )?;
+    let ctx = SliceHeaderContext::from_picture_layout(&layout, Some(sss), false, false);
+    write_first_slice_header(&mut w, &ctx, 0, None)?;
+    let gfid = tr & 0b11;
+
+    for slice_row0 in (0..mb_rows).step_by(mb_rows_per_slice) {
+        if slice_row0 > 0 {
+            let mba = (slice_row0 * mb_cols) as u32;
+            write_slice_layer(&mut w, &ctx, mba, quant, gfid, None)?;
+        }
+        let rows = mb_rows_per_slice.min(mb_rows - slice_row0);
+
+        // Phase 1 — transform + quantise every macroblock of the
+        // slice so the HD partition can carry its CBPC up front.
+        let mut planned = Vec::with_capacity(rows * mb_cols);
+        for r in 0..rows {
+            for c in 0..mb_cols {
+                let src = extract_macroblock(frame, c, slice_row0 + r);
+                let luma: Vec<crate::encoder_block::EncodedIntraBlock> = src
+                    .luma
+                    .iter()
+                    .map(|b| crate::encoder_block::encode_intra_block(b, quant))
+                    .collect();
+                let cb = crate::encoder_block::encode_intra_block(&src.cb, quant);
+                let cr = crate::encoder_block::encode_intra_block(&src.cr, quant);
+                planned.push((luma, cb, cr));
+            }
+        }
+
+        // HD partition (§V.2.1) + Header Marker (§V.2.2).
+        for (_, cb, cr) in &planned {
+            let cbpc = (u8::from(cb.has_ac) << 1) | u8::from(cr.has_ac);
+            write_dps_mb_header(
+                &mut w,
+                TABLE_V1_INTRA,
+                DpsMbHeader::Intra { cbpc, quant: false },
+            )?;
+        }
+        w.write_bits(HEADER_MARKER, HEADER_MARKER_BITS);
+
+        // Coefficient partition (§V.2.6): CBPY + the six blocks per
+        // macroblock, slice order.
+        for (luma, cb, cr) in &planned {
+            let mut cbpy = 0u8;
+            for (i, b) in luma.iter().enumerate() {
+                if b.has_ac {
+                    cbpy |= 1 << (3 - i);
+                }
+            }
+            write_cbpy(&mut w, cbpy)?;
+            for b in luma {
+                crate::encoder_block::write_intra_block(&mut w, b.dc_level, &b.scan, b.has_ac)?;
+            }
+            for b in [cb, cr] {
+                crate::encoder_block::write_intra_block(&mut w, b.dc_level, &b.scan, b.has_ac)?;
+            }
+        }
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an **Annex V Data-Partitioned
+/// Slice** H.263+ **INTER** (P-) picture predicted from `reference`:
+/// per free-running slice, the Table V.2 RVLC COD + MCBPC headers
+/// (skipped / INTER classes), the §V.2.2 Header Marker, the §V.2.3
+/// motion-vector partition — every coded macroblock's vector as Table
+/// D.3 codewords over the single §V.2.3.2 prediction thread (first
+/// predictor zero), with the §V.2.3.3 per-codeword emulation rule,
+/// the redundant §V.2.4 LMVV and the §V.2.5 Motion Vector Marker —
+/// then the §V.2.6 coefficient layer.
+///
+/// Predict the next picture from the decoder's reconstruction for a
+/// drift-free closed loop.
+pub fn encode_inter_picture_dps(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+    mb_rows_per_slice: usize,
+) -> Result<Vec<u8>> {
+    use crate::annex_v::{
+        write_dps_mb_header, DpsMbHeader, MvdEmulationState, HEADER_MARKER, HEADER_MARKER_BITS,
+        MOTION_VECTOR_MARKER, MOTION_VECTOR_MARKER_BITS, TABLE_V2_INTER,
+    };
+    use crate::encoder_vlc::write_cbpy;
+    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if frame.luma_width != reference.luma_width || frame.luma_height != reference.luma_height {
+        return Err(Error::NotImplemented);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let layout =
+        crate::picture::PictureLayout::for_source_format(fmt).ok_or(Error::NotImplemented)?;
+    let lw = frame.luma_width;
+    let lh = frame.luma_height;
+    let cw = frame.chroma_width();
+    let ch = frame.chroma_height();
+    let mb_cols = lw / 16;
+    let mb_rows = lh / 16;
+    if mb_rows_per_slice == 0 || mb_rows_per_slice > mb_rows {
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+    let sss = crate::plus_ptype::SliceStructuredSubmode {
+        rectangular: false,
+        arbitrary_order: false,
+    };
+
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ true,
+        PlusModes {
+            slice_structured: Some(sss),
+            data_partitioned_slices: true,
+            ..PlusModes::default()
+        },
+    )?;
+    let ctx = SliceHeaderContext::from_picture_layout(&layout, Some(sss), false, false);
+    write_first_slice_header(&mut w, &ctx, 0, None)?;
+    let gfid = tr & 0b11;
+    let lambda = 2 * quant as u32;
+
+    /// Per-macroblock plan: either skipped or a coded INTER
+    /// macroblock with its vector and quantised blocks (boxed — the
+    /// coded payload is ~1 KiB next to the unit Skip variant).
+    enum Plan {
+        Skip,
+        Inter(Box<InterPlan>),
+    }
+    struct InterPlan {
+        mv: crate::motion::MotionVector,
+        luma: [crate::encoder_block::EncodedInterBlock; 4],
+        cb: crate::encoder_block::EncodedInterBlock,
+        cr: crate::encoder_block::EncodedInterBlock,
+    }
+
+    for slice_row0 in (0..mb_rows).step_by(mb_rows_per_slice) {
+        if slice_row0 > 0 {
+            let mba = (slice_row0 * mb_cols) as u32;
+            write_slice_layer(&mut w, &ctx, mba, quant, gfid, None)?;
+        }
+        let rows = mb_rows_per_slice.min(mb_rows - slice_row0);
+
+        // Phase 1 — motion-estimate and quantise the whole slice.
+        // §V.2.3.2: the prediction thread runs over the *coded*
+        // macroblocks of the slice, first predictor zero.
+        let mut plans: Vec<Plan> = Vec::with_capacity(rows * mb_cols);
+        let mut thread_prev = crate::motion::MotionVector::new(0, 0);
+        for r in 0..rows {
+            let mb_row = slice_row0 + r;
+            for mb_col in 0..mb_cols {
+                let mv = crate::encoder_motion::estimate_motion(
+                    frame,
+                    reference,
+                    mb_col,
+                    mb_row,
+                    thread_prev,
+                    search_half,
+                    lambda,
+                );
+                let mb_x = mb_col * 16;
+                let mb_y = mb_row * 16;
+                let c_x = mb_col * 8;
+                let c_y = mb_row * 8;
+                let src = extract_macroblock(frame, mb_col, mb_row);
+                let mut luma: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(4);
+                for blk in 0..4 {
+                    let bx = mb_x + (blk % 2) * 8;
+                    let by = mb_y + (blk / 2) * 8;
+                    let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
+                    let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
+                    for (d, &p) in pred_i16.iter_mut().zip(pred.iter()) {
+                        *d = p as i16;
+                    }
+                    let residual = residual_of(&src.luma[blk], &pred_i16);
+                    luma.push(crate::encoder_block::encode_inter_block(&residual, quant));
+                }
+                let chroma_mv = crate::motion::chroma_mv(mv);
+                let cb_pred = motion_compensated_block(&reference.cb, cw, ch, c_x, c_y, chroma_mv);
+                let cr_pred = motion_compensated_block(&reference.cr, cw, ch, c_x, c_y, chroma_mv);
+                let mut cb_pred_i = [0i16; COEFFS_PER_BLOCK];
+                let mut cr_pred_i = [0i16; COEFFS_PER_BLOCK];
+                for i in 0..COEFFS_PER_BLOCK {
+                    cb_pred_i[i] = cb_pred[i] as i16;
+                    cr_pred_i[i] = cr_pred[i] as i16;
+                }
+                let cb = crate::encoder_block::encode_inter_block(
+                    &residual_of(&src.cb, &cb_pred_i),
+                    quant,
+                );
+                let cr = crate::encoder_block::encode_inter_block(
+                    &residual_of(&src.cr, &cr_pred_i),
+                    quant,
+                );
+
+                let any = luma.iter().any(|e| e.has_coeffs) || cb.has_coeffs || cr.has_coeffs;
+                if mv.dx_half == 0 && mv.dy_half == 0 && !any {
+                    plans.push(Plan::Skip);
+                } else {
+                    let luma: [crate::encoder_block::EncodedInterBlock; 4] =
+                        luma.try_into().expect("four luma blocks");
+                    plans.push(Plan::Inter(Box::new(InterPlan { mv, luma, cb, cr })));
+                    thread_prev = mv;
+                }
+            }
+        }
+
+        // HD partition (§V.2.1) + HM (§V.2.2).
+        for plan in &plans {
+            let entry = match plan {
+                Plan::Skip => DpsMbHeader::Skipped,
+                Plan::Inter(p) => DpsMbHeader::Inter {
+                    cbpc: (u8::from(p.cb.has_coeffs) << 1) | u8::from(p.cr.has_coeffs),
+                    quant: false,
+                },
+            };
+            write_dps_mb_header(&mut w, TABLE_V2_INTER, entry)?;
+        }
+        w.write_bits(HEADER_MARKER, HEADER_MARKER_BITS);
+
+        // MV partition (§V.2.3–§V.2.5).
+        let coded_mvs: Vec<crate::motion::MotionVector> = plans
+            .iter()
+            .filter_map(|p| match p {
+                Plan::Inter(p) => Some(p.mv),
+                Plan::Skip => None,
+            })
+            .collect();
+        if !coded_mvs.is_empty() {
+            let mut emu = MvdEmulationState::new();
+            let mut prev = crate::motion::MotionVector::new(0, 0);
+            for &mv in &coded_mvs {
+                emu.write_component(&mut w, mv.dx_half - prev.dx_half)?;
+                emu.write_component(&mut w, mv.dy_half - prev.dy_half)?;
+                prev = mv;
+            }
+            if coded_mvs.len() >= 2 {
+                let last = *coded_mvs.last().expect("non-empty");
+                emu.write_component(&mut w, last.dx_half)?;
+                emu.write_component(&mut w, last.dy_half)?;
+            }
+            w.write_bits(MOTION_VECTOR_MARKER, MOTION_VECTOR_MARKER_BITS);
+        }
+
+        // Coefficient partition (§V.2.6).
+        for plan in &plans {
+            let Plan::Inter(p) = plan else {
+                continue;
+            };
+            let InterPlan { luma, cb, cr, .. } = p.as_ref();
+            let mut coded_pattern = 0u8;
+            for (i, b) in luma.iter().enumerate() {
+                if b.has_coeffs {
+                    coded_pattern |= 1 << (3 - i);
+                }
+            }
+            // §5.3.5 — INTER macroblocks carry the complement pattern.
+            write_cbpy(&mut w, coded_pattern ^ 0b1111)?;
+            for b in luma {
+                if b.has_coeffs {
+                    crate::encoder_block::write_inter_block_coeffs(&mut w, &b.scan)?;
+                }
+            }
+            for b in [cb, cr] {
+                if b.has_coeffs {
+                    crate::encoder_block::write_inter_block_coeffs(&mut w, &b.scan)?;
+                }
+            }
+        }
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
 }
 
 /// Annex R §R.2 rule 4 — the reference view a video picture segment is
