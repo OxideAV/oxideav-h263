@@ -11,7 +11,7 @@ clean-room against [ITU-T Recommendation H.263 (01/2005)][spec].
 Full baseline **decoder**, plus a growing **encoder**. The decoder
 implements the H.263 baseline picture / GOB / macroblock / block layers
 and reconstructs INTRA and INTER pictures end-to-end, plus a wide set of
-optional Annexes (D, E, F, I, J, K, M, N, O, P, Q, S, T).
+optional Annexes (D, E, F, I, J, K, L, M, N, O, P, Q, S, T, W).
 
 The encoder (round 376 onward) produces baseline **INTRA (I-)** and
 **INTER (P-)** pictures plus a growing set of optional modes:
@@ -442,6 +442,25 @@ planar 4:2:0 `YuvFrame`:
   are out of scope, and a B / EI / EP picture signalling UMV is refused
   (§O.4.6 switches MVDFW / MVDBW to Table D.3 in that mode, which this
   path does not stage — round 447).
+* **Annex L / Annex W** — supplemental enhancement information
+  (round 450): the `annex_l` module stages the §5.1.24/§5.1.25 PEI +
+  PSUPP loop primitives (`read_pei_psupp` / `write_pei_psupp`) and the
+  §L.2 function layer (`parse_psupp` / `write_psupp`) over the full
+  Table L.1 inventory — Do Nothing (with the §L.3 start-code-emulation
+  insertion rule applied on write), full / partial / resizing freeze
+  requests and freeze release, snapshot tags, video-time and
+  progressive-refinement segment tags, the §L.14 Chroma Keying
+  Information record (flag-octet-driven key / threshold presence with
+  the DSIZE consistency rule enforced), the §L.15 extended function
+  escape — plus the Annex W assignments: §W.5 Fixed-Point IDCT and
+  the §W.6 Picture Message (CONT / EBIT / MTYPE header, all fourteen
+  Table W.2 message types, the §W.6.3.11 interlaced-field and
+  §W.6.3.12 picture-number constraint rules, 10-bit picture-number
+  accessor / builder). At the picture layer, `extract_psupp` recovers
+  a baseline picture's raw PSUPP octets and `insert_psupp` splices SEI
+  into any single-segment baseline picture post-hoc (bit-shifting the
+  payload and re-padding PSTUF) — validated pixel-neutral over the
+  VLC I / P and SAC encoders through `decode_sequence`.
 * **Annex O §O.6** — spatial-scalability reference up-sampling: the
   Figure O.8 / O.9 2-D and Figure O.10 / O.11 1-D (horizontal / vertical)
   interpolation filters (`upsample_plane_2d` /

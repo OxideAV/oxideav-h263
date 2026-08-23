@@ -30,6 +30,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex L / Annex W supplemental enhancement information**
+  (round 450): new `annex_l` module — §5.1.24/§5.1.25 PEI + PSUPP loop
+  primitives, the §L.2 FTYPE/DSIZE function layer over the complete
+  Table L.1 + Table W.1 inventory (freeze / snapshot / segment-tag
+  functions, §L.14 Chroma Keying with the flag-derived DSIZE rule,
+  §L.15 extended-function escape, §W.5 Fixed-Point IDCT, §W.6 Picture
+  Message with Table W.2 MTYPEs and the §W.6.2/§W.6.3.11/§W.6.3.12
+  CONT/EBIT/DSIZE constraints), the §L.3 start-code-emulation Do
+  Nothing insertion on write, and picture-layer `extract_psupp` /
+  `insert_psupp` (post-hoc SEI splicing into single-segment baseline
+  pictures, bit-shifting the payload and re-padding PSTUF).
+  `tests/sei_roundtrip.rs` pins recoverability and pixel-neutrality
+  over the VLC I / P and SAC encoders. New error variants
+  `TruncatedPsupp` / `BadSupplementalDsize` / `BadPictureMessage`.
+
 - **Streaming sequence-decode API**: `picture::SequenceState` +
   `picture::decode_sequence_step` expose the per-picture step of
   `decode_sequence` (inherited §5.1.4.4 mode state, §G.4 reference-TR

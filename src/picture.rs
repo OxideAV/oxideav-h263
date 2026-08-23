@@ -2550,6 +2550,121 @@ pub fn next_picture_start_code(data: &[u8], from: usize) -> Option<usize> {
     find_next_psc(data, from)
 }
 
+/// Position a reader on the first bit of the §5.1.24 PEI loop of a
+/// **baseline-PTYPE** picture: parse PSC / TR / PTYPE, then consume
+/// §5.1.19 PQUANT, §5.1.20 CPM and — for a PB picture — §5.1.22 TRB +
+/// §5.1.23 DBQUANT. Returns the parsed header.
+///
+/// Refuses extended-PTYPE pictures (the PLUSPTYPE header places the
+/// PEI loop after a variable-length field block this helper does not
+/// frame) and CPM = "1" streams (the PSBI field is not framed).
+fn seek_to_pei(reader: &mut BitReader<'_>) -> Result<H263PictureHeader> {
+    let header = parse_picture_header(reader)?;
+    // §5.1.19 PQUANT + §5.1.20 CPM.
+    reader.skip(5).map_err(|_| Error::UnexpectedEof)?;
+    let cpm = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    if cpm {
+        return Err(Error::NotImplemented);
+    }
+    if header.pb_frames {
+        // §5.1.22 TRB (3) + §5.1.23 DBQUANT (2).
+        reader.skip(5).map_err(|_| Error::UnexpectedEof)?;
+    }
+    Ok(header)
+}
+
+/// Extract the §5.1.25 PSUPP octets of a baseline-PTYPE picture —
+/// the raw supplemental-enhancement payload, ready for
+/// [`crate::annex_l::parse_psupp`].
+///
+/// `picture` must begin at a byte-aligned Picture Start Code (one
+/// picture of an elementary stream, as sliced by
+/// [`next_picture_start_code`]). A picture with PEI = "0" (no
+/// supplemental data — every picture this crate's plain encoders
+/// emit) returns an empty vector.
+///
+/// # Errors
+///
+/// * [`Error::BadPictureStartCode`] / the [`parse_picture_header`]
+///   errors for a malformed or extended-PTYPE header.
+/// * [`Error::NotImplemented`] for CPM = "1" streams.
+/// * [`Error::UnexpectedEof`] if the bitstream ends inside the header
+///   or the PEI loop.
+pub fn extract_psupp(picture: &[u8]) -> Result<Vec<u8>> {
+    let mut reader = BitReader::new(picture);
+    seek_to_pei(&mut reader)?;
+    crate::annex_l::read_pei_psupp(&mut reader)
+}
+
+/// Rewrite a baseline-PTYPE picture so its §5.1.24 / §5.1.25 PEI loop
+/// carries `octets` of PSUPP data (appended after any octets the
+/// picture already carries), shifting the remaining picture payload
+/// and re-padding with §5.1.28 PSTUF zeros to the next byte boundary.
+///
+/// Build `octets` with [`crate::annex_l::write_psupp`] so the §L.3
+/// start-code-emulation rule is honoured — PSUPP octets are raw
+/// bitstream bits, and an octet string ending in a long zero run
+/// could otherwise emulate a start code.
+///
+/// The insertion is purely positional, so it applies to any
+/// **single-segment** baseline picture (the shapes produced by
+/// [`crate::encoder::encode_intra_picture`] /
+/// [`crate::encoder::encode_inter_picture_motion`] /
+/// [`crate::encoder::encode_inter_picture_umv`] and the SAC / PB
+/// encoders): pictures containing byte-aligned mid-picture structures
+/// (§5.2.1 GSTUF-aligned GOB headers, Annex K SSTUF-aligned slice
+/// headers) must not be rewritten this way — the shift by
+/// `9 × octets.len()` bits would break their internal alignment.
+/// Multi-GOB / slice emission wants header-time PSUPP instead.
+///
+/// # Errors
+///
+/// The union of [`extract_psupp`]'s errors (the same header walk
+/// locates the splice point).
+pub fn insert_psupp(picture: &[u8], octets: &[u8]) -> Result<Vec<u8>> {
+    let mut reader = BitReader::new(picture);
+    seek_to_pei(&mut reader)?;
+    let split_bits = reader.bit_position();
+    let existing = crate::annex_l::read_pei_psupp(&mut reader)?;
+
+    let mut w = oxideav_core::bits::BitWriter::new();
+    // Header bits before the PEI loop, copied verbatim.
+    let mut head = BitReader::new(picture);
+    let mut remaining = split_bits;
+    while remaining >= 32 {
+        w.write_bits(head.read_u32(32).map_err(|_| Error::UnexpectedEof)?, 32);
+        remaining -= 32;
+    }
+    if remaining > 0 {
+        w.write_bits(
+            head.read_u32(remaining as u32)
+                .map_err(|_| Error::UnexpectedEof)?,
+            remaining as u32,
+        );
+    }
+    // The combined PEI loop.
+    let mut combined = existing;
+    combined.extend_from_slice(octets);
+    crate::annex_l::write_pei_psupp(&mut w, &combined);
+    // The rest of the picture (macroblock data + original PSTUF),
+    // shifted; then re-pad to the byte boundary.
+    let mut rest = reader.bits_remaining();
+    while rest >= 32 {
+        w.write_bits(reader.read_u32(32).map_err(|_| Error::UnexpectedEof)?, 32);
+        rest -= 32;
+    }
+    if rest > 0 {
+        w.write_bits(
+            reader
+                .read_u32(rest as u32)
+                .map_err(|_| Error::UnexpectedEof)?,
+            rest as u32,
+        );
+    }
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
 /// Peek whether the picture beginning at `data`'s Picture Start Code uses
 /// the extended (PLUSPTYPE) header form — PTYPE bits 6-8 = `"111"`
 /// (§5.1.3).

@@ -212,6 +212,7 @@ use oxideav_core::bits::BitReader;
 pub mod aic;
 pub mod aic_dequant;
 pub mod aic_predict;
+pub mod annex_l;
 pub mod annex_n;
 pub mod annex_p;
 pub mod annex_t;
@@ -256,6 +257,10 @@ pub use aic_dequant::{
 pub use aic_predict::{
     aic_intra_reconstruct_coefficients, aic_intra_reconstruct_samples, reconstruct_intra_block_aic,
     Neighbour, AIC_FALLBACK_DC_PREDICTOR,
+};
+pub use annex_l::{
+    parse_psupp, read_pei_psupp, write_pei_psupp, write_psupp, ChromaKeyingInfo, MessageType,
+    PictureMessage, PictureRect, SeiFunction,
 };
 pub use annex_t::{parse_modified_dquant, quant_c_from_quant, ModifiedDquant};
 pub use block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
@@ -536,6 +541,17 @@ pub enum Error {
     /// The packetizer's `max_payload` budget cannot hold the payload
     /// header plus at least one bitstream byte.
     RtpPayloadTooSmall,
+    /// A PSUPP octet string (§5.1.25 / Annex L) ended inside a
+    /// function's declared DSIZE parameter data.
+    TruncatedPsupp,
+    /// An Annex L / Annex W function carried a DSIZE (or parameter
+    /// shape) its clause mandates differently — e.g. a §L.4 freeze
+    /// request with DSIZE ≠ 0, or a §L.14 chroma-keying record whose
+    /// size disagrees with its flag octet.
+    BadSupplementalDsize,
+    /// A §W.6 Picture Message violated its clause constraints (DSIZE /
+    /// CONT / EBIT rules of §W.6.2, §W.6.3.11, §W.6.3.12).
+    BadPictureMessage,
 }
 
 impl core::fmt::Display for Error {
@@ -678,6 +694,18 @@ impl core::fmt::Display for Error {
             Error::RtpPayloadTooSmall => write!(
                 f,
                 "oxideav-h263: RTP max_payload cannot hold header plus data"
+            ),
+            Error::TruncatedPsupp => write!(
+                f,
+                "oxideav-h263: PSUPP data ends inside a function's DSIZE parameter octets"
+            ),
+            Error::BadSupplementalDsize => write!(
+                f,
+                "oxideav-h263: Annex L/W function DSIZE or parameter shape violates its clause"
+            ),
+            Error::BadPictureMessage => write!(
+                f,
+                "oxideav-h263: Annex W picture message violates its CONT/EBIT/DSIZE constraints"
             ),
         }
     }
