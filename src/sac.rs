@@ -309,6 +309,11 @@ pub struct SacDecoder<'r, 'd> {
     /// §E.5 — length of the current run of `"0"`s seen by the
     /// destuffing filter.
     zero_run: u32,
+    /// Bits synthesised past the end of the source buffer. The §E.6
+    /// flush guarantees a conforming stream's symbols complete within
+    /// a bounded lookahead; a decoder still asking for input far past
+    /// the end is decoding garbage (see [`Self::source_exhausted`]).
+    bits_past_end: u32,
 }
 
 impl core::fmt::Debug for SacDecoder<'_, '_> {
@@ -349,6 +354,7 @@ impl<'r, 'd> SacDecoder<'r, 'd> {
             high: TOP,
             code_value: 0,
             zero_run: zero_run.min(STUFF_RUN),
+            bits_past_end: 0,
         };
         for _ in 0..16 {
             let bit = dec.next_bit();
@@ -369,7 +375,10 @@ impl<'r, 'd> SacDecoder<'r, 'd> {
                 Ok(b) => b,
                 // Past the §E.6 flush any bit value decodes the
                 // already-coded symbols correctly.
-                Err(_) => return 0,
+                Err(_) => {
+                    self.bits_past_end = self.bits_past_end.saturating_add(1);
+                    return 0;
+                }
             };
             if bit {
                 if self.zero_run == STUFF_RUN {
@@ -387,6 +396,21 @@ impl<'r, 'd> SacDecoder<'r, 'd> {
 
     /// §E.3 `decode_a_symbol` — decode one symbol under `cumf` and
     /// return its model index.
+    /// Whether the arithmetic decoder has been synthesising input for
+    /// well past the §E.6 flush lookahead — i.e. the source buffer is
+    /// exhausted and every further symbol is decoded from imaginary
+    /// zero bits. Drivers use this to break symbol loops that a
+    /// conforming stream bounds by construction (e.g. §5.3.2 MCBPC
+    /// stuffing, which consumes no macroblock slot): without the
+    /// check, a truncated or corrupt SAC picture whose post-end state
+    /// keeps yielding stuffing symbols would spin forever.
+    pub fn source_exhausted(&self) -> bool {
+        // The §E.3 renormalisation consumes at most one bit per
+        // interval halving; 64 synthesised bits is far beyond any
+        // legitimate flush lookahead.
+        self.bits_past_end > 64
+    }
+
     pub fn decode_symbol(&mut self, cumf: &[i64]) -> usize {
         let length = self.high - self.low + 1;
         let cum = (-1 + (self.code_value - self.low + 1) * cumf[0]) / length;
@@ -1666,6 +1690,7 @@ mod tests {
             high: TOP,
             code_value: 0,
             zero_run: 0,
+            bits_past_end: 0,
         };
         for (i, &b) in pattern.iter().enumerate() {
             assert_eq!(dec.next_bit() == 1, b, "bit {i}");

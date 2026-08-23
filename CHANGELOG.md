@@ -8,6 +8,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Fuzz-found: infinite loop on truncated SAC pictures** (round
+  450): a corrupt or truncated Annex E picture whose exhausted
+  arithmetic source kept synthesising zero bits could decode §5.3.2
+  MCBPC **stuffing** symbols forever — stuffing consumes no
+  macroblock slot, so the SAC macroblock-stream loop never advanced
+  (>15 s fuzzer timeouts; unbounded on real inputs). `SacDecoder` now
+  tracks bits synthesised past the end of the buffer
+  (`source_exhausted`, threshold 64 — far beyond the §E.6 flush
+  lookahead) and the stuffing retry loop surfaces `UnexpectedEof`
+  instead of spinning. Regression test truncates a real SAC picture
+  at every eighth byte; a 180 s fuzz re-run with a per-input timeout
+  is clean (76k runs).
+
 - **Fuzz-found: quadratic eager re-decode in the streaming registry
   decoder** (round 450): a stream delivered in many small fragments
   made `H263StreamDecoder` re-attempt a decode of the growing

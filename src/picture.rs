@@ -1097,6 +1097,14 @@ fn decode_sac_macroblock_stream(
                     },
                 )?;
                 if matches!(mb.mb_type, Some(MbType::Stuffing)) {
+                    // §5.3.2 — stuffing consumes no macroblock slot. A
+                    // conforming stream bounds the run by construction;
+                    // once the arithmetic source is exhausted the
+                    // decoder would synthesise stuffing symbols forever,
+                    // so surface the truncation instead.
+                    if dec.source_exhausted() {
+                        return Err(Error::UnexpectedEof);
+                    }
                     continue;
                 }
                 break mb;

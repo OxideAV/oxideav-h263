@@ -539,3 +539,24 @@ fn sac_pb_and_single_picture_drivers_route_apart() {
         Error::NotImplemented
     );
 }
+
+/// Fuzz-found regression (round 450): a truncated SAC picture whose
+/// arithmetic source runs out while the post-end decoder state keeps
+/// yielding §5.3.2 MCBPC stuffing symbols must surface an error (or a
+/// bounded decode) instead of spinning forever — the stuffing loop now
+/// breaks on `SacDecoder::source_exhausted`.
+#[test]
+fn truncated_sac_picture_terminates() {
+    let mut f = YuvFrame::grey(176, 144);
+    for y in 0..144 {
+        for x in 0..176 {
+            f.y[y * 176 + x] = ((x * 7 + y * 3) & 0xFF) as u8;
+        }
+    }
+    let coded = encode_intra_picture_sac(&f, 5, 0).expect("encode");
+    // Truncate at every eighth byte boundary; each prefix must
+    // terminate (any decode error is acceptable, hanging is not).
+    for keep in (8..coded.len()).step_by(8) {
+        let _ = decode_picture_sac(&coded[..keep], None, DecodeOptions::default());
+    }
+}
