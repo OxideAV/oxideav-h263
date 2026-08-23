@@ -30,6 +30,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex R Independent Segment Decoding mode, GOB segmentation, both
+  directions** (round 450): the PLUSPTYPE shim accepts the OPPTYPE
+  bit-12 ISD flag (retained in `InheritedExtendedState` for UFEP=000
+  followers) and the GOB driver treats each header-delimited video
+  picture segment as a picture — byte-aligned GBSC pre-scan into a
+  per-row segment-band map, `RefPlane::banded` reference fetches for
+  single-MV / INTER4V / OBMC / chroma prediction (§R.2 rule 4 border
+  extrapolation), §F.3 remote-vector substitution across segments
+  (rule 2), §J.3 deblocking skip across segment boundaries (rule 3),
+  Annex P resampling refused (rule 7). New encoders
+  `encode_intra_picture_isd` / `encode_inter_picture_isd` (ISD + UMV
+  PLUSPTYPE header, one GOB header per GOB, search + prediction against
+  an edge-replicated per-segment reference view) plus
+  `PlusModes::independent_segment_decoding`. `tests/isd_roundtrip.rs`
+  pins closed-loop byte-exactness, a cleared-ISD-bit negative control,
+  the streaming step path and the deblock boundary skip. ISD + SS /
+  Improved-PB / RPS / RRU remain refused.
+
 - **Annex L / Annex W supplemental enhancement information**
   (round 450): new `annex_l` module — §5.1.24/§5.1.25 PEI + PSUPP loop
   primitives, the §L.2 FTYPE/DSIZE function layer over the complete

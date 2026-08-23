@@ -181,6 +181,11 @@ pub struct InheritedExtendedState {
     /// the §5.1.10 SSS rule). `None` when the prior UFEP=001 picture
     /// had UMV off (no UUI was sent) or no UFEP=001 has been seen.
     pub uui: Option<Uui>,
+    /// §5.1.4.4 — Annex R Independent Segment Decoding mode bit from
+    /// the last UFEP=001 OPPTYPE. Retained so a UFEP=000 follow-up
+    /// picture keeps decoding with the segment-boundary treatment in
+    /// force (Annex R applies per stream, not per UFEP=001 picture).
+    pub independent_segment_decoding: bool,
 }
 
 impl InheritedExtendedState {
@@ -191,7 +196,8 @@ impl InheritedExtendedState {
     /// header are retained: the staged decode modes plus the Annex N RPS
     /// flag (which gates the §5.1.13–§5.1.16 RPS fields on a UFEP=000
     /// header where there is no OPPTYPE). Mode bits the driver refuses
-    /// (SAC, SS, IS, AIV, MQ) are dropped.
+    /// (SAC, SS, AIV, MQ) are dropped; the Annex R ISD bit is
+    /// retained (the mode is stream-scoped).
     pub fn from_opptype(opptype: Opptype) -> Self {
         Self {
             custom_pcf: opptype.custom_pcf,
@@ -206,6 +212,7 @@ impl InheritedExtendedState {
             // drivers overwrite this from the parsed header when UMV
             // is on (see `decode_picture_layer_with_inherited`).
             uui: None,
+            independent_segment_decoding: opptype.independent_segment_decoding,
         }
     }
 

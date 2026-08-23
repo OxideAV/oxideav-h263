@@ -202,6 +202,8 @@ pub struct PlusModes {
     pub cpm_psbi: Option<u8>,
     /// MPPTYPE bit 5 — Annex Q Reduced-Resolution Update mode.
     pub rru: bool,
+    /// OPPTYPE bit 12 — Annex R Independent Segment Decoding mode.
+    pub independent_segment_decoding: bool,
 }
 
 /// Write an extended-PTYPE (PLUSPTYPE, §5.1.4) picture header: PSC, TR,
@@ -277,6 +279,9 @@ pub fn write_plus_picture_header(
     }
     if modes.slice_structured.is_some() {
         opptype |= 1 << 8; // bit 10 — Annex K
+    }
+    if modes.independent_segment_decoding {
+        opptype |= 1 << 6; // bit 12 — Annex R
     }
     if modes.alt_inter_vlc {
         opptype |= 1 << 5; // bit 13 — Annex S
@@ -2962,6 +2967,7 @@ pub fn encode_inter_picture_motion(
         /* umv */ false,
         InterFraming::Single,
         /* plus */ false,
+        /* isd */ false,
     )
 }
 
@@ -2989,6 +2995,7 @@ pub fn encode_inter_picture_plus(
         /* umv */ false,
         InterFraming::Single,
         /* plus */ true,
+        /* isd */ false,
     )
 }
 
@@ -3025,6 +3032,7 @@ pub fn encode_inter_picture_slices(
             rows: mb_rows_per_slice,
         },
         /* plus */ true,
+        /* isd */ false,
     )
 }
 
@@ -3051,6 +3059,7 @@ pub fn encode_inter_picture_gobs(
         /* umv */ false,
         InterFraming::GobHeaders,
         /* plus */ false,
+        /* isd */ false,
     )
 }
 
@@ -3092,6 +3101,7 @@ pub fn encode_inter_picture_umv(
         /* umv */ true,
         InterFraming::Single,
         /* plus */ false,
+        /* isd */ false,
     )
 }
 
@@ -3126,6 +3136,7 @@ pub fn encode_inter_picture_umv_plus(
         /* umv */ true,
         InterFraming::Single,
         /* plus */ true,
+        /* isd */ false,
     )
 }
 
@@ -3158,6 +3169,7 @@ pub fn encode_inter_picture_umv_slices(
             rows: mb_rows_per_slice,
         },
         /* plus */ true,
+        /* isd */ false,
     )
 }
 
@@ -3689,6 +3701,139 @@ enum InterFraming {
 /// every-GOB-header or Annex K slice stream shape (with the matching
 /// per-segment predictor treatment).
 #[allow(clippy::too_many_arguments)]
+/// Encode a planar 4:2:0 [`YuvFrame`] as an **Annex R Independent
+/// Segment Decoding** H.263+ **INTRA** picture: the §5.1.4 PLUSPTYPE
+/// header raises the OPPTYPE bit-12 ISD flag and the picture body
+/// carries a §5.2 GOB header on every GOB after the first, so each
+/// GOB is one video picture segment (§R.2) with a byte-aligned
+/// resynchronisation point. An INTRA picture reads no reference, so
+/// the ISD emission reduces to the mode bit + the per-GOB headers
+/// (whose constant per-picture layout satisfies §R.3.2 for the
+/// following P-pictures); the AIC / MV predictor confinement to
+/// segments is inherent in the per-GOB header segmentation.
+///
+/// Decodes through [`crate::picture::decode_picture_layer`] /
+/// [`crate::picture::decode_sequence`].
+pub fn encode_intra_picture_isd(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let rows_per_gob = crate::picture::PictureLayout::for_source_format(fmt)
+        .ok_or(Error::NotImplemented)?
+        .mb_rows_per_gob as usize;
+
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ false,
+        PlusModes {
+            independent_segment_decoding: true,
+            ..PlusModes::default()
+        },
+    )?;
+
+    let gfid = tr & 0b11;
+    let mb_cols = frame.luma_width / 16;
+    let mb_rows = frame.luma_height / 16;
+    for mb_row in 0..mb_rows {
+        // §R.2 — a non-empty GOB header at the top of every GOB after
+        // GOB 0 makes each GOB its own video picture segment.
+        if mb_row > 0 && mb_row % rows_per_gob == 0 {
+            write_gob_header(&mut w, (mb_row / rows_per_gob) as u32, gfid, quant);
+        }
+        for mb_col in 0..mb_cols {
+            let mb = extract_macroblock(frame, mb_col, mb_row);
+            encode_intra_macroblock(
+                &mut w, &mb, quant, /* write_cod */ false, /* picture_is_inter */ false,
+            )?;
+        }
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
+/// Encode a planar 4:2:0 [`YuvFrame`] as an **Annex R Independent
+/// Segment Decoding** H.263+ **INTER** (P-) picture predicted from
+/// `reference`.
+///
+/// The PLUSPTYPE header raises the OPPTYPE bit-12 ISD flag together
+/// with the bit-5 **Annex D UMV** flag (Table D.3 motion coding under
+/// the §5.1.9 UUI Tables-D.1/D.2 range), and a §5.2 GOB header opens
+/// every GOB after the first — each GOB one video picture segment.
+/// UMV matters: §R.2 rule 4 prohibits motion vectors that reference
+/// data outside the current segment *unless* Annex D / F / J / O is
+/// in use, in which case "the borders of the current video picture
+/// segment in the prior picture are extrapolated as described in
+/// Annex D". With UMV on, this encoder searches each segment against
+/// an edge-replicated band view of the reference
+/// ([`band_replicated_reference`]) — byte-identical to the decoder's
+/// banded fetch — so over-boundary vectors are both legal and
+/// closed-loop exact.
+///
+/// §R.3.2 (segment shapes constant from picture to picture) holds by
+/// construction: every picture this pair of entry points emits uses
+/// the uniform one-header-per-GOB segmentation.
+///
+/// Decodes through [`crate::picture::decode_picture_layer`] /
+/// [`crate::picture::decode_sequence`]; predict the next picture from
+/// the decoder's reconstruction for a drift-free closed loop.
+pub fn encode_inter_picture_isd(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+) -> Result<Vec<u8>> {
+    encode_inter_picture_motion_impl(
+        frame,
+        reference,
+        quant,
+        tr,
+        search_half,
+        /* umv */ true,
+        InterFraming::GobHeaders,
+        /* plus */ true,
+        /* isd */ true,
+    )
+}
+
+/// Annex R §R.2 rule 4 — the reference view a video picture segment is
+/// allowed to predict from: the segment's own luma band `top..bottom`
+/// kept verbatim, every row outside it replaced by the nearest band
+/// edge row (and the same, at half resolution, for the chrominance
+/// planes). Sampling this frame with the ordinary §D.1 edge-replicated
+/// fetch is byte-identical to clamping the row coordinate into the
+/// band — the decoder's banded-fetch treatment of segment boundaries
+/// as picture boundaries.
+fn band_replicated_reference(reference: &YuvFrame, top: usize, bottom: usize) -> YuvFrame {
+    let mut out = reference.clone();
+    let replicate = |plane: &mut [u8], width: usize, height: usize, top: usize, bottom: usize| {
+        let bottom = bottom.min(height).max(1);
+        let top = top.min(bottom - 1);
+        let (top_row, bot_row) = (top, bottom - 1);
+        for row in 0..height {
+            let src_row = row.clamp(top_row, bot_row);
+            if src_row != row {
+                let (src_off, dst_off) = (src_row * width, row * width);
+                plane.copy_within(src_off..src_off + width, dst_off);
+            }
+        }
+    };
+    let (lw, lh) = (reference.luma_width, reference.luma_height);
+    let (cw, ch) = (reference.chroma_width(), reference.chroma_height());
+    replicate(&mut out.y, lw, lh, top, bottom);
+    replicate(&mut out.cb, cw, ch, top / 2, bottom.div_ceil(2));
+    replicate(&mut out.cr, cw, ch, top / 2, bottom.div_ceil(2));
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_inter_picture_motion_impl(
     frame: &YuvFrame,
     reference: &YuvFrame,
@@ -3698,6 +3843,12 @@ fn encode_inter_picture_motion_impl(
     umv: bool,
     framing: InterFraming,
     plus: bool,
+    // Annex R — emit the OPPTYPE ISD bit and confine motion
+    // estimation + prediction to each GOB segment's band (the
+    // reference rows outside the segment are edge-replicated, exactly
+    // the decoder's §R.2 rule-4 border extrapolation). Requires
+    // `plus` and [`InterFraming::GobHeaders`].
+    isd: bool,
 ) -> Result<Vec<u8>> {
     use crate::plus_ptype::SliceStructuredSubmode;
     use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
@@ -3731,6 +3882,12 @@ fn encode_inter_picture_motion_impl(
         _ => None,
     };
 
+    if isd && (!plus || !matches!(framing, InterFraming::GobHeaders)) {
+        // Annex R is signalled in OPPTYPE (PLUSPTYPE only), and this
+        // encoder stages it on the GOB segmentation.
+        return Err(Error::NotImplemented);
+    }
+
     let mut w = BitWriter::new();
     if plus {
         write_plus_picture_header(
@@ -3742,6 +3899,7 @@ fn encode_inter_picture_motion_impl(
             PlusModes {
                 umv,
                 slice_structured: sss,
+                independent_segment_decoding: isd,
                 ..PlusModes::default()
             },
         )?;
@@ -3796,6 +3954,9 @@ fn encode_inter_picture_motion_impl(
     // regions on MVD = 0 without over-penalising real motion.
     let lambda = 2 * quant as u32;
 
+    // Annex R — per-segment edge-replicated reference view; rebuilt at
+    // each segment top when `isd` is set.
+    let mut seg_ref_storage: Option<YuvFrame> = None;
     for mb_row in 0..mb_rows {
         match framing {
             InterFraming::Single => {}
@@ -3817,6 +3978,18 @@ fn encode_inter_picture_motion_impl(
                 }
             }
         }
+        // Annex R — at each segment top, materialize the reference
+        // view this segment is allowed to see: its own band with the
+        // out-of-band rows edge-replicated (§R.2 rule 4 treats the
+        // segment borders like picture borders, so a UMV vector
+        // reaching past them predicts from the replicated edge —
+        // byte-identical to the decoder's banded fetch clamp).
+        if isd && mb_row % rows_per_gob == 0 {
+            let top = mb_row * 16;
+            let bottom = ((mb_row + rows_per_gob) * 16).min(lh);
+            seg_ref_storage = Some(band_replicated_reference(reference, top, bottom));
+        }
+        let seg_ref: &YuvFrame = seg_ref_storage.as_ref().unwrap_or(reference);
         for mb_col in 0..mb_cols {
             let predictor = grid.predict(mb_col, mb_row);
             let mv = if umv && plus {
@@ -3825,7 +3998,7 @@ fn encode_inter_picture_motion_impl(
                 // window (∩ the §D.1.1 border bound) is codable.
                 crate::encoder_motion::estimate_motion_umv_plus(
                     frame,
-                    reference,
+                    seg_ref,
                     mb_col,
                     mb_row,
                     predictor,
@@ -3835,7 +4008,7 @@ fn encode_inter_picture_motion_impl(
             } else if umv {
                 crate::encoder_motion::estimate_motion_umv(
                     frame,
-                    reference,
+                    seg_ref,
                     mb_col,
                     mb_row,
                     predictor,
@@ -3845,7 +4018,7 @@ fn encode_inter_picture_motion_impl(
             } else {
                 crate::encoder_motion::estimate_motion(
                     frame,
-                    reference,
+                    seg_ref,
                     mb_col,
                     mb_row,
                     predictor,
@@ -3866,7 +4039,7 @@ fn encode_inter_picture_motion_impl(
             for blk in 0..4 {
                 let bx = mb_x + (blk % 2) * 8;
                 let by = mb_y + (blk / 2) * 8;
-                let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
+                let pred = motion_compensated_block(&seg_ref.y, lw, lh, bx, by, mv);
                 let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
                 for (d, &p) in pred_i16.iter_mut().zip(pred.iter()) {
                     *d = p as i16;
@@ -3874,8 +4047,8 @@ fn encode_inter_picture_motion_impl(
                 let residual = residual_of(&src.luma[blk], &pred_i16);
                 luma_enc.push(crate::encoder_block::encode_inter_block(&residual, quant));
             }
-            let cb_pred = motion_compensated_block(&reference.cb, cw, ch, c_x, c_y, chroma_mv);
-            let cr_pred = motion_compensated_block(&reference.cr, cw, ch, c_x, c_y, chroma_mv);
+            let cb_pred = motion_compensated_block(&seg_ref.cb, cw, ch, c_x, c_y, chroma_mv);
+            let cr_pred = motion_compensated_block(&seg_ref.cr, cw, ch, c_x, c_y, chroma_mv);
             let mut cb_pred_i = [0i16; COEFFS_PER_BLOCK];
             let mut cr_pred_i = [0i16; COEFFS_PER_BLOCK];
             for i in 0..COEFFS_PER_BLOCK {
@@ -3912,7 +4085,7 @@ fn encode_inter_picture_motion_impl(
                 for blk in 0..4 {
                     let bx = mb_x + (blk % 2) * 8;
                     let by = mb_y + (blk / 2) * 8;
-                    let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
+                    let pred = motion_compensated_block(&seg_ref.y, lw, lh, bx, by, mv);
                     for row in 0..8 {
                         for col in 0..8 {
                             let sv = frame.y[(by + row) * lw + (bx + col)] as i32;

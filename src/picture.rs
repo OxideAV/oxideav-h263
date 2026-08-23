@@ -1160,7 +1160,16 @@ fn decode_sac_macroblock_stream(
             // recorded; flush its deferred luminance.
             if let Some(p) = pending_ap.take() {
                 let r = reference.ok_or(Error::NotImplemented)?;
-                reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total, None);
+                reconstruct_pending_ap_luma(
+                    &p,
+                    r,
+                    &mut frame,
+                    &grid,
+                    mb_cols,
+                    mb_rows_total,
+                    None,
+                    None,
+                );
             }
             pending_ap = pending_new;
         }
@@ -1168,12 +1177,21 @@ fn decode_sac_macroblock_stream(
         // right neighbour is outside the picture.
         if let Some(p) = pending_ap.take() {
             let r = reference.ok_or(Error::NotImplemented)?;
-            reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total, None);
+            reconstruct_pending_ap_luma(
+                &p,
+                r,
+                &mut frame,
+                &grid,
+                mb_cols,
+                mb_rows_total,
+                None,
+                None,
+            );
         }
     }
 
     if options.deblock {
-        apply_deblocking(&mut frame, &grid, &mb_quant, mb_cols, mb_rows_total);
+        apply_deblocking(&mut frame, &grid, &mb_quant, mb_cols, mb_rows_total, false);
     }
 
     Ok(frame)
@@ -2596,6 +2614,79 @@ pub fn extract_psupp(picture: &[u8]) -> Result<Vec<u8>> {
     crate::annex_l::read_pei_psupp(&mut reader)
 }
 
+/// Annex R §R.2 — pre-scan a picture's remaining bytes for the GOB
+/// headers that delimit its video picture segments, and return the
+/// per-macroblock-row luma pixel band `(top, bottom)` of the owning
+/// segment.
+///
+/// The location of the top of each segment "is indicated by the
+/// presence of a non-empty GOB header"; GOB headers are byte-aligned
+/// (§5.2.1 GSTUF) and H.263's variable-length layers cannot emulate a
+/// start code, so a byte-aligned match of the 17-bit GBSC followed by
+/// a Group Number in the header range `1..num_gobs` identifies
+/// exactly the GOBs whose headers are on the wire. The scan runs
+/// before macroblock decode because a segment's bottom border (the
+/// top of the *next* segment, §R.2) must be known while motion
+/// compensation inside the segment clamps its reference fetches.
+fn scan_isd_segment_bands(data: &[u8], from: usize, layout: &PictureLayout) -> Vec<(usize, usize)> {
+    use crate::gob_header::{GBSC_BITS, GBSC_VALUE};
+
+    let luma_h = layout.luma_height as usize;
+    let mb_rows_total = luma_h.div_ceil(16);
+    let rows_per_gob = layout.mb_rows_per_gob as usize;
+    let num_gobs = layout.num_gobs;
+
+    // Segment top macroblock rows: the picture top plus every GOB
+    // whose header is on the wire.
+    let mut tops: Vec<usize> = vec![0];
+    let mut i = from;
+    while i + 3 <= data.len() {
+        // Byte-aligned GBSC pre-filter: 16 zero bits then a "1".
+        if data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] & 0x80 != 0 {
+            let mut probe = BitReader::with_position(data, i);
+            if matches!(probe.read_u32(GBSC_BITS), Ok(v) if v == GBSC_VALUE) {
+                if let Ok(gn) = probe.read_u32(5) {
+                    if gn >= 1 && gn < num_gobs {
+                        tops.push(gn as usize * rows_per_gob);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    tops.sort_unstable();
+    tops.dedup();
+
+    let mut bands = vec![(0usize, luma_h); mb_rows_total];
+    for (si, &top_row) in tops.iter().enumerate() {
+        let bottom_row = tops.get(si + 1).copied().unwrap_or(mb_rows_total);
+        let band = (top_row * 16, (bottom_row * 16).min(luma_h));
+        for row_band in bands
+            .iter_mut()
+            .take(bottom_row.min(mb_rows_total))
+            .skip(top_row)
+        {
+            *row_band = band;
+        }
+    }
+    bands
+}
+
+/// Build a reference-plane view for motion compensation: banded to the
+/// Annex R video picture segment when `band` is set, the whole plane
+/// otherwise.
+fn ref_plane_isd<'a>(
+    samples: &'a [u8],
+    width: usize,
+    height: usize,
+    band: Option<(usize, usize)>,
+) -> RefPlane<'a> {
+    match band {
+        Some((top, bottom)) => RefPlane::banded(samples, width, height, top, bottom),
+        None => RefPlane::new(samples, width, height),
+    }
+}
+
 /// Rewrite a baseline-PTYPE picture so its §5.1.24 / §5.1.25 PEI loop
 /// carries `octets` of PSUPP data (appended after any octets the
 /// picture already carries), shifting the remaining picture payload
@@ -2998,6 +3089,7 @@ pub fn decode_picture_layer_with_inherited(
                 improved_pb,
                 cpm_psbi,
                 umv,
+                isd,
             } = plus_ptype_to_baseline_shim(
                 &extended, options, inherited, /* allow_rps */ false,
             )?;
@@ -3023,15 +3115,25 @@ pub fn decode_picture_layer_with_inherited(
             //   zero warping, clip fill, 1/16-pixel accuracy.
             //
             // RCRPR (§P.3) is the current picture's RTYPE bit for both.
-            let resampled_ref = match extended.plus.rprp {
-                Some(params) => explicit_resample(reference, &layout, &params),
-                None => maybe_implicit_resample(
-                    reference,
-                    &layout,
-                    &header,
-                    /* rpr_on */ false,
-                    extended.plus.mpptype.rounding_type,
-                ),
+            let resampled_ref = if isd {
+                // §R.2 rule 7 — no Reference Picture Resampling with
+                // Independent Segment Decoding (the shim already
+                // refused the explicit RPRP form; suppressing the
+                // §P.1 implicit form here means a size-mismatched
+                // reference is refused by the driver instead of
+                // resampled).
+                None
+            } else {
+                match extended.plus.rprp {
+                    Some(params) => explicit_resample(reference, &layout, &params),
+                    None => maybe_implicit_resample(
+                        reference,
+                        &layout,
+                        &header,
+                        /* rpr_on */ false,
+                        extended.plus.mpptype.rounding_type,
+                    ),
+                }
             };
             let effective_ref = resampled_ref.as_ref().or(reference);
             // Annex K Slice-Structured mode (OPPTYPE SS bit set) replaces
@@ -3067,7 +3169,7 @@ pub fn decode_picture_layer_with_inherited(
                     // capability discards PSUPP; consume the loop to leave
                     // the reader on the first bit of GOB-0 macroblock data.
                     skip_pei_psupp(&mut reader)?;
-                    decode_after_picture_header(
+                    decode_after_picture_header_inner(
                         &mut reader,
                         &header,
                         &layout,
@@ -3075,7 +3177,12 @@ pub fn decode_picture_layer_with_inherited(
                         shim_options,
                         None,
                         Some(pquant),
+                        None,
                         umv,
+                        // Annex R — hand the driver the picture bytes
+                        // so it can pre-scan the GOB headers into the
+                        // segment map.
+                        isd.then_some(data),
                     )?
                 }
             };
@@ -3160,13 +3267,16 @@ pub fn decode_picture_layer_rps(
         improved_pb,
         cpm_psbi,
         umv,
+        isd,
     } = plus_ptype_to_baseline_shim(
         &extended,
         options,
         InheritedExtendedState::default(),
         /* allow_rps */ true,
     )?;
-    if improved_pb {
+    if improved_pb || isd {
+        // Annex R + per-segment reference re-selection is unstaged
+        // (defence-in-depth: the shim refuses ISD + RPS already).
         return Err(Error::NotImplemented);
     }
 
@@ -3237,6 +3347,7 @@ pub fn decode_picture_layer_rps(
                 Some(pquant),
                 rps_gob,
                 umv,
+                None,
             )?
         }
     };
@@ -3648,7 +3759,13 @@ pub fn decode_improved_pb_picture_with_inherited(
         improved_pb,
         cpm_psbi: _,
         umv: _,
+        isd,
     } = plus_ptype_to_baseline_shim(&extended, options, inherited, /* allow_rps */ false)?;
+    if isd {
+        // Annex R + Improved PB-frames is unstaged (the BPB part's
+        // bidirectional prediction would need the segment banding).
+        return Err(Error::NotImplemented);
+    }
     if !improved_pb {
         // Not an Improved PB-frame — the caller should use
         // [`decode_picture_layer`] for a plain INTRA / INTER picture.
@@ -4092,6 +4209,11 @@ struct PlusShimOutcome {
     /// pictures with UMV on use the Table D.3 reversible codes with
     /// the UUI-selected range; otherwise [`UmvCoding::Off`].
     umv: UmvCoding,
+    /// Annex R — the OPPTYPE Independent Segment Decoding bit (from
+    /// the wire on UFEP=001, inherited on UFEP=000). The GOB driver
+    /// treats video-picture-segment boundaries as picture boundaries
+    /// when set; callers that cannot honour it must refuse.
+    isd: bool,
 }
 
 /// Annex P §P.1 — apply implicit Reference Picture Resampling to the
@@ -4253,7 +4375,9 @@ fn plus_ptype_to_baseline_shim(
                 false, // DF inherited bit (see below)
                 false,
                 false,
-                false,
+                // Annex R is stream-scoped: a UFEP=000 picture keeps
+                // decoding under the inherited ISD treatment.
+                inherited.independent_segment_decoding,
                 false,
                 false,
             )
@@ -4289,10 +4413,28 @@ fn plus_ptype_to_baseline_shim(
     // CPM without SS stays refused).
     let rps_in_use = extended.plus.trpi.is_some();
     if opptype_sac
-        || opptype_independent_segment_decoding
         || (extended.plus.cpm && !opptype_slice_structured)
         || extended.plus.mpptype.reduced_resolution_update
         || (rps_in_use && !allow_rps)
+    {
+        return Err(Error::NotImplemented);
+    }
+
+    // Annex R — Independent Segment Decoding. Staged on the GOB
+    // driver (each non-empty GOB header opens a segment whose
+    // boundaries are treated as picture boundaries). Unstaged
+    // combinations are refused rather than decoded without the
+    // segment treatment:
+    //
+    // * §R.3.1 — ISD + Slice Structured requires the Rectangular
+    //   Slice submode; the rect-slice band confinement is not staged,
+    //   so any ISD + SS picture is refused.
+    // * §R.2 rule 7 — "no use of the Reference Picture Resampling
+    //   mode with the Independent Segment Decoding mode" (the caller
+    //   also suppresses §P.1 implicit resampling when `isd` is set).
+    // * ISD + Annex N RPS per-segment re-selection is unstaged.
+    if opptype_independent_segment_decoding
+        && (opptype_slice_structured || extended.plus.rprp.is_some() || rps_in_use)
     {
         return Err(Error::NotImplemented);
     }
@@ -4510,6 +4652,7 @@ fn plus_ptype_to_baseline_shim(
         improved_pb,
         cpm_psbi: extended.plus.cpm.then(|| extended.plus.psbi.unwrap_or(0)),
         umv: umv_coding,
+        isd: opptype_independent_segment_decoding,
     })
 }
 
@@ -4632,6 +4775,7 @@ fn decode_after_picture_header(
         gob0_pquant,
         None,
         umv,
+        None,
     )
 }
 
@@ -4653,6 +4797,12 @@ fn decode_after_picture_header_inner(
     gob0_pquant: Option<u8>,
     rps_gob: Option<RpsGobContext<'_>>,
     umv: UmvCoding,
+    // Annex R — `Some(picture_bytes)` (the same buffer `reader` is
+    // positioned in) when the picture decodes under Independent
+    // Segment Decoding mode; the driver pre-scans it for the
+    // byte-aligned GOB start codes that delimit the video picture
+    // segments.
+    isd_data: Option<&[u8]>,
 ) -> Result<YuvFrame> {
     // Unsupported header-signalled modes — refuse rather than guess.
     // SAC is refused outright. A PB-frames picture must arrive through
@@ -4705,6 +4855,19 @@ fn decode_after_picture_header_inner(
     // Annex I §I.3 per-8×8-block reconstructed-coefficient + metadata
     // grid. Always allocated; only read/written by the AIC code path.
     let mut aic_state = AicState::new(mb_cols, mb_rows_total);
+
+    // Annex R §R.2 — the video picture segment map: for each
+    // macroblock row, the luma pixel band `(top, bottom)` of the
+    // segment that owns it. Segments are delimited by the GOBs whose
+    // (byte-aligned, §5.2.1 GSTUF) headers are on the wire; H.263
+    // start codes cannot be emulated by the VLC layers, so a
+    // byte-aligned pre-scan for GBSC + a header-range GN finds
+    // exactly the segment tops before any macroblock decodes —
+    // required because a segment's bottom (the §R.2 "top of the next
+    // video picture segment") must be known while predicting inside
+    // it.
+    let isd_bands: Option<Vec<(usize, usize)>> =
+        isd_data.map(|data| scan_isd_segment_bands(data, reader.byte_position(), layout));
 
     // Walk GOBs top-to-bottom (§4.2.1 vertical scan).
     //
@@ -4879,6 +5042,7 @@ fn decode_after_picture_header_inner(
                     options,
                     &mut aic_state,
                     aic_segment,
+                    isd_bands.as_ref().map(|b| b[row]),
                 )?;
                 // PB-frames mode (Annex G): the six B-blocks of the
                 // macroblock follow the six P-blocks on the wire
@@ -4921,6 +5085,18 @@ fn decode_after_picture_header_inner(
                 // recorded; flush its deferred luminance.
                 if let Some(p) = pending_ap.take() {
                     let r = active_reference.ok_or(Error::NotImplemented)?;
+                    // Annex R: §F.3 — "if either the Slice Structured
+                    // mode or the Independent Segment Decoding mode
+                    // are in use, the remote motion vectors
+                    // corresponding to blocks from other video
+                    // picture segments are set to the motion vector
+                    // of the current block"; the segment id recorded
+                    // on the pending macroblock's grid entry keys the
+                    // comparison, and the reference band confines the
+                    // OBMC fetches.
+                    let seg = isd_bands
+                        .is_some()
+                        .then(|| grid[p.row * mb_cols + p.col].segment);
                     reconstruct_pending_ap_luma(
                         &p,
                         r,
@@ -4928,7 +5104,8 @@ fn decode_after_picture_header_inner(
                         &grid,
                         mb_cols,
                         mb_rows_total,
-                        None,
+                        seg,
+                        isd_bands.as_ref().map(|b| b[p.row]),
                     );
                 }
                 pending_ap = pending_new;
@@ -4940,7 +5117,19 @@ fn decode_after_picture_header_inner(
             // header / reference re-selection applies to the next row.
             if let Some(p) = pending_ap.take() {
                 let r = active_reference.ok_or(Error::NotImplemented)?;
-                reconstruct_pending_ap_luma(&p, r, &mut frame, &grid, mb_cols, mb_rows_total, None);
+                let seg = isd_bands
+                    .is_some()
+                    .then(|| grid[p.row * mb_cols + p.col].segment);
+                reconstruct_pending_ap_luma(
+                    &p,
+                    r,
+                    &mut frame,
+                    &grid,
+                    mb_cols,
+                    mb_rows_total,
+                    seg,
+                    isd_bands.as_ref().map(|b| b[p.row]),
+                );
             }
             // §5.2 carry-over: a header-less GOB inherits the QUANT in
             // force at the end of the previous GOB (the last macroblock's
@@ -4952,7 +5141,16 @@ fn decode_after_picture_header_inner(
     }
 
     if options.deblock {
-        apply_deblocking(&mut frame, &grid, &mb_quant, mb_cols, mb_rows_total);
+        // Annex R §R.2 rule 3 — no deblocking filter operation across
+        // video picture segment boundaries.
+        apply_deblocking(
+            &mut frame,
+            &grid,
+            &mb_quant,
+            mb_cols,
+            mb_rows_total,
+            isd_bands.is_some(),
+        );
     }
 
     Ok(frame)
@@ -7082,6 +7280,7 @@ fn decode_slice_structured_after_header_inner(
                 options,
                 &mut aic_state,
                 segment,
+                None,
             )?;
             record_grid(
                 &mut grid,
@@ -7112,6 +7311,7 @@ fn decode_slice_structured_after_header_inner(
                     mb_cols,
                     mb_rows_total,
                     Some(segment),
+                    None,
                 );
             }
             pending_ap = pending_new;
@@ -7148,6 +7348,7 @@ fn decode_slice_structured_after_header_inner(
                 mb_cols,
                 mb_rows_total,
                 Some(segment),
+                None,
             );
         }
 
@@ -7212,7 +7413,7 @@ fn decode_slice_structured_after_header_inner(
     }
 
     if options.deblock {
-        apply_deblocking(&mut frame, &grid, &mb_quant, mb_cols, mb_rows_total);
+        apply_deblocking(&mut frame, &grid, &mb_quant, mb_cols, mb_rows_total, false);
     }
 
     Ok(frame)
@@ -7280,6 +7481,11 @@ fn decode_one_macroblock(
     options: DecodeOptions,
     aic_state: &mut AicState,
     aic_segment: u32,
+    // Annex R — the luma pixel band `(top, bottom)` of the video
+    // picture segment owning this macroblock's row; `Some` only under
+    // Independent Segment Decoding. Motion-compensated fetches clamp
+    // into the band (§R.2 rule 4 border extrapolation).
+    isd_band: Option<(usize, usize)>,
 ) -> Result<(MotionVector, Mb4Mv, Option<PendingApLuma>)> {
     let luma_stride = frame.luma_width;
     let chroma_stride = frame.chroma_width();
@@ -7559,7 +7765,12 @@ fn decode_one_macroblock(
             zero_right_remote: false,
         });
     } else {
-        let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
+        let y_ref = ref_plane_isd(
+            &reference.y,
+            reference.luma_width,
+            reference.luma_height,
+            isd_band,
+        );
         for blk in 0..4 {
             let has_coef = (inter_cbpy >> (3 - blk)) & 1 == 1;
             let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
@@ -7587,10 +7798,12 @@ fn decode_one_macroblock(
     }
 
     // §T.3 — chrominance dequant uses QUANT_C when MQ is in use.
-    let cb_ref = RefPlane::new(
+    let chroma_band = isd_band.map(|(t, b)| (t / 2, b.div_ceil(2)));
+    let cb_ref = ref_plane_isd(
         &reference.cb,
         reference.chroma_width(),
         reference.chroma_height(),
+        chroma_band,
     );
     let cb_pred = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
     let cb_samples = if cbpc & 0b10 != 0 {
@@ -7614,10 +7827,11 @@ fn decode_one_macroblock(
     };
     blit_block(&mut frame.cb, chroma_stride, c_x, c_y, &cb_samples);
 
-    let cr_ref = RefPlane::new(
+    let cr_ref = ref_plane_isd(
         &reference.cr,
         reference.chroma_width(),
         reference.chroma_height(),
+        chroma_band,
     );
     let cr_pred = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
     let cr_samples = if cbpc & 0b01 != 0 {
@@ -7954,6 +8168,7 @@ struct PendingApLuma {
 /// (remote = Current). The GOB drivers pass `None` (remote vectors
 /// from other GOBs "are used in the same way as remote motion vectors
 /// inside the current GOB").
+#[allow(clippy::too_many_arguments)]
 fn reconstruct_pending_ap_luma(
     pending: &PendingApLuma,
     reference: &YuvFrame,
@@ -7962,13 +8177,20 @@ fn reconstruct_pending_ap_luma(
     mb_cols: usize,
     mb_rows_total: usize,
     slice_segment: Option<u32>,
+    // Annex R — the segment's luma band; OBMC fetches clamp into it.
+    isd_band: Option<(usize, usize)>,
 ) {
     let col = pending.col;
     let row = pending.row;
     let mb_x = col * 16;
     let mb_y = row * 16;
     let luma_stride = frame.luma_width;
-    let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
+    let y_ref = ref_plane_isd(
+        &reference.y,
+        reference.luma_width,
+        reference.luma_height,
+        isd_band,
+    );
 
     let mb_below_outside = row + 1 >= mb_rows_total;
     let mut mb_above_outside = row == 0;
@@ -8678,6 +8900,10 @@ fn apply_deblocking(
     mb_quant: &[u8],
     mb_cols: usize,
     mb_rows: usize,
+    // Annex R §R.2 rule 3 — when set, an edge whose two blocks belong
+    // to macroblocks recorded under different video picture segments
+    // is skipped (segment boundaries are treated as picture edges).
+    isd: bool,
 ) {
     let luma_w = frame.luma_width;
     let luma_h = frame.luma_height;
@@ -8692,6 +8918,18 @@ fn apply_deblocking(
         |b1: (usize, usize), b2: (usize, usize), blocks_per_mb: usize| -> EdgeCondition {
             let mb1 = (b1.0 / blocks_per_mb, b1.1 / blocks_per_mb);
             let mb2 = (b2.0 / blocks_per_mb, b2.1 / blocks_per_mb);
+            // Annex R §R.2 rule 3 — no filtering across segment
+            // boundaries.
+            if isd {
+                let seg = |m: (usize, usize)| -> Option<u32> {
+                    (m.0 < mb_cols && m.1 < mb_rows).then(|| grid[m.1 * mb_cols + m.0].segment)
+                };
+                if let (Some(s1), Some(s2)) = (seg(mb1), seg(mb2)) {
+                    if s1 != s2 {
+                        return EdgeCondition::Skip;
+                    }
+                }
+            }
             let coded = |m: (usize, usize)| -> bool {
                 if m.0 >= mb_cols || m.1 >= mb_rows {
                     return false;
@@ -10018,6 +10256,7 @@ mod tests {
             deblocking: false,
             reference_picture_selection: false,
             uui: Some(Uui::Limited),
+            independent_segment_decoding: false,
         };
         let outcome = decode_picture_layer_with_inherited(
             &data,
@@ -14484,6 +14723,7 @@ mod tests {
             deblocking: false,
             reference_picture_selection: false,
             uui: None,
+            independent_segment_decoding: false,
         };
         let outcome =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited)
@@ -14521,6 +14761,7 @@ mod tests {
             deblocking: false,
             reference_picture_selection: false,
             uui: None,
+            independent_segment_decoding: false,
         };
         let r =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited);
@@ -14662,6 +14903,7 @@ mod tests {
             deblocking: false,
             reference_picture_selection: false,
             uui: None,
+            independent_segment_decoding: false,
         };
         let outcome =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited)
@@ -14730,6 +14972,7 @@ mod tests {
                 deblocking: true,
                 reference_picture_selection: false,
                 uui: None,
+                independent_segment_decoding: false,
             },
             "UFEP=001 OPPTYPE snapshot captured into outcome.inherited"
         );
@@ -14751,6 +14994,7 @@ mod tests {
             deblocking: true,
             reference_picture_selection: false,
             uui: None,
+            independent_segment_decoding: false,
         };
         let outcome =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), primed)
@@ -14807,6 +15051,7 @@ mod tests {
             deblocking: false,
             reference_picture_selection: false,
             uui: None,
+            independent_segment_decoding: false,
         };
         let outcome =
             decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited)
@@ -14859,6 +15104,7 @@ mod tests {
                 deblocking: true,
                 reference_picture_selection: false,
                 uui: None,
+                independent_segment_decoding: false,
             }
         );
     }

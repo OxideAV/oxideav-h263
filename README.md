@@ -11,7 +11,7 @@ clean-room against [ITU-T Recommendation H.263 (01/2005)][spec].
 Full baseline **decoder**, plus a growing **encoder**. The decoder
 implements the H.263 baseline picture / GOB / macroblock / block layers
 and reconstructs INTRA and INTER pictures end-to-end, plus a wide set of
-optional Annexes (D, E, F, I, J, K, L, M, N, O, P, Q, S, T, W).
+optional Annexes (D, E, F, I, J, K, L, M, N, O, P, Q, R, S, T, W).
 
 The encoder (round 376 onward) produces baseline **INTRA (I-)** and
 **INTER (P-)** pictures plus a growing set of optional modes:
@@ -442,6 +442,29 @@ planar 4:2:0 `YuvFrame`:
   are out of scope, and a B / EI / EP picture signalling UMV is refused
   (§O.4.6 switches MVDFW / MVDBW to Table D.3 in that mode, which this
   path does not stage — round 447).
+* **Annex R** — Independent Segment Decoding mode on the GOB
+  segmentation (round 450): an extended-PTYPE picture whose OPPTYPE
+  bit 12 is set (inherited by UFEP=000 followers) treats each video
+  picture segment — the GOBs delimited by the non-empty GOB headers on
+  the wire (§R.2) — as a picture of its own: the driver pre-scans the
+  byte-aligned GBSCs into a per-row segment-band map before any
+  macroblock decodes (a segment's bottom is the *next* header's top,
+  which must be known while predicting inside it), motion-compensated
+  fetches — single-MV, INTER4V, OBMC and chrominance — clamp into the
+  segment's reference band (§R.2 rule 4 border extrapolation, the
+  `RefPlane::banded` view), §F.3 OBMC remotes from other segments
+  substitute the current vector (rule 2), the §J.3 deblocking filter
+  skips every edge crossing a segment boundary (rule 3), and §P
+  Reference Picture Resampling is refused (rule 7); the §6.1.1 / §I.3
+  predictor confinement (rule 1) is inherent in the per-header
+  segmentation. The encoder pair `encode_intra_picture_isd` /
+  `encode_inter_picture_isd` (PLUSPTYPE ISD + UMV, one GOB header per
+  GOB, motion search and prediction against an edge-replicated
+  per-segment reference view) round-trips closed-loop byte-exact;
+  clearing the ISD bit in the emitted stream changes the P-picture
+  reconstruction, pinning that the treatment fires. ISD + Slice
+  Structured (§R.3.1 Rectangular Slice band confinement), ISD +
+  Improved-PB / RPS / RRU stay refused.
 * **Annex L / Annex W** — supplemental enhancement information
   (round 450): the `annex_l` module stages the §5.1.24/§5.1.25 PEI +
   PSUPP loop primitives (`read_pei_psupp` / `write_pei_psupp`) and the
@@ -562,7 +585,10 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   to (§N.4.2.9 NOTE), which the picture-header parser cannot know.
   The §N.4.1 per-segment TRP re-selection decodes to pixels on both
   the GOB-layer and the Annex K slice-layer paths.
-* Slice-boundary / Independent-Segment-Decoding deblock skip rules.
+* Annex R Independent Segment Decoding on the Annex K path (§R.3.1
+  Rectangular-Slice rectangle confinement) and combined with Improved
+  PB-frames / Annex N RPS / Annex Q RRU (the GOB-segmented I / P shape
+  decodes and encodes — see the supported list).
 * Annex G PB-frames and Annex M Improved PB-frames now both decode
   end-to-end through `decode_sequence` (see the supported list). Still
   unstaged within those modes: Advanced Prediction / INTER4V B-blocks, UMV

@@ -431,6 +431,15 @@ pub struct RefPlane<'a> {
     pub width: usize,
     /// Plane height in pixels.
     pub height: usize,
+    /// Optional vertical fetch band `(top, bottom)` — top inclusive,
+    /// bottom exclusive, in plane rows. When set, sample fetches clamp
+    /// the row coordinate into the band instead of the full plane: the
+    /// Annex R Independent Segment Decoding rule that a video picture
+    /// segment's boundaries "are treated as picture boundaries when
+    /// decoding", extrapolating the segment borders of the reference
+    /// exactly as §D.1 extrapolates the picture borders. `None` (the
+    /// [`Self::new`] default) keeps the whole-plane §D.1 behaviour.
+    pub band_rows: Option<(usize, usize)>,
 }
 
 impl<'a> RefPlane<'a> {
@@ -442,15 +451,41 @@ impl<'a> RefPlane<'a> {
             samples,
             width,
             height,
+            band_rows: None,
+        }
+    }
+
+    /// Construct a plane view whose fetches are confined to the rows
+    /// `top..bottom` (Annex R §R.2 rule 4 — the reference data of a
+    /// video picture segment, with the segment's horizontal borders
+    /// extrapolated like picture borders). An empty or out-of-range
+    /// band is clamped to the plane.
+    pub fn banded(
+        samples: &'a [u8],
+        width: usize,
+        height: usize,
+        top: usize,
+        bottom: usize,
+    ) -> Self {
+        debug_assert_eq!(samples.len(), width * height);
+        let bottom = bottom.min(height).max(1);
+        let top = top.min(bottom - 1);
+        Self {
+            samples,
+            width,
+            height,
+            band_rows: Some((top, bottom)),
         }
     }
 
     /// Fetch a sample with §D.1 edge replication: coordinates outside
-    /// the coded picture area are clamped to the nearest edge pixel.
+    /// the coded picture area — or, for a banded view, outside the
+    /// segment band — are clamped to the nearest in-bounds pixel.
     #[inline]
     fn at(&self, x: i32, y: i32) -> i32 {
+        let (top, bottom) = self.band_rows.unwrap_or((0, self.height));
         let cx = x.clamp(0, self.width as i32 - 1) as usize;
-        let cy = y.clamp(0, self.height as i32 - 1) as usize;
+        let cy = y.clamp(top as i32, bottom as i32 - 1) as usize;
         self.samples[cy * self.width + cx] as i32
     }
 }
