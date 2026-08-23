@@ -346,6 +346,12 @@ pub struct H263StreamDecoder {
     reference: Option<YuvFrame>,
     /// §5.1.4.4 inherited-mode + §G.4 reference-TR stream state.
     state: SequenceState,
+    /// Buffered-tail length at the last *failed* eager decode attempt
+    /// (`0` = no failed attempt for the current tail). The next eager
+    /// attempt waits until the tail has at least doubled, so a stream
+    /// delivered in many small fragments costs amortised linear work
+    /// instead of re-decoding the growing tail after every packet.
+    eager_floor: usize,
     /// End-of-stream flag set by `flush`.
     flushed: bool,
 }
@@ -368,6 +374,7 @@ impl H263StreamDecoder {
             pending: VecDeque::new(),
             reference: None,
             state: SequenceState::default(),
+            eager_floor: 0,
             flushed: false,
         })
     }
@@ -404,6 +411,7 @@ impl H263StreamDecoder {
         .map_err(core_error)?;
         self.commit_frames(frames, pts)?;
         self.discard(end);
+        self.eager_floor = 0;
         Ok(())
     }
 
@@ -468,6 +476,16 @@ impl H263StreamDecoder {
                     // Unterminated tail: decode eagerly — a picture
                     // carries a fixed macroblock count, so a truncated
                     // tail surfaces UnexpectedEof and we wait instead.
+                    // Back off geometrically after a failed attempt:
+                    // re-trying after every small fragment would
+                    // re-decode the growing tail quadratically (a
+                    // delivery-shape DoS), so the next attempt waits
+                    // until the tail has doubled; a following PSC
+                    // still terminates the picture immediately.
+                    if self.eager_floor != 0 && self.buf.len() < self.eager_floor.saturating_mul(2)
+                    {
+                        return Ok(());
+                    }
                     let pts_at = self.stream_pos;
                     let mut speculative = self.state;
                     match decode_sequence_step(
@@ -491,9 +509,13 @@ impl H263StreamDecoder {
                             };
                             let drop = self.buf.len() - keep;
                             self.discard(drop);
+                            self.eager_floor = 0;
                             return Ok(());
                         }
-                        Err(crate::Error::UnexpectedEof) => return Ok(()),
+                        Err(crate::Error::UnexpectedEof) => {
+                            self.eager_floor = self.buf.len();
+                            return Ok(());
+                        }
                         Err(e) => return Err(core_error(e)),
                     }
                 }
@@ -546,6 +568,7 @@ impl Decoder for H263StreamDecoder {
         self.pending.clear();
         self.reference = None;
         self.state = SequenceState::default();
+        self.eager_floor = 0;
         self.flushed = false;
         Ok(())
     }

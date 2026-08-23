@@ -8,6 +8,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Fuzz-found: quadratic eager re-decode in the streaming registry
+  decoder** (round 450): a stream delivered in many small fragments
+  made `H263StreamDecoder` re-attempt a decode of the growing
+  unterminated tail after every packet — a delivery-shape DoS the new
+  `registry_decoder` fuzz target surfaced as >10 s single inputs. The
+  eager attempt now backs off geometrically (retry only once the tail
+  has doubled since the last failed attempt; a following PSC still
+  completes the picture immediately), taking the slow units from
+  >10 s to <100 ms with one-packet-per-picture latency unchanged.
+
 - **`register()` installs a real codec entry** (round 450; closes the
   cross-crate finding that the registry path was a no-op stub):
   registry resolution through an `oxideav_core::RuntimeContext` now
@@ -29,6 +39,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   shred and one-picture-per-packet deliveries.
 
 ### Added
+
+- **Fuzz harness** (round 450): `fuzz/` sub-crate with four
+  `cargo fuzz` targets — `decode_sequence`, `registry_decoder`
+  (fuzzer-chosen packetisation + reset-recovery), `psupp` (Annex L/W
+  round-trip idempotence) and `picture_header`. All clean after the
+  eager-decode fix above.
 
 - **Annex R Independent Segment Decoding mode, GOB segmentation, both
   directions** (round 450): the PLUSPTYPE shim accepts the OPPTYPE

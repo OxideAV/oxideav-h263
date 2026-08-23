@@ -690,6 +690,15 @@ output is asserted within that ±1 tolerance; the flat sub-QCIF keyframe
 
 Run with `cargo test -p oxideav-h263`.
 
+The `fuzz/` sub-crate (its own workspace) carries four
+`cargo fuzz` targets: `decode_sequence` (whole-stream decode, default
+and deblock/OBMC-deviation options), `registry_decoder` (the streaming
+`oxideav_core` decoder adapter under fuzzer-chosen packetisation, with
+mid-stream error recovery via `reset()`), `psupp` (Annex L/W
+parse → write → parse idempotence) and `picture_header` (baseline +
+PLUSPTYPE picture-layer parsers plus the `extract_psupp` /
+`insert_psupp` pair). Seed the corpora from `tests/fixtures/`.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
