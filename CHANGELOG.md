@@ -56,6 +56,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   Measured on non-linear motion the searched B-picture beats the
   `MVD = 0` encoder; `b_search_half = 0` restores the old behaviour.
 
+- **Rate/PSNR ladder pin** (round 453): `tests/rate_psnr_ladder.rs`
+  encodes QCIF and CIF moving clips through the closed-loop GOP
+  encoder at QP 2..31 and asserts the ladder is monotone on both axes
+  (rate falls, PSNR falls as QP coarsens) with loose endpoint
+  anchors; the measured table is printed for the README.
+
 - **Black-box reference-decoder cross-validation** (round 453):
   `tests/ffmpeg_blackbox.rs` hands crate-encoded elementary streams
   (baseline I at four quantisers and three sizes, I+P GOPs, UMV,
