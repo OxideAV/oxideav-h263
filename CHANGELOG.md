@@ -6,6 +6,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Annex J Deblocking Filter mode — encoder arm** (round 453):
+  `encode_intra_picture_deblock` / `encode_inter_picture_deblock`
+  (`DeblockConfig`) emit self-describing H.263+ pictures with OPPTYPE
+  bit 9, coding motion under the mode's Table J.1 element set — §F.2
+  predictors for every macroblock, a per-macroblock one/four-vector
+  (INTER4V) cost decision with plain (non-OBMC) block prediction, the
+  Table 18 / Table F.1 chroma-vector split the decoder applies, the
+  §5.3.2 INTRA-refresh decision and COD = 1 skipping — plus optional
+  Annex D extended range (Table D.3 difference coding).
+  `GopConfig::deblock` / `GopConfig::four_mv` route the closed-loop
+  `encode_sequence` GOP driver through the mode, predicting from the
+  §J.3-filtered reconstruction the crate decoder returns.
+
 ### Fixed
 
 - **Fuzz-found: infinite loop on truncated SAC pictures** (round

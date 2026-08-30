@@ -275,6 +275,7 @@ fn gop_driver_public_api_round_trips() {
         search_half: 2,
         umv: false,
         eos: true,
+        ..GopConfig::default()
     };
     let stream = encode_sequence(&frames, &cfg, 0).unwrap();
     assert!(stream.ends_with(&EOS_BYTES));

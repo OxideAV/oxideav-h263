@@ -131,6 +131,7 @@ fn gop_stream_round_trips_at_every_budget() {
         search_half: 4,
         umv: false,
         eos: true,
+        ..GopConfig::default()
     };
     let stream = encode_sequence(&frames, &cfg, 0).expect("encode GOP");
     let reference_frames = decode_sequence(&stream, DecodeOptions::default()).expect("decode");

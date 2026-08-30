@@ -34,8 +34,12 @@ use crate::picture_header::{H263SourceFormat, PSC_VALUE};
 use crate::{Error, Result};
 use oxideav_core::bits::BitWriter;
 
+pub use crate::encoder_deblock::{
+    encode_inter_picture_deblock, encode_intra_picture_deblock, DeblockConfig,
+};
+
 /// Map standard luma dimensions to the §5.1.3 source-format selector.
-fn source_format_for(luma_w: usize, luma_h: usize) -> Option<H263SourceFormat> {
+pub(crate) fn source_format_for(luma_w: usize, luma_h: usize) -> Option<H263SourceFormat> {
     match (luma_w, luma_h) {
         (128, 96) => Some(H263SourceFormat::SubQcif),
         (176, 144) => Some(H263SourceFormat::Qcif),
@@ -63,7 +67,11 @@ fn source_format_bits(fmt: H263SourceFormat) -> u32 {
 ///
 /// Luma blocks are the 2×2 grid Y1..Y4; chroma is a single 8×8 block
 /// each (the macroblock's 16×16 luma maps to 8×8 chroma at 4:2:0).
-fn extract_macroblock(frame: &YuvFrame, mb_col: usize, mb_row: usize) -> MacroblockSamples {
+pub(crate) fn extract_macroblock(
+    frame: &YuvFrame,
+    mb_col: usize,
+    mb_row: usize,
+) -> MacroblockSamples {
     let lw = frame.luma_width;
     let cw = frame.chroma_width();
     let mut mb = MacroblockSamples {
@@ -2821,7 +2829,7 @@ where
 
 /// Per-element signed residual `source − prediction` of two 8×8 sample
 /// blocks (range roughly `[-255, 255]`).
-fn residual_of(
+pub(crate) fn residual_of(
     source: &[i16; COEFFS_PER_BLOCK],
     prediction: &[i16; COEFFS_PER_BLOCK],
 ) -> [i16; COEFFS_PER_BLOCK] {
@@ -2931,7 +2939,7 @@ pub fn encode_inter_picture(
 
 /// Fetch the 8×8 block at pixel origin `(x0, y0)` from a plane with the
 /// given row stride into a flat `[u8; 64]`.
-fn motion_compensated_block(
+pub(crate) fn motion_compensated_block(
     plane: &[u8],
     width: usize,
     height: usize,
@@ -4855,6 +4863,16 @@ pub struct GopConfig {
     /// Append the §5.1.27 End Of Sequence marker after the last
     /// picture.
     pub eos: bool,
+    /// Encode every picture in the Annex J **Deblocking Filter mode**
+    /// (H.263+ headers, OPPTYPE bit 9): the closed loop predicts from
+    /// the §J.3-filtered reconstruction, P-pictures use the mode's
+    /// §F.2 predictors and may carry four vectors per macroblock
+    /// ([`Self::four_mv`]). Composes with [`Self::umv`] (Table D.3
+    /// difference coding).
+    pub deblock: bool,
+    /// Allow four motion vectors per macroblock (INTER4V) in
+    /// deblocking-mode P-pictures (ignored without [`Self::deblock`]).
+    pub four_mv: bool,
 }
 
 impl Default for GopConfig {
@@ -4865,6 +4883,8 @@ impl Default for GopConfig {
             search_half: 8,
             umv: false,
             eos: false,
+            deblock: false,
+            four_mv: true,
         }
     }
 }
@@ -4899,10 +4919,21 @@ pub fn encode_sequence(frames: &[YuvFrame], cfg: &GopConfig, tr0: u8) -> Result<
         let tr = tr0.wrapping_add(i as u8);
         let force_intra = recon.is_none() || (cfg.intra_period != 0 && i % cfg.intra_period == 0);
         let bytes = if force_intra {
-            encode_intra_picture(frame, cfg.quant, tr)?
+            if cfg.deblock {
+                encode_intra_picture_deblock(frame, cfg.quant, tr)?
+            } else {
+                encode_intra_picture(frame, cfg.quant, tr)?
+            }
         } else {
             let reference = recon.as_ref().expect("recon present for P-picture");
-            if cfg.umv {
+            if cfg.deblock {
+                let dcfg = DeblockConfig {
+                    search_half: cfg.search_half,
+                    four_mv: cfg.four_mv,
+                    umv: cfg.umv,
+                };
+                encode_inter_picture_deblock(frame, reference, cfg.quant, tr, &dcfg)?
+            } else if cfg.umv {
                 encode_inter_picture_umv(frame, reference, cfg.quant, tr, cfg.search_half)?
             } else {
                 encode_inter_picture_motion(frame, reference, cfg.quant, tr, cfg.search_half)?
@@ -4910,11 +4941,15 @@ pub fn encode_sequence(frames: &[YuvFrame], cfg: &GopConfig, tr0: u8) -> Result<
         };
         // Closed loop: the next picture predicts from the *decoded*
         // reconstruction of this one, exactly like the decoder will.
-        let decoded = decode_picture_no_gob0_header(
-            &bytes,
-            if force_intra { None } else { recon.as_ref() },
-            DecodeOptions::default(),
-        )?;
+        // Deblocking-mode pictures go through the extended-header
+        // driver, which applies the §J.3 filter from OPPTYPE, so the
+        // reference held here is the filtered one.
+        let prior = if force_intra { None } else { recon.as_ref() };
+        let decoded = if cfg.deblock {
+            crate::picture::decode_picture_layer(&bytes, prior, DecodeOptions::default())?
+        } else {
+            decode_picture_no_gob0_header(&bytes, prior, DecodeOptions::default())?
+        };
         out.extend_from_slice(&bytes);
         recon = Some(decoded);
     }

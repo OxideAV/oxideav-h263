@@ -261,6 +261,7 @@ fn registry_encoder_stream_matches_encode_sequence() {
         search_half: 8,
         umv: false,
         eos: true,
+        ..GopConfig::default()
     };
     let direct = encode_sequence(&frames, &cfg, 0).expect("encode_sequence");
 

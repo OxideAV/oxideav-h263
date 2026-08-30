@@ -225,6 +225,7 @@ pub mod dequant;
 pub mod encoder;
 pub mod encoder_aic;
 pub mod encoder_block;
+pub mod encoder_deblock;
 pub mod encoder_mb;
 pub mod encoder_motion;
 pub mod encoder_vlc;
@@ -297,6 +298,9 @@ pub use encoder_aic::{plan_intra_block_aic, write_intra_block_aic, AicBlockPlan}
 pub use encoder_block::{
     block_has_ac, encode_inter_block, encode_intra_block, tcoef_events, write_inter_block_coeffs,
     write_intra_block, EncodedInterBlock, EncodedIntraBlock,
+};
+pub use encoder_deblock::{
+    encode_inter_picture_deblock, encode_intra_picture_deblock, DeblockConfig,
 };
 pub use encoder_mb::{
     encode_inter4v_macroblock, encode_inter_macroblock, encode_inter_macroblock_dq,
