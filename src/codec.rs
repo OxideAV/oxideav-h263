@@ -37,7 +37,10 @@
 //! every INTER picture predicts from the encoder's own decoded
 //! reconstruction, so the packet stream it emits decodes drift-free.
 //! One frame in, one packet out; the GOP shape, quantiser, motion
-//! search range, Annex D UMV mode and the optional trailing §5.1.27
+//! search range, Annex D UMV mode, Annex J Deblocking Filter mode
+//! (with its INTER4V switch), the rate-control per-picture bit target
+//! (explicit, or derived from [`CodecParameters::bit_rate`] +
+//! [`CodecParameters::frame_rate`]) and the optional trailing §5.1.27
 //! EOS marker are [`CodecParameters::options`] knobs (see
 //! [`H263EncoderOptions`]).
 
@@ -51,12 +54,17 @@ use oxideav_core::{
 };
 
 use crate::encoder::{
-    encode_inter_picture_motion, encode_inter_picture_umv, encode_intra_picture, EOS_BYTES,
+    encode_inter_picture_deblock, encode_inter_picture_motion, encode_inter_picture_umv,
+    encode_intra_picture, encode_intra_picture_deblock, DeblockConfig, EOS_BYTES,
+};
+use crate::encoder_rc::{
+    encode_inter_picture_adaptive, encode_intra_picture_adaptive, AdaptiveQuantConfig,
 };
 use crate::picture::{
     decode_picture_no_gob0_header, decode_sequence_step, next_picture_start_code, DecodeOptions,
     SequenceState, YuvFrame,
 };
+use crate::rate_control::RateController;
 
 /// The registry identifier this crate's codec registers under.
 pub const CODEC_ID: &str = "h263";
@@ -177,6 +185,23 @@ pub struct H263EncoderOptions {
     /// Append the §5.1.27 End Of Sequence marker (as one final packet)
     /// when the encoder is flushed.
     pub eos: bool,
+    /// Encode in the Annex J **Deblocking Filter mode** (H.263+
+    /// headers, OPPTYPE bit 9): the closed loop predicts from the
+    /// §J.3-filtered reconstruction and P-pictures use the mode's
+    /// Table J.1 element set.
+    pub deblock: bool,
+    /// Allow four motion vectors per macroblock (INTER4V) in
+    /// deblocking-mode P-pictures (ignored without `deblock`).
+    pub four_mv: bool,
+    /// Rate control: target bits per coded picture. `0` (default)
+    /// encodes at the constant `quant`; non-zero engages the
+    /// frame-level virtual-buffer controller **and** the §5.3.6
+    /// within-picture DQUANT governor, with `quant` as the starting
+    /// QUANT. When left `0`, a target is derived from
+    /// [`CodecParameters::bit_rate`] and
+    /// [`CodecParameters::frame_rate`] when both are set. Baseline
+    /// pictures only — combining with `deblock` or `umv` is refused.
+    pub picture_bits: u32,
 }
 
 impl Default for H263EncoderOptions {
@@ -187,6 +212,9 @@ impl Default for H263EncoderOptions {
             search: 8,
             umv: false,
             eos: false,
+            deblock: false,
+            four_mv: true,
+            picture_bits: 0,
         }
     }
 }
@@ -223,6 +251,25 @@ impl CodecOptionsStruct for H263EncoderOptions {
             default: OptionValue::Bool(false),
             help: "emit the End Of Sequence marker on flush",
         },
+        OptionField {
+            name: "deblock",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "Annex J Deblocking Filter mode (H.263+ pictures)",
+        },
+        OptionField {
+            name: "four_mv",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(true),
+            help: "INTER4V macroblocks in deblocking-mode P-pictures",
+        },
+        OptionField {
+            name: "picture_bits",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "rate-control target bits per picture; 0 = constant quant \
+                   (or derived from bit_rate + frame_rate when both are set)",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> CoreResult<()> {
@@ -232,6 +279,9 @@ impl CodecOptionsStruct for H263EncoderOptions {
             "search" => self.search = value.as_u32()?,
             "umv" => self.umv = value.as_bool()?,
             "eos" => self.eos = value.as_bool()?,
+            "deblock" => self.deblock = value.as_bool()?,
+            "four_mv" => self.four_mv = value.as_bool()?,
+            "picture_bits" => self.picture_bits = value.as_u32()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -586,6 +636,10 @@ pub struct H263StreamEncoder {
     width: usize,
     height: usize,
     opts: H263EncoderOptions,
+    /// The frame-level rate controller, present when a per-picture bit
+    /// target is configured (`picture_bits` option, or derived from
+    /// `bit_rate` / `frame_rate`).
+    rc: Option<RateController>,
     /// The encoder's own decoded reconstruction of the last picture —
     /// the next P-picture's prediction reference (closed loop, no
     /// drift).
@@ -604,7 +658,23 @@ impl H263StreamEncoder {
     /// 352×288, 4CIF 704×576, 16CIF 1408×1152) and, when set, a
     /// `pixel_format` of planar 4:2:0.
     pub fn from_params(params: &CodecParameters) -> CoreResult<Self> {
-        let opts: H263EncoderOptions = oxideav_core::parse_options(&params.options)?;
+        let mut opts: H263EncoderOptions = oxideav_core::parse_options(&params.options)?;
+        // Derive a per-picture bit target from the stream parameters
+        // when the option is not set explicitly.
+        if opts.picture_bits == 0 {
+            if let (Some(bps), Some(fr)) = (params.bit_rate, params.frame_rate) {
+                if fr.num > 0 && fr.den > 0 {
+                    opts.picture_bits = (bps.saturating_mul(fr.den as u64) / fr.num as u64)
+                        .min(u32::MAX as u64) as u32;
+                }
+            }
+        }
+        if opts.picture_bits != 0 && (opts.deblock || opts.umv) {
+            return Err(CoreError::unsupported(
+                "oxideav-h263: rate control (picture_bits / bit_rate) drives the baseline \
+                 adaptive-quantisation encoder and cannot combine with deblock or umv",
+            ));
+        }
         if !(1..=31).contains(&opts.quant) {
             return Err(CoreError::invalid(format!(
                 "oxideav-h263: quant {} outside 1..=31",
@@ -640,12 +710,15 @@ impl H263StreamEncoder {
         out_params.pixel_format = Some(PixelFormat::Yuv420P);
         out_params.frame_rate = params.frame_rate;
         out_params.tag = Some(CodecTag::fourcc(b"H263"));
+        let rc = (opts.picture_bits != 0)
+            .then(|| RateController::new(opts.picture_bits, opts.quant as u8));
         Ok(H263StreamEncoder {
             id: CodecId::new(CODEC_ID),
             out_params,
             width,
             height,
             opts,
+            rc,
             recon: None,
             frame_index: 0,
             pending: VecDeque::new(),
@@ -681,8 +754,39 @@ impl Encoder for H263StreamEncoder {
         let force_intra = self.recon.is_none() || (gop != 0 && self.frame_index % gop == 0);
         let quant = self.opts.quant as u8;
         let search = self.opts.search as i32;
-        let bytes = if force_intra {
-            encode_intra_picture(&yuv, quant, tr)
+        let bytes = if let Some(rc) = self.rc.as_mut() {
+            // Rate-controlled: the frame-level controller picks the
+            // starting QUANT and the §5.3.6 within-picture governor
+            // regulates against the per-picture budget.
+            let acfg = AdaptiveQuantConfig {
+                target_bits: self.opts.picture_bits,
+                initial_quant: rc.next_quant(),
+                search_half: search,
+            };
+            let pic = if force_intra {
+                encode_intra_picture_adaptive(&yuv, &acfg, tr)
+            } else {
+                let reference = self.recon.as_ref().expect("recon present for P-picture");
+                encode_inter_picture_adaptive(&yuv, reference, &acfg, tr)
+            }
+            .map_err(core_error)?;
+            rc.update(pic.bytes.len() as u64 * 8);
+            pic.bytes
+        } else if self.opts.deblock {
+            if force_intra {
+                encode_intra_picture_deblock(&yuv, quant, tr)
+            } else {
+                let reference = self.recon.as_ref().expect("recon present for P-picture");
+                let dcfg = DeblockConfig {
+                    search_half: search,
+                    four_mv: self.opts.four_mv,
+                    umv: self.opts.umv,
+                };
+                encode_inter_picture_deblock(&yuv, reference, quant, tr, &dcfg)
+            }
+            .map_err(core_error)?
+        } else if force_intra {
+            encode_intra_picture(&yuv, quant, tr).map_err(core_error)?
         } else {
             let reference = self.recon.as_ref().expect("recon present for P-picture");
             if self.opts.umv {
@@ -690,19 +794,22 @@ impl Encoder for H263StreamEncoder {
             } else {
                 encode_inter_picture_motion(&yuv, reference, quant, tr, search)
             }
-        }
-        .map_err(core_error)?;
+            .map_err(core_error)?
+        };
         // Closed loop: the next picture predicts from the *decoded*
         // reconstruction of this one, exactly like the decoder will.
-        let decoded = decode_picture_no_gob0_header(
-            &bytes,
-            if force_intra {
-                None
-            } else {
-                self.recon.as_ref()
-            },
-            DecodeOptions::default(),
-        )
+        // Deblocking-mode pictures go through the extended-header
+        // driver so the reference held here is the §J.3-filtered one.
+        let prior = if force_intra {
+            None
+        } else {
+            self.recon.as_ref()
+        };
+        let decoded = if self.opts.deblock {
+            crate::picture::decode_picture_layer(&bytes, prior, DecodeOptions::default())
+        } else {
+            decode_picture_no_gob0_header(&bytes, prior, DecodeOptions::default())
+        }
         .map_err(core_error)?;
         self.recon = Some(decoded);
         self.frame_index += 1;

@@ -357,3 +357,204 @@ fn registry_encoder_rejects_bad_geometry_and_options() {
     params.options = CodecOptions::new().set("quant", "32");
     assert!(ctx.codecs.first_encoder(&params).is_err());
 }
+
+/// The `deblock` option: the registry encoder's Annex J stream is
+/// byte-identical to the direct `encode_sequence` GOP driver with
+/// `GopConfig::deblock` (same closed loop, same governor), and decodes
+/// through the registry decoder.
+#[test]
+fn registry_encoder_deblock_option_matches_gop_driver() {
+    let frames: Vec<YuvFrame> = (0..5)
+        .map(|i| {
+            let mut f = YuvFrame {
+                y: vec![0; 176 * 144],
+                cb: vec![100; 88 * 72],
+                cr: vec![160; 88 * 72],
+                luma_width: 176,
+                luma_height: 144,
+            };
+            for y in 0..144usize {
+                for x in 0..176usize {
+                    f.y[y * 176 + x] = ((x * 3 + y * 2 + i * 9) & 0xFF) as u8;
+                }
+            }
+            f
+        })
+        .collect();
+    let cfg = GopConfig {
+        quant: 9,
+        intra_period: 4,
+        search_half: 6,
+        deblock: true,
+        four_mv: true,
+        ..GopConfig::default()
+    };
+    let direct = encode_sequence(&frames, &cfg, 0).expect("encode_sequence");
+
+    let ctx = registered_context();
+    let mut params = video_params();
+    params.width = Some(176);
+    params.height = Some(144);
+    params.options = CodecOptions::new()
+        .set("quant", "9")
+        .set("gop", "4")
+        .set("search", "6")
+        .set("deblock", "true");
+    let mut enc = ctx.codecs.first_encoder(&params).expect("resolve encoder");
+    let mut out = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        let vf = oxideav_core::VideoFrame {
+            pts: Some(i as i64),
+            planes: vec![
+                oxideav_core::VideoPlane {
+                    stride: 176,
+                    data: f.y.clone(),
+                },
+                oxideav_core::VideoPlane {
+                    stride: 88,
+                    data: f.cb.clone(),
+                },
+                oxideav_core::VideoPlane {
+                    stride: 88,
+                    data: f.cr.clone(),
+                },
+            ],
+        };
+        enc.send_frame(&Frame::Video(vf)).expect("send_frame");
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(CoreError::NeedMore) => break,
+                Err(e) => panic!("receive_packet: {e}"),
+            }
+        }
+    }
+    enc.flush().expect("flush");
+    assert_eq!(out, direct, "registry deblock stream != GOP driver");
+
+    // And it decodes through the registry decoder.
+    let mut dec = ctx
+        .codecs
+        .first_decoder(&{
+            let mut p = video_params();
+            p.width = Some(176);
+            p.height = Some(144);
+            p
+        })
+        .expect("resolve decoder");
+    dec.send_packet(&Packet::new(0, TimeBase::MICROS, out))
+        .expect("send_packet");
+    dec.flush().expect("flush");
+    let mut n = 0;
+    loop {
+        match dec.receive_frame() {
+            Ok(_) => n += 1,
+            Err(CoreError::Eof) | Err(CoreError::NeedMore) => break,
+            Err(e) => panic!("receive_frame: {e}"),
+        }
+    }
+    assert_eq!(n, frames.len());
+}
+
+/// The `picture_bits` option engages rate control: packet sizes track
+/// the per-picture budget, and the same target is derived from
+/// `bit_rate` + `frame_rate` when the option is absent.
+#[test]
+fn registry_encoder_rate_control_option_and_derivation() {
+    let frames: Vec<YuvFrame> = (0..8)
+        .map(|i| {
+            let mut f = YuvFrame {
+                y: vec![0; 176 * 144],
+                cb: vec![100; 88 * 72],
+                cr: vec![160; 88 * 72],
+                luma_width: 176,
+                luma_height: 144,
+            };
+            for y in 0..144usize {
+                for x in 0..176usize {
+                    f.y[y * 176 + x] =
+                        ((x * 5 + y * 3 + i * 17 + (x / 8 + y / 8) * 31) & 0xFF) as u8;
+                }
+            }
+            f
+        })
+        .collect();
+    let target = 6_000u32;
+
+    let run = |params: CodecParameters| {
+        let ctx = registered_context();
+        let mut enc = ctx.codecs.first_encoder(&params).expect("resolve encoder");
+        let mut sizes = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            let vf = oxideav_core::VideoFrame {
+                pts: Some(i as i64),
+                planes: vec![
+                    oxideav_core::VideoPlane {
+                        stride: 176,
+                        data: f.y.clone(),
+                    },
+                    oxideav_core::VideoPlane {
+                        stride: 88,
+                        data: f.cb.clone(),
+                    },
+                    oxideav_core::VideoPlane {
+                        stride: 88,
+                        data: f.cr.clone(),
+                    },
+                ],
+            };
+            enc.send_frame(&Frame::Video(vf)).expect("send_frame");
+            loop {
+                match enc.receive_packet() {
+                    Ok(p) => sizes.push(p.data.len() as u64 * 8),
+                    Err(CoreError::NeedMore) => break,
+                    Err(e) => panic!("receive_packet: {e}"),
+                }
+            }
+        }
+        sizes
+    };
+
+    let mut params = video_params();
+    params.width = Some(176);
+    params.height = Some(144);
+    params.options = CodecOptions::new()
+        .set("picture_bits", "6000")
+        .set("gop", "0");
+    let explicit = run(params);
+
+    // Steady state (skip the I picture + warm-up): mean within ±30 %.
+    let steady = &explicit[2..];
+    let mean = steady.iter().sum::<u64>() as f64 / steady.len() as f64;
+    let err = (mean - target as f64).abs() / target as f64;
+    assert!(err < 0.30, "mean {mean:.0} bits vs target {target}");
+
+    // Derived target: bit_rate 90 000 b/s at 15 fps = 6 000 b/picture.
+    let mut params = video_params();
+    params.width = Some(176);
+    params.height = Some(144);
+    params.bit_rate = Some(90_000);
+    params.frame_rate = Some(oxideav_core::Rational::new(15, 1));
+    params.options = CodecOptions::new().set("gop", "0");
+    let derived = run(params);
+    assert_eq!(explicit, derived, "derived target != explicit target");
+}
+
+/// Rate control drives the baseline adaptive-quantisation encoder and
+/// refuses the deblock / umv combinations.
+#[test]
+fn registry_encoder_rejects_rate_control_mode_combinations() {
+    let ctx = registered_context();
+    for other in ["deblock", "umv"] {
+        let mut params = video_params();
+        params.width = Some(176);
+        params.height = Some(144);
+        params.options = CodecOptions::new()
+            .set("picture_bits", "6000")
+            .set(other, "true");
+        assert!(
+            ctx.codecs.first_encoder(&params).is_err(),
+            "picture_bits + {other} must be refused"
+        );
+    }
+}

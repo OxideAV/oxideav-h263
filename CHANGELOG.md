@@ -33,6 +33,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   driver through them, so the frame-level controller and the
   within-picture governor compose.
 
+- **Registry encoder options: `deblock`, `four_mv`, `picture_bits`**
+  (round 453): the `oxideav_core` streaming encoder now drives the
+  Annex J Deblocking Filter GOP loop (`deblock` / `four_mv`,
+  byte-identical to `encode_sequence` with `GopConfig::deblock`) and
+  the rate-controlled adaptive-quantisation loop (`picture_bits`
+  engages the frame-level virtual-buffer controller plus the §5.3.6
+  within-picture DQUANT governor; when the option is unset the target
+  derives from `CodecParameters::bit_rate` + `frame_rate`). The
+  baseline-only rate-controlled path refuses the `deblock` / `umv`
+  combinations instead of silently ignoring them.
+
 - **Black-box reference-decoder cross-validation** (round 453):
   `tests/ffmpeg_blackbox.rs` hands crate-encoded elementary streams
   (baseline I at four quantisers and three sizes, I+P GOPs, UMV,
