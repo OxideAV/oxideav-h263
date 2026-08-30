@@ -37,6 +37,10 @@ use oxideav_core::bits::BitWriter;
 pub use crate::encoder_deblock::{
     encode_inter_picture_deblock, encode_intra_picture_deblock, DeblockConfig,
 };
+pub use crate::encoder_rc::{
+    encode_inter_picture_adaptive, encode_intra_picture_adaptive, AdaptiveQuantConfig,
+    AdaptiveQuantPicture,
+};
 
 /// Map standard luma dimensions to the §5.1.3 source-format selector.
 pub(crate) fn source_format_for(luma_w: usize, luma_h: usize) -> Option<H263SourceFormat> {
@@ -109,7 +113,7 @@ pub(crate) fn extract_macroblock(
 /// The §5.1.3 PTYPE optional-mode flags the encoder can raise (bits
 /// 10–13). Baseline pictures leave every flag `false`.
 #[derive(Debug, Clone, Copy, Default)]
-struct PtypeFlags {
+pub(crate) struct PtypeFlags {
     /// Bit 10 — Annex D Unrestricted Motion Vector mode.
     umv: bool,
     /// Bit 11 — Annex E Syntax-based Arithmetic Coding mode.
@@ -124,7 +128,7 @@ struct PtypeFlags {
 /// (SAC stays 0 on this path). `pb_fields` — `Some((trb, dbquant))` —
 /// raises the PTYPE bit-13 PB-frames flag and emits the §5.1.22 TRB +
 /// §5.1.23 DBQUANT fields between CPM and PEI.
-fn write_picture_header(
+pub(crate) fn write_picture_header(
     w: &mut BitWriter,
     fmt: H263SourceFormat,
     quant: u8,
@@ -4978,6 +4982,12 @@ pub struct RateControlConfig {
     /// Annex B HRD parameters to regulate against; `None` runs the
     /// virtual-buffer controller without the HRD conformance loop.
     pub hrd: Option<crate::rate_control::HrdParams>,
+    /// Regulate **inside** each picture as well: encode pictures with
+    /// the §5.3.6 per-macroblock DQUANT governors
+    /// ([`crate::encoder_rc::encode_intra_picture_adaptive`] /
+    /// [`crate::encoder_rc::encode_inter_picture_adaptive`]) aimed at
+    /// this picture budget, instead of one QUANT per picture.
+    pub mb_adaptive: bool,
     /// Maximum re-encodes of a single picture when it lands outside
     /// the regulation bounds (HRD violation → finer QUANT; > 4× budget
     /// → coarser QUANT). `0` disables re-encoding.
@@ -4992,6 +5002,7 @@ impl Default for RateControlConfig {
             intra_period: 12,
             search_half: 8,
             hrd: None,
+            mb_adaptive: false,
             max_reencodes: 1,
         }
     }
@@ -5063,7 +5074,20 @@ pub fn encode_sequence_rate_controlled(
         let mut bytes;
         let mut reencodes = cfg.max_reencodes;
         loop {
-            bytes = if force_intra {
+            bytes = if cfg.mb_adaptive {
+                let acfg = crate::encoder_rc::AdaptiveQuantConfig {
+                    target_bits: cfg.target_bits_per_picture,
+                    initial_quant: quant,
+                    search_half: cfg.search_half,
+                };
+                if force_intra {
+                    crate::encoder_rc::encode_intra_picture_adaptive(frame, &acfg, tr)?.bytes
+                } else {
+                    let reference = recon.as_ref().expect("recon present for P-picture");
+                    crate::encoder_rc::encode_inter_picture_adaptive(frame, reference, &acfg, tr)?
+                        .bytes
+                }
+            } else if force_intra {
                 encode_intra_picture(frame, quant, tr)?
             } else {
                 let reference = recon.as_ref().expect("recon present for P-picture");

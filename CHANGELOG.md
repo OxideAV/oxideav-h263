@@ -21,6 +21,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `encode_sequence` GOP driver through the mode, predicting from the
   §J.3-filtered reconstruction the crate decoder returns.
 
+- **Within-picture adaptive quantisation** (round 453): the
+  `encoder_rc` module's `encode_intra_picture_adaptive` /
+  `encode_inter_picture_adaptive` (`AdaptiveQuantConfig`,
+  `AdaptiveQuantPicture` with the per-macroblock QUANT trace) drive
+  the §5.3.6 DQUANT primitives from a bit-budget governor: each coded
+  macroblock's QUANT follows the pro-rata picture budget through the
+  `+Q` macroblock types (±2 differential, `1..=31`), skipped
+  macroblocks hold QUANT, and the pictures stay plain baseline
+  streams. `RateControlConfig::mb_adaptive` routes the regulated GOP
+  driver through them, so the frame-level controller and the
+  within-picture governor compose.
+
 - **Black-box reference-decoder cross-validation** (round 453):
   `tests/ffmpeg_blackbox.rs` hands crate-encoded elementary streams
   (baseline I at four quantisers and three sizes, I+P GOPs, UMV,

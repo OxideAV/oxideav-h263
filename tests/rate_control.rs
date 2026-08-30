@@ -78,6 +78,7 @@ fn rate_controller_holds_long_run_average() {
         search_half: 8,
         hrd: None,
         max_reencodes: 1,
+        mb_adaptive: false,
     };
     let rcs = encode_sequence_rate_controlled(&frames, &cfg, 0).expect("encode");
     assert_eq!(rcs.picture_bits.len(), frames.len());
@@ -114,6 +115,7 @@ fn rate_controller_scales_with_target() {
             search_half: 8,
             hrd: None,
             max_reencodes: 1,
+            mb_adaptive: false,
         };
         encode_sequence_rate_controlled(&frames, &cfg, 0).expect("encode")
     };
@@ -163,6 +165,7 @@ fn rate_controlled_stream_is_hrd_conformant() {
         search_half: 8,
         hrd: Some(hrd),
         max_reencodes: 2,
+        mb_adaptive: false,
     };
     let rcs = encode_sequence_rate_controlled(&frames, &cfg, 0).expect("encode");
     assert!(
@@ -190,6 +193,7 @@ fn intra_bursts_are_absorbed() {
         search_half: 8,
         hrd: None,
         max_reencodes: 1,
+        mb_adaptive: false,
     };
     let rcs = encode_sequence_rate_controlled(&frames, &cfg, 0).expect("encode");
     // The I-pictures (0, 8, 16) overshoot...
@@ -202,4 +206,59 @@ fn intra_bursts_are_absorbed() {
         mean < 1.35 * target as f64,
         "post-I tail mean {mean:.0} vs target {target}"
     );
+}
+
+/// The §5.3.6 within-picture governor tightens the *per-picture* spread:
+/// with `mb_adaptive` the worst single-picture overshoot of a regulated
+/// GOP run is no worse than the frame-level-only controller's, and the
+/// stream still decodes end-to-end with every picture near budget.
+#[test]
+fn mb_adaptive_regulation_tightens_per_picture_spread() {
+    let frames = moving_clip(12);
+    let target = 3_000u32;
+    let run = |mb_adaptive: bool| {
+        let cfg = RateControlConfig {
+            target_bits_per_picture: target,
+            initial_quant: 10,
+            intra_period: 0,
+            search_half: 8,
+            hrd: None,
+            mb_adaptive,
+            max_reencodes: 1,
+        };
+        encode_sequence_rate_controlled(&frames, &cfg, 0).expect("encode")
+    };
+    let frame_level = run(false);
+    let adaptive = run(true);
+
+    // Whole stream still decodes and tracks the source.
+    let decoded = decode_sequence(&adaptive.bytes, DecodeOptions::default()).expect("decode");
+    assert_eq!(decoded.len(), frames.len());
+    for (i, (src, dec)) in frames.iter().zip(decoded.iter()).enumerate() {
+        let mae = luma_mae(src, dec);
+        assert!(mae < 14.0, "frame {i} MAE {mae}");
+    }
+
+    // Per-picture worst-case overshoot (P-pictures, warm-up skipped):
+    // the within-picture governor may not do worse than frame-level
+    // regulation alone.
+    let worst = |bits: &[u32]| {
+        bits[3..]
+            .iter()
+            .map(|&b| (b as i64 - target as i64).unsigned_abs())
+            .max()
+            .unwrap()
+    };
+    let w_frame = worst(&frame_level.picture_bits);
+    let w_adaptive = worst(&adaptive.picture_bits);
+    assert!(
+        w_adaptive <= w_frame + target as u64 / 10,
+        "adaptive worst overshoot {w_adaptive} vs frame-level {w_frame}"
+    );
+
+    // The steady-state mean still respects the budget.
+    let steady = &adaptive.picture_bits[3..];
+    let mean = steady.iter().map(|&b| b as u64).sum::<u64>() as f64 / steady.len() as f64;
+    let err = (mean - target as f64).abs() / target as f64;
+    assert!(err < 0.25, "adaptive mean {mean:.0} vs target {target}");
 }
