@@ -28,7 +28,9 @@ macroblock with §F.3 OBMC-exact prediction, two-pass;
 `encode_inter_picture_ap_umv_plus` pairs it with UMV+ Table D.3
 extended-range block vectors on an H.263+ header — round 447),
 `encode_pb_picture` (**Annex G** PB-frames: P-part + §G.4/§G.5
-bidirectionally-predicted B-part with BQUANT residuals),
+bidirectionally-predicted B-part with BQUANT residuals and a §5.3.9
+**MVDB** delta-vector search — the full Table 11 MODB row set,
+round 453),
 `encode_intra_picture_dquant` (§5.3.6 per-macroblock DQUANT),
 `encode_intra_picture_gobs` / `encode_inter_picture_gobs` (§5.2 GOB
 headers with per-GOB GQUANT + segmented MV prediction),
@@ -38,10 +40,17 @@ headers with per-GOB GQUANT + segmented MV prediction),
 with a rate-driven mode decision, §I.3 coefficient-domain DC/AC
 prediction from the encoder's own reconstructed neighbours, the
 Table I.2 separate INTRA VLC, and the optional **Annex T** §T.3
-chroma `QUANT_C` + §T.4 EXTENDED-ESCAPE range), and the closed-loop
-GOP driver `encode_sequence` (I + P GOPs predicting from the
-encoder's own decoded reconstruction — no drift; optional §5.1.27
-EOS).
+chroma `QUANT_C` + §T.4 EXTENDED-ESCAPE range),
+`encode_intra_picture_deblock` / `encode_inter_picture_deblock`
+(**Annex J** Deblocking Filter mode on the write side, round 453:
+OPPTYPE bit 9, the Table J.1 element set — §F.2 predictors for every
+macroblock, a per-macroblock one/four-vector INTER4V decision with
+plain non-OBMC block prediction, optional Annex D extended range —
+with the closed loop predicting from the §J.3-filtered
+reconstruction), and the closed-loop GOP driver `encode_sequence`
+(I + P GOPs predicting from the encoder's own decoded reconstruction
+— no drift; optional §5.1.27 EOS; `GopConfig::deblock` routes the
+whole GOP through the Annex J mode).
 
 The encoder also emits **on-wire H.263+ (PLUSPTYPE)** pictures:
 `write_plus_picture_header` (§5.1.4 UFEP `"001"` + OPPTYPE +
@@ -119,6 +128,23 @@ encoder against a bits-per-picture budget with §B.4-violation /
 overshoot re-encodes. Measured steady-state accuracy on the
 moving-square QCIF clip: mean bits/picture within −9.1 % … +4.6 % of
 target across 1.5 k–5 k budgets, all §B.4-conformant at `B = 4T`.
+Round 453 adds **within-picture adaptive quantisation**: the
+`encoder_rc` module's `encode_intra_picture_adaptive` /
+`encode_inter_picture_adaptive` drive the §5.3.6 per-macroblock
+DQUANT primitives from a bit-budget governor (pro-rata budget
+tracking, ±2 steps through the `+Q` macroblock types, QUANT held
+across skips), and `RateControlConfig::mb_adaptive` composes both
+layers — the frame-level controller sets each picture's budget and
+starting QUANT while the governor regulates inside it.
+
+Measured **rate/PSNR ladder** (closed-loop GOP, I + P, moving
+textured clips; pinned monotone by `tests/rate_psnr_ladder.rs`):
+
+| QP | QCIF bits/picture | QCIF Y-PSNR | CIF bits/picture | CIF Y-PSNR |
+|---:|---:|---:|---:|---:|
+| 2  | 50 808 | 44.1 dB | 206 188 | 41.5 dB |
+| 8  | 17 508 | 38.8 dB |  69 348 | 40.0 dB |
+| 31 |  4 252 | 26.2 dB |  19 244 | 26.5 dB |
 
 Everything is built bottom-up from reusable layers —
 `encoder_vlc`, `fdct`, `encoder_block` (§5.4), `encoder_aic` (§I.3
@@ -159,8 +185,10 @@ drivers: byte-aligned PSC re-framing, so one-picture-per-packet and
 arbitrarily-split raw streams both decode; PB pairs yield two display-
 order frames; `reset()` clears the cross-picture state for seeks) and
 the closed-loop `H263StreamEncoder` (`Encoder`; per-frame form of
-`encode_sequence` with `quant` / `gop` / `search` / `umv` / `eos`
-option knobs), plus the direct `make_decoder` / `make_encoder`
+`encode_sequence` with `quant` / `gop` / `search` / `umv` / `eos` /
+`deblock` / `four_mv` / `picture_bits` option knobs — the last
+engaging rate control, with the target derived from
+`CodecParameters::bit_rate` + `frame_rate` when unset — round 453), plus the direct `make_decoder` / `make_encoder`
 factories, the `H263` / `S263` FourCC tag claims and the `00 00 8x`
 Picture-Start-Code payload magics for raw-stream identification.
 Callers can equally drive the decoder through the free
@@ -283,7 +311,12 @@ planar 4:2:0 `YuvFrame`:
   and auto-enabled from the PLUSPTYPE OPPTYPE bit (the vendored
   `deblocking-filter` conformance fixture decodes within a small
   bounded tolerance — the Annex A.7 ±1 IDCT bound applies before the
-  in-loop filter, which can amplify it slightly).
+  in-loop filter, which can amplify it slightly). **Both directions**
+  since round 453: `encode_intra_picture_deblock` /
+  `encode_inter_picture_deblock` emit the mode (Table J.1 element
+  set, one/four-vector decision, optional UMV), and
+  `GopConfig::deblock` / the registry `deblock` option run the
+  closed-loop GOP through it.
   Deblocking-Filter mode also turns on the §5.3.8 / Table J.1 **four
   motion vectors per macroblock** element *without* the §F.3 OBMC
   element: when `deblock` is set, an INTER4V / INTER4V+Q macroblock
@@ -654,14 +687,14 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   non-row-aligned free-running slices (the slice encoders emit
   row-aligned slices; the rect encoders emit full-height vertical
   stripes); UMV + AP on the *baseline-PTYPE* header (the H.263+ form
-  is landed — `encode_inter_picture_ap_umv_plus`); PB-frames with
-  non-zero MVDB /
-  Annex M Improved-PB; INTRA-refresh inside the AP and PB paths; AIC
-  INTRA macroblocks inside a P-picture (only whole AIC I-pictures
-  encode so far); within-picture adaptive quantisation for rate
-  control (the Annex B HRD loop regulates per picture — the per-MB
-  DQUANT / per-GOB GQUANT / per-slice SQUANT primitives are not yet
-  driven by the controller).
+  is landed — `encode_inter_picture_ap_umv_plus`); Annex M
+  Improved-PB emission (the §5.3.9 MVDB search landed round 453 —
+  B-part deltas within the §G.4 MVF-range constraint); INTRA-refresh
+  inside the AP and PB paths; AIC INTRA macroblocks inside a
+  P-picture (only whole AIC I-pictures encode so far); per-GOB
+  GQUANT / per-slice SQUANT driven by the rate controller (the
+  per-MB §5.3.6 DQUANT governor landed round 453 —
+  `RateControlConfig::mb_adaptive`).
 * RTP: RFC 2190 Mode B/C fragmentation of SAC or Advanced-Prediction
   pictures (no macroblock-aligned bit boundaries / no 4MV predictor
   side channel); RTP transport-header (RFC 3550) concerns
@@ -669,8 +702,9 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * Registry adapter subsets: the `H263StreamDecoder` covers every
   stream shape `decode_sequence` covers (scalability / CPM streams
   still take their dedicated drivers), and the `H263StreamEncoder`
-  drives the baseline I + P GOP loop (the Annex-mode and
-  rate-controlled encoders remain direct-call entry points).
+  drives the baseline / Annex J / rate-controlled GOP loops (the
+  remaining Annex-mode encoders — AP, AIC, SAC, slices, RRU, PB —
+  stay direct-call entry points).
 
 ## Testing
 
@@ -703,6 +737,20 @@ across payload budgets, including redundant-picture-header re-parse
 checks, plus the RFC 2190 legs: Mode A GOB packets, Mode B / Mode C
 macroblock-boundary fragmentation with the side channel cross-checked
 against `enumerate_mb_boundaries`, and bit-granular reassembly.
+
+`tests/ffmpeg_blackbox.rs` cross-validates crate-encoded streams
+against an independent reference decoder binary invoked as an opaque
+oracle (baseline I across sizes and quantisers, I + P GOPs, UMV,
+Advanced Prediction, H.263+ AIC + UMV, Annex J deblocking with 1MV
+and INTER4V pictures): flat (no-AC) pictures must match byte-exactly;
+because §6.2 leaves the inverse transform to the implementation,
+AC-bearing picture `i` of a P-chain is asserted within the
+compounding per-IDCT divergence bound `±(i + 1)` (Annex A.7 bounds
+one pass at ±1; measured, the two decoders sit exactly on that
+staircase) plus a tight mean-|diff| ceiling. The tests skip with a
+notice when no oracle binary is on `PATH`.
+`tests/rate_psnr_ladder.rs` pins the measured rate/PSNR ladder above
+(monotone on both axes, endpoint anchors).
 
 `tests/fixture_decode.rs` adds end-to-end **conformance** tests against
 real H.263 elementary streams (the reference encoder) vendored under
