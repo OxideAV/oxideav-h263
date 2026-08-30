@@ -21,6 +21,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `encode_sequence` GOP driver through the mode, predicting from the
   §J.3-filtered reconstruction the crate decoder returns.
 
+- **Black-box reference-decoder cross-validation** (round 453):
+  `tests/ffmpeg_blackbox.rs` hands crate-encoded elementary streams
+  (baseline I at four quantisers and three sizes, I+P GOPs, UMV,
+  Advanced Prediction, AIC+UMV H.263+, Annex J deblocking with
+  one- and four-vector pictures) to an independent decoder binary and
+  compares its planar output with the crate's own reconstruction:
+  flat (no-AC) pictures byte-exact, AC-bearing picture `i` within the
+  compounding per-IDCT divergence bound `±(i + 1)` (§6.2 leaves the
+  inverse transform open; Annex A.7 bounds one pass at ±1) and a mean
+  |diff| ceiling three orders of magnitude under a real mismatch.
+  Skips with a notice when no oracle binary is on `PATH`.
+
 ### Fixed
 
 - **Fuzz-found: infinite loop on truncated SAC pictures** (round
