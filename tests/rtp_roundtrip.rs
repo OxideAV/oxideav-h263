@@ -411,6 +411,7 @@ fn rfc2190_mode_a_pb_fields_and_mode_c_fragmentation() {
             dbquant: 1,
             trb: 4,
             search_half: 4,
+            b_search_half: 0,
         },
     )
     .expect("PB");

@@ -44,6 +44,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   baseline-only rate-controlled path refuses the `deblock` / `umv`
   combinations instead of silently ignoring them.
 
+- **PB-frames with non-zero MVDB** (round 453): `encode_pb_picture`
+  gains a §5.3.9 delta-vector search (`PbConfig::b_search_half`,
+  half-pel window around the §G.4 scaled prediction): candidate
+  deltas are admitted only when Table 14 codable **and** keeping each
+  forward-vector component inside the §G.4 permitted range — the
+  in-range value is the one any decoder selects from the Table 14
+  codeword pair, its mate sitting exactly 64 half-pels outside — and
+  the winning delta rides MODB `"10"` (MVDB only) or `"11"`
+  (CBPB + MVDB), completing the Table 11 row set on the write side.
+  Measured on non-linear motion the searched B-picture beats the
+  `MVD = 0` encoder; `b_search_half = 0` restores the old behaviour.
+
 - **Black-box reference-decoder cross-validation** (round 453):
   `tests/ffmpeg_blackbox.rs` hands crate-encoded elementary streams
   (baseline I at four quantisers and three sizes, I+P GOPs, UMV,

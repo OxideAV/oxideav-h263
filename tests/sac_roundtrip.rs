@@ -426,6 +426,7 @@ fn sac_pb_matches_vlc_pb_reconstruction_exactly() {
         trb: 1,
         dbquant: 1,
         search_half: 3,
+        b_search_half: 0,
     };
     let vlc = encode_pb_picture(&fp, &fb, &recon, 5, 3, &cfg).expect("VLC PB");
     let sac = encode_pb_picture_sac(&fp, &fb, &recon, 5, 3, &cfg).expect("SAC PB");
@@ -456,6 +457,7 @@ fn sac_pb_static_is_lossless_both_parts() {
         trb: 1,
         dbquant: 0,
         search_half: 3,
+        b_search_half: 0,
     };
     let pb = encode_pb_picture_sac(&recon, &recon, &recon, 2, 0, &cfg).expect("encode PB");
     let pair = decode_pb_picture_sac(&pb, &recon, 0, DecodeOptions::default()).expect("decode PB");
@@ -501,6 +503,7 @@ fn sac_ap_and_pb_stream_decodes_through_decode_sequence() {
         trb: 1,
         dbquant: 0,
         search_half: 3,
+        b_search_half: 0,
     };
     let pb = encode_pb_picture_sac(&fp, &fb, &r1, 3, 1, &cfg).unwrap();
 

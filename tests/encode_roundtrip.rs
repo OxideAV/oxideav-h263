@@ -242,6 +242,7 @@ fn mixed_mode_stream_decodes_end_to_end() {
         trb: 1,
         dbquant: 0,
         search_half: 3,
+        b_search_half: 0,
     };
     let pb = encode_pb_picture(&fp, &fb, &r3, 5, 3, &cfg).unwrap();
 
@@ -1126,5 +1127,54 @@ fn cpm_slice_subbitstream_mismatch_is_refused() {
     assert_eq!(
         decode_picture_layer(&bytes, None, DecodeOptions::default()).unwrap_err(),
         Error::NotImplemented
+    );
+}
+
+/// §5.3.9 MVDB: on non-linear motion (the B-frame does not sit on the
+/// §G.4 linear interpolation of the P-vector) the delta-vector search
+/// must beat the MVD = 0 encoder on B-picture quality, and the stream
+/// still decodes as a PB pair through `decode_sequence`.
+#[test]
+fn pb_mvdb_search_improves_nonlinear_b_prediction() {
+    use oxideav_h263::encoder::{encode_intra_picture, encode_pb_picture, PbConfig};
+
+    let base = gradient(176, 144, 31);
+    // Reference at t=0, B at t=1 moved 1 px, P at t=2 moved 6 px:
+    // linear §G.4 scaling predicts the B at 3 px — off by 2 px, which
+    // only a non-zero MVDB can correct.
+    let b_src = translated(&base, 1);
+    let p_src = translated(&base, 6);
+
+    let i_bytes = encode_intra_picture(&base, 8, 0).unwrap();
+    let recon = decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
+
+    let encode_with = |b_search_half: i32| {
+        let cfg = PbConfig {
+            quant: 8,
+            trb: 1,
+            dbquant: 0,
+            search_half: 8,
+            b_search_half,
+        };
+        encode_pb_picture(&p_src, &b_src, &recon, 2, 0, &cfg).unwrap()
+    };
+    let plain = encode_with(0);
+    let searched = encode_with(6);
+    assert_ne!(plain, searched, "the MVDB search never engaged");
+
+    let decode_b = |bytes: &[u8]| {
+        let mut stream = i_bytes.clone();
+        stream.extend_from_slice(bytes);
+        let frames = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+        assert_eq!(frames.len(), 3, "I + PB pair = 3 display frames");
+        frames[1].clone() // display order: I, B, P
+    };
+    let b_plain = decode_b(&plain);
+    let b_searched = decode_b(&searched);
+    let mae_plain = luma_mae(&b_src, &b_plain);
+    let mae_searched = luma_mae(&b_src, &b_searched);
+    assert!(
+        mae_searched < mae_plain,
+        "MVDB search must improve the B picture: {mae_searched:.3} vs {mae_plain:.3}"
     );
 }

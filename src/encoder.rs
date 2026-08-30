@@ -4531,6 +4531,14 @@ pub struct PbConfig {
     pub dbquant: u8,
     /// Motion-search window for the P-part (±whole pixels).
     pub search_half: i32,
+    /// §5.3.9 MVDB refinement window for the B-part, in **half-pel**
+    /// units around the §G.4 scaled prediction (`0` disables the
+    /// search: every macroblock keeps `MVD = 0`). Each candidate
+    /// delta must keep the per-component forward vector MVF inside
+    /// the §G.4 permitted range `[-16, 15.5]` (half-pel `[-32, 31]`)
+    /// — the constraint that disambiguates the Table 14 codeword's
+    /// value pair for any decoder — and be Table 14 codable itself.
+    pub b_search_half: i32,
 }
 
 impl Default for PbConfig {
@@ -4540,6 +4548,7 @@ impl Default for PbConfig {
             trb: 1,
             dbquant: 0,
             search_half: 8,
+            b_search_half: 2,
         }
     }
 }
@@ -4717,18 +4726,81 @@ pub fn encode_pb_picture(
                 prec_cb: crate::motion::RefPlane::new(&prec_cb, 8, 8),
                 prec_cr: crate::motion::RefPlane::new(&prec_cr, 8, 8),
             };
-            let b_pred = pb_b_predict_macroblock(
-                &planes,
-                mb_x,
-                mb_y,
-                &[mv; 4],
-                None,
-                trb,
-                trd,
-                crate::motion::RCONTROL_DEFAULT,
-            );
-
             let b_src = extract_macroblock(b_source, mb_col, mb_row);
+
+            // §5.3.9 / §G.4 — MVDB refinement: search a small window
+            // of delta vectors, keeping only deltas that are Table 14
+            // codable and whose per-component MVF stays inside the
+            // §G.4 permitted range (the in-range value is what any
+            // decoder selects from the Table 14 pair, since the pair
+            // mate sits exactly 64 half-pels away — outside a range
+            // only 64 wide). SAD of the B-luma against the §G.5
+            // blended prediction decides; the zero delta (MVD = 0)
+            // competes with a flat bias so static content never pays
+            // the MODB/MVDB bits.
+            let b_sad_of = |pred: &crate::pb_layer::PbBMacroblockPrediction| -> u32 {
+                let mut sad = 0u32;
+                for blk in 0..4 {
+                    let ox = (blk % 2) * 8;
+                    let oy = (blk / 2) * 8;
+                    for j in 0..8 {
+                        for i in 0..8 {
+                            let sv = b_src.luma[blk][j * 8 + i] as i32;
+                            let pv = pred.luma[oy + j][ox + i] as i32;
+                            sad += (sv - pv).unsigned_abs();
+                        }
+                    }
+                }
+                sad
+            };
+            let mvf_in_range = |p_comp: i32, delta: i32| -> bool {
+                let mvf = (trb * p_comp) / trd + delta;
+                (-32..=31).contains(&mvf)
+            };
+            let predict_at = |delta: Option<crate::macroblock::Mvd>| {
+                pb_b_predict_macroblock(
+                    &planes,
+                    mb_x,
+                    mb_y,
+                    &[mv; 4],
+                    delta,
+                    trb,
+                    trd,
+                    crate::motion::RCONTROL_DEFAULT,
+                )
+            };
+            let mut b_pred = predict_at(None);
+            let mut best_delta: Option<crate::macroblock::Mvd> = None;
+            if cfg.b_search_half > 0 {
+                let bw = cfg.b_search_half;
+                let mut best_cost = b_sad_of(&b_pred);
+                for dy in -bw..=bw {
+                    for dx in -bw..=bw {
+                        if (dx == 0 && dy == 0)
+                            || !(-32..=31).contains(&dx)
+                            || !(-32..=31).contains(&dy)
+                            || !mvf_in_range(mv.dx_half, dx)
+                            || !mvf_in_range(mv.dy_half, dy)
+                        {
+                            continue;
+                        }
+                        let delta = crate::macroblock::Mvd {
+                            dx_half: dx as i16,
+                            dy_half: dy as i16,
+                        };
+                        let cand = predict_at(Some(delta));
+                        let cost = b_sad_of(&cand)
+                            + lambda * (dx.unsigned_abs() + dy.unsigned_abs())
+                            + 4 * lambda;
+                        if cost < best_cost {
+                            best_cost = cost;
+                            best_delta = Some(delta);
+                            b_pred = cand;
+                        }
+                    }
+                }
+            }
+
             let mut b_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(6);
             for blk in 0..4 {
                 let ox = (blk % 2) * 8;
@@ -4763,7 +4835,7 @@ pub fn encode_pb_picture(
             let any_b = b_enc.iter().any(|e| e.has_coeffs);
 
             // ---- Skip / emit. ---------------------------------------
-            if !any_p && !any_b && is_zero_mv {
+            if !any_p && !any_b && is_zero_mv && best_delta.is_none() {
                 crate::encoder_mb::encode_skipped_macroblock(&mut w);
                 grid.set_zero_candidate(mb_col, mb_row);
                 continue;
@@ -4780,7 +4852,9 @@ pub fn encode_pb_picture(
             }
             crate::encoder_vlc::write_mcbpc_p(&mut w, crate::macroblock::MbType::Inter, cbpc)?;
 
-            // §5.3.3 MODB (Table 11): "0" = no CBPB/MVDB; "11" = both.
+            // §5.3.3 MODB (Table 11): "0" = no CBPB/MVDB, "10" = MVDB
+            // only, "11" = CBPB + MVDB.
+            let has_mvdb = any_b || best_delta.is_some();
             if any_b {
                 w.write_bit(true);
                 w.write_bit(true);
@@ -4792,6 +4866,9 @@ pub fn encode_pb_picture(
                     }
                 }
                 w.write_bits(cbpb as u32, 6);
+            } else if has_mvdb {
+                w.write_bit(true);
+                w.write_bit(false);
             } else {
                 w.write_bit(false);
             }
@@ -4810,10 +4887,15 @@ pub fn encode_pb_picture(
             crate::encoder_vlc::write_mvd_component(&mut w, mvd.dx_half)?;
             crate::encoder_vlc::write_mvd_component(&mut w, mvd.dy_half)?;
 
-            // §5.3.9 MVDB = (0, 0) when MODB carries it.
-            if any_b {
-                crate::encoder_vlc::write_mvd_component(&mut w, 0)?;
-                crate::encoder_vlc::write_mvd_component(&mut w, 0)?;
+            // §5.3.9 MVDB — the searched delta (zero when only CBPB
+            // forced MODB).
+            if has_mvdb {
+                let d = best_delta.unwrap_or(crate::macroblock::Mvd {
+                    dx_half: 0,
+                    dy_half: 0,
+                });
+                crate::encoder_vlc::write_mvd_component(&mut w, d.dx_half)?;
+                crate::encoder_vlc::write_mvd_component(&mut w, d.dy_half)?;
             }
 
             // §G.3 — six P-blocks, then six B-blocks.
@@ -5975,6 +6057,7 @@ mod tests {
             trb: 1,
             dbquant: 0,
             search_half: 2,
+            b_search_half: 0,
         };
         let pb_bytes = encode_pb_picture(&recon_ref, &recon_ref, &recon_ref, 2, 0, &cfg).unwrap();
         let pair =
@@ -6011,6 +6094,7 @@ mod tests {
             trb: 1,
             dbquant: 0,
             search_half: 3,
+            b_search_half: 0,
         };
         let pb_bytes = encode_pb_picture(&p_src, &b_src, &recon_ref, 2, 0, &cfg).unwrap();
         let pair =
@@ -6047,6 +6131,7 @@ mod tests {
             trb: 1,
             dbquant: 0,
             search_half: 3,
+            b_search_half: 0,
         };
         let pb_bytes = encode_pb_picture(&p_src, &b_src, &recon_ref, 2, 0, &cfg).unwrap();
         let mut stream = i_bytes.clone();
