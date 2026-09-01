@@ -6,6 +6,58 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-h263/compare/v0.0.9...v0.0.10) - 2026-08-30
+
+### Other
+
+- round 453 encoder refresh — Annex J both directions, MVDB, adaptive quantisation, oracle validation, rate/PSNR ladder
+- rate/PSNR ladder pin over the closed-loop GOP encoder
+- PB-frames gain the §5.3.9 MVDB delta-vector search
+- encoder gains deblock / four_mv / picture_bits rate-control options
+- within-picture adaptive quantisation over the §5.3.6 DQUANT primitives
+- black-box reference-decoder cross-validation of every encoder family
+- Deblocking Filter mode encoder arm — Table J.1 element set, one/four-vector decision, GOP-driver switch
+- fix fuzz-found infinite loop on truncated arithmetic pictures
+- Data-Partitioned Slice mode, decode + encode — RVLC header partition, single-thread MV partition, marker/LMVV redundancy
+- §W.5.3 reference fixed-point IDCT 0 + companion FDCT, oracle-verified bit-exact
+- four-target harness; fix fuzz-found quadratic eager re-decode in the registry decoder
+- Independent Segment Decoding on the GOB segmentation — banded reference fetches, OBMC/deblock segment rules, ISD encoder pair
+- supplemental enhancement information layer + picture-level PSUPP splice
+- real oxideav_core codec entry — streaming decoder/encoder adapters, dual-API factories, tags + PSC payload magics
+- DF-4MV Table D.3 cell + UFEP=000 UUI inheritance pinned
+- AP + UMV+ combined encoder — Table D.3 four-vector emission
+- RRU + UMV Table D.3 pseudo-vectors land; B/EI/EP refuse UMV
+- UMV+ conformance fixture + interaction-matrix sweep + slice encoder
+- UMV+PLUSPTYPE motion vectors switch to Table D.3, both directions
+- section N.4.2 Back-Channel Message syntax, parse + write
+- Reduced-Resolution Update end-to-end, decode + encode
+- Figure-F.1 predictor fixes, skip-MB OBMC, K+AP and K+CPM compose; AP/DF fixtures vendored
+- Annex F Advanced Prediction + Annex G PB-frames compose with SAC, both directions
+- round 438 — Annex E SAC both directions, Annex K RS/ASO, HRD rate control, RFC 2190 Mode B/C
+- RFC 2190 Mode B/C — macroblock-boundary fragmentation both directions
+- Annex B HRD-regulated bit-budget loop over the GOP encoder
+- Rectangular Slice + Arbitrary Slice Ordering submodes, decode + encode
+- decode_sequence routing, motion-search SAC P encoder, §E.5 boundary-run fix
+- Annex E pictures end-to-end — decode_picture_sac + SAC I/P encoders
+- Annex E arithmetic coder core — §E.2/§E.3 coders, §E.5 stuffing, §E.8 models
+- RFC 2190 legacy Mode A + hard picture-boundary rule for both packetizers
+- round 432 — on-wire PLUSPTYPE + Annex K slice encoding + RFC 4629 RTP
+- §6.1.2 redundant picture header attachment (PLEN>0 + PEBIT)
+- RFC 4629 payload format — header, packetizer, depacketizer
+- Annex K Slice-Structured INTER pictures (encode_inter_picture_slices)
+- fix clippy doc-list lint in AIC+MQ slice docs
+- AIC (+MQ) inside Annex K slices — per-segment §I.3 availability
+- Annex K Slice-Structured INTRA pictures (encode_intra_picture_slices)
+- §K.2 slice-header writers (first-slice reduced form + SSTUF/SSC full form)
+- self-describing H.263+ pictures — on-wire AIC/MQ/UMV signalling
+- §5.1.4 PLUSPTYPE picture-header writer (PlusModes + UFEP=001 emission)
+- AIC intra sequence encoder + README AIC-encoder rollup
+- AIC + Annex T Modified Quantization INTRA picture encoder
+- per-macroblock AIC INTRA_MODE decision (rate-driven)
+- Annex I §I.3 Advanced INTRA Coding picture encoder
+- Annex I §I.3 block-level AIC encoder (plan + Table-I.2 emit)
+- Annex I §I.3 / Table I.2 INTRA-coefficient VLC writer
+
 ### Added
 
 - **Annex J Deblocking Filter mode — encoder arm** (round 453):
