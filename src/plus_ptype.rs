@@ -89,12 +89,16 @@ pub const ETR_BITS: u32 = 2;
 /// Length in bits of SSS (§5.1.10).
 pub const SSS_BITS: u32 = 2;
 /// Length in bits of ELNUM (§5.1.11).
+#[doc(hidden)]
 pub const ELNUM_BITS: u32 = 4;
 /// Length in bits of RLNUM (§5.1.12).
+#[doc(hidden)]
 pub const RLNUM_BITS: u32 = 4;
 /// Length in bits of RPSMF (§5.1.13).
+#[doc(hidden)]
 pub const RPSMF_BITS: u32 = 3;
 /// Length in bits of TRP (§5.1.15).
+#[doc(hidden)]
 pub const TRP_BITS: u32 = 10;
 
 /// UFEP value indicating the full optional part (OPPTYPE) is present.
@@ -104,10 +108,12 @@ pub const UFEP_MANDATORY_ONLY: u32 = 0b000;
 
 /// OPPTYPE source-format code `"110"` — custom source format (CPFMT
 /// follows when UFEP is `"001"`).
+#[doc(hidden)]
 pub const OPPTYPE_SRCFMT_CUSTOM: u32 = 0b110;
 
 /// CPFMT PAR-code value `"1111"` — extended PAR, EPAR follows (§5.1.5,
 /// Table 5).
+#[doc(hidden)]
 pub const PAR_CODE_EXTENDED: u32 = 0b1111;
 
 /// State carried from a prior `UFEP = "001"` picture header that a

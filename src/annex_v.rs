@@ -23,14 +23,18 @@ use oxideav_core::bits::{BitReader, BitWriter};
 
 /// §V.2.2 — the 9-bit Header Marker `1010 0010 1` that terminates the
 /// HD partition.
+#[doc(hidden)]
 pub const HEADER_MARKER: u32 = 0b1_0100_0101;
 /// Bit length of [`HEADER_MARKER`].
+#[doc(hidden)]
 pub const HEADER_MARKER_BITS: u32 = 9;
 /// §V.2.5 — the 10-bit Motion Vector Marker `0000 0000 01` that
 /// terminates the MV partition (absent when the segment carries no
 /// motion vector data).
+#[doc(hidden)]
 pub const MOTION_VECTOR_MARKER: u32 = 0b00_0000_0001;
 /// Bit length of [`MOTION_VECTOR_MARKER`].
+#[doc(hidden)]
 pub const MOTION_VECTOR_MARKER_BITS: u32 = 10;
 
 /// One decoded Table V.1 / V.2 HD entry: the macroblock's class plus
@@ -423,6 +427,7 @@ pub fn write_dps_mb_header(w: &mut BitWriter, table: &[RvlcRow], entry: DpsMbHea
 /// data and the §V.2.4 LMVV are contiguous, and the §V.2.5 marker's
 /// zero run is exactly what the rule protects.
 #[derive(Debug, Clone, Copy, Default)]
+#[doc(hidden)]
 pub struct MvdEmulationState {
     consecutive_ones: u8,
 }

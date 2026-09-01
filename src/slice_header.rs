@@ -105,6 +105,7 @@ pub const SSBI_BITS: u32 = 4;
 pub const SQUANT_BITS: u32 = 5;
 
 /// Length in bits of GFID (§5.2.5).
+#[doc(hidden)]
 pub const GFID_BITS: u32 = 2;
 
 /// Width-of-MBA-field lookup per Table K.2 for the default

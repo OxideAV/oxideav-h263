@@ -45,6 +45,7 @@ use oxideav_core::bits::{BitReader, BitWriter};
 /// Length in bits of the §N.4.1.4 GOB/slice-layer TRP field (always 10
 /// bits, unlike the picture-layer TR which is 8 or 10 bits per the
 /// custom-PCF state).
+#[doc(hidden)]
 pub const NEWPRED_TRP_BITS: u32 = 10;
 
 /// §N.4.1 — the per-segment (GOB or slice) NEWPRED reference-selection
