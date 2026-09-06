@@ -1733,7 +1733,6 @@ fn decode_rru_picture_body(
     if opptype.sac
         || opptype.advanced_prediction
         || opptype.advanced_intra
-        || opptype.deblocking
         || opptype.slice_structured
         || opptype.independent_segment_decoding
         || opptype.alternative_inter_vlc
@@ -1744,10 +1743,16 @@ fn decode_rru_picture_body(
         || options.aic
         || options.modified_quant
         || options.alt_inter_vlc
-        || options.deblock
     {
         return Err(Error::NotImplemented);
     }
+    // Annex J with RRU (round 457): the §Q.7.2 block boundary filter
+    // (the §J.3 four-tap filter with STRENGTH = +∞ on the 16 × 16
+    // block edges) replaces the §Q.7.1 default filter, and the Table
+    // J.1 four-vectors element makes MVD2-4 parseable — an INTER4V
+    // macroblock (four pseudo vectors per 32 × 32 macroblock) is still
+    // refused below.
+    let deblock = opptype.deblocking || options.deblock;
     // §Q.4 / §D.2 — with UMV on, MVDs are Table D.3 and the pseudo
     // vector is `pseudo-PC + difference` bounded by the UUI-selected
     // range ("the specified range applies to the pseudo motion
@@ -1852,7 +1857,7 @@ fn decode_rru_picture_body(
                     MbContext {
                         picture_coding_type: coding_type,
                         advanced_prediction: false,
-                        deblocking_filter: false,
+                        deblocking_filter: deblock,
                         aic_intra_mode: false,
                         pb_frames: false,
                         pb_annex_m: false,
@@ -1863,6 +1868,11 @@ fn decode_rru_picture_body(
                 )?;
                 if matches!(mb.mb_type, Some(MbType::Stuffing)) {
                     continue;
+                }
+                if matches!(mb.mb_type, Some(MbType::Inter4V | MbType::Inter4VQ)) {
+                    // Four pseudo vectors per 32 × 32 macroblock (Table
+                    // J.1 element under RRU) are unstaged.
+                    return Err(Error::NotImplemented);
                 }
                 break mb;
             };
@@ -2070,20 +2080,20 @@ fn decode_rru_picture_body(
             RruEdgeCondition::Skip
         }
     };
-    rru_filter_plane(
-        &mut frame.y,
-        geo.hc,
-        geo.vc,
-        geo.hc,
-        RruFilterMode::Default,
-        luma_cond,
-    );
+    // §Q.7 — the §Q.7.1 default two-tap filter, or under Annex J the
+    // §Q.7.2 variant (the §J.3 filter with STRENGTH = +∞).
+    let filter_mode = if deblock {
+        RruFilterMode::Deblocking
+    } else {
+        RruFilterMode::Default
+    };
+    rru_filter_plane(&mut frame.y, geo.hc, geo.vc, geo.hc, filter_mode, luma_cond);
     rru_filter_plane(
         &mut frame.cb,
         geo.hc / 2,
         geo.vc / 2,
         geo.hc / 2,
-        RruFilterMode::Default,
+        filter_mode,
         chroma_cond,
     );
     rru_filter_plane(
@@ -2091,7 +2101,7 @@ fn decode_rru_picture_body(
         geo.hc / 2,
         geo.vc / 2,
         geo.hc / 2,
-        RruFilterMode::Default,
+        filter_mode,
         chroma_cond,
     );
 

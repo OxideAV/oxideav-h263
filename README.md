@@ -410,10 +410,14 @@ planar 4:2:0 `YuvFrame`:
   formats. **UMV composes** (round 447): §Q.4 — the pseudo vector is
   `pseudo-PC + difference` with the difference read from Table D.3,
   the UUI-selected Tables-D.1/D.2 range applying to the *pseudo*
-  vectors (actual motion reach roughly doubled). AP / DF / AIC / SAC
-  / AIV / MQ / Annex K / B-EI-EP combinations inside RRU are refused. The §Q.7.2 Deblocking-Filter
-  variant and §Q.5 enlarged OBMC stay as primitives
-  (`rru_filter_plane`, `STRENGTH_RRU_INFINITE`).
+  vectors (actual motion reach roughly doubled). **Deblocking Filter
+  composes** (round 457): the §Q.7.2 variant — the §J.3 four-tap
+  filter with `STRENGTH = +∞` on the 16 × 16 block edges — replaces
+  the §Q.7.1 default, both directions
+  (`encode_intra_picture_rru_deblock` / `encode_inter_picture_rru_deblock`;
+  INTER4V under RRU stays refused). AP / AIC / SAC / AIV / MQ / Annex
+  K / B-EI-EP combinations inside RRU are refused; §Q.5 enlarged OBMC
+  stays a primitive.
 * **Annex N §N.4.1 / §N.5** — Reference Picture Selection mode (forward
   channel) end-to-end, including **per-GOB** re-selection: the
   `RpsReferenceStore` picture memory keys decoded anchors by their 10-bit
@@ -705,11 +709,12 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   not yet threaded into the EP / spatial-scalability path (only the §O.6
   factor-of-two upsample is wired there).
 * Annex Q Reduced-Resolution Update combined with Advanced
-  Prediction (§Q.5 enlarged OBMC), Deblocking Filter (§Q.7.2 filter
-  variant), Annex K slices, custom source formats or mid-picture GOB
-  headers — the single-segment standard-format I/P subset (including
-  the §Q.4 UMV Table-D.3 pseudo-vector coding, both directions)
-  decodes and encodes end-to-end (see the supported list).
+  Prediction (§Q.5 enlarged OBMC), the Table J.1 four-vector
+  macroblocks under Deblocking Filter mode, Annex K slices, custom
+  source formats or mid-picture GOB headers — the single-segment
+  standard-format I/P subset (including the §Q.4 UMV Table-D.3
+  pseudo-vector coding and the §Q.7.2 Deblocking-Filter variant, both
+  directions) decodes and encodes end-to-end (see the supported list).
 * A true Annex C multiplex (interleaved sub-bitstreams — the GOB and
   slice paths decode one PSBI / GSBI / SSBI member each); the EOSBS
   end marker (the §5.1.27 EOS is emitted by the encoder and

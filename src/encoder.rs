@@ -749,6 +749,26 @@ fn rru_downsample_residual(res: &[i32; 256]) -> [i16; COEFFS_PER_BLOCK] {
 /// divisible by 32 (sub-QCIF / QCIF / 4CIF) the source is §Q.3-style
 /// edge-extended to the coded size before down-sampling.
 pub fn encode_intra_picture_rru(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    encode_intra_picture_rru_impl(frame, quant, tr, /* deblock */ false)
+}
+
+/// As [`encode_intra_picture_rru`], with **Annex J Deblocking Filter
+/// mode** signalled (OPPTYPE bit 9): the decoder runs the §Q.7.2 block
+/// boundary filter (the §J.3 four-tap filter with `STRENGTH = +∞` on
+/// the 16 × 16 block edges) in place of the §Q.7.1 default filter. The
+/// coded data is identical — the filter is a decoder-side
+/// reconstruction step (§Q.7: "performed on the complete reconstructed
+/// image data before storing the data in the picture store").
+pub fn encode_intra_picture_rru_deblock(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    encode_intra_picture_rru_impl(frame, quant, tr, /* deblock */ true)
+}
+
+fn encode_intra_picture_rru_impl(
+    frame: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    deblock: bool,
+) -> Result<Vec<u8>> {
     use crate::encoder_mb::{encode_intra_macroblock, MacroblockSamples};
 
     if quant == 0 || quant > 31 {
@@ -771,6 +791,7 @@ pub fn encode_intra_picture_rru(frame: &YuvFrame, quant: u8, tr: u8) -> Result<V
         /* is_inter */ false,
         PlusModes {
             rru: true,
+            deblocking: deblock,
             ..PlusModes::default()
         },
     )?;
@@ -831,7 +852,31 @@ pub fn encode_inter_picture_rru(
     tr: u8,
     search_pseudo_half: i32,
 ) -> Result<Vec<u8>> {
-    encode_inter_picture_rru_impl(frame, reference, quant, tr, search_pseudo_half, false)
+    encode_inter_picture_rru_impl(
+        frame,
+        reference,
+        quant,
+        tr,
+        search_pseudo_half,
+        false,
+        false,
+    )
+}
+
+/// As [`encode_inter_picture_rru`], with **Annex J Deblocking Filter
+/// mode** signalled: single-vector macroblocks (the Table J.1
+/// four-vectors element is not used — one pseudo vector per 32 × 32
+/// macroblock), the decoder applying the §Q.7.2 filter variant to its
+/// reconstruction; `reference` must be that filtered reconstruction
+/// (the RRU decode driver's output for the previous picture).
+pub fn encode_inter_picture_rru_deblock(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_pseudo_half: i32,
+) -> Result<Vec<u8>> {
+    encode_inter_picture_rru_impl(frame, reference, quant, tr, search_pseudo_half, false, true)
 }
 
 /// As [`encode_inter_picture_rru`], but with the **Annex D
@@ -850,7 +895,7 @@ pub fn encode_inter_picture_rru_umv(
     tr: u8,
     search_pseudo_half: i32,
 ) -> Result<Vec<u8>> {
-    encode_inter_picture_rru_impl(frame, reference, quant, tr, search_pseudo_half, true)
+    encode_inter_picture_rru_impl(frame, reference, quant, tr, search_pseudo_half, true, false)
 }
 
 fn encode_inter_picture_rru_impl(
@@ -860,6 +905,7 @@ fn encode_inter_picture_rru_impl(
     tr: u8,
     search_pseudo_half: i32,
     umv: bool,
+    deblock: bool,
 ) -> Result<Vec<u8>> {
     use crate::motion::{rru_actual_mv, rru_pseudo_mv, MotionVector};
 
@@ -887,6 +933,7 @@ fn encode_inter_picture_rru_impl(
         PlusModes {
             rru: true,
             umv,
+            deblocking: deblock,
             ..PlusModes::default()
         },
     )?;

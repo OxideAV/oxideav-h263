@@ -78,6 +78,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   §I.3 segment ids following the Annex K slices). An all-INTRA AIC
   P-picture reconstructs byte-identically to the AIC I-picture
   encoder's; the oracle agrees exactly on both.
+- **Annex Q + Annex J (§Q.7.2)**, both directions: an RRU picture with
+  the Deblocking Filter mode on (OPPTYPE bit 9, or `DecodeOptions::deblock`)
+  runs the §J.3 four-tap filter with `STRENGTH = +∞` on the 16 × 16
+  block edges (`RruFilterMode::Deblocking`) in place of the §Q.7.1
+  two-tap default; the Table J.1 four-vectors element makes MVD2-4
+  parseable there, an INTER4V macroblock (four pseudo vectors per
+  32 × 32 macroblock) staying refused. `encode_intra_picture_rru_deblock`
+  / `encode_inter_picture_rru_deblock` signal the mode (single-vector
+  macroblocks, identical coded data).
 - **CPM on the GOB path**, both directions: `gob_header::parse_gob_layer_cpm`
   reads the §5.2.4 GSBI between GN and GFID (`GobLayer::gsbi`); the
   baseline / PB / Improved-PB / extended GOB drivers read §5.1.21 PSBI

@@ -4,7 +4,8 @@
 //! plus the §Q.4 pseudo-motion-vector lattice pins.
 
 use oxideav_h263::encoder::{
-    encode_inter_picture_rru, encode_inter_picture_rru_umv, encode_intra_picture_rru,
+    encode_inter_picture_rru, encode_inter_picture_rru_deblock, encode_inter_picture_rru_umv,
+    encode_intra_picture_rru, encode_intra_picture_rru_deblock,
 };
 use oxideav_h263::motion::{rru_actual_component, rru_pseudo_component};
 use oxideav_h263::picture::{decode_picture_layer, decode_sequence, DecodeOptions, YuvFrame};
@@ -234,21 +235,65 @@ fn rru_umv_stream_decodes_through_decode_sequence() {
 /// AP / DF / AIC bits alter the OBMC / filter layers): a caller-forced
 /// deblock option on an RRU stream is refused rather than
 /// mis-filtered.
+/// Annex J with RRU (§Q.7.2): the deblocking-filter variant of the
+/// block boundary filter — the §J.3 four-tap filter with STRENGTH = +∞
+/// on the 16 × 16 block edges — replaces the §Q.7.1 two-tap default.
+/// Signalled in OPPTYPE by the `_deblock` encoders (identical coded
+/// data), or forced by `DecodeOptions::deblock`; the two filters must
+/// yield different, both source-close, reconstructions.
 #[test]
-fn rru_refuses_deblock_option() {
-    use oxideav_h263::Error;
-    let src = gradient(176, 144, 1);
-    let bytes = encode_intra_picture_rru(&src, 8, 0).unwrap();
-    assert_eq!(
-        decode_picture_layer(
-            &bytes,
-            None,
-            DecodeOptions {
-                deblock: true,
-                ..DecodeOptions::default()
+fn rru_deblocking_filter_variant_round_trips() {
+    // A 16-px checkerboard puts a real discontinuity on every RRU block
+    // edge (a slow ramp leaves both filters as no-ops after rounding).
+    let mut src = gradient(176, 144, 5);
+    for r in 0..144 {
+        for c in 0..176 {
+            if ((r / 16) + (c / 16)) % 2 == 0 {
+                src.y[r * 176 + c] = src.y[r * 176 + c].saturating_add(40);
             }
-        )
-        .unwrap_err(),
-        Error::NotImplemented
+        }
+    }
+    let plain = encode_intra_picture_rru(&src, 8, 0).unwrap();
+    let df = encode_intra_picture_rru_deblock(&src, 8, 0).unwrap();
+    assert_eq!(plain.len(), df.len(), "only the OPPTYPE bit differs");
+    let r_plain = decode_picture_layer(&plain, None, DecodeOptions::default()).unwrap();
+    let r_df = decode_picture_layer(&df, None, DecodeOptions::default()).unwrap();
+    // The same wire under `deblock` forced on the plain stream selects
+    // the §Q.7.2 variant too.
+    let r_forced = decode_picture_layer(
+        &plain,
+        None,
+        DecodeOptions {
+            deblock: true,
+            ..DecodeOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(r_df, r_forced);
+    assert!(r_df.y != r_plain.y, "§Q.7.2 and §Q.7.1 filter differently");
+    let (m_plain, m_df) = (luma_mae(&r_plain, &src), luma_mae(&r_df, &src));
+    eprintln!("RRU I: §Q.7.1 MAE {m_plain:.3}, §Q.7.2 MAE {m_df:.3}");
+    assert!(
+        m_df < 6.0,
+        "§Q.7.2 reconstruction stays close to the source"
     );
+
+    // P-picture on the §Q.7.2-filtered reference, through decode_sequence.
+    let next = translated(&src, 4);
+    let p = encode_inter_picture_rru_deblock(&next, &r_df, 8, 1, 6).unwrap();
+    let mut stream = df.clone();
+    stream.extend_from_slice(&p);
+    let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.len(), 2);
+    assert_eq!(decoded[0], r_df);
+    let m_p = luma_mae(&decoded[1], &next);
+    eprintln!("RRU P (§Q.7.2): MAE {m_p:.3}");
+    assert!(m_p < 6.0, "P MAE {m_p:.3}");
+    // A static P is lossless under §Q.7.2 as well: an all-skipped
+    // picture is not filtered (no coded macroblock touches any edge).
+    let p_static = encode_inter_picture_rru_deblock(&r_df, &r_df, 8, 2, 6).unwrap();
+    let mut s2 = df.clone();
+    s2.extend_from_slice(&p_static);
+    let decoded = decode_sequence(&s2, DecodeOptions::default()).unwrap();
+    assert_eq!(decoded[1], r_df);
 }
