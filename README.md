@@ -213,6 +213,15 @@ Callers can equally drive the decoder through the free
 per-picture form is `decode_sequence_step` + `SequenceState`) and the
 encoder through `encode_intra_picture` and friends.
 
+Round 457 closed the PB-frame encoder family: Annex M Improved
+PB-frames (three §M.2 modes), Advanced Prediction / UMV / AIC / Annex
+K slices / INTRA refresh composing with both PB annexes, AP under
+Rectangular-Slice / ASO stripes, CPM on the GOB path, the §Q.7.2 RRU
+deblocking variant and the §P.2.2 EP-picture RPR refinement — every
+new stream shape reconstructed by the crate's own decoder and, where
+the oracle decoder supports the mode, cross-checked against it (see
+[Testing](#testing) for the oracle's documented deviations).
+
 Any path that is not yet wired returns `Error::NotImplemented` rather
 than silently guessing.
 
@@ -744,6 +753,26 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   stay direct-call entry points).
 
 ## Testing
+
+**Black-box oracle findings (round 457).** `tests/ffmpeg_blackbox.rs`
+cross-checks every encoder family against an independent decoder
+binary invoked as an opaque oracle. It agrees exactly (max |diff| ≤ 1
+per IDCT pass) on every plain PB / Improved-PB / UMV / AIC / CPM-free
+stream this crate emits; the following deviations from the spec text
+are pinned as tests or documented, with this crate's decoder following
+the text in each case: (1) under Advanced Prediction + PB-frames the
+oracle's P-part output depends on the B-part's content (§G.3 / §G.5
+forbid that — two streams with identical P data and different B data
+decode to different P pictures there); (2) it zeroes an INTRA
+macroblock's candidate predictor in PB-frames mode (§6.1.1 rule 1
+exempts it — the PB encoders send a zero INTRA vector so their plain
+streams agree); (3) it reads a forward-mode MVDB under UMV +
+PLUSPTYPE with a table other than Table D.3 (§M.2.2 → §5.3.7 /
+§D.2); (4) it does not apply the §F.3 Slice-Structured remote-vector
+substitution ("set to the motion vector of the current block") — with
+that rule disabled our decoder matches it byte-for-byte on AP +
+slice streams; (5) it does not frame CPM = "1" and refuses
+Rectangular Slices outright.
 
 The crate carries an extensive unit-test suite over synthetic buffers
 built with the spec's bit layout (round-tripped via
