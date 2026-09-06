@@ -809,17 +809,19 @@ pub fn parse_plus_ptype(
     // picture-resampling parameters: a §P.2.1 WDA, eight §P.2.2 warping
     // parameters (Table D.3 VLC), a §P.2.3 fill mode and an optional
     // §P.2.4 fill colour. We parse it for INTER / B / Improved-PB
-    // pictures (the eight-warping-parameter case). The EP-picture
-    // explicit RPR case (§P.2.2 paragraph 2 — lower-layer parameter
-    // reuse / refinement) is not staged: refuse it rather than mis-parse
-    // the variable-length field.
+    // pictures (the eight-warping-parameter case). An EP-picture's RPRP
+    // is the §P.2.2 paragraph-2 lower-layer refinement form (WDA + one
+    // bit per up-sampled dimension's parameters, no fill mode), whose
+    // width depends on the layer geometry only the EP decode driver
+    // knows: the reader is left at the field for it
+    // ([`crate::picture::decode_ep_picture_layer_rpr`]). An EI-picture
+    // with the RPR bit is refused.
     let rprp = if mpptype.reference_picture_resampling {
         match mpptype.picture_type {
             PlusPictureType::Inter | PlusPictureType::BPicture | PlusPictureType::ImprovedPb => {
                 Some(crate::annex_p::parse_rprp(reader, mpptype.rounding_type)?)
             }
-            // EP-picture / EI-picture explicit RPR: lower-layer
-            // refinement form not staged here.
+            PlusPictureType::EpPicture => None,
             _ => return Err(Error::PlusPtypeUnsupported),
         }
     } else {
@@ -1447,10 +1449,13 @@ mod tests {
     }
 
     #[test]
-    fn rpr_mode_ep_picture_is_unsupported() {
+    fn rpr_mode_ep_picture_leaves_the_refinement_field_to_the_driver() {
         // §P.2.2 paragraph 2 — the EP-picture explicit-RPR case reuses /
-        // refines the lower-layer warping parameters and is not staged;
-        // it is still refused.
+        // refines the lower-layer warping parameters with a field whose
+        // width depends on the layer geometry, so the header parser
+        // returns `rprp: None` and leaves the reader at it (the EP
+        // decode driver reads it — round 457). An EI-picture with the
+        // RPR bit stays refused.
         let mut w = BitWriter::new();
         w.write_u32(UFEP_FULL, 3);
         write_opptype(
@@ -1460,6 +1465,24 @@ mod tests {
         write_mpptype(&mut w, 0b101, true, false, false); // EP-picture, RPR on
         w.write_bit(false); // CPM
         w.write_u32(2, ELNUM_BITS); // ELNUM (scalability in use)
+        w.write_u32(1, RLNUM_BITS); // RLNUM
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+        let header = parse(&w.finish(), InheritedExtendedState::default()).expect("EP + RPR");
+        assert!(header.mpptype.reference_picture_resampling);
+        assert_eq!(header.rprp, None);
+
+        let mut w = BitWriter::new();
+        w.write_u32(UFEP_FULL, 3);
+        write_opptype(
+            &mut w, 0b010, false, false, false, false, false, false, false, false, false, false,
+            false,
+        );
+        write_mpptype(&mut w, 0b100, true, false, false); // EI-picture, RPR on
+        w.write_bit(false); // CPM
+        w.write_u32(2, ELNUM_BITS);
+        w.write_u32(1, RLNUM_BITS);
         while !w.is_byte_aligned() {
             w.write_bit(false);
         }

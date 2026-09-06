@@ -87,6 +87,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   32 × 32 macroblock) staying refused. `encode_intra_picture_rru_deblock`
   / `encode_inter_picture_rru_deblock` signal the mode (single-vector
   macroblocks, identical coded data).
+- **Annex P explicit RPR on EP-pictures** (§P.2.2 paragraph 2):
+  `annex_p::parse_rprp_ep_refinement` reads the EP-picture RPRP form
+  (WDA + one bit per warping parameter of every up-sampled dimension,
+  no fill mode) and `RprParams::refine_for_layer` derives the effective
+  parameters (`w' = 2·w + bit`, the lower layer's fill mode);
+  `decode_ep_picture_rpr` / `decode_ep_picture_layer_rpr` thread the
+  reference layer's parameters and warp the enhancement layer's forward
+  reference (which may differ in size) before prediction. The header
+  parser leaves the EP RPRP field to the driver instead of refusing it
+  (an EI-picture with the RPR bit is still refused).
 - **CPM on the GOB path**, both directions: `gob_header::parse_gob_layer_cpm`
   reads the §5.2.4 GSBI between GN and GFID (`GobLayer::gsbi`); the
   baseline / PB / Improved-PB / extended GOB drivers read §5.1.21 PSBI

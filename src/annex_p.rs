@@ -179,6 +179,76 @@ impl RprParams {
 ///
 /// Worked §D.3 example: `-13` (`s = 1`, magnitude `1101`) is encoded
 /// `0 x2 1 x1 1 x0 1 s 0` = `0 11 01 11 10`.
+/// §P.2.2 — the **EP-picture** form of the warping parameters: the
+/// lower layer's parameters are reused, refined by one bit per
+/// up-sampled dimension. `bits[i]` is `Some(b)` for a parameter that
+/// was refined on the wire (`w' = 2·w + b`) and `None` for one reused
+/// as is. Index order is the §P.2.2 transmission order
+/// `w_x0, w_0y, w_xx, w_yx, w_xy, w_yy, w_xxy, w_yxy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RprRefinement {
+    /// §P.2.1 WDA of the EP-picture.
+    pub wda: Wda,
+    /// One refinement bit per refined warping parameter.
+    pub bits: [Option<bool>; 8],
+}
+
+/// Parse the EP-picture RPRP field (§P.2 / §P.2.2 paragraph 2): the
+/// §P.2.1 WDA, then one bit "sent in place of the associated warping
+/// parameter" for every parameter of an up-sampled dimension —
+/// `refine_x` for the x-displacement parameters (`w_x0, w_xx, w_xy,
+/// w_xxy`), `refine_y` for the y-displacement ones (`w_0y, w_yx, w_yy,
+/// w_yxy`); an SNR-scalability EP-picture (neither dimension
+/// up-sampled) reuses the lower layer's parameters and sends none. No
+/// fill mode / fill colour follows: "for an EP-picture, the fill-mode
+/// action (and fill color) is the same as that for the reference
+/// layer" (§P.2.3 / §P.2.4).
+pub fn parse_rprp_ep_refinement(
+    reader: &mut BitReader<'_>,
+    refine_x: bool,
+    refine_y: bool,
+) -> Result<RprRefinement> {
+    let wda_bits = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)?;
+    let wda = match wda_bits {
+        0b10 => Wda::Half,
+        0b11 => Wda::Sixteenth,
+        _ => return Err(Error::PlusPtypeReservedField),
+    };
+    let mut bits = [None; 8];
+    for (i, slot) in bits.iter_mut().enumerate() {
+        // Even indices carry the x-displacement parameters, odd the y.
+        let refined = if i % 2 == 0 { refine_x } else { refine_y };
+        if refined {
+            *slot = Some(reader.read_bit().map_err(|_| Error::UnexpectedEof)?);
+        }
+    }
+    Ok(RprRefinement { wda, bits })
+}
+
+impl RprParams {
+    /// The EP-picture's effective parameters (§P.2.2 paragraph 2): the
+    /// lower layer's `self` with every refined parameter "multiplied by
+    /// two and adding the value of one additional bit", the EP-picture's
+    /// own WDA and RTYPE, and the lower layer's fill mode / colour.
+    pub fn refine_for_layer(&self, refinement: &RprRefinement, rcrpr: bool) -> RprParams {
+        let mut warp = self.warp;
+        for (w, bit) in warp.iter_mut().zip(refinement.bits.iter()) {
+            if let Some(b) = bit {
+                *w = 2 * *w + i32::from(*b);
+            }
+        }
+        RprParams {
+            wda: refinement.wda,
+            warp,
+            fill: self.fill,
+            fill_y: self.fill_y,
+            fill_cb: self.fill_cb,
+            fill_cr: self.fill_cr,
+            rcrpr: rcrpr as i64,
+        }
+    }
+}
+
 pub fn read_table_d3(reader: &mut BitReader<'_>) -> Result<i32> {
     // First bit: "1" => the codeword is just "1", magnitude 0. No sign
     // bit follows for the zero codeword.

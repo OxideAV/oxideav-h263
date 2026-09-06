@@ -454,7 +454,11 @@ planar 4:2:0 `YuvFrame`:
   (a size-mismatched reference, zero warp / clip / 1/16-pixel) and the
   §P.2 **explicit** RPRP field (WDA + eight Table-D.3 warping parameters
   + fill mode, parsed for INTER / B / Improved-PB pictures). The
-  EP-picture explicit-RPR lower-layer-refinement case is not yet staged.
+  EP-picture explicit-RPR case (§P.2.2 paragraph 2) lands round 457:
+  `decode_ep_picture_layer_rpr` reads the WDA + one-bit-per-parameter
+  refinement of the reference layer's parameters (none under SNR
+  scalability, all eight under 2-D spatial scalability) and warps the
+  enhancement layer's forward reference with them (`RprParams::refine_for_layer`).
 * **Annex G §G.1–§G.5** — PB-frames decode end-to-end, both through the
   per-layer `decode_pb_picture` driver (test-convention wire layout) and —
   new this round — through the headline `decode_sequence` streaming entry
@@ -705,9 +709,9 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   Annex T combinations outright.
 * Annex O CPM-multiplexed / Advanced-Prediction / SAC / Annex-K-slice
   enhancement-layer pictures (refused on the EI / EP / B paths); the
-  Annex P explicit-warp resampling engine (see the supported list) is
-  not yet threaded into the EP / spatial-scalability path (only the §O.6
-  factor-of-two upsample is wired there).
+  Annex P warp on the EP path applies to the enhancement layer's
+  forward reference (round 457), the upward reference keeping the §O.6
+  factor-of-two upsample.
 * Annex Q Reduced-Resolution Update combined with Advanced
   Prediction (§Q.5 enlarged OBMC), the Table J.1 four-vector
   macroblocks under Deblocking Filter mode, Annex K slices, custom

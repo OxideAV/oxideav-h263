@@ -6155,7 +6155,42 @@ pub fn decode_ep_picture(
     layout: &PictureLayout,
     forward_ref: &YuvFrame,
     upward_ref: &YuvFrame,
+    options: DecodeOptions,
+) -> Result<YuvFrame> {
+    decode_ep_picture_rpr(
+        reader,
+        extended,
+        layout,
+        forward_ref,
+        upward_ref,
+        options,
+        None,
+    )
+}
+
+/// [`decode_ep_picture`] with the **Annex P explicit Reference Picture
+/// Resampling** case staged (§P.2.2 paragraph 2): when the EP-picture's
+/// MPPTYPE RPR bit is set, its RPRP field is the lower-layer refinement
+/// form — the §P.2.1 WDA plus one bit per warping parameter of every
+/// up-sampled dimension (none for SNR scalability) — and the effective
+/// parameters are `lower_rpr` (the reference layer's, which §P.1
+/// requires to carry the RPR bit whenever the EP-picture does) refined
+/// per [`crate::annex_p::RprParams::refine_for_layer`]. The
+/// enhancement layer's temporal reference `forward_ref` is then warped
+/// (§P.3, [`crate::annex_p::resample_yuv`]) to the EP-picture's size
+/// before prediction — so it may differ in size from the EP-picture,
+/// exactly like an INTER-picture's reference under RPR; the upward
+/// reference keeps the §O.6 up-sampling. An RPR-flagged EP-picture with
+/// no `lower_rpr` is refused.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_ep_picture_rpr(
+    reader: &mut BitReader<'_>,
+    extended: &H263ExtendedPicture,
+    layout: &PictureLayout,
+    forward_ref: &YuvFrame,
+    upward_ref: &YuvFrame,
     _options: DecodeOptions,
+    lower_rpr: Option<&crate::annex_p::RprParams>,
 ) -> Result<YuvFrame> {
     // Refuse the enhancement-layer optional modes this path does not
     // stage.
@@ -6183,6 +6218,37 @@ pub fn decode_ep_picture(
     // geometry for SNR scalability (§O.1.2), or a factor-of-two smaller
     // for spatial scalability (§O.1.3) — in which case it is §O.6
     // up-sampled to the enhancement geometry before prediction.
+    // §P.2.2 paragraph 2 — the EP-picture's RPRP refinement sits right
+    // before PQUANT; which parameters carry a bit follows from which
+    // dimensions the enhancement layer up-samples relative to the
+    // reference layer (§O.1.3 factor of two per dimension).
+    let warped_forward: Option<YuvFrame> = if plus.mpptype.reference_picture_resampling {
+        let lower = lower_rpr.ok_or(Error::NotImplemented)?;
+        let refine_x = upward_ref.luma_width * 2 == luma_w;
+        let refine_y = upward_ref.luma_height * 2 == luma_h;
+        let refinement = crate::annex_p::parse_rprp_ep_refinement(reader, refine_x, refine_y)?;
+        let params = lower.refine_for_layer(&refinement, plus.mpptype.rounding_type);
+        let (y, cb, cr) = crate::annex_p::resample_yuv(
+            &forward_ref.y,
+            &forward_ref.cb,
+            &forward_ref.cr,
+            forward_ref.luma_width,
+            forward_ref.luma_height,
+            luma_w,
+            luma_h,
+            &params,
+        );
+        Some(YuvFrame {
+            y,
+            cb,
+            cr,
+            luma_width: luma_w,
+            luma_height: luma_h,
+        })
+    } else {
+        None
+    };
+    let forward_ref: &YuvFrame = warped_forward.as_ref().unwrap_or(forward_ref);
     if forward_ref.luma_width != luma_w || forward_ref.luma_height != luma_h {
         return Err(Error::BadScalabilityReferenceGeometry);
     }
@@ -6543,6 +6609,20 @@ pub fn decode_ep_picture_layer(
     options: DecodeOptions,
     inherited: InheritedExtendedState,
 ) -> Result<YuvFrame> {
+    decode_ep_picture_layer_rpr(data, forward_ref, upward_ref, options, inherited, None)
+}
+
+/// [`decode_ep_picture_layer`] threading the reference layer's Annex P
+/// parameters for an RPR-flagged EP-picture (see
+/// [`decode_ep_picture_rpr`]).
+pub fn decode_ep_picture_layer_rpr(
+    data: &[u8],
+    forward_ref: &YuvFrame,
+    upward_ref: &YuvFrame,
+    options: DecodeOptions,
+    inherited: InheritedExtendedState,
+    lower_rpr: Option<&crate::annex_p::RprParams>,
+) -> Result<YuvFrame> {
     let mut reader = BitReader::new(data);
     let layer = parse_picture_layer(&mut reader, inherited)?;
     let extended = match layer {
@@ -6556,13 +6636,14 @@ pub fn decode_ep_picture_layer(
         return Err(Error::NotImplemented);
     }
     let layout = ei_layout_for(&extended)?;
-    decode_ep_picture(
+    decode_ep_picture_rpr(
         &mut reader,
         &extended,
         &layout,
         forward_ref,
         upward_ref,
         options,
+        lower_rpr,
     )
 }
 
@@ -12725,6 +12806,13 @@ mod tests {
     /// header except the §5.1.4.3 MPPTYPE picture-type field is "101"
     /// (EP) rather than "100" (EI).
     fn write_plus_qcif_ep_header(w: &mut BitWriter) {
+        write_plus_qcif_ep_header_with(w, /* rpr */ false);
+    }
+
+    /// [`write_plus_qcif_ep_header`] with the MPPTYPE Reference Picture
+    /// Resampling bit selectable; the caller appends the §P.2 RPRP
+    /// refinement field when `rpr` is set.
+    fn write_plus_qcif_ep_header_with(w: &mut BitWriter, rpr: bool) {
         w.write_u32(PSC_VALUE, PSC_BITS);
         w.write_u32(0, 8); // TR
         w.write_bit(true); // PTYPE bits 1-2 = "10"
@@ -12739,7 +12827,7 @@ mod tests {
         w.write_bit(true); // bit 15 SCE-guard
         w.write_u32(0b000, 3); // bits 16-18 reserved
         w.write_u32(0b101, 3); // MPPTYPE picture type EP
-        w.write_bit(false); // RPR
+        w.write_bit(rpr); // RPR
         w.write_bit(false); // RRU
         w.write_bit(false); // RTYPE
         w.write_bit(false); // reserved
@@ -12916,6 +13004,171 @@ mod tests {
         assert_eq!(frame.y, forward.y, "zero-MV forward copies forward ref");
         assert_eq!(frame.cb, forward.cb);
         assert_eq!(frame.cr, forward.cr);
+    }
+
+    /// Body of an all-Forward, zero-MV, no-texture EP-picture (every
+    /// macroblock a verbatim forward-reference copy), GOB headers on
+    /// every GOB after the first.
+    fn write_ep_forward_zero_mv_body(w: &mut BitWriter) {
+        w.write_u32(8, SQUANT_BITS); // PQUANT
+        for gob in 0..9usize {
+            if gob != 0 {
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS);
+            }
+            for _mb in 0..11 {
+                w.write_bit(false); // COD = 0
+                w.write_bit(true); // MBTYPE Forward
+                w.write_bit(false); // CBPC 00
+                w.write_bit(true); // CBPY 1111 (INTER pattern 0000)
+                w.write_bit(true);
+                w.write_bit(true); // MVDFW dx = 0
+                w.write_bit(true); // MVDFW dy = 0
+            }
+        }
+        while !w.is_byte_aligned() {
+            w.write_bit(false);
+        }
+    }
+
+    /// A deterministic 88 × 72 reference-layer frame (half of QCIF in
+    /// both dimensions) for the spatial-scalability EP cases.
+    fn synthetic_half_qcif() -> YuvFrame {
+        let (lw, lh) = (88usize, 72usize);
+        let y = (0..lw * lh).map(|i| ((i * 5 + 31) % 211) as u8).collect();
+        let cb = (0..lw * lh / 4)
+            .map(|i| ((i * 7 + 3) % 199) as u8)
+            .collect();
+        let cr = (0..lw * lh / 4)
+            .map(|i| ((i * 11 + 5) % 193) as u8)
+            .collect();
+        YuvFrame {
+            y,
+            cb,
+            cr,
+            luma_width: lw,
+            luma_height: lh,
+        }
+    }
+
+    /// §P.2.2 paragraph 2, SNR scalability: an RPR-flagged EP-picture
+    /// whose reference layer has the same size sends only the §P.2.1 WDA
+    /// (no refinement bits, no fill mode) and reuses the lower layer's
+    /// parameters as is — a zero-warp lower layer therefore leaves the
+    /// forward reference untouched, and the all-forward zero-MV picture
+    /// is a verbatim copy of it. Without the lower layer's parameters
+    /// the picture is refused.
+    #[test]
+    fn ep_rpr_snr_refinement_reuses_lower_layer_parameters() {
+        let mut w = BitWriter::new();
+        write_plus_qcif_ep_header_with(&mut w, /* rpr */ true);
+        w.write_u32(0b11, 2); // §P.2.1 WDA = 1/16 pixel; nothing else (SNR)
+        write_ep_forward_zero_mv_body(&mut w);
+        let data = w.finish();
+        let forward = synthetic_qcif_forward();
+        let upward = synthetic_qcif_reference();
+        assert_eq!(
+            decode_ep_picture_layer(
+                &data,
+                &forward,
+                &upward,
+                DecodeOptions::default(),
+                InheritedExtendedState::default()
+            )
+            .unwrap_err(),
+            Error::NotImplemented,
+            "RPR-flagged EP without the lower layer's parameters"
+        );
+        let lower = crate::annex_p::RprParams::implicit(false);
+        let frame = decode_ep_picture_layer_rpr(
+            &data,
+            &forward,
+            &upward,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+            Some(&lower),
+        )
+        .expect("decode EP + RPR (SNR)");
+        assert_eq!(frame, forward, "zero warp reused as is");
+    }
+
+    /// §P.2.2 paragraph 2, 2-D spatial scalability: the reference layer
+    /// is half-size in both dimensions, so every warping parameter is
+    /// refined (`w' = 2·w + bit`) by one bit sent in place of it. The
+    /// all-forward zero-MV picture then equals the §P.3 warp of the
+    /// forward reference under the refined parameters (with the lower
+    /// layer's fill mode), pinned against `resample_yuv` directly. The
+    /// forward reference may differ in size from the EP-picture.
+    #[test]
+    fn ep_rpr_spatial_refinement_warps_the_forward_reference() {
+        let bits = [true, false, true, true, false, false, true, false];
+        let mut w = BitWriter::new();
+        write_plus_qcif_ep_header_with(&mut w, /* rpr */ true);
+        w.write_u32(0b11, 2); // WDA
+        for &b in &bits {
+            w.write_bit(b);
+        }
+        write_ep_forward_zero_mv_body(&mut w);
+        let data = w.finish();
+        let forward = synthetic_qcif_forward();
+        let upward = synthetic_half_qcif();
+        let mut lower = crate::annex_p::RprParams::implicit(false);
+        lower.warp = [4, -2, 3, 0, 0, 1, -1, 2];
+        lower.fill = crate::annex_p::FillMode::Gray;
+        let frame = decode_ep_picture_layer_rpr(
+            &data,
+            &forward,
+            &upward,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+            Some(&lower),
+        )
+        .expect("decode EP + RPR (spatial)");
+        let mut refined = lower;
+        for (w, &b) in refined.warp.iter_mut().zip(bits.iter()) {
+            *w = 2 * *w + i32::from(b);
+        }
+        assert_eq!(refined.warp, [9, -4, 7, 1, 0, 2, -1, 4]);
+        let (y, cb, cr) = crate::annex_p::resample_yuv(
+            &forward.y,
+            &forward.cb,
+            &forward.cr,
+            176,
+            144,
+            176,
+            144,
+            &refined,
+        );
+        assert_eq!(frame.y, y);
+        assert_eq!(frame.cb, cb);
+        assert_eq!(frame.cr, cr);
+        assert_ne!(frame.y, forward.y, "a non-zero warp moves the picture");
+
+        // A forward reference of another size (a resolution change in
+        // the enhancement layer) is warped to the EP-picture's size.
+        let small_forward = synthetic_half_qcif();
+        let frame = decode_ep_picture_layer_rpr(
+            &data,
+            &small_forward,
+            &upward,
+            DecodeOptions::default(),
+            InheritedExtendedState::default(),
+            Some(&lower),
+        )
+        .expect("decode EP + RPR from a half-size forward reference");
+        let (y, _, _) = crate::annex_p::resample_yuv(
+            &small_forward.y,
+            &small_forward.cb,
+            &small_forward.cr,
+            88,
+            72,
+            176,
+            144,
+            &refined,
+        );
+        assert_eq!(frame.y, y);
     }
 
     /// An EP-picture coded entirely Bi-dir (no texture) (MBTYPE `00010`)
