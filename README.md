@@ -71,7 +71,10 @@ MPPTYPE + UUI / SSS emission) underpins the self-describing
 `encode_inter_picture_umv_plus` / `encode_intra_picture_aic_plus` /
 `encode_intra_picture_aic_mq_plus` entry points, whose Annex
 I / T / D modes are signalled in OPPTYPE and decode with
-`DecodeOptions::default()`. **Annex K Slice Structured encoding**
+`DecodeOptions::default()`; `encode_inter_picture_aic_plus` (round
+457) puts §I-coded INTRA-refresh macroblocks inside a motion-searched
+P-picture (INTER neighbours are no §I.3 predictors), and
+`ImprovedPbConfig::aic` does the same inside Improved PB-frames. **Annex K Slice Structured encoding**
 is landed on both picture types: `encode_intra_picture_slices`
 (per-slice §K.2.7 SQUANT rate control), `encode_inter_picture_slices`
 (motion + per-slice §6.1.1 predictor segments) and
@@ -715,9 +718,8 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   emit row-aligned slices); UMV + AP on the *baseline-PTYPE* header
   (the H.263+ form is landed — `encode_inter_picture_ap_umv_plus`;
   the PB encoders refuse that pairing too); INTRA-refresh inside the
-  non-PB AP path (the PB encoders have `ImprovedPbConfig::intra_refresh`);
-  AIC INTRA macroblocks inside a
-  P-picture (only whole AIC I-pictures encode so far); per-GOB
+  non-PB AP path (the PB encoders have `ImprovedPbConfig::intra_refresh`,
+  the single-MV P-picture has `encode_inter_picture_aic_plus`); per-GOB
   GQUANT / per-slice SQUANT driven by the rate controller (the
   per-MB §5.3.6 DQUANT governor landed round 453 —
   `RateControlConfig::mb_adaptive`).

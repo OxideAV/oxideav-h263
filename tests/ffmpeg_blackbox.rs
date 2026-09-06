@@ -16,11 +16,11 @@
 //! failing premise behind `#[ignore]`.
 
 use oxideav_h263::encoder::{
-    encode_improved_pb_picture, encode_inter_picture_ap, encode_inter_picture_deblock,
-    encode_inter_picture_motion, encode_inter_picture_umv_plus, encode_intra_picture,
-    encode_intra_picture_aic_plus, encode_intra_picture_deblock, encode_pb_picture,
-    encode_pb_picture_ap, encode_pb_picture_umv, encode_sequence, DeblockConfig, GopConfig,
-    ImprovedPbConfig, PbConfig,
+    encode_improved_pb_picture, encode_inter_picture_aic_plus, encode_inter_picture_ap,
+    encode_inter_picture_deblock, encode_inter_picture_motion, encode_inter_picture_umv_plus,
+    encode_intra_picture, encode_intra_picture_aic_plus, encode_intra_picture_deblock,
+    encode_pb_picture, encode_pb_picture_ap, encode_pb_picture_umv, encode_sequence, DeblockConfig,
+    GopConfig, ImprovedPbConfig, PbConfig,
 };
 use oxideav_h263::picture::{decode_sequence, DecodeOptions, YuvFrame};
 use std::path::PathBuf;
@@ -435,6 +435,7 @@ fn improved_pb_frames_agree_with_oracle() {
         advanced_prediction: false,
         umv: false,
         slice_rows: 0,
+        aic: false,
         intra_refresh: 0,
     };
     let mut prev_tr = 0u8;
@@ -530,6 +531,7 @@ fn improved_pb_intra_refresh_agrees_with_oracle() {
             advanced_prediction: ap,
             umv: false,
             slice_rows: 0,
+            aic: false,
             intra_refresh: 4,
         };
         let mut prev_tr = 0u8;
@@ -580,6 +582,7 @@ fn oracle_ap_pb_p_part_depends_on_b_content() {
         advanced_prediction: true,
         umv: false,
         slice_rows: 0,
+        aic: false,
         intra_refresh: 0,
     };
     let mut ours_p = Vec::new();
@@ -661,6 +664,7 @@ fn pb_frames_with_umv_agree_with_oracle() {
         advanced_prediction: false,
         umv: true,
         slice_rows: 0,
+        aic: false,
         intra_refresh: 0,
     };
     let mut prev_tr = 0u8;
@@ -700,6 +704,7 @@ fn improved_pb_with_slices_agrees_with_oracle() {
         advanced_prediction: false,
         umv: false,
         slice_rows: 2,
+        aic: false,
         intra_refresh: 0,
     };
     let mut prev_tr = 0u8;
@@ -716,4 +721,59 @@ fn improved_pb_with_slices_agrees_with_oracle() {
         prev_tr = tr_p;
     }
     cross_check_anchors(&stream, 176, 144, "improved-pb-slices", 0.08, &[0, 2, 4]);
+}
+
+/// Annex I INTRA macroblocks inside P-pictures and Improved PB-frames:
+/// the §I.3 predictor availability (INTER neighbours are none) and the
+/// Figure-I.1 INTRA_MODE position must be what the oracle decodes.
+#[test]
+fn aic_intra_macroblocks_in_p_and_improved_pb_agree_with_oracle() {
+    require_oracle!();
+    let base = gradient(176, 144, 53);
+    let mut stream = encode_intra_picture_aic_plus(&base, 8, 0).unwrap();
+    let mut recon = decode_sequence(&stream, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    for k in 1..=2usize {
+        let p = translated(&base, 3 * k, k);
+        let unit = encode_inter_picture_aic_plus(&p, &recon, 8, k as u8, 6, 3).unwrap();
+        stream.extend_from_slice(&unit);
+        recon = decode_sequence(&stream, DecodeOptions::default())
+            .unwrap()
+            .pop()
+            .unwrap();
+    }
+    cross_check(&stream, 176, 144, "aic-p", 0.08);
+
+    let mut stream = encode_intra_picture_aic_plus(&base, 8, 0).unwrap();
+    let mut recon = decode_sequence(&stream, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    let cfg = ImprovedPbConfig {
+        quant: 8,
+        trb: 1,
+        dbquant: 0,
+        search_half: 6,
+        forward_search_half: 3,
+        allow_backward: true,
+        advanced_prediction: false,
+        umv: false,
+        slice_rows: 0,
+        aic: true,
+        intra_refresh: 3,
+    };
+    let mut prev_tr = 0u8;
+    for k in 1..=2usize {
+        let p = translated(&base, 4 * k, k);
+        let b = translated(&base, 4 * k - 3, k);
+        let tr_p = (2 * k) as u8;
+        let unit = encode_improved_pb_picture(&p, &b, &recon, tr_p, prev_tr, &cfg).unwrap();
+        stream.extend_from_slice(&unit);
+        recon = decode_sequence(&stream, DecodeOptions::default())
+            .unwrap()
+            .pop()
+            .unwrap();
+        prev_tr = tr_p;
+    }
+    cross_check_anchors(&stream, 176, 144, "improved-pb-aic", 0.08, &[0, 2, 4]);
 }

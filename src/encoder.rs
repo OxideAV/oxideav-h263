@@ -2597,7 +2597,7 @@ pub fn encode_intra_picture_plus(frame: &YuvFrame, quant: u8, tr: u8) -> Result<
 /// decoder's `AicBlockMeta` treatment. Single-segment pictures (the
 /// header-less I-picture form) pass segment `0` everywhere, which
 /// reduces to "every in-bounds encoded block is available".
-struct AicEncodeGrid {
+pub(crate) struct AicEncodeGrid {
     luma_block_cols: usize,
     mb_cols: usize,
     /// `RecC'` per luma block; `None` until the block has been encoded.
@@ -2611,7 +2611,7 @@ struct AicEncodeGrid {
 }
 
 impl AicEncodeGrid {
-    fn new(mb_cols: usize, mb_rows: usize) -> Self {
+    pub(crate) fn new(mb_cols: usize, mb_rows: usize) -> Self {
         let luma_block_cols = 2 * mb_cols;
         let luma_block_rows = 2 * mb_rows;
         AicEncodeGrid {
@@ -2622,6 +2622,21 @@ impl AicEncodeGrid {
             cr: vec![None; mb_cols * mb_rows],
             segment: vec![u32::MAX; mb_cols * mb_rows],
         }
+    }
+
+    /// Record a non-INTRA (INTER / skipped) macroblock: its blocks stay
+    /// unavailable as §I.3 predictors ("neighbour not INTRA → fallback"),
+    /// but it belongs to `segment` — the decoder's
+    /// `AicState::record_non_intra_macroblock` counterpart.
+    pub(crate) fn record_non_intra(&mut self, mb_col: usize, mb_row: usize, segment: u32) {
+        for blk in 0..4 {
+            let bx = 2 * mb_col + (blk & 1);
+            let by = 2 * mb_row + (blk >> 1);
+            self.luma[by * self.luma_block_cols + bx] = None;
+        }
+        self.cb[mb_row * self.mb_cols + mb_col] = None;
+        self.cr[mb_row * self.mb_cols + mb_col] = None;
+        self.segment[mb_row * self.mb_cols + mb_col] = segment;
     }
 
     /// Whether the macroblock owning luma-block-grid column `bx` / row
@@ -2697,28 +2712,80 @@ fn neigh(arr: &Option<[i32; COEFFS_PER_BLOCK]>) -> Neighbour<'_> {
 /// chosen INTRA_MODE. Produced by [`plan_macroblock_aic`] without
 /// mutating the grid, so several candidate modes can be planned and
 /// compared before one is committed.
-struct MbAicPlan {
-    mode: IntraMode,
-    luma: [AicBlockPlan; 4],
-    cb: AicBlockPlan,
-    cr: AicBlockPlan,
+pub(crate) struct MbAicPlan {
+    pub(crate) mode: IntraMode,
+    pub(crate) luma: [AicBlockPlan; 4],
+    pub(crate) cb: AicBlockPlan,
+    pub(crate) cr: AicBlockPlan,
     /// Whether the block streams are emitted under Annex T Modified
     /// Quantization mode (§T.4 EXTENDED-ESCAPE enabled on the wire).
-    modified_quant: bool,
+    pub(crate) modified_quant: bool,
+}
+
+impl MbAicPlan {
+    /// §5.3.2 CBPC bits (`0b10` Cb, `0b01` Cr) of the planned macroblock.
+    pub(crate) fn cbpc(&self) -> u8 {
+        (u8::from(self.cb.coded) << 1) | u8::from(self.cr.coded)
+    }
+
+    /// §5.3.5 CBPY (INTRA orientation) of the planned macroblock.
+    pub(crate) fn cbpy(&self) -> u8 {
+        let mut cbpy = 0u8;
+        for (blk, p) in self.luma.iter().enumerate() {
+            if p.coded {
+                cbpy |= 1 << (3 - blk);
+            }
+        }
+        cbpy
+    }
+
+    /// Emit the six Table-I.2 block streams (Y1..Y4, Cb, Cr).
+    pub(crate) fn write_blocks(&self, w: &mut BitWriter) -> Result<()> {
+        let mq = self.modified_quant;
+        for p in &self.luma {
+            write_intra_block_aic(w, p, mq)?;
+        }
+        write_intra_block_aic(w, &self.cb, mq)?;
+        write_intra_block_aic(w, &self.cr, mq)
+    }
+
+    /// The decoder-side sample reconstruction of the planned macroblock
+    /// (luma row-major 16 × 16, then Cb / Cr 8 × 8) — PREC for a
+    /// PB-frame INTRA macroblock.
+    pub(crate) fn reconstruct_samples(
+        &self,
+    ) -> ([u8; 256], [u8; COEFFS_PER_BLOCK], [u8; COEFFS_PER_BLOCK]) {
+        use crate::aic_predict::aic_intra_reconstruct_samples;
+        let mut y = [0u8; 256];
+        for (blk, p) in self.luma.iter().enumerate() {
+            let samples = aic_intra_reconstruct_samples(&p.rec);
+            let ox = (blk % 2) * 8;
+            let oy = (blk / 2) * 8;
+            for j in 0..8 {
+                y[(oy + j) * 16 + ox..(oy + j) * 16 + ox + 8]
+                    .copy_from_slice(&samples[j * 8..j * 8 + 8]);
+            }
+        }
+        (
+            y,
+            aic_intra_reconstruct_samples(&self.cb.rec),
+            aic_intra_reconstruct_samples(&self.cr.rec),
+        )
+    }
 }
 
 /// The picture-constant §I / §T parameters threaded into every AIC
 /// macroblock plan: the luma QUANT, the §T.3 chroma `QUANT_C` (equal to
 /// QUANT outside Modified Quantization mode), and the MQ flag.
 #[derive(Debug, Clone, Copy)]
-struct AicParams {
-    quant: u8,
-    chroma_quant: u8,
-    modified_quant: bool,
+pub(crate) struct AicParams {
+    pub(crate) quant: u8,
+    pub(crate) chroma_quant: u8,
+    pub(crate) modified_quant: bool,
     /// §6.1.1 / §I.3 video-picture-segment id the macroblock is encoded
     /// in (0 for single-segment pictures; the slice index in Annex K
     /// Slice-Structured pictures).
-    segment: u32,
+    pub(crate) segment: u32,
 }
 
 /// Plan one AIC INTRA macroblock with a fixed INTRA_MODE, reading the
@@ -2828,42 +2895,20 @@ fn plan_macroblock_aic(
 /// INTRADC — a not-coded block reconstructs from the predictor alone).
 fn write_macroblock_aic(w: &mut BitWriter, plan: &MbAicPlan) -> Result<()> {
     // §5.3.2 — MCBPC(INTRA): CBPC bit 0b10 = Cb coded, 0b01 = Cr coded.
-    let mut cbpc = 0u8;
-    if plan.cb.coded {
-        cbpc |= 0b10;
-    }
-    if plan.cr.coded {
-        cbpc |= 0b01;
-    }
-    write_mcbpc_i(w, MbType::Intra, cbpc)?;
-
+    write_mcbpc_i(w, MbType::Intra, plan.cbpc())?;
     // §I.2 — INTRA_MODE (Table I.1), between MCBPC and CBPY.
     write_intra_mode(w, plan.mode);
-
     // §5.3.5 — CBPY (INTRA orientation): bit (3 - blk) set when luma
     // block blk is coded (in AIC the bit gates the whole block).
-    let mut cbpy = 0u8;
-    for (blk, p) in plan.luma.iter().enumerate() {
-        if p.coded {
-            cbpy |= 1 << (3 - blk);
-        }
-    }
-    write_cbpy(w, cbpy)?;
-
+    write_cbpy(w, plan.cbpy())?;
     // §5.4 / §I.3 — six Table-I.2 block streams in order Y1..Y4, Cb, Cr.
-    let mq = plan.modified_quant;
-    for p in &plan.luma {
-        write_intra_block_aic(w, p, mq)?;
-    }
-    write_intra_block_aic(w, &plan.cb, mq)?;
-    write_intra_block_aic(w, &plan.cr, mq)?;
-    Ok(())
+    plan.write_blocks(w)
 }
 
 /// Store a planned macroblock's reconstructions into `grid` so downstream
 /// macroblocks pick them up as §I.3 neighbours, recording the video
 /// picture segment the macroblock was encoded in.
-fn commit_macroblock_aic(
+pub(crate) fn commit_macroblock_aic(
     grid: &mut AicEncodeGrid,
     plan: &MbAicPlan,
     mb_col: usize,
@@ -2907,7 +2952,24 @@ fn encode_choose_macroblock_aic(
     mb_row: usize,
     grid: &mut AicEncodeGrid,
 ) -> Result<()> {
-    let plan = match fixed_mode {
+    let plan = plan_choose_macroblock_aic(grid, mb, params, fixed_mode, mb_col, mb_row);
+    write_macroblock_aic(w, &plan)?;
+    commit_macroblock_aic(grid, &plan, mb_col, mb_row, params.segment);
+    Ok(())
+}
+
+/// Plan one AIC INTRA macroblock, choosing the cheapest INTRA_MODE when
+/// `fixed_mode` is `None` (see [`encode_choose_macroblock_aic`]); the
+/// caller emits and commits it.
+pub(crate) fn plan_choose_macroblock_aic(
+    grid: &AicEncodeGrid,
+    mb: &MacroblockSamples,
+    params: AicParams,
+    fixed_mode: Option<IntraMode>,
+    mb_col: usize,
+    mb_row: usize,
+) -> MbAicPlan {
+    match fixed_mode {
         Some(mode) => plan_macroblock_aic(grid, mb, params, mode, mb_col, mb_row),
         None => {
             let mut best: Option<(u64, MbAicPlan)> = None;
@@ -2928,10 +2990,7 @@ fn encode_choose_macroblock_aic(
             }
             best.unwrap().1
         }
-    };
-    write_macroblock_aic(w, &plan)?;
-    commit_macroblock_aic(grid, &plan, mb_col, mb_row, params.segment);
-    Ok(())
+    }
 }
 
 /// Encode a planar 4:2:0 [`YuvFrame`] as an Annex I **Advanced INTRA
@@ -3024,6 +3083,150 @@ pub fn encode_intra_picture_aic_mq_plus(frame: &YuvFrame, quant: u8, tr: u8) -> 
 /// INTRA_MODE or the per-macroblock rate decision (`None`);
 /// `modified_quant` activates Annex T (§T.3 chroma `QUANT_C`, §T.4
 /// EXTENDED-ESCAPE).
+/// Encode a planar 4:2:0 [`YuvFrame`] as an H.263+ **INTER (P-)
+/// picture with Annex I Advanced INTRA Coding**: OPPTYPE signals AIC,
+/// the macroblocks are motion-estimated INTER macroblocks
+/// ([`encode_inter_picture_motion`]'s search), and every
+/// `intra_refresh`-th macroblock (raster order, starting with the
+/// first; `0` codes none) is an INTRA macroblock coded per §I — the
+/// §I.2 INTRA_MODE decision, the §I.3 DC/AC prediction from the
+/// encoder's own reconstructed INTRA neighbours (an INTER or skipped
+/// neighbour is *not* a §I.3 predictor, exactly as the decoder treats
+/// it) and the Table I.2 VLC. Outside PB-frames mode an INTRA
+/// macroblock is a zero §6.1.1 candidate for its neighbours' vectors.
+/// Self-describing: decodes through
+/// [`crate::picture::decode_picture_layer`] / `decode_sequence` with
+/// `DecodeOptions::default()`.
+pub fn encode_inter_picture_aic_plus(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+    intra_refresh: usize,
+) -> Result<Vec<u8>> {
+    use crate::encoder_block::encode_inter_block;
+    use crate::encoder_motion::{estimate_motion, mvd_for, MvGrid};
+    use crate::encoder_vlc::write_mvd_component;
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if frame.luma_width != reference.luma_width || frame.luma_height != reference.luma_height {
+        return Err(Error::NotImplemented);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let lw = frame.luma_width;
+    let lh = frame.luma_height;
+    let cw = frame.chroma_width();
+    let ch = frame.chroma_height();
+    let mb_cols = lw / 16;
+    let mb_rows = lh / 16;
+    let lambda = 2 * quant as u32;
+
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ true,
+        PlusModes {
+            advanced_intra: true,
+            ..PlusModes::default()
+        },
+    )?;
+    let params = AicParams {
+        quant,
+        chroma_quant: quant,
+        modified_quant: false,
+        segment: 0,
+    };
+    let mut aic_grid = AicEncodeGrid::new(mb_cols, mb_rows);
+    let mut grid = MvGrid::new(mb_cols, mb_rows);
+
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let idx = mb_row * mb_cols + mb_col;
+            let src = extract_macroblock(frame, mb_col, mb_row);
+            if intra_refresh > 0 && idx % intra_refresh == 0 {
+                // COD = 0, then the §I macroblock: MCBPC (Table 8, INTRA),
+                // INTRA_MODE, CBPY, the six Table-I.2 block streams.
+                let plan =
+                    plan_choose_macroblock_aic(&aic_grid, &src, params, None, mb_col, mb_row);
+                w.write_bit(false);
+                crate::encoder_vlc::write_mcbpc_p(&mut w, MbType::Intra, plan.cbpc())?;
+                write_intra_mode(&mut w, plan.mode);
+                write_cbpy(&mut w, plan.cbpy())?;
+                plan.write_blocks(&mut w)?;
+                commit_macroblock_aic(&mut aic_grid, &plan, mb_col, mb_row, 0);
+                // §6.1.1 rule 1 — an INTRA macroblock is a zero candidate.
+                grid.set_zero_candidate(mb_col, mb_row);
+                continue;
+            }
+            let predictor = grid.predict(mb_col, mb_row);
+            let mv = estimate_motion(
+                frame,
+                reference,
+                mb_col,
+                mb_row,
+                predictor,
+                search_half,
+                lambda,
+            );
+            let chroma_vec = crate::motion::chroma_mv(mv);
+            let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(4);
+            for blk in 0..4 {
+                let bx = mb_col * 16 + (blk % 2) * 8;
+                let by = mb_row * 16 + (blk / 2) * 8;
+                let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
+                let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
+                for (d, &pv) in pred_i16.iter_mut().zip(pred.iter()) {
+                    *d = pv as i16;
+                }
+                luma_enc.push(encode_inter_block(
+                    &residual_of(&src.luma[blk], &pred_i16),
+                    quant,
+                ));
+            }
+            let cb_pred =
+                motion_compensated_block(&reference.cb, cw, ch, mb_col * 8, mb_row * 8, chroma_vec);
+            let cr_pred =
+                motion_compensated_block(&reference.cr, cw, ch, mb_col * 8, mb_row * 8, chroma_vec);
+            let mut cb_pred_i = [0i16; COEFFS_PER_BLOCK];
+            let mut cr_pred_i = [0i16; COEFFS_PER_BLOCK];
+            for i in 0..COEFFS_PER_BLOCK {
+                cb_pred_i[i] = cb_pred[i] as i16;
+                cr_pred_i[i] = cr_pred[i] as i16;
+            }
+            let cb_enc = encode_inter_block(&residual_of(&src.cb, &cb_pred_i), quant);
+            let cr_enc = encode_inter_block(&residual_of(&src.cr, &cr_pred_i), quant);
+            let any =
+                luma_enc.iter().any(|e| e.has_coeffs) || cb_enc.has_coeffs || cr_enc.has_coeffs;
+            aic_grid.record_non_intra(mb_col, mb_row, 0);
+            if !any && mv.dx_half == 0 && mv.dy_half == 0 {
+                crate::encoder_mb::encode_skipped_macroblock(&mut w);
+                grid.set_zero_candidate(mb_col, mb_row);
+                continue;
+            }
+            let mvd = mvd_for(mv, predictor);
+            let _ = write_mvd_component;
+            let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
+                luma_enc[0].clone(),
+                luma_enc[1].clone(),
+                luma_enc[2].clone(),
+                luma_enc[3].clone(),
+            ];
+            crate::encoder_mb::encode_inter_macroblock(&mut w, &luma_arr, &cb_enc, &cr_enc, mvd)?;
+            grid.set_inter(mb_col, mb_row, mv);
+        }
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
 fn encode_intra_picture_aic_core(
     frame: &YuvFrame,
     quant: u8,

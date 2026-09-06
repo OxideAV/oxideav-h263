@@ -67,6 +67,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   full-width stripe reconstructs byte-identically to the free-running
   AP picture. The oracle decoder refuses Rectangular Slices outright
   ("not supported"), so the check is own-decoder only.
+- **Annex I INTRA macroblocks inside P-pictures and Improved
+  PB-frames** (encode side): `encode_inter_picture_aic_plus` codes the
+  INTRA-refresh macroblocks of a motion-searched P-picture per §I
+  (INTRA_MODE decision, §I.3 DC/AC prediction from the encoder's own
+  reconstructed INTRA neighbours — an INTER or skipped neighbour is no
+  §I.3 predictor, as the decoder treats it — and the Table I.2 VLC);
+  `ImprovedPbConfig::aic` does the same inside the PB core (INTRA_MODE
+  between MCBPC and MODB per Figure I.1, PREC = the §I reconstruction,
+  §I.3 segment ids following the Annex K slices). An all-INTRA AIC
+  P-picture reconstructs byte-identically to the AIC I-picture
+  encoder's; the oracle agrees exactly on both.
 - **CPM on the GOB path**, both directions: `gob_header::parse_gob_layer_cpm`
   reads the §5.2.4 GSBI between GN and GFID (`GobLayer::gsbi`); the
   baseline / PB / Improved-PB / extended GOB drivers read §5.1.21 PSBI

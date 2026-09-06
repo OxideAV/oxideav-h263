@@ -138,6 +138,7 @@ fn improved_pb_all_three_modes_round_trip_through_decode_sequence() {
         advanced_prediction: false,
         umv: false,
         slice_rows: 0,
+        aic: false,
         intra_refresh: 0,
     };
     let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
@@ -371,6 +372,7 @@ fn improved_pb_with_advanced_prediction_and_intra_refresh_round_trips() {
         advanced_prediction: true,
         umv: false,
         slice_rows: 0,
+        aic: false,
         intra_refresh: 4,
     };
     let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
@@ -502,6 +504,7 @@ fn improved_pb_umv_plus_round_trips_with_over_boundary_forward_vectors() {
             advanced_prediction: ap,
             umv: true,
             slice_rows: 0,
+            aic: false,
             intra_refresh: 0,
         };
         let (bytes, stats) = encode_improved_pb_picture_stats(&p, &b, &r0, 2, 0, &cfg).unwrap();
@@ -554,6 +557,7 @@ fn improved_pb_with_annex_k_slices_round_trips() {
             advanced_prediction: ap,
             umv: false,
             slice_rows: 3,
+            aic: false,
             intra_refresh: 0,
         };
         let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
@@ -594,4 +598,84 @@ fn improved_pb_with_annex_k_slices_round_trips() {
         encode_improved_pb_picture(&p1, &b1, &r0, 2, 0, &bad).unwrap_err(),
         Error::UnsupportedPictureGeometry
     );
+}
+
+/// Annex I inside P-pictures and Improved PB-frames: the INTRA-refresh
+/// macroblocks are §I-coded (INTRA_MODE, §I.3 prediction from INTRA
+/// neighbours only, Table I.2), their PREC the §I reconstruction; with
+/// Annex K slices the §I.3 segment rule keeps predictors per slice.
+#[test]
+fn aic_intra_macroblocks_inside_p_and_improved_pb_pictures_round_trip() {
+    use oxideav_h263::encoder::encode_inter_picture_aic_plus;
+    let base = textured(176, 144, 27);
+    let i_bytes = encode_intra_picture(&base, 6, 0).unwrap();
+    let r0 = decode_sequence(&i_bytes, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    // P-picture with every third macroblock AIC-INTRA (dense enough that
+    // INTRA neighbours predict each other through §I.3).
+    let p1 = translated(&base, 4, 1);
+    let p_bytes = encode_inter_picture_aic_plus(&p1, &r0, 6, 1, 6, 3).unwrap();
+    let mut stream = i_bytes.clone();
+    stream.extend_from_slice(&p_bytes);
+    let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.len(), 2);
+    let (mae, psnr) = (luma_mae(&decoded[1], &p1), luma_psnr(&decoded[1], &p1));
+    eprintln!(
+        "AIC P (refresh 3): {} bytes, luma MAE {mae:.3}, PSNR {psnr:.2} dB",
+        p_bytes.len()
+    );
+    assert!(
+        mae < 3.0 && psnr > 35.0,
+        "AIC P: MAE {mae:.3} PSNR {psnr:.2}"
+    );
+    // Every macroblock INTRA: the AIC P-picture is then a pure §I
+    // picture and must reconstruct like the AIC I-picture encoder's.
+    let all_intra = encode_inter_picture_aic_plus(&p1, &r0, 6, 1, 6, 1).unwrap();
+    let mut s2 = i_bytes.clone();
+    s2.extend_from_slice(&all_intra);
+    let dec_all = decode_sequence(&s2, DecodeOptions::default())
+        .unwrap()
+        .remove(1);
+    let i_aic = oxideav_h263::encoder::encode_intra_picture_aic_plus(&p1, 6, 1).unwrap();
+    let dec_i = decode_sequence(&i_aic, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    assert_eq!(dec_all, dec_i, "all-INTRA AIC P == AIC I picture");
+
+    // Improved PB + AIC, with and without slices.
+    let half1 = translated(&base, 2, 0);
+    let b1 = banded_b(&r0, &p1, &half1);
+    for slice_rows in [0usize, 3] {
+        let cfg = ImprovedPbConfig {
+            quant: 6,
+            trb: 1,
+            dbquant: 0,
+            search_half: 6,
+            forward_search_half: 3,
+            allow_backward: true,
+            advanced_prediction: false,
+            umv: false,
+            slice_rows,
+            aic: true,
+            intra_refresh: 3,
+        };
+        let (ipb, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
+        eprintln!("Improved-PB + AIC (slices {slice_rows}) census: {stats:?}");
+        assert_eq!(stats.intra, 33);
+        let pair = decode_improved_pb_picture(&ipb, &r0, 0, DecodeOptions::default()).unwrap();
+        for (name, src, dec) in [("P", &p1, &pair.p_frame), ("BPB", &b1, &pair.b_frame)] {
+            let (mae, psnr) = (luma_mae(src, dec), luma_psnr(src, dec));
+            eprintln!("slices {slice_rows} {name}: luma MAE {mae:.3}, PSNR {psnr:.2} dB");
+            assert!(
+                mae < 3.0 && psnr > 35.0,
+                "{name}: MAE {mae:.3} PSNR {psnr:.2}"
+            );
+        }
+        let mut stream = i_bytes.clone();
+        stream.extend_from_slice(&ipb);
+        let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded[1], pair.b_frame);
+        assert_eq!(decoded[2], pair.p_frame);
+    }
 }

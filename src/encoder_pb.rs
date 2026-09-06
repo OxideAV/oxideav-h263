@@ -98,6 +98,12 @@ pub struct ImprovedPbConfig {
     /// rules 1 / 3, the §M.2.2 forward predictor restarting at every
     /// slice's left edge). `0` emits the single-segment GOB layout.
     pub slice_rows: usize,
+    /// Annex I Advanced INTRA Coding (OPPTYPE bit 8): the INTRA-refresh
+    /// macroblocks are coded per §I (INTRA_MODE decision, §I.3 DC/AC
+    /// prediction from the encoder's own reconstructed INTRA neighbours
+    /// — an INTER macroblock is no §I.3 predictor — and the Table I.2
+    /// VLC); their PREC is the §I reconstruction.
+    pub aic: bool,
     /// INTRA-code every `intra_refresh`-th macroblock (raster order,
     /// starting with the first); `0` disables the refresh. A PB-frame
     /// INTRA macroblock still carries the vector its B-blocks use
@@ -123,6 +129,7 @@ impl Default for ImprovedPbConfig {
             advanced_prediction: false,
             umv: false,
             slice_rows: 0,
+            aic: false,
             intra_refresh: 0,
         }
     }
@@ -191,6 +198,8 @@ struct PbCore {
     /// Annex K row-aligned free-running slices every `slice_rows`
     /// macroblock rows (`0` = none; Annex M only).
     slice_rows: usize,
+    /// Annex I on the INTRA-refresh macroblocks (Annex M only).
+    aic: bool,
     intra_refresh: usize,
 }
 
@@ -247,6 +256,7 @@ pub fn encode_improved_pb_picture_stats(
             advanced_prediction: cfg.advanced_prediction,
             umv: if cfg.umv { UmvMode::Plus } else { UmvMode::Off },
             slice_rows: cfg.slice_rows,
+            aic: cfg.aic,
             intra_refresh: cfg.intra_refresh,
         },
         PbFlavour::AnnexM {
@@ -302,6 +312,7 @@ pub fn encode_pb_picture_ap_stats(
             advanced_prediction: true,
             umv: UmvMode::Off,
             slice_rows: 0,
+            aic: false,
             intra_refresh: 0,
         },
         PbFlavour::AnnexG {
@@ -354,6 +365,7 @@ pub fn encode_pb_picture_umv_stats(
             advanced_prediction: false,
             umv: UmvMode::Wrap,
             slice_rows: 0,
+            aic: false,
             intra_refresh: 0,
         },
         PbFlavour::AnnexG {
@@ -365,6 +377,9 @@ pub fn encode_pb_picture_umv_stats(
 /// The P-part of one macroblock after prediction + residual coding:
 /// what goes on the wire and the decoder-side reconstruction (PREC).
 struct PPart {
+    /// `Some` when the macroblock is an Annex I INTRA macroblock (its
+    /// blocks, CBPC / CBPY and PREC all come from the plan).
+    aic_plan: Option<crate::encoder::MbAicPlan>,
     luma_inter: [Option<EncodedInterBlock>; 4],
     luma_intra: [Option<EncodedIntraBlock>; 4],
     cb_inter: Option<EncodedInterBlock>,
@@ -453,6 +468,11 @@ fn encode_pb_core(
         // rule per block vector); the PLUSPTYPE form is.
         return Err(Error::NotImplemented);
     }
+    if core.aic && matches!(flavour, PbFlavour::AnnexG { .. }) {
+        // Annex I is PLUSPTYPE-only (§G.1 bars it from Annex G).
+        return Err(Error::NotImplemented);
+    }
+    let mut aic_grid = crate::encoder::AicEncodeGrid::new(mb_cols_of(p_source), mb_rows_total);
     // Vector search + difference coding under the picture's UMV mode.
     let search_mb =
         |src: &YuvFrame, mb_col: usize, mb_row: usize, predictor: MotionVector| match core.umv {
@@ -532,6 +552,7 @@ fn encode_pb_core(
             PlusModes {
                 advanced_prediction: ap,
                 umv: core.umv == UmvMode::Plus,
+                advanced_intra: core.aic,
                 improved_pb: Some((core.trb, core.dbquant)),
                 slice_structured: sss,
                 ..PlusModes::default()
@@ -662,7 +683,22 @@ fn encode_pb_core(
 
             // ---- P-part. ----------------------------------------------
             let src = extract_macroblock(p_source, mb_col, mb_row);
-            let p_part = if intra {
+            // §I.3 segment id: the slice index under Annex K, else 0.
+            let segment = mb_row.checked_div(core.slice_rows).unwrap_or(0) as u32;
+            let p_part = if intra && core.aic {
+                intra_p_part_aic(
+                    &aic_grid,
+                    &src,
+                    crate::encoder::AicParams {
+                        quant,
+                        chroma_quant: quant,
+                        modified_quant: false,
+                        segment,
+                    },
+                    mb_col,
+                    mb_row,
+                )
+            } else if intra {
                 intra_p_part(&src, quant)
             } else if ap {
                 let above = (mb_row > 0 && above_in_slice).then(|| field[idx - mb_cols]);
@@ -724,6 +760,7 @@ fn encode_pb_core(
             if !intra && !p_part.any_coeffs && all_zero && b_needs_nothing {
                 crate::encoder_mb::encode_skipped_macroblock(&mut w);
                 grid.set_zero_candidate(mb_col, mb_row);
+                aic_grid.record_non_intra(mb_col, mb_row, segment);
                 stats.skipped += 1;
                 continue;
             }
@@ -738,6 +775,10 @@ fn encode_pb_core(
                 MbType::Inter
             };
             write_mcbpc_p(&mut w, mb_type, p_part.cbpc)?;
+            // §I.2 — INTRA_MODE between MCBPC and MODB (Figure I.1).
+            if let Some(plan) = p_part.aic_plan.as_ref() {
+                crate::aic::write_intra_mode(&mut w, plan.mode);
+            }
 
             // MODB (+ CBPB).
             match flavour {
@@ -816,7 +857,11 @@ fn encode_pb_core(
             }
 
             // §G.3 — six P-blocks, then six B-blocks.
-            if intra {
+            if let Some(plan) = p_part.aic_plan.as_ref() {
+                plan.write_blocks(&mut w)?;
+                crate::encoder::commit_macroblock_aic(&mut aic_grid, plan, mb_col, mb_row, segment);
+            } else if intra {
+                aic_grid.record_non_intra(mb_col, mb_row, segment);
                 for e in p_part.luma_intra.iter().flatten() {
                     write_intra_block(&mut w, e.dc_level, &e.scan, e.has_ac)?;
                 }
@@ -825,6 +870,7 @@ fn encode_pb_core(
                 write_intra_block(&mut w, cb.dc_level, &cb.scan, cb.has_ac)?;
                 write_intra_block(&mut w, cr.dc_level, &cr.scan, cr.has_ac)?;
             } else {
+                aic_grid.record_non_intra(mb_col, mb_row, segment);
                 for e in p_part.luma_inter.iter().flatten() {
                     if e.has_coeffs {
                         write_inter_block_coeffs(&mut w, &e.scan)?;
@@ -861,6 +907,10 @@ fn write_mv_pair(w: &mut BitWriter, mvd: Mvd, table_d3: bool) -> Result<()> {
         write_mvd_component(w, mvd.dx_half)?;
         write_mvd_component(w, mvd.dy_half)
     }
+}
+
+fn mb_cols_of(frame: &YuvFrame) -> usize {
+    frame.luma_width / 16
 }
 
 fn to_i16(pred: &[u8; COEFFS_PER_BLOCK]) -> [i16; COEFFS_PER_BLOCK] {
@@ -936,12 +986,43 @@ fn intra_p_part(src: &crate::encoder_mb::MacroblockSamples, quant: u8) -> PPart 
     let prec_cb = recon_intra_block(&cb, quant);
     let prec_cr = recon_intra_block(&cr, quant);
     PPart {
+        aic_plan: None,
         luma_inter: [None, None, None, None],
         luma_intra,
         cb_inter: None,
         cr_inter: None,
         cb_intra: Some(cb),
         cr_intra: Some(cr),
+        prec_y,
+        prec_cb,
+        prec_cr,
+        cbpc,
+        cbpy,
+        any_coeffs: true,
+    }
+}
+
+/// §I — the INTRA-refresh macroblock coded with Advanced INTRA Coding:
+/// planned against the encoder's reconstructed INTRA neighbours, PREC
+/// being the §I reconstruction.
+fn intra_p_part_aic(
+    grid: &crate::encoder::AicEncodeGrid,
+    src: &crate::encoder_mb::MacroblockSamples,
+    params: crate::encoder::AicParams,
+    mb_col: usize,
+    mb_row: usize,
+) -> PPart {
+    let plan = crate::encoder::plan_choose_macroblock_aic(grid, src, params, None, mb_col, mb_row);
+    let (prec_y, prec_cb, prec_cr) = plan.reconstruct_samples();
+    let (cbpc, cbpy) = (plan.cbpc(), plan.cbpy());
+    PPart {
+        aic_plan: Some(plan),
+        luma_inter: [None, None, None, None],
+        luma_intra: [None, None, None, None],
+        cb_inter: None,
+        cr_inter: None,
+        cb_intra: None,
+        cr_intra: None,
         prec_y,
         prec_cb,
         prec_cr,
@@ -992,6 +1073,7 @@ fn finish_inter_p_part(
     let prec_cb = recon_inter_block(&cb, &cb_pred, quant);
     let prec_cr = recon_inter_block(&cr, &cr_pred, quant);
     PPart {
+        aic_plan: None,
         luma_inter,
         luma_intra: [None, None, None, None],
         cb_inter: Some(cb),
