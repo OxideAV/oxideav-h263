@@ -225,8 +225,12 @@ planar 4:2:0 `YuvFrame`:
   scalability / reference-picture-selection fixed-length fields
   ELNUM / RLNUM / RPSMF / TRPI / TRP and the BCI codeword (the
   variable-length §5.1.17 BCM and §5.1.18 RPRP payloads are refused).
-* **GOB layer (§5.2)** — GBSC, Group Number, GOB Frame ID, GQUANT
-  (CPM = "0" branch), plus the §5.2.2 first-GOB (group-number-0)
+* **GOB layer (§5.2)** — GBSC, Group Number, §5.2.4 GSBI under CPM
+  (round 457: the §5.1.21 PSBI is read after a set CPM bit and every
+  GOB header's GSBI validated against it — a single-Sub-Bitstream
+  decode of one Annex C multiplex member, both directions via
+  `encode_intra_picture_gobs_cpm` / `encode_inter_picture_gobs_cpm`),
+  GOB Frame ID, GQUANT, plus the §5.2.2 first-GOB (group-number-0)
   header elision: the `decode_picture_no_gob0_header` entry point reads
   the §5.1.19 PQUANT / §5.1.20 CPM picture-header fields, the §5.1.24
   PEI / §5.1.25 PSUPP extension loop, decodes the header-less GOB 0 at
@@ -235,8 +239,7 @@ planar 4:2:0 `YuvFrame`:
   GSTUF byte-alignment); a present header primes a fresh QUANT and
   video-picture segment, an absent one continues the previous segment
   at the carried-over QUANT — so streams that omit empty GOB headers
-  (the reference encoder for the standard formats) decode correctly
-  (CPM = "1" refused).
+  (the reference encoder for the standard formats) decode correctly.
 * **Elementary-stream demux** — `decode_sequence` splits a multi-picture
   stream on byte-aligned Picture Start Codes (§5.1.1 / §5.1.28),
   decoding each picture and threading the reconstructed frame forward as
@@ -684,8 +687,7 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   Arbitrary Slice Ordering submodes on the encode side (the decoder
   composes them — §K.1 rules 1/3 confine the predictors and OBMC
   remotes per slice — but the encoders emit only free-running AP
-  slices); CPM on the GOB path (the §5.2.4 GSBI field — the Annex K
-  SSBI path decodes and encodes, see the supported list).
+  slices).
 * Annex E SAC combined with mid-picture GOB headers (the §E.5
   start-code resynchronisation inside a picture), or with Advanced
   Prediction **and** PB-frames simultaneously (each composes with SAC
@@ -702,8 +704,10 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   headers — the single-segment standard-format I/P subset (including
   the §Q.4 UMV Table-D.3 pseudo-vector coding, both directions)
   decodes and encodes end-to-end (see the supported list).
-* GSBI (CPM = "1"); the EOSBS end marker (the §5.1.27 EOS is emitted
-  by the encoder and transparently skipped by `decode_sequence`).
+* A true Annex C multiplex (interleaved sub-bitstreams — the GOB and
+  slice paths decode one PSBI / GSBI / SSBI member each); the EOSBS
+  end marker (the §5.1.27 EOS is emitted by the encoder and
+  transparently skipped by `decode_sequence`).
 * Encoder: arbitrary (non-stripe) rectangular slice shapes and
   non-row-aligned free-running slices (the slice encoders emit
   row-aligned slices; the rect encoders emit full-height vertical

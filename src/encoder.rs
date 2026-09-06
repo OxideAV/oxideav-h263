@@ -125,6 +125,10 @@ pub(crate) struct PtypeFlags {
     pub(crate) sac: bool,
     /// Bit 12 — Annex F Advanced Prediction mode.
     pub(crate) advanced_prediction: bool,
+    /// §5.1.20 / §5.1.21 — `Some(psbi)` emits CPM = "1" + the 2-bit
+    /// PSBI after PQUANT (every GOB header must then carry the §5.2.4
+    /// GSBI); `None` emits CPM = "0".
+    pub(crate) cpm_psbi: Option<u8>,
 }
 
 /// Write the §5.1 baseline picture header (PSC, TR, PTYPE, PQUANT,
@@ -161,8 +165,14 @@ pub(crate) fn write_picture_header(
     w.write_bit(pb_fields.is_some()); // PB (Annex G)
                                       // §5.1.19 — PQUANT (5 bits).
     w.write_bits(quant as u32, 5);
-    // §5.1.20 — CPM (1 bit, 0 = single bitstream).
-    w.write_bit(false);
+    // §5.1.20 — CPM (1 bit); §5.1.21 — PSBI (2 bits) follows a set CPM.
+    match flags.cpm_psbi {
+        Some(psbi) => {
+            w.write_bit(true);
+            w.write_bits(psbi as u32 & 0b11, 2);
+        }
+        None => w.write_bit(false),
+    }
     // §5.1.22 TRB (3 bits) + §5.1.23 DBQUANT (2 bits) — PB-frames only.
     if let Some((trb, dbquant)) = pb_fields {
         w.write_bits(trb as u32, 3);
@@ -172,15 +182,19 @@ pub(crate) fn write_picture_header(
     w.write_bit(false);
 }
 
-/// Write a §5.2 GOB header for GOB `gn` (CPM = 0 stream): §5.2.1 GSTUF
-/// zero-stuffing to the next byte boundary, the 17-bit GBSC, the 5-bit
-/// Group Number, the 2-bit GOB Frame ID and the 5-bit GQUANT.
-fn write_gob_header(w: &mut BitWriter, gn: u32, gfid: u8, gquant: u8) {
+/// Write a §5.2 GOB header for GOB `gn`: §5.2.1 GSTUF zero-stuffing to
+/// the next byte boundary, the 17-bit GBSC, the 5-bit Group Number,
+/// the 2-bit §5.2.4 GSBI when the picture signalled CPM (`gsbi`), the
+/// 2-bit GOB Frame ID and the 5-bit GQUANT.
+fn write_gob_header(w: &mut BitWriter, gn: u32, gsbi: Option<u8>, gfid: u8, gquant: u8) {
     use crate::gob_header::{GBSC_BITS, GBSC_VALUE, GFID_BITS, GN_BITS, GQUANT_BITS};
     // §5.2.1 — GSTUF: zero bits until the GBSC is byte aligned.
     w.align_to_byte_zero();
     w.write_bits(GBSC_VALUE, GBSC_BITS);
     w.write_bits(gn, GN_BITS);
+    if let Some(gsbi) = gsbi {
+        w.write_bits(gsbi as u32 & 0b11, 2);
+    }
     w.write_bits(gfid as u32 & 0b11, GFID_BITS);
     w.write_bits(gquant as u32, GQUANT_BITS);
 }
@@ -396,7 +410,40 @@ pub fn write_plus_picture_header(
 /// [`crate::picture::decode_picture_no_gob0_header`] (whose
 /// `gob_header_present` probe accepts the §5.2 optional headers) and
 /// [`crate::picture::decode_sequence`].
-pub fn encode_intra_picture_gobs<F>(frame: &YuvFrame, tr: u8, mut gob_quant: F) -> Result<Vec<u8>>
+pub fn encode_intra_picture_gobs<F>(frame: &YuvFrame, tr: u8, gob_quant: F) -> Result<Vec<u8>>
+where
+    F: FnMut(usize) -> u8,
+{
+    encode_intra_picture_gobs_impl(frame, tr, gob_quant, None)
+}
+
+/// As [`encode_intra_picture_gobs`], as one member of an Annex C
+/// **Continuous Presence Multipoint** multiplex: the picture header
+/// signals CPM = "1" with `psbi` (§5.1.20 / §5.1.21, `0..=3`) and every
+/// GOB header carries the same value as its §5.2.4 GSBI. Decodes
+/// through the same entry points (single-Sub-Bitstream decode; a GOB
+/// whose GSBI differs from PSBI is refused).
+pub fn encode_intra_picture_gobs_cpm<F>(
+    frame: &YuvFrame,
+    tr: u8,
+    psbi: u8,
+    gob_quant: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(usize) -> u8,
+{
+    if psbi > 3 {
+        return Err(Error::BadSliceSsbiCode);
+    }
+    encode_intra_picture_gobs_impl(frame, tr, gob_quant, Some(psbi))
+}
+
+fn encode_intra_picture_gobs_impl<F>(
+    frame: &YuvFrame,
+    tr: u8,
+    mut gob_quant: F,
+    cpm_psbi: Option<u8>,
+) -> Result<Vec<u8>>
 where
     F: FnMut(usize) -> u8,
 {
@@ -418,7 +465,10 @@ where
         pquant,
         tr,
         /* is_inter */ false,
-        PtypeFlags::default(),
+        PtypeFlags {
+            cpm_psbi,
+            ..PtypeFlags::default()
+        },
         None,
     );
 
@@ -433,7 +483,7 @@ where
             if quant == 0 || quant > 31 {
                 return Err(Error::InvalidQuantiser);
             }
-            write_gob_header(&mut w, gn as u32, gfid, quant);
+            write_gob_header(&mut w, gn as u32, cpm_psbi, gfid, quant);
         }
         for mb_col in 0..mb_cols {
             let mb = extract_macroblock(frame, mb_col, mb_row);
@@ -3106,7 +3156,37 @@ pub fn encode_inter_picture_gobs(
         tr,
         search_half,
         /* umv */ false,
-        InterFraming::GobHeaders,
+        InterFraming::GobHeaders { cpm_psbi: None },
+        /* plus */ false,
+        /* isd */ false,
+    )
+}
+
+/// As [`encode_inter_picture_gobs`], as one member of an Annex C
+/// **Continuous Presence Multipoint** multiplex (CPM = "1" + `psbi` in
+/// the picture header, the same §5.2.4 GSBI in every GOB header — see
+/// [`encode_intra_picture_gobs_cpm`]).
+pub fn encode_inter_picture_gobs_cpm(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+    psbi: u8,
+) -> Result<Vec<u8>> {
+    if psbi > 3 {
+        return Err(Error::BadSliceSsbiCode);
+    }
+    encode_inter_picture_motion_impl(
+        frame,
+        reference,
+        quant,
+        tr,
+        search_half,
+        /* umv */ false,
+        InterFraming::GobHeaders {
+            cpm_psbi: Some(psbi),
+        },
         /* plus */ false,
         /* isd */ false,
     )
@@ -3735,8 +3815,11 @@ enum InterFraming {
     /// headers).
     Single,
     /// §5.2 GOB header on every GOB after the first, each GOB its own
-    /// §6.1.1 segment (baseline-PTYPE stream shape).
-    GobHeaders,
+    /// §6.1.1 segment (baseline-PTYPE stream shape). `cpm_psbi` makes
+    /// the picture an Annex C multiplex member: CPM = "1" + PSBI in the
+    /// picture header, the same value as §5.2.4 GSBI in every GOB
+    /// header.
+    GobHeaders { cpm_psbi: Option<u8> },
     /// Annex K free-running slices every `rows` macroblock rows, each
     /// slice its own §6.1.1 segment. Requires the PLUSPTYPE header
     /// (`plus = true`) — the SS mode bit lives in OPPTYPE.
@@ -3793,7 +3876,7 @@ pub fn encode_intra_picture_isd(frame: &YuvFrame, quant: u8, tr: u8) -> Result<V
         // §R.2 — a non-empty GOB header at the top of every GOB after
         // GOB 0 makes each GOB its own video picture segment.
         if mb_row > 0 && mb_row % rows_per_gob == 0 {
-            write_gob_header(&mut w, (mb_row / rows_per_gob) as u32, gfid, quant);
+            write_gob_header(&mut w, (mb_row / rows_per_gob) as u32, None, gfid, quant);
         }
         for mb_col in 0..mb_cols {
             let mb = extract_macroblock(frame, mb_col, mb_row);
@@ -3846,7 +3929,7 @@ pub fn encode_inter_picture_isd(
         tr,
         search_half,
         /* umv */ true,
-        InterFraming::GobHeaders,
+        InterFraming::GobHeaders { cpm_psbi: None },
         /* plus */ true,
         /* isd */ true,
     )
@@ -4269,7 +4352,7 @@ fn encode_inter_picture_motion_impl(
         _ => None,
     };
 
-    if isd && (!plus || !matches!(framing, InterFraming::GobHeaders)) {
+    if isd && (!plus || !matches!(framing, InterFraming::GobHeaders { .. })) {
         // Annex R is signalled in OPPTYPE (PLUSPTYPE only), and this
         // encoder stages it on the GOB segmentation.
         return Err(Error::NotImplemented);
@@ -4299,6 +4382,10 @@ fn encode_inter_picture_motion_impl(
             /* is_inter */ true,
             PtypeFlags {
                 umv,
+                cpm_psbi: match framing {
+                    InterFraming::GobHeaders { cpm_psbi } => cpm_psbi,
+                    _ => None,
+                },
                 ..PtypeFlags::default()
             },
             None,
@@ -4329,7 +4416,7 @@ fn encode_inter_picture_motion_impl(
     // uniform segments).
     let mut grid = match framing {
         InterFraming::Single => crate::encoder_motion::MvGrid::new(mb_cols, mb_rows),
-        InterFraming::GobHeaders => {
+        InterFraming::GobHeaders { .. } => {
             crate::encoder_motion::MvGrid::with_gob_headers(mb_cols, mb_rows, rows_per_gob)
         }
         InterFraming::Slices { rows } => {
@@ -4350,9 +4437,15 @@ fn encode_inter_picture_motion_impl(
             // §5.2 — a GOB header before the first macroblock row of
             // every GOB after GOB 0 (which is always header-less,
             // §5.2.2).
-            InterFraming::GobHeaders => {
+            InterFraming::GobHeaders { cpm_psbi } => {
                 if mb_row > 0 && mb_row % rows_per_gob == 0 {
-                    write_gob_header(&mut w, (mb_row / rows_per_gob) as u32, gfid, quant);
+                    write_gob_header(
+                        &mut w,
+                        (mb_row / rows_per_gob) as u32,
+                        cpm_psbi,
+                        gfid,
+                        quant,
+                    );
                 }
             }
             // §K.2 — SSTUF + SSC slice header at every slice start

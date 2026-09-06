@@ -46,6 +46,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   reaching over the picture boundary (§D.1 / §M.2.2);
   `ImprovedPbConfig::umv` on the encode side, the Improved-PB decode
   driver no longer refuses UMV.
+- **CPM on the GOB path**, both directions: `gob_header::parse_gob_layer_cpm`
+  reads the §5.2.4 GSBI between GN and GFID (`GobLayer::gsbi`); the
+  baseline / PB / Improved-PB / extended GOB drivers read §5.1.21 PSBI
+  after a set CPM bit and validate every GOB header's GSBI against it
+  (single-Sub-Bitstream decode; a foreign GSBI is refused), and the
+  PLUSPTYPE shim no longer refuses CPM without Slice Structured mode.
+  `encode_intra_picture_gobs_cpm` / `encode_inter_picture_gobs_cpm`
+  emit CPM = "1" + PSBI and the matching GSBI on every GOB header
+  (pixel-neutral against the CPM = "0" forms). The oracle decoder does
+  not frame CPM (it misparses from the first GOB), so no black-box
+  check exists for it.
 - Black-box finding (pinned by `tests/ffmpeg_blackbox.rs`): the oracle
   decoder's P-part output for an AP + PB picture depends on the B-part's
   content (§G.3 / §G.5 forbid that), and it zeroes an INTRA

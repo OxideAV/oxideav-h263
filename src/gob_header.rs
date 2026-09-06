@@ -107,6 +107,11 @@ pub struct GobLayer {
     /// previous GFID; round-2 does not enforce that the value is
     /// stable across GOBs of a single picture.
     pub gfid: u8,
+    /// §5.2.4 — GOB Sub-Bitstream Indicator, present only when the
+    /// picture header signalled CPM = "1" ([`parse_gob_layer_cpm`]):
+    /// the sub-bitstream number for the GOB header and all following
+    /// information until the next Picture or GOB start code.
+    pub gsbi: Option<u8>,
     /// Total number of bits consumed for this header (GBSC + GN +
     /// GFID + GQUANT). Fixed at [`GOB_HEADER_BITS_NO_CPM`] for the
     /// round-2 CPM-off case; exposed so that a caller composing
@@ -137,6 +142,13 @@ pub struct GobLayer {
 /// * [`Error::InvalidQuantiser`] — GQUANT was `0`; §5.2.6 limits
 ///   QUANT to the natural-binary range `1..=31`.
 pub fn parse_gob_layer(reader: &mut BitReader<'_>) -> Result<GobLayer> {
+    parse_gob_layer_cpm(reader, false)
+}
+
+/// As [`parse_gob_layer`], for a picture whose header signalled CPM
+/// (`cpm = true`): the 2-bit §5.2.4 GSBI sits between GN and GFID and
+/// is returned on [`GobLayer::gsbi`] (`header_bits` grows to 31).
+pub fn parse_gob_layer_cpm(reader: &mut BitReader<'_>, cpm: bool) -> Result<GobLayer> {
     // §5.2.2 — GBSC (17 bits, value 0x00001).
     let gbsc = reader
         .read_u32(GBSC_BITS)
@@ -152,9 +164,15 @@ pub fn parse_gob_layer(reader: &mut BitReader<'_>) -> Result<GobLayer> {
         return Err(Error::InvalidGroupNumber);
     }
 
+    // §5.2.4 — GSBI (2 bits), "only present if CPM is '1' in the
+    // picture header".
+    let gsbi = if cpm {
+        Some(reader.read_u32(2).map_err(|_| Error::UnexpectedEof)? as u8)
+    } else {
+        None
+    };
+
     // §5.2.5 — GFID (2 bits). Always present when GBSC is present.
-    // GSBI is *not* read here: round-2 only handles the CPM = "0"
-    // case; see module-level docs.
     let gfid = reader
         .read_u32(GFID_BITS)
         .map_err(|_| Error::UnexpectedEof)? as u8;
@@ -171,7 +189,8 @@ pub fn parse_gob_layer(reader: &mut BitReader<'_>) -> Result<GobLayer> {
         number: gn,
         quantiser: gquant,
         gfid,
-        header_bits: GOB_HEADER_BITS_NO_CPM,
+        gsbi,
+        header_bits: GOB_HEADER_BITS_NO_CPM + if cpm { 2 } else { 0 },
     })
 }
 

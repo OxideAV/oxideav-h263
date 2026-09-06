@@ -47,7 +47,7 @@
 //!   per macroblock; the candidate-predictor redefinition lives in
 //!   Annex F (§F.2 / Figure F.1) which is not yet wired. The driver
 //!   returns [`Error::NotImplemented`] when it meets such a macroblock.
-//! * **Annex T variable-length DQUANT**, **CPM = 1 / GSBI**, **slice
+//! * **Annex T variable-length DQUANT**, **slice
 //!   structured mode (Annex K)**, the Annex-I prediction
 //!   reconstruction, and **GSTUF** auto-detection — all rejected /
 //!   skipped exactly as the per-layer parsers do. **PB-frames**
@@ -695,6 +695,7 @@ pub fn decode_picture(
         None,
         None,
         UmvCoding::from_baseline(header.umv_mode),
+        None,
     )
 }
 
@@ -723,9 +724,12 @@ pub fn decode_picture(
 /// [`Error::InvalidQuantiser`] when the 5-bit PQUANT field is `0`
 /// (§5.1.19 limits QUANT to the natural-binary range `1..=31`).
 ///
-/// Continuous-Presence-Multipoint multiplexing (CPM = "1", §5.1.20) is
-/// refused: the 2-bit PSBI that follows a set CPM bit, and the per-GOB
-/// GSBI it implies, are not framed by this driver.
+/// Continuous-Presence-Multipoint multiplexing (CPM = "1", §5.1.20)
+/// frames (round 457): the 2-bit PSBI that follows a set CPM bit is
+/// read and every GOB header's §5.2.4 GSBI is validated against it —
+/// a single-Sub-Bitstream decode of one Annex C multiplex member; a
+/// GOB naming another sub-bitstream is refused with
+/// [`Error::NotImplemented`].
 pub fn decode_picture_no_gob0_header(
     data: &[u8],
     reference: Option<&YuvFrame>,
@@ -743,13 +747,10 @@ pub fn decode_picture_no_gob0_header(
         return Err(Error::InvalidQuantiser);
     }
 
-    // §5.1.20 — CPM (1 bit). The "1" branch pulls in PSBI + per-GOB GSBI
-    // (Annex C) that this driver does not frame; refuse rather than
-    // mis-align the first GOB's macroblock data.
-    let cpm = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
-    if cpm {
-        return Err(Error::NotImplemented);
-    }
+    // §5.1.20 / §5.1.21 — CPM (1 bit) and, when set, PSBI (2 bits): the
+    // sub-bitstream number every GOB header's §5.2.4 GSBI must repeat
+    // (single-Sub-Bitstream decode of an Annex C multiplex member).
+    let cpm_psbi = read_cpm_psbi(&mut reader)?;
 
     // §5.1.22 / §5.1.23 — TRB + DBQUANT are present only for PB / Improved
     // PB pictures. Those flow through [`decode_pb_picture`]; a PB picture
@@ -777,7 +778,21 @@ pub fn decode_picture_no_gob0_header(
         None,
         Some(pquant),
         UmvCoding::from_baseline(header.umv_mode),
+        cpm_psbi,
     )
+}
+
+/// §5.1.20 / §5.1.21 — read the baseline-header CPM bit and, when it is
+/// "1", the 2-bit PSBI that follows it.
+fn read_cpm_psbi(reader: &mut BitReader<'_>) -> Result<Option<u8>> {
+    let cpm = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
+    if cpm {
+        Ok(Some(
+            reader.read_u32(2).map_err(|_| Error::UnexpectedEof)? as u8
+        ))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Consume the §5.1.24 PEI / §5.1.25 PSUPP extension loop at the reader's
@@ -3033,6 +3048,7 @@ pub fn decode_picture_layer_with_inherited(
                 None,
                 None,
                 UmvCoding::from_baseline(header.umv_mode),
+                None,
             )?;
             // §5.1.4.5 rule 3 — a picture without PLUSPTYPE clears all
             // inferred mode state.
@@ -3208,6 +3224,7 @@ pub fn decode_picture_layer_with_inherited(
                         // so it can pre-scan the GOB headers into the
                         // segment map.
                         isd.then_some(data),
+                        cpm_psbi,
                     )?
                 }
             };
@@ -3374,6 +3391,7 @@ pub fn decode_picture_layer_rps(
                 rps_gob,
                 umv,
                 None,
+                cpm_psbi,
             )?
         }
     };
@@ -3563,6 +3581,7 @@ pub fn decode_pb_picture(
         }),
         None,
         UmvCoding::from_baseline(header.umv_mode),
+        None,
     )?;
     Ok(PbFramePair { p_frame, b_frame })
 }
@@ -3622,12 +3641,9 @@ pub fn decode_pb_picture_no_gob0_header(
         return Err(Error::InvalidQuantiser);
     }
 
-    // §5.1.20 — CPM (1 bit). The "1" branch pulls in PSBI + per-GOB
-    // GSBI (Annex C) this driver does not frame; refuse it.
-    let cpm = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
-    if cpm {
-        return Err(Error::NotImplemented);
-    }
+    // §5.1.20 / §5.1.21 — CPM and, when set, PSBI (every GOB header
+    // then carries a §5.2.4 GSBI).
+    let cpm_psbi = read_cpm_psbi(&mut reader)?;
 
     // §5.1.22 — TRB (3 bits at the standard CIF picture clock frequency;
     // the 5-bit custom-PCF form is a PLUSPTYPE-only feature §G.1 bars
@@ -3678,6 +3694,7 @@ pub fn decode_pb_picture_no_gob0_header(
         }),
         Some(pquant),
         UmvCoding::from_baseline(header.umv_mode),
+        cpm_psbi,
     )?;
     Ok(PbFramePair { p_frame, b_frame })
 }
@@ -3793,7 +3810,7 @@ pub fn decode_improved_pb_picture_with_inherited(
         options: shim_options,
         slice_structured,
         improved_pb,
-        cpm_psbi: _,
+        cpm_psbi,
         umv,
         isd,
         dps,
@@ -3876,6 +3893,7 @@ pub fn decode_improved_pb_picture_with_inherited(
         }),
         Some(pquant),
         umv,
+        cpm_psbi,
     )?;
     Ok((PbFramePair { p_frame, b_frame }, next_inherited))
 }
@@ -4491,13 +4509,8 @@ fn plus_ptype_to_baseline_shim(
     // §5.1.20 / §5.1.21 — Continuous Presence Multipoint (CPM = "1" +
     // PSBI) is staged only on the Annex K Slice-Structured path, where
     // the §K.2.4 SSBI codeword identifies each slice's Sub-Bitstream
-    // (the GOB path's §5.2.4 GSBI is not framed by the GOB driver, so
-    // CPM without SS stays refused).
     let rps_in_use = extended.plus.trpi.is_some();
-    if opptype_sac
-        || (extended.plus.cpm && !opptype_slice_structured)
-        || extended.plus.mpptype.reduced_resolution_update
-        || (rps_in_use && !allow_rps)
+    if opptype_sac || extended.plus.mpptype.reduced_resolution_update || (rps_in_use && !allow_rps)
     {
         return Err(Error::NotImplemented);
     }
@@ -4873,6 +4886,7 @@ fn decode_after_picture_header(
     pb: Option<PbPictureCtx<'_>>,
     gob0_pquant: Option<u8>,
     umv: UmvCoding,
+    cpm_psbi: Option<u8>,
 ) -> Result<YuvFrame> {
     decode_after_picture_header_inner(
         reader,
@@ -4885,6 +4899,7 @@ fn decode_after_picture_header(
         None,
         umv,
         None,
+        cpm_psbi,
     )
 }
 
@@ -4912,6 +4927,11 @@ fn decode_after_picture_header_inner(
     // byte-aligned GOB start codes that delimit the video picture
     // segments.
     isd_data: Option<&[u8]>,
+    // §5.1.20 / §5.1.21 — `Some(psbi)` when the picture header
+    // signalled CPM = "1": every GOB header then carries a §5.2.4 GSBI,
+    // validated against PSBI (a single-Sub-Bitstream decode; a true
+    // Annex C multiplex is refused).
+    cpm_psbi: Option<u8>,
 ) -> Result<YuvFrame> {
     // Unsupported header-signalled modes — refuse rather than guess.
     // SAC is refused outright. A PB-frames picture must arrive through
@@ -5012,6 +5032,17 @@ fn decode_after_picture_header_inner(
     // carries a mandatory header on the wire — is preserved unchanged so
     // the synthetic-fixture layer tests keep their meaning.
     let optional_gob_headers = gob0_pquant.is_some();
+    // §5.2.4 — GSBI accompanies every GOB header under CPM; a GOB from
+    // another sub-bitstream cannot be decoded into this picture.
+    let parse_gob = |reader: &mut BitReader<'_>| -> Result<crate::gob_header::GobLayer> {
+        let gob = crate::gob_header::parse_gob_layer_cpm(reader, cpm_psbi.is_some())?;
+        if let (Some(psbi), Some(gsbi)) = (cpm_psbi, gob.gsbi) {
+            if psbi != gsbi {
+                return Err(Error::NotImplemented);
+            }
+        }
+        Ok(gob)
+    };
     // QUANT in force, threaded across GOB boundaries when a GOB has no
     // header. Primed from PQUANT for the spec-conformant path.
     let mut picture_quant = gob0_pquant.unwrap_or(0);
@@ -5047,14 +5078,14 @@ fn decode_after_picture_header_inner(
                 Some(pquant) => (pquant, 0u32, true),
                 // Legacy convention: GOB 0 carries a header like any
                 // other GOB.
-                None => (parse_gob_layer(reader)?.quantiser, 0u32, true),
+                None => (parse_gob(reader)?.quantiser, 0u32, true),
             }
         } else if optional_gob_headers {
             // GOBs 1..N: a header is present only if a GBSC (optionally
             // after a GSTUF run) is on the wire here. Otherwise the GOB
             // continues the previous segment at the carried-over QUANT.
             if crate::gob_header::gob_header_present(reader) {
-                let gob = parse_gob_layer(reader)?;
+                let gob = parse_gob(reader)?;
                 picture_quant = gob.quantiser;
                 current_segment += 1;
                 (gob.quantiser, current_segment, true)
@@ -5063,7 +5094,7 @@ fn decode_after_picture_header_inner(
             }
         } else {
             // Legacy mandatory-header path.
-            (parse_gob_layer(reader)?.quantiser, gob_index as u32, true)
+            (parse_gob(reader)?.quantiser, gob_index as u32, true)
         };
         let gob_top_row = gob_index * mb_rows_per_gob as usize;
 
@@ -9913,9 +9944,10 @@ mod tests {
     }
 
     #[test]
-    fn decode_gob0_elided_rejects_cpm_on() {
-        // A CPM = "1" picture pulls in PSBI + per-GOB GSBI this driver
-        // does not frame; it must be refused, not mis-aligned.
+    fn decode_gob0_elided_frames_cpm_on() {
+        // A CPM = "1" picture carries PSBI; the driver frames it (round
+        // 457) and then runs out of data at the first macroblock —
+        // no longer a refusal.
         let mut w = BitWriter::new();
         w.write_u32(PSC_VALUE, PSC_BITS);
         w.write_u32(0, 8);
@@ -9936,7 +9968,7 @@ mod tests {
             w.write_bit(false);
         }
         let data = w.finish();
-        assert_eq!(
+        assert_ne!(
             decode_picture_no_gob0_header(&data, None, DecodeOptions::default()).unwrap_err(),
             Error::NotImplemented,
         );
