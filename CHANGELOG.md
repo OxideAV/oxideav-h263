@@ -18,6 +18,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `ModbAnnexM::from_parts` / `code`) and BQUANT residuals.
   `PlusModes::improved_pb` carries the §5.1.22 TRB / §5.1.23 DBQUANT
   header fields through `write_plus_picture_header`.
+- **Advanced Prediction + PB-frames**, both annexes, both directions.
+  Decoder: the B-part of an AP macroblock is parsed in bitstream order
+  and reconstructed only after the deferred §F.3 OBMC flush (PREC is the
+  *final* P-macroblock, §G.5); the §G.2 rule makes an INTRA neighbour's
+  B-purpose vector its OBMC remote (`RemoteMv::Vector` instead of
+  `Current`); the §6.1.1 rule-1 PB-frames exception now reaches the
+  §F.2 four-vector / block-1 predictors too; INTRA macroblocks in an
+  AIC PB picture carry their §G.2 vector. `decode_pb_picture` /
+  `decode_pb_picture_no_gob0_header` / the Improved-PB drivers accept
+  AP pictures. Encoder: `encode_pb_picture_ap` (Annex G + AP) and
+  `ImprovedPbConfig::advanced_prediction` (Annex M + AP) — two-pass
+  §F.2 vector field, OBMC PREC, per-block §G.4 scaling, MVDB search
+  range-checked over all four vectors — plus
+  `ImprovedPbConfig::intra_refresh` (INTRA macroblocks inside PB
+  pictures, carrying the §G.2 / §M.2.1 MVD; Annex M keeps them
+  bidirectional so the vector is always on the wire).
+- Black-box finding (pinned by `tests/ffmpeg_blackbox.rs`): the oracle
+  decoder's P-part output for an AP + PB picture depends on the B-part's
+  content (§G.3 / §G.5 forbid that), and it zeroes an INTRA
+  macroblock's candidate predictor in PB-frames mode (§6.1.1 rule 1
+  exempts it). The crate's decoder follows the text; the PB encoders
+  send a zero INTRA vector so their plain (non-AP) streams decode
+  identically on both.
 
 ### Fixed
 

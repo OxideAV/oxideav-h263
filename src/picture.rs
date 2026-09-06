@@ -1257,13 +1257,14 @@ fn decode_one_macroblock_sac(
             MotionVector::new(0, 0),
         );
         let zero = MotionVector::new(0, 0);
-        let pending = (advanced_prediction && !pb_mode).then_some(PendingApLuma {
+        let pending = advanced_prediction.then_some(PendingApLuma {
             col,
             row,
             quant: *current_quant,
             mvs4: [zero; 4],
             blocks: [None, None, None, None],
             zero_right_remote: obmc_skip_zero_right,
+            intra_remote_vector: pb_mode,
         });
         return Ok((zero, [zero; 4], pending));
     }
@@ -1327,6 +1328,7 @@ fn decode_one_macroblock_sac(
             /* gob_header_present */ true,
             UmvCoding::from_baseline(umv_mode),
             /* segment */ 0,
+            pb_mode,
         )?;
         let chroma_vec = chroma_mv_4mv(&mvs4);
         let inter_cbpy = cbpy ^ 0b1111;
@@ -1346,6 +1348,7 @@ fn decode_one_macroblock_sac(
             mvs4,
             blocks,
             zero_right_remote: false,
+            intra_remote_vector: pb_mode,
         });
 
         // Chroma: no OBMC (§F.2) — immediate reconstruction.
@@ -1356,10 +1359,10 @@ fn decode_one_macroblock_sac(
     // INTER / INTER+Q (single MV). §F.2 — under Advanced Prediction
     // the candidates are "defined as for the 8 × 8 block numbered 1"
     // (Figure F.1).
-    let predictor = if advanced_prediction && !pb_mode {
+    let predictor = if advanced_prediction {
         predict_mv_ap_single(
             grid, mb_cols, col, row, /* gob_top_row */ 0, /* gob_header_present */ true,
-            /* segment */ 0,
+            /* segment */ 0, pb_mode,
         )
     } else {
         predict_mv(
@@ -1398,6 +1401,7 @@ fn decode_one_macroblock_sac(
             mvs4: [luma_mv; 4],
             blocks,
             zero_right_remote: false,
+            intra_remote_vector: pb_mode,
         });
     } else {
         let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
@@ -3476,11 +3480,13 @@ struct PbPictureCtx<'b> {
 ///
 /// * [`Error::NotImplemented`] — PTYPE bit 13 clear (use
 ///   [`decode_picture`] / [`decode_picture_layer`]), an INTRA coding
-///   type, SAC, Advanced Prediction (the §G.2 OBMC remote-vector
-///   exception — "the remote 'INTRA' motion vector is used" — is not
-///   yet applied by the Annex F path), `options.aic` (Annex I is
-///   PLUSPTYPE-only, which §G.1 bars from Annex G), a reserved source
-///   format, or a `reference` of mismatched geometry.
+///   type, SAC, `options.aic` (Annex I is PLUSPTYPE-only, which §G.1
+///   bars from Annex G), a reserved source format, or a `reference` of
+///   mismatched geometry. Advanced Prediction composes (round 457):
+///   the P-part's §F.3 OBMC luminance is deferred until the right
+///   neighbour's vectors are known, the B-part waits for that PREC,
+///   the §G.4 vectors scale per 8 × 8 block, and the §G.2 rule makes
+///   an INTRA neighbour's B-purpose vector its OBMC remote.
 /// * [`Error::BadPbTemporalReference`] — TRB was `0`, or the TR
 ///   increment from `prev_tr` was `0`.
 pub fn decode_pb_picture(
@@ -3499,7 +3505,7 @@ pub fn decode_pb_picture(
     if !matches!(header.coding_type, H263PictureCodingType::Inter) {
         return Err(Error::NotImplemented);
     }
-    if header.advanced_prediction || header.sac_mode || options.aic {
+    if header.sac_mode || options.aic {
         return Err(Error::NotImplemented);
     }
 
@@ -3598,7 +3604,7 @@ pub fn decode_pb_picture_no_gob0_header(
     if !matches!(header.coding_type, H263PictureCodingType::Inter) {
         return Err(Error::NotImplemented);
     }
-    if header.advanced_prediction || header.sac_mode || options.aic {
+    if header.sac_mode || options.aic {
         return Err(Error::NotImplemented);
     }
 
@@ -3709,10 +3715,10 @@ pub fn decode_pb_picture_no_gob0_header(
 ///   [`plus_ptype_to_baseline_shim`] refuses (SAC, ISD, Alternative
 ///   INTER VLC, Modified Quantisation, custom PCF, CPM, RRU); the
 ///   Slice-Structured submode (Annex K + Improved-PB is unstaged);
-///   Advanced Prediction (the §F.2 four-vector BPB derivation under
-///   Annex M is unstaged); UMV (the §M.2.2 over-boundary forward vector
-///   under the extended range is unstaged); AIC; or a `reference` of
-///   mismatched geometry.
+///   UMV (the §M.2.2 over-boundary forward vector under the extended
+///   range is unstaged); or a `reference` of mismatched geometry.
+///   Advanced Prediction composes as for [`decode_pb_picture`]
+///   (round 457).
 /// * [`Error::BadPbTemporalReference`] — TRB was `0`, or the TR
 ///   increment from `prev_tr` was `0`.
 pub fn decode_improved_pb_picture(
@@ -3794,10 +3800,9 @@ pub fn decode_improved_pb_picture_with_inherited(
         return Err(Error::NotImplemented);
     }
     // Annex K + Improved-PB (the §K.2 slice-boundary BPB exclusions) and
-    // Advanced Prediction + Improved-PB (the §F.2 four-vector BPB
-    // derivation) and UMV + Improved-PB (the §M.2.2 over-boundary
-    // forward vector under the extended range) are unstaged.
-    if slice_structured.is_some() || header.advanced_prediction || header.umv_mode {
+    // UMV + Improved-PB (the §M.2.2 over-boundary forward vector under
+    // the extended range) are unstaged.
+    if slice_structured.is_some() || header.umv_mode {
         return Err(Error::NotImplemented);
     }
 
@@ -4002,11 +4007,20 @@ fn decode_pb_b_part(
     mvs4: &Mb4Mv,
     quant: u8,
 ) -> Result<()> {
-    // §G.3 — the six B-blocks follow the P-blocks in Figure-5 order;
-    // only those CBPB lights carry a TCOEF sequence. The parse is
-    // separated from the reconstruction so the Annex E SAC driver can
-    // supply arithmetic-decoded blocks through the same
-    // reconstruction core.
+    let blocks = parse_pb_b_blocks(reader, mb)?;
+    reconstruct_pb_b_part(mb, reference, p_frame, pb, col, row, mvs4, quant, &blocks)
+}
+
+/// §G.3 — parse the six B-blocks that follow the P-blocks in Figure-5
+/// order; only those CBPB lights carry a TCOEF sequence. The parse is
+/// separated from the reconstruction so the Annex E SAC driver can
+/// supply arithmetic-decoded blocks through the same reconstruction
+/// core, and so the Advanced-Prediction drivers can defer the
+/// reconstruction until PREC is final (see [`PendingPbB`]).
+fn parse_pb_b_blocks(
+    reader: &mut BitReader<'_>,
+    mb: &H263Macroblock,
+) -> Result<[Option<H263Block>; 6]> {
     let cbpb = mb.cbpb.unwrap_or(0);
     let mut blocks: [Option<H263Block>; 6] = [None, None, None, None, None, None];
     for (i, slot) in blocks.iter_mut().enumerate() {
@@ -4021,7 +4035,24 @@ fn decode_pb_b_part(
             )?);
         }
     }
-    reconstruct_pb_b_part(mb, reference, p_frame, pb, col, row, mvs4, quant, &blocks)
+    Ok(blocks)
+}
+
+/// A PB-macroblock's parsed B-part whose reconstruction is deferred
+/// until its P-part is final — under Advanced Prediction the P-luma
+/// OBMC blend waits for the right neighbour's vectors
+/// ([`PendingApLuma`]), and §G.5 defines PREC as the *reconstructed and
+/// clipped* P-macroblock, so the B-part must wait for that flush. The
+/// B-blocks are parsed in bitstream order (§G.3) and reconstructed in
+/// macroblock order, which also keeps the §M.2.2 left-neighbour
+/// forward-vector predictor sequential.
+struct PendingPbB {
+    mb: H263Macroblock,
+    col: usize,
+    row: usize,
+    mvs4: Mb4Mv,
+    quant: u8,
+    blocks: [Option<H263Block>; 6],
 }
 
 /// Reconstruct the B-part of one PB-macroblock from its already-parsed
@@ -4981,6 +5012,10 @@ fn decode_after_picture_header_inner(
     // at the end of the macroblock row). At most one macroblock is
     // ever pending.
     let mut pending_ap: Option<PendingApLuma> = None;
+    // PB-frames + Advanced Prediction: the B-part of the macroblock
+    // whose P-luma is still pending (reconstructed right after the
+    // OBMC flush, see [`PendingPbB`]).
+    let mut pending_b: Option<PendingPbB> = None;
     for gob_index in 0..num_gobs as usize {
         // Resolve this GOB's QUANT, segment id, and whether the §6.1.1
         // rule-3 "outside the GOB at the top" border applies.
@@ -5112,19 +5147,35 @@ fn decode_after_picture_header_inner(
                 // decoded picture (forward, MVF) and PREC (backward,
                 // MVB), then B-residuals are added where CBPB lights
                 // them.
+                let mut pending_b_new: Option<PendingPbB> = None;
                 if let Some(pb) = pb.as_mut() {
                     let prev = reference.ok_or(Error::NotImplemented)?;
-                    decode_pb_b_part(
-                        reader,
-                        &mb,
-                        prev,
-                        &frame,
-                        pb,
-                        col,
-                        row,
-                        &mvs4,
-                        current_quant,
-                    )?;
+                    if header.advanced_prediction {
+                        // §F.3 defers this macroblock's P-luma until the
+                        // right neighbour is known; PREC (§G.5) is that
+                        // final reconstruction, so parse the B-blocks
+                        // now and reconstruct after the OBMC flush.
+                        pending_b_new = Some(PendingPbB {
+                            mb,
+                            col,
+                            row,
+                            mvs4,
+                            quant: current_quant,
+                            blocks: parse_pb_b_blocks(reader, &mb)?,
+                        });
+                    } else {
+                        decode_pb_b_part(
+                            reader,
+                            &mb,
+                            prev,
+                            &frame,
+                            pb,
+                            col,
+                            row,
+                            &mvs4,
+                            current_quant,
+                        )?;
+                    }
                 }
                 record_grid(
                     &mut grid,
@@ -5166,7 +5217,17 @@ fn decode_after_picture_header_inner(
                         isd_bands.as_ref().map(|b| b[p.row]),
                     );
                 }
+                // The previous macroblock's PREC is final: its B-part
+                // can now be reconstructed (macroblock order).
+                if let Some(b) = pending_b.take() {
+                    let pb = pb.as_mut().ok_or(Error::NotImplemented)?;
+                    let prev = reference.ok_or(Error::NotImplemented)?;
+                    reconstruct_pb_b_part(
+                        &b.mb, prev, &frame, pb, b.col, b.row, &b.mvs4, b.quant, &b.blocks,
+                    )?;
+                }
                 pending_ap = pending_new;
+                pending_b = pending_b_new;
             }
             // §F.3 — at the end of the macroblock row, a still-pending
             // macroblock is the row's last: its right neighbour is
@@ -5188,6 +5249,13 @@ fn decode_after_picture_header_inner(
                     seg,
                     isd_bands.as_ref().map(|b| b[p.row]),
                 );
+            }
+            if let Some(b) = pending_b.take() {
+                let pb = pb.as_mut().ok_or(Error::NotImplemented)?;
+                let prev = reference.ok_or(Error::NotImplemented)?;
+                reconstruct_pb_b_part(
+                    &b.mb, prev, &frame, pb, b.col, b.row, &b.mvs4, b.quant, &b.blocks,
+                )?;
             }
             // §5.2 carry-over: a header-less GOB inherits the QUANT in
             // force at the end of the previous GOB (the last macroblock's
@@ -7952,13 +8020,14 @@ fn decode_one_macroblock(
         // overwritten at flush time). Neighbour classification is
         // unaffected: this macroblock stays a not-coded → zero-remote
         // / zero-candidate entry on the grid.
-        let pending = (advanced_prediction && !pb_mode).then_some(PendingApLuma {
+        let pending = advanced_prediction.then_some(PendingApLuma {
             col,
             row,
             quant: *current_quant,
             mvs4: [zero; 4],
             blocks: [None, None, None, None],
             zero_right_remote: options.obmc_skip_zero_right,
+            intra_remote_vector: pb_mode,
         });
         return Ok((zero, [zero; 4], pending));
     }
@@ -7983,6 +8052,7 @@ fn decode_one_macroblock(
             gob_header_present,
             umv,
             advanced_prediction,
+            pb_mode,
             current_quant,
             options,
             aic_state,
@@ -8009,10 +8079,55 @@ fn decode_one_macroblock(
     let cbpc = mb.cbpc.unwrap_or(0);
 
     if mb_type.is_intra() {
+        // Outside PB-frames mode, INTRA macroblocks have no motion
+        // vector (§6.1.1 rule 1 treats them as zero candidates for
+        // neighbours). In PB-frames mode an INTRA macroblock carries
+        // MVD whenever the parser surfaced one (§G.2 — "the vector is
+        // used for the B-blocks only"; Annex M's §M.2.1 limits it to
+        // the bidirectional rows, a forward / backward INTRA
+        // macroblock carrying none); it is reconstructed exactly like
+        // an INTER vector — the §6.1.1 predictor (or its §F.2 block-1
+        // form when four vectors per macroblock are possible) plus
+        // Table 14 — and returned so the B-part prediction, the §6.1.1
+        // rule-1 PB exception (INTRA candidates are NOT zeroed in
+        // PB-frames mode) and the §G.2 OBMC remote rule can see it.
+        // The INTRA P-block reconstruction is unaffected.
+        let pb_intra_mv = |grid: &[MbGridEntry]| -> Result<MotionVector> {
+            if !pb_mode {
+                return Ok(MotionVector::new(0, 0));
+            }
+            let Some(mvd) = mb.mvd else {
+                return Ok(MotionVector::new(0, 0));
+            };
+            let predictor = if advanced_prediction || options.deblock {
+                predict_mv_ap_single(
+                    grid,
+                    mb_cols,
+                    col,
+                    row,
+                    gob_top_row,
+                    gob_header_present,
+                    aic_segment,
+                    pb_mode,
+                )
+            } else {
+                predict_mv(
+                    grid,
+                    mb_cols,
+                    col,
+                    row,
+                    gob_top_row,
+                    gob_header_present,
+                    pb_mode,
+                    aic_segment,
+                )
+            };
+            reconstruct_mv_coded(umv, predictor, mvd)
+        };
         if options.aic {
             // Annex I §I.2 / §I.3 INTRA path: per-block INTRA_MODE +
             // absorbed INTRADC + §I.3 reconstruction.
-            return decode_intra_macroblock_aic(
+            decode_intra_macroblock_aic(
                 reader,
                 mb,
                 frame,
@@ -8025,8 +8140,9 @@ fn decode_one_macroblock(
                 cbpc,
                 aic_state,
                 aic_segment,
-            )
-            .map(|(mv, mvs4)| (mv, mvs4, None));
+            )?;
+            let mv = pb_intra_mv(grid)?;
+            return Ok((mv, [mv; 4], None));
         }
         // INTRA / INTRA+Q: every block has INTRADC; CBPY/CBPC govern AC.
         // CBPY is in CBPY(INTRA) orientation: bit 3 (0b1000) = block 1,
@@ -8069,31 +8185,7 @@ fn decode_one_macroblock(
         let cr_samples = reconstruct_intra_block(&cr_block, chroma_quant);
         blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr_samples);
 
-        // Outside PB-frames mode, INTRA macroblocks have no motion
-        // vector (§6.1.1 rule 1 treats them as zero candidates for
-        // neighbours). In PB-frames mode every INTRA macroblock
-        // carries MVD (§G.2 — "the vector is used for the B-blocks
-        // only"); it is reconstructed exactly like an INTER vector
-        // (§6.1.1 predictor + Table 14) and returned so the B-part
-        // prediction and the §6.1.1 rule-1 PB exception (INTRA
-        // candidates are NOT zeroed in PB-frames mode) can see it.
-        // The INTRA P-block reconstruction above is unaffected.
-        let mv = if pb_mode {
-            let predictor = predict_mv(
-                grid,
-                mb_cols,
-                col,
-                row,
-                gob_top_row,
-                gob_header_present,
-                pb_mode,
-                aic_segment,
-            );
-            let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
-            reconstruct_mv_coded(umv, predictor, mvd)?
-        } else {
-            MotionVector::new(0, 0)
-        };
+        let mv = pb_intra_mv(grid)?;
         return Ok((mv, [mv; 4], None));
     }
 
@@ -8110,7 +8202,7 @@ fn decode_one_macroblock(
     // numbered 1" (Figure F.1): an INTER4V neighbour contributes the
     // vector of the specific 8×8 block Figure F.1 names, not its
     // macroblock-level vector.
-    let predictor = if (advanced_prediction || options.deblock) && !pb_mode {
+    let predictor = if advanced_prediction || options.deblock {
         predict_mv_ap_single(
             grid,
             mb_cols,
@@ -8119,6 +8211,7 @@ fn decode_one_macroblock(
             gob_top_row,
             gob_header_present,
             aic_segment,
+            pb_mode,
         )
     } else {
         predict_mv(
@@ -8158,13 +8251,6 @@ fn decode_one_macroblock(
         // luminance reconstruction is deferred exactly like the
         // INTER4V case: parse the coefficient blocks now, reconstruct
         // once the right neighbour's grid entry is recorded.
-        if pb_mode {
-            // §G.1 bars the Advanced Prediction combination for
-            // PB-frames on this driver (refused upstream); the B-part
-            // would read the P-part's pixels before the deferred OBMC
-            // lands, so refuse defensively.
-            return Err(Error::NotImplemented);
-        }
         let mut blocks: [Option<H263Block>; 4] = [None, None, None, None];
         for (blk_i, slot) in blocks.iter_mut().enumerate() {
             let has_coef = (inter_cbpy >> (3 - blk_i)) & 1 == 1;
@@ -8191,6 +8277,7 @@ fn decode_one_macroblock(
             mvs4: [luma_mv; 4],
             blocks,
             zero_right_remote: false,
+            intra_remote_vector: pb_mode,
         });
     } else {
         let y_ref = ref_plane_isd(
@@ -8573,6 +8660,14 @@ struct PendingApLuma {
     /// macroblock: its right-half remote vectors are zero instead of
     /// the right neighbour's actual vector.
     zero_right_remote: bool,
+    /// §G.2 — PB-frames mode: "when in both the Advanced Prediction
+    /// mode and the PB-frames mode, and one of the surrounding blocks
+    /// was coded in INTRA mode, the corresponding remote motion vector
+    /// is not replaced by the motion vector for the current block.
+    /// Instead, the remote 'INTRA' motion vector is used" (the vector
+    /// every INTRA macroblock carries for its B-blocks). `false`
+    /// outside PB-frames mode (INTRA remote → current vector, §F.3).
+    intra_remote_vector: bool,
 }
 
 /// Reconstruct the luminance of a deferred Advanced-Prediction INTER
@@ -8683,10 +8778,8 @@ fn reconstruct_pending_ap_luma(
             mb_left_outside,
             mb_right_outside,
             mb_below_outside,
+            pending.intra_remote_vector,
         );
-        if std::env::var("H263_DBG").is_ok() && row == 6 && col == 6 {
-            eprintln!("FLUSH mb({row},{col}) blk{blk_i} q={q_mv:?} top={r_top:?} bot={r_bot:?} left={s_left:?} right={s_right:?}");
-        }
         let prediction = obmc_predict_block(
             &y_ref,
             bx,
@@ -8732,6 +8825,7 @@ fn decode_inter4v_macroblock(
     gob_header_present: bool,
     umv: UmvCoding,
     advanced_prediction: bool,
+    pb_mode: bool,
     current_quant: &mut u8,
     options: DecodeOptions,
     aic_state: &mut AicState,
@@ -8770,6 +8864,7 @@ fn decode_inter4v_macroblock(
         gob_header_present,
         umv,
         aic_segment,
+        pb_mode,
     )?;
 
     // Chroma vector per §F.2 / Table F.1: sum of the four luma vectors
@@ -8808,6 +8903,7 @@ fn decode_inter4v_macroblock(
             mvs4,
             blocks,
             zero_right_remote: false,
+            intra_remote_vector: pb_mode,
         });
     } else {
         // Deblocking-Filter-mode four vectors (Table J.1: OBMC OFF):
@@ -8924,6 +9020,7 @@ fn reconstruct_inter4v_mvs(
     gob_header_present: bool,
     umv: UmvCoding,
     current_segment: u32,
+    pb_frames: bool,
 ) -> Result<Mb4Mv> {
     // §5.3.7 / §5.3.8 — the parser already pulled the four MVDs for an
     // INTER4V macroblock in AP mode. Block order is Figure 5
@@ -8941,7 +9038,7 @@ fn reconstruct_inter4v_mvs(
     // reads the **already-reconstructed** vectors of this macroblock as
     // candidates for its later blocks (B2's MV1 is B1's vector, B3's
     // MV2/MV3 are B1's/B2's, B4's MV1/MV2 are B3's/B2's).
-    let mut neighbourhood = build_4mv_neighbourhood(grid, mb_cols, col, row);
+    let mut neighbourhood = build_4mv_neighbourhood(grid, mb_cols, col, row, pb_frames);
 
     // Per-neighbour segment membership: an off-picture or
     // different-segment neighbour is "outside the slice". For the GOB
@@ -9024,6 +9121,7 @@ fn reconstruct_inter4v_mvs(
 ///
 /// The §6.1.1 border / segment rules are applied as in
 /// [`reconstruct_inter4v_mvs`]'s B1 arm.
+#[allow(clippy::too_many_arguments)]
 fn predict_mv_ap_single(
     grid: &[MbGridEntry],
     mb_cols: usize,
@@ -9032,8 +9130,9 @@ fn predict_mv_ap_single(
     gob_top_row: usize,
     gob_header_present: bool,
     current_segment: u32,
+    pb_frames: bool,
 ) -> MotionVector {
-    let mut neighbourhood = build_4mv_neighbourhood(grid, mb_cols, col, row);
+    let mut neighbourhood = build_4mv_neighbourhood(grid, mb_cols, col, row, pb_frames);
 
     let in_seg = |c: isize, r: isize| -> bool {
         if c < 0 || r < 0 || c as usize >= mb_cols {
@@ -9077,9 +9176,12 @@ fn build_4mv_neighbourhood(
     mb_cols: usize,
     col: usize,
     row: usize,
+    // §6.1.1 rule 1 — an INTRA neighbour is a zero candidate "except in
+    // PB-frames mode", where its B-purpose vector (§G.2) counts.
+    pb_frames: bool,
 ) -> Mb4MvNeighbourhood {
     let take = |entry: MbGridEntry| -> Option<Mb4Mv> {
-        if entry.intra || entry.not_coded {
+        if entry.not_coded || (entry.intra && !pb_frames) {
             None
         } else {
             Some(entry.mvs4)
@@ -9135,6 +9237,9 @@ fn classify_remote_mvs(
     mb_left_outside: bool,
     mb_right_outside: bool,
     mb_below_outside: bool,
+    // §G.2 — in PB-frames mode an INTRA neighbour's remote vector is
+    // the vector it carries for its B-blocks, not the current vector.
+    intra_remote_vector: bool,
 ) -> (RemoteMv, RemoteMv, RemoteMv, RemoteMv) {
     // Classify one neighbouring 8×8 block: returns the §F.3 RemoteMv
     // tag given the source (the 8×8 vector to use if the case is
@@ -9153,7 +9258,7 @@ fn classify_remote_mvs(
                 Some(entry) => {
                     if entry.not_coded {
                         RemoteMv::Zero
-                    } else if entry.intra {
+                    } else if entry.intra && !intra_remote_vector {
                         RemoteMv::Current
                     } else {
                         RemoteMv::Vector(source)
@@ -11455,6 +11560,7 @@ mod tests {
             true,
             true,
             true,
+            false,
         );
         assert_eq!(r_top, RemoteMv::Current);
         assert_eq!(s_left, RemoteMv::Current);
@@ -11493,7 +11599,8 @@ mod tests {
             false, // mb_above present
             true,
             true,
-            false, // mb_below present — still must yield Current
+            false, // mb_below present — still must yield Current,
+            false,
         );
         // Top remote of B3 = current B1 (inside this MB).
         assert_eq!(r_top, RemoteMv::Vector(current[LumaBlockIndex::B1.index()]));
@@ -11524,6 +11631,7 @@ mod tests {
             false, // mb_left present
             true,
             true,
+            false,
         );
         assert_eq!(s_left, RemoteMv::Zero);
     }
@@ -11551,6 +11659,7 @@ mod tests {
             true,
             true,
             true,
+            false,
         );
         assert_eq!(r_top, RemoteMv::Current);
     }
@@ -11570,7 +11679,7 @@ mod tests {
             segment: 0,
         };
         // Current MB at (1, 1); left = (0, 1) which is INTRA.
-        let n = build_4mv_neighbourhood(&grid, mb_cols, 1, 1);
+        let n = build_4mv_neighbourhood(&grid, mb_cols, 1, 1, false);
         assert!(n.left.is_none());
     }
 
@@ -11593,7 +11702,7 @@ mod tests {
             mvs4: mvs,
             segment: 0,
         };
-        let n = build_4mv_neighbourhood(&grid, mb_cols, 1, 1);
+        let n = build_4mv_neighbourhood(&grid, mb_cols, 1, 1, false);
         assert_eq!(n.left, Some(mvs));
         // The above-right above-row entries default to OUTSIDE-zero so
         // their `take` returns Some([0; 4]) (not None — OUTSIDE is

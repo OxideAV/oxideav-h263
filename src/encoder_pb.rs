@@ -1,4 +1,5 @@
-//! Annex M **Improved PB-frames** encoder (§M.1 – §M.4).
+//! PB-frame encoders: Annex M **Improved PB-frames** (§M.1 – §M.4) and
+//! the Annex G / Annex M **Advanced Prediction** compositions.
 //!
 //! An Improved PB-frame is one picture unit carrying a P-picture and a
 //! BPB-picture (the "B-part", §M.1), signalled by the PLUSPTYPE
@@ -18,22 +19,42 @@
 //! The mode decision is rate-biased SAD (the luminance SAD of the
 //! B-source against each candidate prediction plus λ × the MODB / MVDB
 //! bits); the residual of the chosen prediction is coded at the
-//! Table-6 BQUANT where it survives quantisation (CBPB). The output
-//! decodes through
-//! [`crate::picture::decode_improved_pb_picture_with_inherited`] and —
+//! Table-6 BQUANT where it survives quantisation (CBPB).
+//!
+//! With **Advanced Prediction** (Annex F) the P-part carries four
+//! §F.2 vectors per macroblock predicted through the §F.3 OBMC blend
+//! (two-pass: the whole vector field is estimated first so every
+//! remote vector is known), PREC is that OBMC reconstruction, and the
+//! B-part's §G.4 forward / backward vectors are scaled per 8 × 8 block.
+//! In PB-frames mode an INTRA macroblock carries a motion vector for
+//! its B-blocks (§G.2), which also serves as its neighbours' OBMC
+//! remote vector ("the remote 'INTRA' motion vector is used") and
+//! §6.1.1 candidate predictor — the optional INTRA refresh exercises
+//! exactly those rules on the crate's decoder (the vector sent is zero,
+//! see [`ImprovedPbConfig::intra_refresh`]).
+//!
+//! Every output decodes through the crate's PB drivers
+//! ([`crate::picture::decode_pb_picture_no_gob0_header`] /
+//! [`crate::picture::decode_improved_pb_picture_with_inherited`]) and —
 //! inside an elementary stream — [`crate::picture::decode_sequence`],
-//! which splices the decoded pair in display order (BPB before P).
+//! which splices the decoded pair in display order (B before P).
 
-use crate::block::COEFFS_PER_BLOCK;
+use crate::block::{H263Block, COEFFS_PER_BLOCK};
 use crate::encoder::{
     extract_macroblock, motion_compensated_block, residual_of, source_format_for,
-    write_plus_picture_header, PlusModes,
+    write_picture_header, write_plus_picture_header, PbConfig, PlusModes, PtypeFlags,
 };
-use crate::encoder_block::{encode_inter_block, write_inter_block_coeffs, EncodedInterBlock};
-use crate::encoder_motion::{estimate_motion, mvd_for, MvGrid};
+use crate::encoder_block::{
+    encode_inter_block, encode_intra_block, write_inter_block_coeffs, write_intra_block,
+    EncodedInterBlock, EncodedIntraBlock,
+};
+use crate::encoder_motion::{estimate_block_motion, estimate_motion, mvd_for, Mv4Grid, MvGrid};
 use crate::encoder_vlc::{write_cbpy, write_mcbpc_p, write_mvd_component};
-use crate::macroblock::MbType;
-use crate::motion::{chroma_mv, MotionVector, RefPlane, RCONTROL_DEFAULT};
+use crate::macroblock::{MbType, Mvd};
+use crate::motion::{
+    chroma_mv, chroma_mv_4mv, obmc_predict_block, LumaBlockIndex, Mb4Mv, MotionVector, RefPlane,
+    RemoteMv, RCONTROL_DEFAULT,
+};
 use crate::pb_layer::{
     pb_b_predict_macroblock, pb_bquant, write_modb_annex_m, BpbCodingMode, ModbAnnexM,
     PbBMacroblockPrediction, PbBReferencePlanes,
@@ -60,6 +81,21 @@ pub struct ImprovedPbConfig {
     pub forward_search_half: i32,
     /// Allow the §M.2.3 backward mode (prediction = PREC) to compete.
     pub allow_backward: bool,
+    /// Annex F Advanced Prediction on the P-part (OPPTYPE bit 7): four
+    /// §F.2 vectors per macroblock through the §F.3 OBMC blend, with
+    /// the B-part's §G.4 vectors scaled per 8 × 8 block.
+    pub advanced_prediction: bool,
+    /// INTRA-code every `intra_refresh`-th macroblock (raster order,
+    /// starting with the first); `0` disables the refresh. A PB-frame
+    /// INTRA macroblock still carries the vector its B-blocks use
+    /// (§G.2 / §M.2.1); this encoder always sends the **zero** vector
+    /// there. Any vector is legal, but a zero one keeps the stream
+    /// decodable by decoders that ignore the §6.1.1 rule-1 PB-frames
+    /// exception (an INTRA candidate predictor is *not* zeroed in
+    /// PB-frames mode) — the black-box oracle decoder does exactly
+    /// that, so a non-zero INTRA vector would desynchronise every
+    /// vector predicted from it there.
+    pub intra_refresh: usize,
 }
 
 impl Default for ImprovedPbConfig {
@@ -71,25 +107,58 @@ impl Default for ImprovedPbConfig {
             search_half: 8,
             forward_search_half: 4,
             allow_backward: true,
+            advanced_prediction: false,
+            intra_refresh: 0,
         }
     }
 }
 
-/// Per-picture mode census returned by
-/// [`encode_improved_pb_picture_stats`].
+/// Per-picture mode census returned by the `_stats` encoder forms.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ImprovedPbStats {
-    /// Macroblocks emitted with COD = 1 (their BPB-part is the
-    /// zero-vector bidirectional prediction, §M.2.1).
+    /// Macroblocks emitted with COD = 1 (their B-part is the
+    /// zero-vector bidirectional prediction).
     pub skipped: usize,
-    /// Coded macroblocks whose BPB-part took the §M.2.1 mode.
+    /// Coded macroblocks whose B-part took the bidirectional mode
+    /// (every coded Annex G macroblock counts here).
     pub bidirectional: usize,
-    /// Coded macroblocks whose BPB-part took the §M.2.2 mode.
+    /// Coded macroblocks whose BPB-part took the §M.2.2 forward mode.
     pub forward: usize,
-    /// Coded macroblocks whose BPB-part took the §M.2.3 mode.
+    /// Coded macroblocks whose BPB-part took the §M.2.3 backward mode.
     pub backward: usize,
-    /// Macroblocks with at least one CBPB-lit BPB-block.
+    /// Macroblocks with at least one CBPB-lit B-block.
     pub b_residual: usize,
+    /// Macroblocks whose P-part was INTRA coded.
+    pub intra: usize,
+    /// Macroblocks that carried a non-zero MVDB (Annex G delta search
+    /// hits, or Annex M forward vectors).
+    pub mvdb: usize,
+}
+
+/// Which PB-frame flavour the shared core emits.
+#[derive(Debug, Clone, Copy)]
+enum PbFlavour {
+    /// Annex G (baseline PTYPE bit 13, Table 11 MODB): the B-part is
+    /// always bidirectional, optionally refined by a §5.3.9 MVDB delta
+    /// searched over ±`b_search_half` half-pels.
+    AnnexG { b_search_half: i32 },
+    /// Annex M (PLUSPTYPE `"010"`, Table M.1 MODB): the three §M.2
+    /// modes compete.
+    AnnexM {
+        forward_search_half: i32,
+        allow_backward: bool,
+    },
+}
+
+/// The flavour-independent knobs of the shared core.
+#[derive(Debug, Clone, Copy)]
+struct PbCore {
+    quant: u8,
+    trb: u8,
+    dbquant: u8,
+    search_half: i32,
+    advanced_prediction: bool,
+    intra_refresh: usize,
 }
 
 /// Encode an Annex M **Improved PB-frame**: one picture unit carrying a
@@ -131,14 +200,126 @@ pub fn encode_improved_pb_picture_stats(
     prev_tr: u8,
     cfg: &ImprovedPbConfig,
 ) -> Result<(Vec<u8>, ImprovedPbStats)> {
-    if cfg.quant == 0 || cfg.quant > 31 {
+    encode_pb_core(
+        p_source,
+        b_source,
+        reference,
+        tr_p,
+        prev_tr,
+        PbCore {
+            quant: cfg.quant,
+            trb: cfg.trb,
+            dbquant: cfg.dbquant,
+            search_half: cfg.search_half,
+            advanced_prediction: cfg.advanced_prediction,
+            intra_refresh: cfg.intra_refresh,
+        },
+        PbFlavour::AnnexM {
+            forward_search_half: cfg.forward_search_half,
+            allow_backward: cfg.allow_backward,
+        },
+    )
+}
+
+/// Encode an Annex G **PB-frame with Advanced Prediction** (baseline
+/// PTYPE bits 12 + 13): the P-part carries four §F.2 vectors per
+/// macroblock through the §F.3 OBMC blend, PREC is that OBMC
+/// reconstruction, and the B-part's §G.4 vectors (plus the searched
+/// §5.3.9 MVDB delta, [`PbConfig::b_search_half`]) are scaled per 8 × 8
+/// block. Same contract as [`crate::encoder::encode_pb_picture`]
+/// otherwise; decodes through
+/// [`crate::picture::decode_pb_picture_no_gob0_header`] /
+/// `decode_sequence`.
+pub fn encode_pb_picture_ap(
+    p_source: &YuvFrame,
+    b_source: &YuvFrame,
+    reference: &YuvFrame,
+    tr_p: u8,
+    prev_tr: u8,
+    cfg: &PbConfig,
+) -> Result<Vec<u8>> {
+    encode_pb_picture_ap_stats(p_source, b_source, reference, tr_p, prev_tr, cfg)
+        .map(|(bytes, _)| bytes)
+}
+
+/// As [`encode_pb_picture_ap`], additionally returning the per-picture
+/// [`ImprovedPbStats`] census (`forward` / `backward` stay zero under
+/// Annex G).
+pub fn encode_pb_picture_ap_stats(
+    p_source: &YuvFrame,
+    b_source: &YuvFrame,
+    reference: &YuvFrame,
+    tr_p: u8,
+    prev_tr: u8,
+    cfg: &PbConfig,
+) -> Result<(Vec<u8>, ImprovedPbStats)> {
+    encode_pb_core(
+        p_source,
+        b_source,
+        reference,
+        tr_p,
+        prev_tr,
+        PbCore {
+            quant: cfg.quant,
+            trb: cfg.trb,
+            dbquant: cfg.dbquant,
+            search_half: cfg.search_half,
+            advanced_prediction: true,
+            intra_refresh: 0,
+        },
+        PbFlavour::AnnexG {
+            b_search_half: cfg.b_search_half,
+        },
+    )
+}
+
+/// The P-part of one macroblock after prediction + residual coding:
+/// what goes on the wire and the decoder-side reconstruction (PREC).
+struct PPart {
+    luma_inter: [Option<EncodedInterBlock>; 4],
+    luma_intra: [Option<EncodedIntraBlock>; 4],
+    cb_inter: Option<EncodedInterBlock>,
+    cr_inter: Option<EncodedInterBlock>,
+    cb_intra: Option<EncodedIntraBlock>,
+    cr_intra: Option<EncodedIntraBlock>,
+    prec_y: [u8; 256],
+    prec_cb: [u8; COEFFS_PER_BLOCK],
+    prec_cr: [u8; COEFFS_PER_BLOCK],
+    /// CBPC bits (`0b10` Cb, `0b01` Cr) and CBPY in INTRA orientation.
+    cbpc: u8,
+    cbpy: u8,
+    any_coeffs: bool,
+}
+
+/// The B-part decision for one macroblock.
+struct BPart {
+    mode: BpbCodingMode,
+    /// Annex G delta / Annex M forward vector difference on the wire.
+    mvdb: Option<Mvd>,
+    /// Annex M forward vector (the next macroblock's predictor).
+    forward_mv: Option<MotionVector>,
+    blocks: [EncodedInterBlock; 6],
+    any: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_pb_core(
+    p_source: &YuvFrame,
+    b_source: &YuvFrame,
+    reference: &YuvFrame,
+    tr_p: u8,
+    prev_tr: u8,
+    core: PbCore,
+    flavour: PbFlavour,
+) -> Result<(Vec<u8>, ImprovedPbStats)> {
+    if core.quant == 0 || core.quant > 31 {
         return Err(Error::InvalidQuantiser);
     }
-    if cfg.trb == 0 || cfg.trb > 7 || cfg.dbquant > 3 {
+    if core.trb == 0 || core.trb > 7 || core.dbquant > 3 {
         return Err(Error::BadPbTemporalReference);
     }
     let trd = i32::from(tr_p.wrapping_sub(prev_tr));
-    if trd == 0 || i32::from(cfg.trb) >= trd {
+    if trd == 0 || i32::from(core.trb) >= trd {
         return Err(Error::BadPbTemporalReference);
     }
     if p_source.luma_width != reference.luma_width
@@ -151,23 +332,11 @@ pub fn encode_improved_pb_picture_stats(
     let fmt = source_format_for(p_source.luma_width, p_source.luma_height)
         .ok_or(Error::NotImplemented)?;
 
-    let quant = cfg.quant;
-    let bquant = pb_bquant(cfg.dbquant, quant);
-    let trb = i32::from(cfg.trb);
+    let quant = core.quant;
+    let bquant = pb_bquant(core.dbquant, quant);
+    let trb = i32::from(core.trb);
+    let ap = core.advanced_prediction;
     let mut stats = ImprovedPbStats::default();
-
-    let mut w = BitWriter::new();
-    write_plus_picture_header(
-        &mut w,
-        fmt,
-        quant,
-        tr_p,
-        /* is_inter */ true,
-        PlusModes {
-            improved_pb: Some((cfg.trb, cfg.dbquant)),
-            ..PlusModes::default()
-        },
-    )?;
 
     let lw = p_source.luma_width;
     let lh = p_source.luma_height;
@@ -175,217 +344,228 @@ pub fn encode_improved_pb_picture_stats(
     let ch = p_source.chroma_height();
     let mb_cols = lw / 16;
     let mb_rows = lh / 16;
-    let mut grid = MvGrid::new(mb_cols, mb_rows);
     let lambda = 2 * quant as u32;
+    let is_intra_mb =
+        |idx: usize| -> bool { core.intra_refresh > 0 && idx % core.intra_refresh == 0 };
 
-    let prev_y = RefPlane::new(&reference.y, lw, lh);
+    // ---- Header. ------------------------------------------------------
+    let mut w = BitWriter::new();
+    match flavour {
+        PbFlavour::AnnexG { .. } => write_picture_header(
+            &mut w,
+            fmt,
+            quant,
+            tr_p,
+            /* is_inter */ true,
+            PtypeFlags {
+                advanced_prediction: ap,
+                ..PtypeFlags::default()
+            },
+            Some((core.trb, core.dbquant)),
+        ),
+        PbFlavour::AnnexM { .. } => write_plus_picture_header(
+            &mut w,
+            fmt,
+            quant,
+            tr_p,
+            /* is_inter */ true,
+            PlusModes {
+                advanced_prediction: ap,
+                improved_pb: Some((core.trb, core.dbquant)),
+                ..PlusModes::default()
+            },
+        )?,
+    }
+
+    // ---- Pass 1 (Advanced Prediction): the whole §F.2 vector field,
+    // so every §F.3 remote vector is known before any prediction. An
+    // INTRA-refresh macroblock carries one 16 × 16 vector (§G.2) whose
+    // predictor is the §F.2 block-1 form. -------------------------------
+    let mut field: Vec<Mb4Mv> = Vec::new();
+    let mut mvds_field: Vec<[Mvd; 4]> = Vec::new();
+    if ap {
+        let mut grid4 = Mv4Grid::new(mb_cols, mb_rows);
+        for mb_row in 0..mb_rows {
+            for mb_col in 0..mb_cols {
+                let idx = mb_row * mb_cols + mb_col;
+                let mut cur: Mb4Mv = [MotionVector::new(0, 0); 4];
+                let mut mvds = [Mvd {
+                    dx_half: 0,
+                    dy_half: 0,
+                }; 4];
+                if is_intra_mb(idx) {
+                    // The INTRA macroblock's B-purpose vector is zero
+                    // (see `intra_refresh`); MVD still codes it against
+                    // the §F.2 block-1 predictor.
+                    let predictor = grid4.predict_block(mb_col, mb_row, LumaBlockIndex::B1, &cur);
+                    mvds[0] = mvd_for(MotionVector::new(0, 0), predictor);
+                } else {
+                    for &blk in &LumaBlockIndex::ALL {
+                        let blk_i = blk.index();
+                        let bx = mb_col * 16 + (blk_i % 2) * 8;
+                        let by = mb_row * 16 + (blk_i / 2) * 8;
+                        let predictor = grid4.predict_block(mb_col, mb_row, blk, &cur);
+                        let mv = estimate_block_motion(
+                            p_source,
+                            reference,
+                            bx,
+                            by,
+                            predictor,
+                            core.search_half,
+                            lambda,
+                        );
+                        cur[blk_i] = mv;
+                        mvds[blk_i] = mvd_for(mv, predictor);
+                    }
+                }
+                grid4.set(mb_col, mb_row, cur);
+                field.push(cur);
+                mvds_field.push(mvds);
+            }
+        }
+    }
+
+    // ---- Pass 2: prediction, residuals, B-part, emission. ---------------
+    let y_ref = RefPlane::new(&reference.y, lw, lh);
     let prev_cb = RefPlane::new(&reference.cb, cw, ch);
     let prev_cr = RefPlane::new(&reference.cr, cw, ch);
+    let mut grid = MvGrid::new(mb_cols, mb_rows);
 
     for mb_row in 0..mb_rows {
         // §M.2.2 — the forward-vector predictor restarts at the far-left
         // edge of every macroblock row (the decoder resets it per row).
         let mut left_forward: Option<MotionVector> = None;
         for mb_col in 0..mb_cols {
+            let idx = mb_row * mb_cols + mb_col;
             let mb_x = mb_col * 16;
             let mb_y = mb_row * 16;
-            let c_x = mb_col * 8;
-            let c_y = mb_row * 8;
+            let intra = is_intra_mb(idx);
 
-            // ---- P-part: motion estimation + residual coding. -------
-            let predictor = grid.predict(mb_col, mb_row);
-            let mv = estimate_motion(
-                p_source,
+            // ---- Vectors (and their MVDs) for this macroblock. --------
+            let (mvs4, mvds): (Mb4Mv, [Mvd; 4]) = if ap {
+                (field[idx], mvds_field[idx])
+            } else {
+                let predictor = grid.predict(mb_col, mb_row);
+                let mv = if intra {
+                    MotionVector::new(0, 0)
+                } else {
+                    estimate_motion(
+                        p_source,
+                        reference,
+                        mb_col,
+                        mb_row,
+                        predictor,
+                        core.search_half,
+                        lambda,
+                    )
+                };
+                let zero = Mvd {
+                    dx_half: 0,
+                    dy_half: 0,
+                };
+                ([mv; 4], [mvd_for(mv, predictor), zero, zero, zero])
+            };
+            let single_mv = mvs4[0];
+            let all_zero = mvs4.iter().all(|m| m.dx_half == 0 && m.dy_half == 0);
+
+            // ---- P-part. ----------------------------------------------
+            let src = extract_macroblock(p_source, mb_col, mb_row);
+            let p_part = if intra {
+                intra_p_part(&src, quant)
+            } else if ap {
+                let above = (mb_row > 0).then(|| field[idx - mb_cols]);
+                let left = (mb_col > 0).then(|| field[idx - 1]);
+                let right = (mb_col + 1 < mb_cols).then(|| field[idx + 1]);
+                inter_p_part_ap(
+                    &src, &y_ref, reference, mb_col, mb_row, &mvs4, above, left, right, quant,
+                )
+            } else {
+                inter_p_part_single(&src, reference, mb_col, mb_row, single_mv, quant)
+            };
+
+            // ---- B-part. ----------------------------------------------
+            let planes = PbBReferencePlanes {
+                prev_y: y_ref,
+                prev_cb,
+                prev_cr,
+                prec_y: RefPlane::new(&p_part.prec_y, 16, 16),
+                prec_cb: RefPlane::new(&p_part.prec_cb, 8, 8),
+                prec_cr: RefPlane::new(&p_part.prec_cr, 8, 8),
+            };
+            let b_src = extract_macroblock(b_source, mb_col, mb_row);
+            // §M.2.1 — only the bidirectional row carries MVD for an
+            // INTRA macroblock; a forward / backward INTRA macroblock
+            // would transmit no vector at all, so its neighbours (which
+            // already used the estimated vector as §6.1.1 candidate and
+            // §G.2 OBMC remote) would desynchronise. Keep INTRA
+            // macroblocks bidirectional under Annex M.
+            let b_part = decide_b_part(
+                &planes,
+                &b_src,
+                mb_x,
+                mb_y,
+                &mvs4,
+                trb,
+                trd,
+                bquant,
+                lambda,
+                flavour,
+                left_forward,
+                b_source,
                 reference,
                 mb_col,
                 mb_row,
-                predictor,
-                cfg.search_half,
-                lambda,
+                /* bidirectional_only */ intra,
             );
-            let chroma_vec = chroma_mv(mv);
-            let src = extract_macroblock(p_source, mb_col, mb_row);
 
-            let mut luma_pred: Vec<[u8; COEFFS_PER_BLOCK]> = Vec::with_capacity(4);
-            let mut luma_enc: Vec<EncodedInterBlock> = Vec::with_capacity(4);
-            for blk in 0..4 {
-                let bx = mb_x + (blk % 2) * 8;
-                let by = mb_y + (blk / 2) * 8;
-                let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
-                luma_enc.push(encode_inter_block(
-                    &residual_of(&src.luma[blk], &to_i16(&pred)),
-                    quant,
-                ));
-                luma_pred.push(pred);
-            }
-            let cb_pred = motion_compensated_block(&reference.cb, cw, ch, c_x, c_y, chroma_vec);
-            let cr_pred = motion_compensated_block(&reference.cr, cw, ch, c_x, c_y, chroma_vec);
-            let cb_enc = encode_inter_block(&residual_of(&src.cb, &to_i16(&cb_pred)), quant);
-            let cr_enc = encode_inter_block(&residual_of(&src.cr, &to_i16(&cr_pred)), quant);
-
-            let any_p =
-                luma_enc.iter().any(|e| e.has_coeffs) || cb_enc.has_coeffs || cr_enc.has_coeffs;
-            let is_zero_mv = mv.dx_half == 0 && mv.dy_half == 0;
-
-            // ---- PREC (§G.5): the decoder-reconstructed P-macroblock.
-            let mut prec_y = [0u8; 256];
-            for blk in 0..4 {
-                let samples = recon_block(&luma_enc[blk], &luma_pred[blk], quant);
-                let ox = (blk % 2) * 8;
-                let oy = (blk / 2) * 8;
-                for j in 0..8 {
-                    prec_y[(oy + j) * 16 + ox..(oy + j) * 16 + ox + 8]
-                        .copy_from_slice(&samples[j * 8..j * 8 + 8]);
-                }
-            }
-            let prec_cb = recon_block(&cb_enc, &cb_pred, quant);
-            let prec_cr = recon_block(&cr_enc, &cr_pred, quant);
-
-            // ---- BPB-part: §M.2 mode decision. ----------------------
-            let planes = PbBReferencePlanes {
-                prev_y,
-                prev_cb,
-                prev_cr,
-                prec_y: RefPlane::new(&prec_y, 16, 16),
-                prec_cb: RefPlane::new(&prec_cb, 8, 8),
-                prec_cr: RefPlane::new(&prec_cr, 8, 8),
-            };
-            let b_src = extract_macroblock(b_source, mb_col, mb_row);
-            let b_sad_of = |pred: &PbBMacroblockPrediction| -> u32 {
-                let mut sad = 0u32;
-                for blk in 0..4 {
-                    let ox = (blk % 2) * 8;
-                    let oy = (blk / 2) * 8;
-                    for j in 0..8 {
-                        for i in 0..8 {
-                            let sv = b_src.luma[blk][j * 8 + i] as i32;
-                            let pv = pred.luma[oy + j][ox + i] as i32;
-                            sad += (sv - pv).unsigned_abs();
-                        }
-                    }
-                }
-                sad
-            };
-
-            // §M.2.1 — bidirectional, MVD = 0 (Table M.1 rows 0 / 1).
-            let bidir = pb_b_predict_macroblock(
-                &planes,
-                mb_x,
-                mb_y,
-                &[mv; 4],
-                None,
-                trb,
-                trd,
-                RCONTROL_DEFAULT,
-            );
-            let mut best_mode = BpbCodingMode::Bidirectional;
-            let mut best_cost = b_sad_of(&bidir) + lambda;
-            let mut best_pred = bidir;
-            let mut forward_choice: Option<(MotionVector, crate::macroblock::Mvd)> = None;
-
-            // §M.2.2 — forward: one 16 × 16 vector into the previous
-            // reference, coded against the left-neighbour predictor.
-            if cfg.forward_search_half > 0 {
-                let fwd_predictor = left_forward.unwrap_or_default();
-                let fwd_mv = estimate_motion(
-                    b_source,
-                    reference,
-                    mb_col,
-                    mb_row,
-                    fwd_predictor,
-                    cfg.forward_search_half,
-                    lambda,
-                );
-                let fwd_pred = forward_prediction(&planes, mb_x, mb_y, fwd_mv);
-                let mvdb = mvd_for(fwd_mv, fwd_predictor);
-                let bits = 3
-                    + (mvdb.dx_half.unsigned_abs() as u32)
-                    + (mvdb.dy_half.unsigned_abs() as u32)
-                    + 2;
-                let cost = b_sad_of(&fwd_pred) + lambda * bits;
-                if cost < best_cost {
-                    best_cost = cost;
-                    best_mode = BpbCodingMode::Forward;
-                    best_pred = fwd_pred;
-                    forward_choice = Some((fwd_mv, mvdb));
-                }
-            }
-
-            // §M.2.3 — backward: the prediction is PREC itself.
-            if cfg.allow_backward {
-                let bwd_pred = backward_prediction(&prec_y, &prec_cb, &prec_cr);
-                let cost = b_sad_of(&bwd_pred) + lambda * 5;
-                if cost < best_cost {
-                    best_cost = cost;
-                    best_mode = BpbCodingMode::Backward;
-                    best_pred = bwd_pred;
-                    forward_choice = None;
-                }
-            }
-            let _ = best_cost;
-
-            // Residual of the chosen prediction at BQUANT.
-            let mut b_enc: Vec<EncodedInterBlock> = Vec::with_capacity(6);
-            for blk in 0..4 {
-                let ox = (blk % 2) * 8;
-                let oy = (blk / 2) * 8;
-                let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
-                for j in 0..8 {
-                    for i in 0..8 {
-                        pred_i16[j * 8 + i] = best_pred.luma[oy + j][ox + i] as i16;
-                    }
-                }
-                b_enc.push(encode_inter_block(
-                    &residual_of(&b_src.luma[blk], &pred_i16),
-                    bquant,
-                ));
-            }
-            let mut b_cb_pred = [0i16; COEFFS_PER_BLOCK];
-            let mut b_cr_pred = [0i16; COEFFS_PER_BLOCK];
-            for j in 0..8 {
-                for i in 0..8 {
-                    b_cb_pred[j * 8 + i] = best_pred.cb[j][i] as i16;
-                    b_cr_pred[j * 8 + i] = best_pred.cr[j][i] as i16;
-                }
-            }
-            b_enc.push(encode_inter_block(
-                &residual_of(&b_src.cb, &b_cb_pred),
-                bquant,
-            ));
-            b_enc.push(encode_inter_block(
-                &residual_of(&b_src.cr, &b_cr_pred),
-                bquant,
-            ));
-            let any_b = b_enc.iter().any(|e| e.has_coeffs);
-
-            // ---- Skip / emit. ---------------------------------------
-            // A skipped macroblock (COD = 1) carries no MODB: its
-            // BPB-part is the zero-vector bidirectional prediction and
-            // the §M.2.2 predictor state is left untouched.
-            if !any_p && !any_b && is_zero_mv && matches!(best_mode, BpbCodingMode::Bidirectional) {
+            // ---- Skip / emit. -----------------------------------------
+            // A skipped macroblock (COD = 1) carries no MODB: its B-part
+            // is the zero-vector bidirectional prediction and the §M.2.2
+            // predictor state is left untouched. Under Advanced
+            // Prediction the decoder still OBMC-blends a skipped
+            // macroblock (§5.3.1 NOTE) with zero vectors — which is what
+            // the field holds when `all_zero`.
+            let b_needs_nothing = !b_part.any
+                && b_part.mvdb.is_none()
+                && matches!(b_part.mode, BpbCodingMode::Bidirectional);
+            if !intra && !p_part.any_coeffs && all_zero && b_needs_nothing {
                 crate::encoder_mb::encode_skipped_macroblock(&mut w);
                 grid.set_zero_candidate(mb_col, mb_row);
                 stats.skipped += 1;
                 continue;
             }
 
-            // COD = 0; MCBPC (Table 8, INTER type 0).
+            // COD = 0; MCBPC (Table 8).
             w.write_bit(false);
-            let mut cbpc = 0u8;
-            if cb_enc.has_coeffs {
-                cbpc |= 0b10;
-            }
-            if cr_enc.has_coeffs {
-                cbpc |= 0b01;
-            }
-            write_mcbpc_p(&mut w, MbType::Inter, cbpc)?;
+            let mb_type = if intra {
+                MbType::Intra
+            } else if ap {
+                MbType::Inter4V
+            } else {
+                MbType::Inter
+            };
+            write_mcbpc_p(&mut w, mb_type, p_part.cbpc)?;
 
-            // §M.4 / Table M.1 MODB.
-            write_modb_annex_m(&mut w, ModbAnnexM::from_parts(best_mode, any_b));
-            if any_b {
+            // MODB (+ CBPB).
+            match flavour {
+                PbFlavour::AnnexG { .. } => {
+                    // §5.3.3 Table 11: "0" none, "10" MVDB, "11" CBPB + MVDB.
+                    if b_part.any {
+                        w.write_bits(0b11, 2);
+                    } else if b_part.mvdb.is_some() {
+                        w.write_bits(0b10, 2);
+                    } else {
+                        w.write_bit(false);
+                    }
+                }
+                PbFlavour::AnnexM { .. } => {
+                    write_modb_annex_m(&mut w, ModbAnnexM::from_parts(b_part.mode, b_part.any));
+                }
+            }
+            if b_part.any {
                 // §5.3.4 CBPB — block N lights bit (6 − N).
                 let mut cbpb = 0u8;
-                for (blk, e) in b_enc.iter().enumerate() {
+                for (blk, e) in b_part.blocks.iter().enumerate() {
                     if e.has_coeffs {
                         cbpb |= 1 << (6 - (blk + 1));
                     }
@@ -394,57 +574,85 @@ pub fn encode_improved_pb_picture_stats(
                 stats.b_residual += 1;
             }
 
-            // §5.3.5 CBPY (INTER complement).
-            let mut cbpy_intra = 0u8;
-            for (blk, e) in luma_enc.iter().enumerate() {
-                if e.has_coeffs {
-                    cbpy_intra |= 1 << (3 - blk);
+            // §5.3.5 CBPY (INTRA orientation for INTRA, complement for INTER).
+            let cbpy_wire = if intra {
+                p_part.cbpy
+            } else {
+                p_part.cbpy ^ 0b1111
+            };
+            write_cbpy(&mut w, cbpy_wire)?;
+
+            // §5.3.7 MVD — every INTER macroblock; an INTRA macroblock
+            // in PB-frames mode too (§G.2), except Annex M's forward /
+            // backward rows (§M.2.1).
+            let intra_mvd = match flavour {
+                PbFlavour::AnnexG { .. } => true,
+                PbFlavour::AnnexM { .. } => matches!(b_part.mode, BpbCodingMode::Bidirectional),
+            };
+            if !intra || intra_mvd {
+                write_mvd_component(&mut w, mvds[0].dx_half)?;
+                write_mvd_component(&mut w, mvds[0].dy_half)?;
+            }
+            // §5.3.8 MVD2-4 — INTER4V only ("never used for INTRA", §G.2).
+            if ap && !intra {
+                for d in mvds.iter().skip(1) {
+                    write_mvd_component(&mut w, d.dx_half)?;
+                    write_mvd_component(&mut w, d.dy_half)?;
                 }
             }
-            write_cbpy(&mut w, cbpy_intra ^ 0b1111)?;
-
-            // §5.3.7 MVD.
-            let mvd = mvd_for(mv, predictor);
-            write_mvd_component(&mut w, mvd.dx_half)?;
-            write_mvd_component(&mut w, mvd.dy_half)?;
-
-            // §5.3.9 MVDB — forward mode only (Table M.1 rows 2 / 3).
-            match best_mode {
+            // §5.3.9 MVDB.
+            if let Some(d) = b_part.mvdb {
+                write_mvd_component(&mut w, d.dx_half)?;
+                write_mvd_component(&mut w, d.dy_half)?;
+                if d.dx_half != 0 || d.dy_half != 0 {
+                    stats.mvdb += 1;
+                }
+            }
+            match b_part.mode {
                 BpbCodingMode::Forward => {
-                    let (fwd_mv, mvdb) = forward_choice.expect("forward mode carries a vector");
-                    write_mvd_component(&mut w, mvdb.dx_half)?;
-                    write_mvd_component(&mut w, mvdb.dy_half)?;
-                    left_forward = Some(fwd_mv);
+                    left_forward = b_part.forward_mv;
                     stats.forward += 1;
                 }
                 BpbCodingMode::Backward => {
                     left_forward = None;
                     stats.backward += 1;
                 }
-                BpbCodingMode::Bidirectional => {
-                    stats.bidirectional += 1;
-                }
+                BpbCodingMode::Bidirectional => stats.bidirectional += 1,
+            }
+            if intra {
+                stats.intra += 1;
             }
 
-            // §G.3 — six P-blocks, then six BPB-blocks.
-            for e in luma_enc.iter() {
+            // §G.3 — six P-blocks, then six B-blocks.
+            if intra {
+                for e in p_part.luma_intra.iter().flatten() {
+                    write_intra_block(&mut w, e.dc_level, &e.scan, e.has_ac)?;
+                }
+                let cb = p_part.cb_intra.as_ref().expect("intra chroma");
+                let cr = p_part.cr_intra.as_ref().expect("intra chroma");
+                write_intra_block(&mut w, cb.dc_level, &cb.scan, cb.has_ac)?;
+                write_intra_block(&mut w, cr.dc_level, &cr.scan, cr.has_ac)?;
+            } else {
+                for e in p_part.luma_inter.iter().flatten() {
+                    if e.has_coeffs {
+                        write_inter_block_coeffs(&mut w, &e.scan)?;
+                    }
+                }
+                for e in [&p_part.cb_inter, &p_part.cr_inter].into_iter().flatten() {
+                    if e.has_coeffs {
+                        write_inter_block_coeffs(&mut w, &e.scan)?;
+                    }
+                }
+            }
+            for e in b_part.blocks.iter() {
                 if e.has_coeffs {
                     write_inter_block_coeffs(&mut w, &e.scan)?;
                 }
             }
-            if cb_enc.has_coeffs {
-                write_inter_block_coeffs(&mut w, &cb_enc.scan)?;
-            }
-            if cr_enc.has_coeffs {
-                write_inter_block_coeffs(&mut w, &cr_enc.scan)?;
-            }
-            for e in b_enc.iter() {
-                if e.has_coeffs {
-                    write_inter_block_coeffs(&mut w, &e.scan)?;
-                }
-            }
 
-            grid.set_inter(mb_col, mb_row, mv);
+            // In PB-frames mode an INTRA macroblock's vector is a
+            // §6.1.1 candidate for its neighbours (rule-1 exception).
+            grid.set_inter(mb_col, mb_row, single_mv);
         }
     }
 
@@ -463,13 +671,13 @@ fn to_i16(pred: &[u8; COEFFS_PER_BLOCK]) -> [i16; COEFFS_PER_BLOCK] {
 /// The decoder-side reconstruction of one INTER block: prediction plus
 /// the dequantised residual (§6.3.1) and the §6.3.2 clip, or the bare
 /// prediction when no coefficient survived.
-fn recon_block(
+fn recon_inter_block(
     enc: &EncodedInterBlock,
     pred: &[u8; COEFFS_PER_BLOCK],
     quant: u8,
 ) -> [u8; COEFFS_PER_BLOCK] {
     if enc.has_coeffs {
-        let block = crate::block::H263Block {
+        let block = H263Block {
             coefficients: enc.scan,
             tcoef_event_count: 0,
             had_intradc: false,
@@ -477,6 +685,427 @@ fn recon_block(
         crate::reconstruct_inter_block_with_prediction(&block, quant, pred)
     } else {
         *pred
+    }
+}
+
+/// The decoder-side reconstruction of one INTRA block (§6.2 / §6.3.2).
+fn recon_intra_block(enc: &EncodedIntraBlock, quant: u8) -> [u8; COEFFS_PER_BLOCK] {
+    let mut coefficients = enc.scan;
+    coefficients[0] = enc.dc_level;
+    let block = H263Block {
+        coefficients,
+        tcoef_event_count: 0,
+        had_intradc: true,
+    };
+    crate::reconstruct_intra_block(&block, quant)
+}
+
+fn blit_prec_luma(prec_y: &mut [u8; 256], blk: usize, samples: &[u8; COEFFS_PER_BLOCK]) {
+    let ox = (blk % 2) * 8;
+    let oy = (blk / 2) * 8;
+    for j in 0..8 {
+        prec_y[(oy + j) * 16 + ox..(oy + j) * 16 + ox + 8]
+            .copy_from_slice(&samples[j * 8..j * 8 + 8]);
+    }
+}
+
+fn intra_p_part(src: &crate::encoder_mb::MacroblockSamples, quant: u8) -> PPart {
+    let mut prec_y = [0u8; 256];
+    let mut luma_intra: [Option<EncodedIntraBlock>; 4] = [None, None, None, None];
+    let mut cbpy = 0u8;
+    for (blk, slot) in luma_intra.iter_mut().enumerate() {
+        let e = encode_intra_block(&src.luma[blk], quant);
+        if e.has_ac {
+            cbpy |= 1 << (3 - blk);
+        }
+        blit_prec_luma(&mut prec_y, blk, &recon_intra_block(&e, quant));
+        *slot = Some(e);
+    }
+    let cb = encode_intra_block(&src.cb, quant);
+    let cr = encode_intra_block(&src.cr, quant);
+    let mut cbpc = 0u8;
+    if cb.has_ac {
+        cbpc |= 0b10;
+    }
+    if cr.has_ac {
+        cbpc |= 0b01;
+    }
+    let prec_cb = recon_intra_block(&cb, quant);
+    let prec_cr = recon_intra_block(&cr, quant);
+    PPart {
+        luma_inter: [None, None, None, None],
+        luma_intra,
+        cb_inter: None,
+        cr_inter: None,
+        cb_intra: Some(cb),
+        cr_intra: Some(cr),
+        prec_y,
+        prec_cb,
+        prec_cr,
+        cbpc,
+        cbpy,
+        any_coeffs: true,
+    }
+}
+
+fn finish_inter_p_part(
+    src: &crate::encoder_mb::MacroblockSamples,
+    luma_pred: [[u8; COEFFS_PER_BLOCK]; 4],
+    cb_pred: [u8; COEFFS_PER_BLOCK],
+    cr_pred: [u8; COEFFS_PER_BLOCK],
+    quant: u8,
+) -> PPart {
+    let mut prec_y = [0u8; 256];
+    let mut luma_inter: [Option<EncodedInterBlock>; 4] = [None, None, None, None];
+    let mut cbpy = 0u8;
+    let mut any = false;
+    for blk in 0..4 {
+        let e = encode_inter_block(
+            &residual_of(&src.luma[blk], &to_i16(&luma_pred[blk])),
+            quant,
+        );
+        if e.has_coeffs {
+            cbpy |= 1 << (3 - blk);
+            any = true;
+        }
+        blit_prec_luma(
+            &mut prec_y,
+            blk,
+            &recon_inter_block(&e, &luma_pred[blk], quant),
+        );
+        luma_inter[blk] = Some(e);
+    }
+    let cb = encode_inter_block(&residual_of(&src.cb, &to_i16(&cb_pred)), quant);
+    let cr = encode_inter_block(&residual_of(&src.cr, &to_i16(&cr_pred)), quant);
+    let mut cbpc = 0u8;
+    if cb.has_coeffs {
+        cbpc |= 0b10;
+        any = true;
+    }
+    if cr.has_coeffs {
+        cbpc |= 0b01;
+        any = true;
+    }
+    let prec_cb = recon_inter_block(&cb, &cb_pred, quant);
+    let prec_cr = recon_inter_block(&cr, &cr_pred, quant);
+    PPart {
+        luma_inter,
+        luma_intra: [None, None, None, None],
+        cb_inter: Some(cb),
+        cr_inter: Some(cr),
+        cb_intra: None,
+        cr_intra: None,
+        prec_y,
+        prec_cb,
+        prec_cr,
+        cbpc,
+        cbpy,
+        any_coeffs: any,
+    }
+}
+
+fn inter_p_part_single(
+    src: &crate::encoder_mb::MacroblockSamples,
+    reference: &YuvFrame,
+    mb_col: usize,
+    mb_row: usize,
+    mv: MotionVector,
+    quant: u8,
+) -> PPart {
+    let lw = reference.luma_width;
+    let lh = reference.luma_height;
+    let cw = reference.chroma_width();
+    let ch = reference.chroma_height();
+    let mut luma_pred = [[0u8; COEFFS_PER_BLOCK]; 4];
+    for (blk, pred) in luma_pred.iter_mut().enumerate() {
+        let bx = mb_col * 16 + (blk % 2) * 8;
+        let by = mb_row * 16 + (blk / 2) * 8;
+        *pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
+    }
+    let chroma_vec = chroma_mv(mv);
+    let cb_pred =
+        motion_compensated_block(&reference.cb, cw, ch, mb_col * 8, mb_row * 8, chroma_vec);
+    let cr_pred =
+        motion_compensated_block(&reference.cr, cw, ch, mb_col * 8, mb_row * 8, chroma_vec);
+    finish_inter_p_part(src, luma_pred, cb_pred, cr_pred, quant)
+}
+
+/// §F.3 OBMC prediction of an INTER4V P-macroblock. Every macroblock of
+/// the field carries vectors — INTER4V ones their four, INTRA-refresh
+/// ones the §G.2 B-purpose vector (four copies), which per §G.2 is
+/// exactly the remote the neighbours use ("the remote 'INTRA' motion
+/// vector is used") — so a present neighbour always contributes its
+/// actual cell vector and only an off-picture neighbour falls back to
+/// the current vector.
+#[allow(clippy::too_many_arguments)]
+fn inter_p_part_ap(
+    src: &crate::encoder_mb::MacroblockSamples,
+    y_ref: &RefPlane<'_>,
+    reference: &YuvFrame,
+    mb_col: usize,
+    mb_row: usize,
+    cur: &Mb4Mv,
+    above: Option<Mb4Mv>,
+    left: Option<Mb4Mv>,
+    right: Option<Mb4Mv>,
+    quant: u8,
+) -> PPart {
+    let remote = |nb: Option<Mb4Mv>, cell: LumaBlockIndex| -> RemoteMv {
+        match nb {
+            Some(m) => RemoteMv::Vector(m[cell.index()]),
+            None => RemoteMv::Current,
+        }
+    };
+    let tags = |blk: LumaBlockIndex| -> (RemoteMv, RemoteMv, RemoteMv, RemoteMv) {
+        match blk {
+            LumaBlockIndex::B1 => (
+                remote(above, LumaBlockIndex::B3),
+                RemoteMv::Vector(cur[LumaBlockIndex::B3.index()]),
+                remote(left, LumaBlockIndex::B2),
+                RemoteMv::Vector(cur[LumaBlockIndex::B2.index()]),
+            ),
+            LumaBlockIndex::B2 => (
+                remote(above, LumaBlockIndex::B4),
+                RemoteMv::Vector(cur[LumaBlockIndex::B4.index()]),
+                RemoteMv::Vector(cur[LumaBlockIndex::B1.index()]),
+                remote(right, LumaBlockIndex::B1),
+            ),
+            LumaBlockIndex::B3 => (
+                RemoteMv::Vector(cur[LumaBlockIndex::B1.index()]),
+                RemoteMv::Current,
+                remote(left, LumaBlockIndex::B4),
+                RemoteMv::Vector(cur[LumaBlockIndex::B4.index()]),
+            ),
+            LumaBlockIndex::B4 => (
+                RemoteMv::Vector(cur[LumaBlockIndex::B2.index()]),
+                RemoteMv::Current,
+                RemoteMv::Vector(cur[LumaBlockIndex::B3.index()]),
+                remote(right, LumaBlockIndex::B3),
+            ),
+        }
+    };
+    let mut luma_pred = [[0u8; COEFFS_PER_BLOCK]; 4];
+    for &blk in &LumaBlockIndex::ALL {
+        let blk_i = blk.index();
+        let bx = mb_col * 16 + (blk_i % 2) * 8;
+        let by = mb_row * 16 + (blk_i / 2) * 8;
+        let (r_top, r_bot, s_left, s_right) = tags(blk);
+        luma_pred[blk_i] = obmc_predict_block(
+            y_ref,
+            bx,
+            by,
+            cur[blk_i],
+            r_top,
+            r_bot,
+            s_left,
+            s_right,
+            RCONTROL_DEFAULT,
+        );
+    }
+    // §F.2 chroma: sum-of-four / Table F.1 vector, plain half-pel
+    // motion compensation (no OBMC).
+    let chroma_vec = chroma_mv_4mv(cur);
+    let cw = reference.chroma_width();
+    let ch = reference.chroma_height();
+    let cb_pred =
+        motion_compensated_block(&reference.cb, cw, ch, mb_col * 8, mb_row * 8, chroma_vec);
+    let cr_pred =
+        motion_compensated_block(&reference.cr, cw, ch, mb_col * 8, mb_row * 8, chroma_vec);
+    finish_inter_p_part(src, luma_pred, cb_pred, cr_pred, quant)
+}
+
+/// Luminance SAD of the B-source macroblock against a candidate B
+/// prediction.
+fn b_sad(b_src: &crate::encoder_mb::MacroblockSamples, pred: &PbBMacroblockPrediction) -> u32 {
+    let mut sad = 0u32;
+    for blk in 0..4 {
+        let ox = (blk % 2) * 8;
+        let oy = (blk / 2) * 8;
+        for j in 0..8 {
+            for i in 0..8 {
+                let sv = b_src.luma[blk][j * 8 + i] as i32;
+                let pv = pred.luma[oy + j][ox + i] as i32;
+                sad += (sv - pv).unsigned_abs();
+            }
+        }
+    }
+    sad
+}
+
+/// Code the B-residual of `pred` at BQUANT.
+fn b_residual(
+    b_src: &crate::encoder_mb::MacroblockSamples,
+    pred: &PbBMacroblockPrediction,
+    bquant: u8,
+) -> ([EncodedInterBlock; 6], bool) {
+    let mut out: Vec<EncodedInterBlock> = Vec::with_capacity(6);
+    for blk in 0..4 {
+        let ox = (blk % 2) * 8;
+        let oy = (blk / 2) * 8;
+        let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
+        for j in 0..8 {
+            for i in 0..8 {
+                pred_i16[j * 8 + i] = pred.luma[oy + j][ox + i] as i16;
+            }
+        }
+        out.push(encode_inter_block(
+            &residual_of(&b_src.luma[blk], &pred_i16),
+            bquant,
+        ));
+    }
+    let mut cb_pred = [0i16; COEFFS_PER_BLOCK];
+    let mut cr_pred = [0i16; COEFFS_PER_BLOCK];
+    for j in 0..8 {
+        for i in 0..8 {
+            cb_pred[j * 8 + i] = pred.cb[j][i] as i16;
+            cr_pred[j * 8 + i] = pred.cr[j][i] as i16;
+        }
+    }
+    out.push(encode_inter_block(
+        &residual_of(&b_src.cb, &cb_pred),
+        bquant,
+    ));
+    out.push(encode_inter_block(
+        &residual_of(&b_src.cr, &cr_pred),
+        bquant,
+    ));
+    let any = out.iter().any(|e| e.has_coeffs);
+    let blocks: [EncodedInterBlock; 6] = out.try_into().expect("six blocks");
+    (blocks, any)
+}
+
+/// The per-macroblock B-part decision for either flavour.
+#[allow(clippy::too_many_arguments)]
+fn decide_b_part(
+    planes: &PbBReferencePlanes<'_>,
+    b_src: &crate::encoder_mb::MacroblockSamples,
+    mb_x: usize,
+    mb_y: usize,
+    mvs4: &Mb4Mv,
+    trb: i32,
+    trd: i32,
+    bquant: u8,
+    lambda: u32,
+    flavour: PbFlavour,
+    left_forward: Option<MotionVector>,
+    b_source: &YuvFrame,
+    reference: &YuvFrame,
+    mb_col: usize,
+    mb_row: usize,
+    bidirectional_only: bool,
+) -> BPart {
+    let predict_at = |delta: Option<Mvd>| {
+        pb_b_predict_macroblock(planes, mb_x, mb_y, mvs4, delta, trb, trd, RCONTROL_DEFAULT)
+    };
+    let mut best_pred = predict_at(None);
+    let mut best_cost = b_sad(b_src, &best_pred) + lambda;
+    let mut mode = BpbCodingMode::Bidirectional;
+    let mut mvdb: Option<Mvd> = None;
+    let mut forward_mv: Option<MotionVector> = None;
+
+    match flavour {
+        PbFlavour::AnnexG { b_search_half } if b_search_half > 0 => {
+            // §5.3.9 / §G.4 — MVDB refinement: search a small window of
+            // delta vectors, keeping only deltas that are Table 14
+            // codable and whose per-component MVF stays inside the §G.4
+            // permitted range for every block (the in-range value is
+            // what any decoder selects from the Table 14 pair, since
+            // the pair mate sits exactly 64 half-pels away — outside a
+            // range only 64 wide). The zero delta competes with a flat
+            // bias so static content never pays the MODB / MVDB bits.
+            let mvf_in_range = |p_comp: i32, delta: i32| -> bool {
+                let mvf = (trb * p_comp) / trd + delta;
+                (-32..=31).contains(&mvf)
+            };
+            let bw = b_search_half;
+            for dy in -bw..=bw {
+                for dx in -bw..=bw {
+                    if (dx == 0 && dy == 0)
+                        || !(-32..=31).contains(&dx)
+                        || !(-32..=31).contains(&dy)
+                        || !mvs4
+                            .iter()
+                            .all(|m| mvf_in_range(m.dx_half, dx) && mvf_in_range(m.dy_half, dy))
+                    {
+                        continue;
+                    }
+                    let delta = Mvd {
+                        dx_half: dx as i16,
+                        dy_half: dy as i16,
+                    };
+                    let cand = predict_at(Some(delta));
+                    let cost = b_sad(b_src, &cand)
+                        + lambda * (dx.unsigned_abs() + dy.unsigned_abs())
+                        + 4 * lambda;
+                    if cost < best_cost {
+                        best_cost = cost;
+                        mvdb = Some(delta);
+                        best_pred = cand;
+                    }
+                }
+            }
+        }
+        PbFlavour::AnnexG { .. } => {}
+        PbFlavour::AnnexM { .. } if bidirectional_only => {}
+        PbFlavour::AnnexM {
+            forward_search_half,
+            allow_backward,
+        } => {
+            // §M.2.2 — forward: one 16 × 16 vector into the previous
+            // reference, coded against the left-neighbour predictor.
+            if forward_search_half > 0 {
+                let fwd_predictor = left_forward.unwrap_or_default();
+                let fwd_mv = estimate_motion(
+                    b_source,
+                    reference,
+                    mb_col,
+                    mb_row,
+                    fwd_predictor,
+                    forward_search_half,
+                    lambda,
+                );
+                let fwd_pred = forward_prediction(planes, mb_x, mb_y, fwd_mv);
+                let d = mvd_for(fwd_mv, fwd_predictor);
+                let bits =
+                    3 + (d.dx_half.unsigned_abs() as u32) + (d.dy_half.unsigned_abs() as u32) + 2;
+                let cost = b_sad(b_src, &fwd_pred) + lambda * bits;
+                if cost < best_cost {
+                    best_cost = cost;
+                    mode = BpbCodingMode::Forward;
+                    best_pred = fwd_pred;
+                    mvdb = Some(d);
+                    forward_mv = Some(fwd_mv);
+                }
+            }
+            // §M.2.3 — backward: the prediction is PREC itself.
+            if allow_backward {
+                let bwd_pred = backward_prediction(planes);
+                let cost = b_sad(b_src, &bwd_pred) + lambda * 5;
+                if cost < best_cost {
+                    mode = BpbCodingMode::Backward;
+                    best_pred = bwd_pred;
+                    mvdb = None;
+                    forward_mv = None;
+                }
+            }
+        }
+    }
+
+    let (blocks, any) = b_residual(b_src, &best_pred, bquant);
+    // Annex G: a lit CBPB without a searched delta still needs MODB
+    // "11" → a zero MVDB on the wire.
+    if matches!(flavour, PbFlavour::AnnexG { .. }) && any && mvdb.is_none() {
+        mvdb = Some(Mvd {
+            dx_half: 0,
+            dy_half: 0,
+        });
+    }
+    BPart {
+        mode,
+        mvdb,
+        forward_mv,
+        blocks,
+        any,
     }
 }
 
@@ -530,20 +1159,16 @@ fn forward_prediction(
 }
 
 /// §M.2.3 — the backward BPB prediction is PREC.
-fn backward_prediction(
-    prec_y: &[u8; 256],
-    prec_cb: &[u8; COEFFS_PER_BLOCK],
-    prec_cr: &[u8; COEFFS_PER_BLOCK],
-) -> PbBMacroblockPrediction {
+fn backward_prediction(planes: &PbBReferencePlanes<'_>) -> PbBMacroblockPrediction {
     let mut luma = [[0u8; 16]; 16];
     for (j, row) in luma.iter_mut().enumerate() {
-        row.copy_from_slice(&prec_y[j * 16..j * 16 + 16]);
+        row.copy_from_slice(&planes.prec_y.samples[j * 16..j * 16 + 16]);
     }
     let mut cb = [[0u8; 8]; 8];
     let mut cr = [[0u8; 8]; 8];
     for j in 0..8 {
-        cb[j].copy_from_slice(&prec_cb[j * 8..j * 8 + 8]);
-        cr[j].copy_from_slice(&prec_cr[j * 8..j * 8 + 8]);
+        cb[j].copy_from_slice(&planes.prec_cb.samples[j * 8..j * 8 + 8]);
+        cr[j].copy_from_slice(&planes.prec_cr.samples[j * 8..j * 8 + 8]);
     }
     PbBMacroblockPrediction { luma, cb, cr }
 }

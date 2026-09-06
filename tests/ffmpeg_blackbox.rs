@@ -18,8 +18,8 @@
 use oxideav_h263::encoder::{
     encode_improved_pb_picture, encode_inter_picture_ap, encode_inter_picture_deblock,
     encode_inter_picture_motion, encode_inter_picture_umv_plus, encode_intra_picture,
-    encode_intra_picture_aic_plus, encode_intra_picture_deblock, encode_sequence, DeblockConfig,
-    GopConfig, ImprovedPbConfig,
+    encode_intra_picture_aic_plus, encode_intra_picture_deblock, encode_pb_picture,
+    encode_pb_picture_ap, encode_sequence, DeblockConfig, GopConfig, ImprovedPbConfig, PbConfig,
 };
 use oxideav_h263::picture::{decode_sequence, DecodeOptions, YuvFrame};
 use std::path::PathBuf;
@@ -244,6 +244,46 @@ fn cross_check_anchors(
     }
 }
 
+/// [`cross_check_anchors`] for the PB + Advanced Prediction P-parts,
+/// where the oracle's P-part output provably depends on the B-part's
+/// content (see `oracle_ap_pb_p_part_depends_on_b_content`) — a
+/// behaviour §G.3 / §G.5 do not permit (the P-blocks precede the
+/// B-blocks and only PREC feeds the B prediction, never the reverse).
+/// This crate's decoder matches the encoder's PREC byte-exactly there
+/// (pinned by `tests/improved_pb_roundtrip.rs`), so the oracle check
+/// degrades to a PSNR floor: the contamination is confined to a few
+/// 8 × 8 blocks per picture, every other block sitting on the IDCT
+/// staircase.
+fn cross_check_anchors_psnr(
+    stream: &[u8],
+    lw: usize,
+    lh: usize,
+    name: &str,
+    psnr_floor: f64,
+    ours_indices: &[usize],
+) {
+    let ours = decode_sequence(stream, DecodeOptions::default()).expect("own decode");
+    let theirs = oracle_decode(stream, lw, lh, name);
+    assert_eq!(
+        theirs.len(),
+        ours_indices.len(),
+        "{name}: oracle picture count"
+    );
+    for (i, (&oi, b)) in ours_indices.iter().zip(theirs.iter()).enumerate() {
+        let a = &ours[oi];
+        let m = max_abs_diff(a, b) as usize;
+        let f = mean_abs_diff(a, b);
+        let psnr = luma_psnr(a, b);
+        eprintln!(
+            "{name} anchor {i} (ours #{oi}): max |diff| {m}, mean {f:.4}, luma PSNR vs oracle {psnr:.2} dB"
+        );
+        assert!(
+            psnr >= psnr_floor,
+            "{name} anchor {i}: luma PSNR vs oracle {psnr:.2} dB (floor {psnr_floor})"
+        );
+    }
+}
+
 macro_rules! require_oracle {
     () => {
         if !ffmpeg_available() {
@@ -391,6 +431,8 @@ fn improved_pb_frames_agree_with_oracle() {
         search_half: 6,
         forward_search_half: 3,
         allow_backward: true,
+        advanced_prediction: false,
+        intra_refresh: 0,
     };
     let mut prev_tr = 0u8;
     for k in 1..=3usize {
@@ -409,4 +451,150 @@ fn improved_pb_frames_agree_with_oracle() {
     }
     // Display order: I, BPB1, P1, BPB2, P2, BPB3, P3 — anchors at 0, 2, 4, 6.
     cross_check_anchors(&stream, 176, 144, "improved-pb", 0.08, &[0, 2, 4, 6]);
+}
+
+/// Annex G PB-frames, plain and with Advanced Prediction: the oracle
+/// parses every macroblock's twelve blocks and outputs the P-parts —
+/// under AP the §F.3 OBMC P-luma, so an OBMC / MODB / MVDB misparse
+/// would show up as a P-part disagreement.
+#[test]
+fn pb_frames_plain_and_advanced_prediction_agree_with_oracle() {
+    require_oracle!();
+    for ap in [false, true] {
+        let base = gradient(176, 144, 29);
+        let mut stream = encode_intra_picture(&base, 8, 0).unwrap();
+        let mut recon = decode_sequence(&stream, DecodeOptions::default())
+            .unwrap()
+            .remove(0);
+        let cfg = PbConfig {
+            quant: 8,
+            trb: 1,
+            dbquant: 2,
+            search_half: 6,
+            b_search_half: 2,
+        };
+        let mut prev_tr = 0u8;
+        for k in 1..=2usize {
+            let p = translated(&base, 4 * k, 2 * k);
+            let b = translated(&base, 4 * k - 3, 2 * k - 1);
+            let tr_p = (2 * k) as u8;
+            let unit = if ap {
+                encode_pb_picture_ap(&p, &b, &recon, tr_p, prev_tr, &cfg).unwrap()
+            } else {
+                encode_pb_picture(&p, &b, &recon, tr_p, prev_tr, &cfg).unwrap()
+            };
+            stream.extend_from_slice(&unit);
+            recon = decode_sequence(&stream, DecodeOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+            prev_tr = tr_p;
+        }
+        // The plain form must match exactly; under Advanced Prediction
+        // the oracle's P-part is B-content-dependent (see
+        // `cross_check_anchors_psnr`).
+        if ap {
+            cross_check_anchors_psnr(&stream, 176, 144, "pb-ap", 30.0, &[0, 2, 4]);
+        } else {
+            cross_check_anchors(&stream, 176, 144, "pb-plain", 0.08, &[0, 2, 4]);
+        }
+    }
+}
+
+/// Annex M with an INTRA refresh, plain and with Advanced Prediction:
+/// every fourth P-macroblock is INTRA and carries the §G.2 / §M.2.1
+/// B-purpose MVD. On the plain form the oracle must agree exactly
+/// (the encoder sends a zero INTRA vector — see
+/// `ImprovedPbConfig::intra_refresh` for why that matters to the
+/// oracle); under AP the INTRA neighbours' §G.2 OBMC remotes join the
+/// documented right-column disagreement, so the tolerant bound applies.
+#[test]
+fn improved_pb_intra_refresh_agrees_with_oracle() {
+    require_oracle!();
+    for ap in [false, true] {
+        let base = gradient(176, 144, 31);
+        let mut stream = encode_intra_picture(&base, 7, 0).unwrap();
+        let mut recon = decode_sequence(&stream, DecodeOptions::default())
+            .unwrap()
+            .remove(0);
+        let cfg = ImprovedPbConfig {
+            quant: 7,
+            trb: 1,
+            dbquant: 0,
+            search_half: 6,
+            forward_search_half: 3,
+            allow_backward: true,
+            advanced_prediction: ap,
+            intra_refresh: 4,
+        };
+        let mut prev_tr = 0u8;
+        for k in 1..=2usize {
+            let p = translated(&base, 5 * k, k);
+            let b = translated(&base, 5 * k - 2, k);
+            let tr_p = (2 * k) as u8;
+            let unit = encode_improved_pb_picture(&p, &b, &recon, tr_p, prev_tr, &cfg).unwrap();
+            stream.extend_from_slice(&unit);
+            recon = decode_sequence(&stream, DecodeOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+            prev_tr = tr_p;
+        }
+        if ap {
+            cross_check_anchors_psnr(&stream, 176, 144, "improved-pb-intra-ap", 30.0, &[0, 2, 4]);
+        } else {
+            cross_check_anchors(&stream, 176, 144, "improved-pb-intra", 0.08, &[0, 2, 4]);
+        }
+    }
+}
+
+/// Black-box evidence for the AP + PB oracle deviation: two streams
+/// whose P-parts are bit-identical in every P-field (same P source,
+/// same reference, same vectors) but whose B-parts differ make the
+/// oracle output *different* P-pictures, while this crate's decoder
+/// (matching the encoder's PREC) outputs identical ones. §G.3 orders
+/// the P-blocks before the B-blocks and §G.5 derives the B prediction
+/// from PREC, never the reverse — so the P-part cannot legitimately
+/// depend on the B-part.
+#[test]
+fn oracle_ap_pb_p_part_depends_on_b_content() {
+    require_oracle!();
+    let base = gradient(176, 144, 31);
+    let i_bytes = encode_intra_picture(&base, 7, 0).unwrap();
+    let recon = decode_sequence(&i_bytes, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    let p = translated(&base, 5, 1);
+    let cfg = ImprovedPbConfig {
+        quant: 7,
+        trb: 1,
+        dbquant: 0,
+        search_half: 6,
+        forward_search_half: 0,
+        allow_backward: false,
+        advanced_prediction: true,
+        intra_refresh: 0,
+    };
+    let mut ours_p = Vec::new();
+    let mut oracle_p = Vec::new();
+    for (k, b) in [translated(&base, 3, 1), base.clone()].iter().enumerate() {
+        let mut stream = i_bytes.clone();
+        stream.extend_from_slice(&encode_improved_pb_picture(&p, b, &recon, 2, 0, &cfg).unwrap());
+        let ours = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+        let theirs = oracle_decode(&stream, 176, 144, &format!("ap-pb-bdep{k}"));
+        assert_eq!(theirs.len(), 2);
+        let psnr = luma_psnr(&ours[2], &theirs[1]);
+        eprintln!("B-variant {k}: luma PSNR ours-vs-oracle on the P-part {psnr:.2} dB");
+        assert!(psnr >= 35.0);
+        ours_p.push(ours[2].clone());
+        oracle_p.push(theirs[1].clone());
+    }
+    assert_eq!(
+        ours_p[0], ours_p[1],
+        "our P-part is independent of the B-part"
+    );
+    assert_ne!(
+        oracle_p[0], oracle_p[1],
+        "the oracle's P-part varies with the B-part (documented deviation)"
+    );
 }

@@ -38,7 +38,8 @@ pub use crate::encoder_deblock::{
     encode_inter_picture_deblock, encode_intra_picture_deblock, DeblockConfig,
 };
 pub use crate::encoder_pb::{
-    encode_improved_pb_picture, encode_improved_pb_picture_stats, ImprovedPbConfig, ImprovedPbStats,
+    encode_improved_pb_picture, encode_improved_pb_picture_stats, encode_pb_picture_ap,
+    encode_pb_picture_ap_stats, ImprovedPbConfig, ImprovedPbStats,
 };
 pub use crate::encoder_rc::{
     encode_inter_picture_adaptive, encode_intra_picture_adaptive, AdaptiveQuantConfig,
@@ -118,11 +119,11 @@ pub(crate) fn extract_macroblock(
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct PtypeFlags {
     /// Bit 10 — Annex D Unrestricted Motion Vector mode.
-    umv: bool,
+    pub(crate) umv: bool,
     /// Bit 11 — Annex E Syntax-based Arithmetic Coding mode.
-    sac: bool,
+    pub(crate) sac: bool,
     /// Bit 12 — Annex F Advanced Prediction mode.
-    advanced_prediction: bool,
+    pub(crate) advanced_prediction: bool,
 }
 
 /// Write the §5.1 baseline picture header (PSC, TR, PTYPE, PQUANT,

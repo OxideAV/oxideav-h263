@@ -2,9 +2,12 @@
 
 use oxideav_h263::encoder::{
     encode_improved_pb_picture, encode_improved_pb_picture_stats, encode_intra_picture,
-    ImprovedPbConfig, EOS_BYTES,
+    encode_pb_picture, encode_pb_picture_ap_stats, ImprovedPbConfig, PbConfig, EOS_BYTES,
 };
-use oxideav_h263::picture::{decode_improved_pb_picture, decode_sequence, DecodeOptions, YuvFrame};
+use oxideav_h263::picture::{
+    decode_improved_pb_picture, decode_pb_picture_no_gob0_header, decode_sequence, DecodeOptions,
+    YuvFrame,
+};
 use oxideav_h263::Error;
 
 fn textured(lw: usize, lh: usize, seed: usize) -> YuvFrame {
@@ -131,6 +134,8 @@ fn improved_pb_all_three_modes_round_trip_through_decode_sequence() {
         search_half: 6,
         forward_search_half: 3,
         allow_backward: true,
+        advanced_prediction: false,
+        intra_refresh: 0,
     };
     let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
     eprintln!("Improved-PB #1 mode census: {stats:?}");
@@ -262,4 +267,134 @@ fn improved_pb_rejects_bad_parameters() {
         encode_improved_pb_picture(&other, &f, &f, 2, 0, &ImprovedPbConfig::default()).unwrap_err(),
         Error::NotImplemented
     );
+}
+
+/// Annex G PB-frames + Advanced Prediction: INTER4V P-parts through the
+/// §F.3 OBMC blend, the B-part scaled per 8 × 8 block. The stream
+/// decodes through `decode_sequence`; the OBMC P-part must beat the
+/// single-vector Annex G P-part on a warped (non-translational) clip.
+#[test]
+fn annex_g_pb_with_advanced_prediction_round_trips() {
+    let base = textured(176, 144, 3);
+    let i_bytes = encode_intra_picture(&base, 6, 0).unwrap();
+    let r0 = decode_sequence(&i_bytes, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    // Non-uniform motion: the left half moves 4 px, the right half 2 px.
+    let mut p = translated(&base, 4, 0);
+    let p_right = translated(&base, 2, 0);
+    for r in 0..144 {
+        p.y[r * 176 + 88..r * 176 + 176].copy_from_slice(&p_right.y[r * 176 + 88..r * 176 + 176]);
+    }
+    for r in 0..72 {
+        p.cb[r * 88 + 44..r * 88 + 88].copy_from_slice(&p_right.cb[r * 88 + 44..r * 88 + 88]);
+        p.cr[r * 88 + 44..r * 88 + 88].copy_from_slice(&p_right.cr[r * 88 + 44..r * 88 + 88]);
+    }
+    let mut b = translated(&base, 2, 0);
+    let b_right = translated(&base, 1, 0);
+    for r in 0..144 {
+        b.y[r * 176 + 88..r * 176 + 176].copy_from_slice(&b_right.y[r * 176 + 88..r * 176 + 176]);
+    }
+    let cfg = PbConfig {
+        quant: 6,
+        trb: 1,
+        dbquant: 0,
+        search_half: 6,
+        b_search_half: 2,
+    };
+    let (ap_bytes, stats) = encode_pb_picture_ap_stats(&p, &b, &r0, 2, 0, &cfg).unwrap();
+    eprintln!("Annex G + AP census: {stats:?}");
+    assert_eq!(
+        stats.forward + stats.backward,
+        0,
+        "Annex G has no §M.2 modes"
+    );
+    let plain_bytes = encode_pb_picture(&p, &b, &r0, 2, 0, &cfg).unwrap();
+
+    let ap_pair =
+        decode_pb_picture_no_gob0_header(&ap_bytes, &r0, 0, DecodeOptions::default()).unwrap();
+    let plain_pair =
+        decode_pb_picture_no_gob0_header(&plain_bytes, &r0, 0, DecodeOptions::default()).unwrap();
+    let (ap_p, plain_p) = (
+        luma_mae(&ap_pair.p_frame, &p),
+        luma_mae(&plain_pair.p_frame, &p),
+    );
+    let (ap_b, plain_b) = (
+        luma_mae(&ap_pair.b_frame, &b),
+        luma_mae(&plain_pair.b_frame, &b),
+    );
+    eprintln!(
+        "AP: {} bytes, P MAE {ap_p:.3}, B MAE {ap_b:.3}; plain: {} bytes, P MAE {plain_p:.3}, B MAE {plain_b:.3}",
+        ap_bytes.len(),
+        plain_bytes.len()
+    );
+    assert!(
+        ap_p < 3.0 && ap_b < 3.5,
+        "AP PB pair reconstructs the sources"
+    );
+
+    let mut stream = i_bytes;
+    stream.extend_from_slice(&ap_bytes);
+    stream.extend_from_slice(&EOS_BYTES);
+    let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.len(), 3);
+    assert_eq!(decoded[1], ap_pair.b_frame);
+    assert_eq!(decoded[2], ap_pair.p_frame);
+}
+
+/// Annex M + Advanced Prediction with an INTRA refresh: every fourth
+/// macroblock is INTRA coded and still carries its §G.2 B-purpose
+/// vector, which the neighbours' OBMC uses as the remote vector
+/// ("the remote 'INTRA' motion vector is used") — the decoder must
+/// reproduce the encoder's closed-loop prediction for the pair to
+/// reconstruct cleanly.
+#[test]
+fn improved_pb_with_advanced_prediction_and_intra_refresh_round_trips() {
+    let base = textured(176, 144, 7);
+    let i_bytes = encode_intra_picture(&base, 5, 0).unwrap();
+    let r0 = decode_sequence(&i_bytes, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    let p1 = translated(&base, 5, 2);
+    let half1 = translated(&base, 3, 1);
+    let b1 = banded_b(&r0, &p1, &half1);
+    let cfg = ImprovedPbConfig {
+        quant: 5,
+        trb: 1,
+        dbquant: 0,
+        search_half: 6,
+        forward_search_half: 3,
+        allow_backward: true,
+        advanced_prediction: true,
+        intra_refresh: 4,
+    };
+    let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
+    eprintln!("Improved-PB + AP census: {stats:?}");
+    assert_eq!(stats.intra, 99usize.div_ceil(4));
+    assert!(stats.forward > 0 && stats.bidirectional > 0 && stats.backward > 0);
+
+    let pair1 = decode_improved_pb_picture(&ipb1, &r0, 0, DecodeOptions::default()).unwrap();
+    let p2 = translated(&base, 9, 3);
+    let half2 = translated(&base, 7, 2);
+    let b2 = banded_b(&pair1.p_frame, &p2, &half2);
+    let ipb2 = encode_improved_pb_picture(&p2, &b2, &pair1.p_frame, 4, 2, &cfg).unwrap();
+
+    let mut stream = i_bytes;
+    stream.extend_from_slice(&ipb1);
+    stream.extend_from_slice(&ipb2);
+    let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.len(), 5);
+    for (name, src, dec) in [
+        ("BPB1", &b1, &decoded[1]),
+        ("P1", &p1, &decoded[2]),
+        ("BPB2", &b2, &decoded[3]),
+        ("P2", &p2, &decoded[4]),
+    ] {
+        let mae = luma_mae(src, dec);
+        eprintln!(
+            "{name}: luma MAE {mae:.3}, PSNR {:.2} dB",
+            luma_psnr(src, dec)
+        );
+        assert!(mae < 3.0, "{name}: luma MAE {mae:.3} too high");
+    }
 }
