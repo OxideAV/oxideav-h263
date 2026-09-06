@@ -6,6 +6,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-h263/compare/v0.0.10...v0.0.11) - 2026-09-06
+
+### Other
+
+- round 457 rollup — PB-frame encoder family closed, oracle deviation catalogue
+- explicit Reference Picture Resampling on EP-pictures (§P.2.2 lower-layer refinement)
+- the §Q.7.2 block boundary filter (RRU + Deblocking Filter), both directions
+- Advanced INTRA Coding macroblocks inside P-pictures and Improved PB-frames (encoder)
+- Rectangular Slice / ASO stripes with Advanced Prediction on the encode side
+- Slice Structured mode composes with Improved PB-frames, both directions
+- §5.2.4 GSBI on the GOB path, both directions
+- Unrestricted Motion Vectors compose with PB-frames, both directions
+- Advanced Prediction composes with PB-frames, both directions
+- Improved PB-frames encoder — §M.2 three-mode BPB decision, Table M.1 MODB writer; fix decoder header-tail framing + §M.2.1 INTRA MVD presence
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Added
 
 - Annex M **Improved PB-frames encoder** (`encoder_pb` module,
