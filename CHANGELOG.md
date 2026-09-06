@@ -54,6 +54,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   and `ImprovedPbConfig::slice_rows` emits row-aligned free-running
   slices (per-slice §K.1 rule-1 predictors and rule-3 OBMC remotes)
   from the PB encoder core. The oracle agrees exactly on every P-part.
+- **Annex K Rectangular Slice / Arbitrary Slice Ordering + Advanced
+  Prediction on the encode side**: `encode_inter_picture_ap_slices_rect`
+  emits full-height vertical stripes (SWI on the wire, right-to-left
+  under ASO) whose macroblocks carry four §F.2 vectors predicted
+  through the §F.3 OBMC blend, with both §K.1 confinement rules
+  replayed per stripe — `Mv4Grid::with_segments` carries an arbitrary
+  segment map (rule 1: a neighbour in another stripe is outside the
+  slice; rule 3 folds the above / above-right candidates into MV1
+  independently, as the decoder does) and the stripe's left / right
+  edges substitute the current vector for the OBMC remotes. A single
+  full-width stripe reconstructs byte-identically to the free-running
+  AP picture. The oracle decoder refuses Rectangular Slices outright
+  ("not supported"), so the check is own-decoder only.
 - **CPM on the GOB path**, both directions: `gob_header::parse_gob_layer_cpm`
   reads the §5.2.4 GSBI between GN and GFID (`GobLayer::gsbi`); the
   baseline / PB / Improved-PB / extended GOB drivers read §5.1.21 PSBI

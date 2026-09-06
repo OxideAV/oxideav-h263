@@ -86,7 +86,9 @@ under ASO — accepts slices in any bitstream order (coverage-driven
 completion, per-segment predictor rules already order-independent);
 `encode_intra_picture_slices_rect` / `encode_inter_picture_slices_rect`
 emit full-height vertical stripes (SWI on the wire, optional
-right-to-left ASO emission). Round 443 adds
+right-to-left ASO emission), and `encode_inter_picture_ap_slices_rect`
+(round 457) does so with Annex F four-vector OBMC macroblocks under
+the §K.1 per-stripe predictor / remote confinement. Round 443 adds
 `encode_inter_picture_ap_slices` (Annex K + Annex F: free-running
 slices whose macroblocks carry four §F.2 vectors predicted through
 the slice-confined §F.3 OBMC blend) and
@@ -685,11 +687,10 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   including Advanced Prediction / INTER4V B-blocks, AIC, UMV and the
   Annex K Slice-Structured + Improved-PB combination (round 457). Still
   unstaged within those modes: SAC + Improved-PB.
-* Annex K + Advanced Prediction under the Rectangular Slice /
-  Arbitrary Slice Ordering submodes on the encode side (the decoder
-  composes them — §K.1 rules 1/3 confine the predictors and OBMC
-  remotes per slice — but the encoders emit only free-running AP
-  slices).
+* Annex K Rectangular Slices narrower than the picture height on the
+  encode side (the rect encoders — including the round-457 Advanced
+  Prediction form `encode_inter_picture_ap_slices_rect` — emit
+  full-height vertical stripes; arbitrary rectangles decode).
 * Annex E SAC combined with mid-picture GOB headers (the §E.5
   start-code resynchronisation inside a picture), or with Advanced
   Prediction **and** PB-frames simultaneously (each composes with SAC
@@ -710,12 +711,12 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   slice paths decode one PSBI / GSBI / SSBI member each); the EOSBS
   end marker (the §5.1.27 EOS is emitted by the encoder and
   transparently skipped by `decode_sequence`).
-* Encoder: arbitrary (non-stripe) rectangular slice shapes and
-  non-row-aligned free-running slices (the slice encoders emit
-  row-aligned slices; the rect encoders emit full-height vertical
-  stripes); UMV + AP on the *baseline-PTYPE* header (the H.263+ form
-  is landed — `encode_inter_picture_ap_umv_plus`); Annex M
-  INTRA-refresh inside the AP and PB paths; AIC INTRA macroblocks inside a
+* Encoder: non-row-aligned free-running slices (the slice encoders
+  emit row-aligned slices); UMV + AP on the *baseline-PTYPE* header
+  (the H.263+ form is landed — `encode_inter_picture_ap_umv_plus`;
+  the PB encoders refuse that pairing too); INTRA-refresh inside the
+  non-PB AP path (the PB encoders have `ImprovedPbConfig::intra_refresh`);
+  AIC INTRA macroblocks inside a
   P-picture (only whole AIC I-pictures encode so far); per-GOB
   GQUANT / per-slice SQUANT driven by the rate controller (the
   per-MB §5.3.6 DQUANT governor landed round 453 —

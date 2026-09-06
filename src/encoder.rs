@@ -1115,6 +1115,272 @@ pub fn encode_inter_picture_slices_rect(
     )
 }
 
+/// Encode a planar 4:2:0 [`YuvFrame`] as an **Annex K Rectangular
+/// Slice + Annex F Advanced Prediction** H.263+ P-picture: full-height
+/// vertical stripes `stripe_width_mbs` macroblocks wide (SWI on the
+/// wire), emitted left-to-right or — under the Arbitrary Slice
+/// Ordering submode (`arbitrary_order`) — right-to-left, every
+/// macroblock carrying four §F.2 vectors predicted through the §F.3
+/// OBMC blend.
+///
+/// Both §K.1 confinement rules are replayed per stripe on the encode
+/// side: the §6.1.1 / §F.2 candidate predictors treat a neighbour in
+/// another stripe as outside the slice
+/// ([`crate::encoder_motion::Mv4Grid::with_segments`] — the left
+/// candidates fall to zero, the above-right ones to MV1 at a stripe's
+/// right edge), and the §F.3 remote vectors of blocks in another stripe
+/// are substituted with the current block's vector — exactly what the
+/// slice decode driver reconstructs with, so the round trip is exact at
+/// the prediction level. Self-describing: decodes through
+/// [`crate::picture::decode_picture_layer`] / `decode_sequence`.
+pub fn encode_inter_picture_ap_slices_rect(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+    stripe_width_mbs: usize,
+    arbitrary_order: bool,
+) -> Result<Vec<u8>> {
+    use crate::encoder_motion::{estimate_block_motion, mvd_for, Mv4Grid};
+    use crate::motion::{chroma_mv_4mv, LumaBlockIndex, Mb4Mv, MotionVector, RemoteMv};
+    use crate::plus_ptype::SliceStructuredSubmode;
+    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+
+    if quant == 0 || quant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    if frame.luma_width != reference.luma_width || frame.luma_height != reference.luma_height {
+        return Err(Error::NotImplemented);
+    }
+    let fmt =
+        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
+    let layout =
+        crate::picture::PictureLayout::for_source_format(fmt).ok_or(Error::NotImplemented)?;
+    let lw = frame.luma_width;
+    let lh = frame.luma_height;
+    let mb_cols = lw / 16;
+    let mb_rows = lh / 16;
+    if stripe_width_mbs == 0 || stripe_width_mbs > mb_cols {
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+    let lambda = 2 * quant as u32;
+
+    let stripe_count = mb_cols.div_ceil(stripe_width_mbs);
+    let stripe_of = |i: usize| -> (usize, usize) {
+        let col0 = i * stripe_width_mbs;
+        (col0, stripe_width_mbs.min(mb_cols - col0))
+    };
+    // Segment map: every stripe is one §6.1.1 video picture segment.
+    let segment_of: Vec<u32> = (0..mb_cols * mb_rows)
+        .map(|i| ((i % mb_cols) / stripe_width_mbs) as u32)
+        .collect();
+    let order: Vec<usize> = if arbitrary_order {
+        (0..stripe_count).rev().collect()
+    } else {
+        (0..stripe_count).collect()
+    };
+
+    // ---- Pass 1: per-block motion estimation with the stripe-confined
+    // §F.2 predictor replay, in emission order (each stripe's scan is
+    // self-contained, so the order across stripes is immaterial). ------
+    let mut grid4 = Mv4Grid::with_segments(mb_cols, mb_rows, segment_of.clone());
+    let mut field: Vec<Mb4Mv> = vec![[MotionVector::new(0, 0); 4]; mb_cols * mb_rows];
+    let mut mvds_field: Vec<[crate::macroblock::Mvd; 4]> = vec![
+        [crate::macroblock::Mvd {
+            dx_half: 0,
+            dy_half: 0,
+        }; 4];
+        mb_cols * mb_rows
+    ];
+    for &stripe in &order {
+        let (col0, width) = stripe_of(stripe);
+        for mb_row in 0..mb_rows {
+            for mb_col in col0..col0 + width {
+                let mut cur: Mb4Mv = [MotionVector::new(0, 0); 4];
+                let mut mvds = [crate::macroblock::Mvd {
+                    dx_half: 0,
+                    dy_half: 0,
+                }; 4];
+                for &blk in &LumaBlockIndex::ALL {
+                    let blk_i = blk.index();
+                    let bx = mb_col * 16 + (blk_i % 2) * 8;
+                    let by = mb_row * 16 + (blk_i / 2) * 8;
+                    let predictor = grid4.predict_block(mb_col, mb_row, blk, &cur);
+                    let mv = estimate_block_motion(
+                        frame,
+                        reference,
+                        bx,
+                        by,
+                        predictor,
+                        search_half,
+                        lambda,
+                    );
+                    cur[blk_i] = mv;
+                    mvds[blk_i] = mvd_for(mv, predictor);
+                }
+                grid4.set(mb_col, mb_row, cur);
+                field[mb_row * mb_cols + mb_col] = cur;
+                mvds_field[mb_row * mb_cols + mb_col] = mvds;
+            }
+        }
+    }
+
+    // ---- Pass 2: §F.3 OBMC prediction (remotes confined per stripe,
+    // §K.1 rule 3) + residual coding, stripe by stripe. ----------------
+    let sss = SliceStructuredSubmode {
+        rectangular: true,
+        arbitrary_order,
+    };
+    let mut w = BitWriter::new();
+    write_plus_picture_header(
+        &mut w,
+        fmt,
+        quant,
+        tr,
+        /* is_inter */ true,
+        PlusModes {
+            advanced_prediction: true,
+            slice_structured: Some(sss),
+            ..PlusModes::default()
+        },
+    )?;
+    let ctx = SliceHeaderContext::from_picture_layout(&layout, Some(sss), false, false);
+    let gfid = tr & 0b11;
+    let y_ref = crate::motion::RefPlane::new(&reference.y, lw, lh);
+    let cw = frame.chroma_width();
+    let ch = frame.chroma_height();
+
+    for (emit_index, &stripe) in order.iter().enumerate() {
+        let (col0, width) = stripe_of(stripe);
+        let mba = col0 as u32;
+        if emit_index == 0 {
+            write_first_slice_header(&mut w, &ctx, mba, Some(width as u32))?;
+        } else {
+            write_slice_layer(&mut w, &ctx, mba, quant, gfid, Some(width as u32))?;
+        }
+        for mb_row in 0..mb_rows {
+            for mb_col in col0..col0 + width {
+                let idx = mb_row * mb_cols + mb_col;
+                let cur = field[idx];
+                let mvds = mvds_field[idx];
+                // §F.3 / §K.1 rule 3 — only same-stripe neighbours
+                // contribute their vectors; the stripe's left and right
+                // edges behave like picture borders (remote = current).
+                let above = (mb_row > 0).then(|| field[idx - mb_cols]);
+                let left = (mb_col > col0).then(|| field[idx - 1]);
+                let right = (mb_col + 1 < col0 + width).then(|| field[idx + 1]);
+                let remote = |nb: Option<Mb4Mv>, cell: LumaBlockIndex| -> RemoteMv {
+                    match nb {
+                        Some(m) => RemoteMv::Vector(m[cell.index()]),
+                        None => RemoteMv::Current,
+                    }
+                };
+                let tags = |blk: LumaBlockIndex| -> (RemoteMv, RemoteMv, RemoteMv, RemoteMv) {
+                    match blk {
+                        LumaBlockIndex::B1 => (
+                            remote(above, LumaBlockIndex::B3),
+                            RemoteMv::Vector(cur[LumaBlockIndex::B3.index()]),
+                            remote(left, LumaBlockIndex::B2),
+                            RemoteMv::Vector(cur[LumaBlockIndex::B2.index()]),
+                        ),
+                        LumaBlockIndex::B2 => (
+                            remote(above, LumaBlockIndex::B4),
+                            RemoteMv::Vector(cur[LumaBlockIndex::B4.index()]),
+                            RemoteMv::Vector(cur[LumaBlockIndex::B1.index()]),
+                            remote(right, LumaBlockIndex::B1),
+                        ),
+                        LumaBlockIndex::B3 => (
+                            RemoteMv::Vector(cur[LumaBlockIndex::B1.index()]),
+                            RemoteMv::Current,
+                            remote(left, LumaBlockIndex::B4),
+                            RemoteMv::Vector(cur[LumaBlockIndex::B4.index()]),
+                        ),
+                        LumaBlockIndex::B4 => (
+                            RemoteMv::Vector(cur[LumaBlockIndex::B2.index()]),
+                            RemoteMv::Current,
+                            RemoteMv::Vector(cur[LumaBlockIndex::B3.index()]),
+                            remote(right, LumaBlockIndex::B3),
+                        ),
+                    }
+                };
+
+                let src = extract_macroblock(frame, mb_col, mb_row);
+                let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> =
+                    Vec::with_capacity(4);
+                for &blk in &LumaBlockIndex::ALL {
+                    let blk_i = blk.index();
+                    let bx = mb_col * 16 + (blk_i % 2) * 8;
+                    let by = mb_row * 16 + (blk_i / 2) * 8;
+                    let (r_top, r_bot, s_left, s_right) = tags(blk);
+                    let pred = crate::motion::obmc_predict_block(
+                        &y_ref,
+                        bx,
+                        by,
+                        cur[blk_i],
+                        r_top,
+                        r_bot,
+                        s_left,
+                        s_right,
+                        crate::motion::RCONTROL_DEFAULT,
+                    );
+                    let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
+                    for (d, &p) in pred_i16.iter_mut().zip(pred.iter()) {
+                        *d = p as i16;
+                    }
+                    luma_enc.push(crate::encoder_block::encode_inter_block(
+                        &residual_of(&src.luma[blk_i], &pred_i16),
+                        quant,
+                    ));
+                }
+                let chroma_vec = chroma_mv_4mv(&cur);
+                let cb_pred = motion_compensated_block(
+                    &reference.cb,
+                    cw,
+                    ch,
+                    mb_col * 8,
+                    mb_row * 8,
+                    chroma_vec,
+                );
+                let cr_pred = motion_compensated_block(
+                    &reference.cr,
+                    cw,
+                    ch,
+                    mb_col * 8,
+                    mb_row * 8,
+                    chroma_vec,
+                );
+                let mut cb_pred_i = [0i16; COEFFS_PER_BLOCK];
+                let mut cr_pred_i = [0i16; COEFFS_PER_BLOCK];
+                for i in 0..COEFFS_PER_BLOCK {
+                    cb_pred_i[i] = cb_pred[i] as i16;
+                    cr_pred_i[i] = cr_pred[i] as i16;
+                }
+                let cb_enc = crate::encoder_block::encode_inter_block(
+                    &residual_of(&src.cb, &cb_pred_i),
+                    quant,
+                );
+                let cr_enc = crate::encoder_block::encode_inter_block(
+                    &residual_of(&src.cr, &cr_pred_i),
+                    quant,
+                );
+                let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
+                    luma_enc[0].clone(),
+                    luma_enc[1].clone(),
+                    luma_enc[2].clone(),
+                    luma_enc[3].clone(),
+                ];
+                crate::encoder_mb::encode_inter4v_macroblock(
+                    &mut w, &luma_arr, &cb_enc, &cr_enc, &mvds,
+                )?;
+            }
+        }
+    }
+
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
 /// Shared body of the Rectangular-Slice stripe encoders.
 /// `reference = None` encodes an INTRA picture; `Some(_)` a zero-MV
 /// INTER picture.

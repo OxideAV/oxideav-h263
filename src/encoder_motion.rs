@@ -186,12 +186,13 @@ impl MvGrid {
 pub struct Mv4Grid {
     entries: Vec<Mb4Mv>,
     cols: usize,
-    /// `Some(rows)` when the picture is emitted as row-aligned
-    /// segments `rows` macroblock rows tall (Annex K slices): every
-    /// row divisible by `rows` opens a fresh §6.1.1 video picture
-    /// segment, so the rule-3 "outside the slice at the top" border
-    /// applies there in addition to the picture's top row.
-    segment_rows: Option<usize>,
+    /// `Some(map)` when the picture is emitted as several §6.1.1 video
+    /// picture segments (Annex K slices): `map[row * cols + col]` is
+    /// the segment id of each macroblock, and a candidate-supplying
+    /// neighbour in another segment is "outside the slice" — the left
+    /// candidates fall to zero (rule 2), the above / above-right ones
+    /// to MV1 (rule 3) — exactly the decoder's per-segment grid check.
+    segment_of: Option<Vec<u32>>,
 }
 
 impl Mv4Grid {
@@ -200,7 +201,7 @@ impl Mv4Grid {
         Mv4Grid {
             entries: vec![[MotionVector::new(0, 0); 4]; mb_cols * mb_rows],
             cols: mb_cols,
-            segment_rows: None,
+            segment_of: None,
         }
     }
 
@@ -211,10 +212,32 @@ impl Mv4Grid {
     /// §F.2 candidates — applies at the top row of every segment,
     /// replaying the decoder's per-segment grid checks.
     pub fn with_row_segments(mb_cols: usize, mb_rows: usize, rows_per_segment: usize) -> Self {
+        let rows = rows_per_segment.max(1);
+        let map = (0..mb_cols * mb_rows)
+            .map(|i| ((i / mb_cols) / rows) as u32)
+            .collect();
+        Self::with_segments(mb_cols, mb_rows, map)
+    }
+
+    /// A grid for a picture emitted as arbitrary §6.1.1 segments:
+    /// `segment_of[row * mb_cols + col]` names each macroblock's
+    /// segment (e.g. the Annex K Rectangular Slice stripes). Candidates
+    /// from another segment are unavailable per §K.1 rule 1.
+    pub fn with_segments(mb_cols: usize, mb_rows: usize, segment_of: Vec<u32>) -> Self {
+        assert_eq!(segment_of.len(), mb_cols * mb_rows);
         Mv4Grid {
             entries: vec![[MotionVector::new(0, 0); 4]; mb_cols * mb_rows],
             cols: mb_cols,
-            segment_rows: Some(rows_per_segment.max(1)),
+            segment_of: Some(segment_of),
+        }
+    }
+
+    /// Whether the macroblock at `(c, r)` belongs to the same §6.1.1
+    /// segment as the one at `(col, row)` (always, without segments).
+    fn same_segment(&self, col: usize, row: usize, c: usize, r: usize) -> bool {
+        match &self.segment_of {
+            Some(map) => map[row * self.cols + col] == map[r * self.cols + c],
+            None => true,
         }
     }
 
@@ -244,20 +267,30 @@ impl Mv4Grid {
         blk: LumaBlockIndex,
         current: &Mb4Mv,
     ) -> MotionVector {
+        // §6.1.1 rule 2 — a left neighbour outside the picture or the
+        // slice contributes zero candidates.
+        let left_avail = col > 0 && self.same_segment(col, row, col - 1, row);
+        let above_avail = row > 0 && self.same_segment(col, row, col, row - 1);
+        let above_right_avail =
+            row > 0 && col + 1 < self.cols && self.same_segment(col, row, col + 1, row - 1);
         let n = Mb4MvNeighbourhood {
             current: *current,
-            left: (col > 0).then(|| self.get(col - 1, row)),
+            left: left_avail.then(|| self.get(col - 1, row)),
             above: (row > 0).then(|| self.get(col, row - 1)),
             above_right: (row > 0 && col + 1 < self.cols).then(|| self.get(col + 1, row - 1)),
         };
         let (mv1, mut mv2, mut mv3) = select_4mv_candidates(blk, &n);
-        // §6.1.1 rule 3 at the picture top row, and — under row-aligned
-        // segment framing — at every segment's top row (the above /
-        // above-right macroblocks belong to the previous slice).
-        let segment_top = row == 0 || self.segment_rows.is_some_and(|r| row % r == 0);
-        if matches!(blk, LumaBlockIndex::B1 | LumaBlockIndex::B2) && segment_top {
-            mv2 = mv1;
-            mv3 = mv1;
+        // §6.1.1 rule 3 — the above / above-right candidates of the
+        // macroblock's top blocks fold into MV1 when those macroblocks
+        // are outside the picture or the slice (the decoder's
+        // `reconstruct_inter4v_mvs` applies the two independently).
+        if matches!(blk, LumaBlockIndex::B1 | LumaBlockIndex::B2) {
+            if !above_avail {
+                mv2 = mv1;
+            }
+            if !above_right_avail {
+                mv3 = mv1;
+            }
         }
         // §6.1.1 rule 4 at the right picture edge — the MV3 candidate
         // of B1 / B2 comes from the above-right macroblock (Figure
