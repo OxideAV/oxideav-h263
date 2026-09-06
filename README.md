@@ -38,7 +38,10 @@ rate-biased SAD — the full Table M.1 MODB row set; the oracle decoder
 agrees on every P-part; `advanced_prediction` / `intra_refresh`
 compose Annex F and INTRA macroblocks into the pair) and
 `encode_pb_picture_ap` (Annex G + Annex F: two-pass §F.2 field, OBMC
-PREC, per-block §G.4 scaling),
+PREC, per-block §G.4 scaling), `encode_pb_picture_umv` (Annex G +
+Annex D: extended-range P vectors and the §D.2 per-block MVDB pair
+rule with `Pc = (TRB × MV)/TRD`; `ImprovedPbConfig::umv` is the Annex
+M Table D.3 form with over-boundary forward vectors),
 `encode_intra_picture_dquant` (§5.3.6 per-macroblock DQUANT),
 `encode_intra_picture_gobs` / `encode_inter_picture_gobs` (§5.2 GOB
 headers with per-GOB GQUANT + segmented MV prediction),
@@ -457,7 +460,9 @@ planar 4:2:0 `YuvFrame`:
   composes** (round 457): the P-part's OBMC luminance stays deferred
   until the right neighbour is known and the B-part waits for that
   final PREC (§G.5); the §G.2 INTRA-remote rule and the §6.1.1 rule-1
-  PB exception thread through the §F.2 / §F.3 paths. SAC / AIC
+  PB exception thread through the §F.2 / §F.3 paths. **UMV composes**
+  (round 457): the Table 14 MVDB resolves through the §D.2 pair rule
+  with `Pc = (TRB × MV)/TRD` per luminance block. SAC / AIC
   combinations are refused (§G.1 bars the PLUSPTYPE-gated modes).
 * **Annex M §M.1–§M.4** — Improved PB-frames decode end-to-end, both
   through the per-layer `decode_improved_pb_picture` driver and — new this
@@ -470,9 +475,11 @@ planar 4:2:0 `YuvFrame`:
   §G.4 TR. Per macroblock the §M.4 / Table M.1 MODB form drives the §M.2
   coding modes (bidirectional / forward with the §M.2.2 left-neighbour MVDB
   predictor / backward); an INTRA P-macroblock carries MVD only in the
-  bidirectional row (§M.2.1). Advanced Prediction and AIC compose (round
-  457); Annex K + Improved-PB and UMV combinations are refused (unstaged
-  §M sub-cases).
+  bidirectional row (§M.2.1). Advanced Prediction, AIC and UMV compose
+  (round 457 — Table D.3 P-part and §M.2.2 forward vectors under the
+  UUI range, the forward fetch edge-replicating over the picture
+  boundary per §D.1); Annex K + Improved-PB is refused (unstaged §M
+  sub-case).
 * **Annex O §O.4 / §O.5** — temporal-scalability **B-pictures** decode
   end-to-end (`decode_b_picture` / `decode_b_picture_layer`): the Table
   O.1 MBTYPE layer drives Forward / Backward / Bi-dir / INTRA
@@ -670,10 +677,9 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   decodes and encodes — see the supported list).
 * Annex G PB-frames and Annex M Improved PB-frames both decode and
   encode end-to-end through `decode_sequence` (see the supported list),
-  including Advanced Prediction / INTER4V B-blocks and AIC (round 457).
-  Still unstaged within those modes: UMV over-boundary forward vectors
-  (Annex M), SAC + Improved-PB, and the Annex K Slice-Structured +
-  Improved-PB combination.
+  including Advanced Prediction / INTER4V B-blocks, AIC and UMV
+  (round 457). Still unstaged within those modes: SAC + Improved-PB and
+  the Annex K Slice-Structured + Improved-PB combination.
 * Annex K + Advanced Prediction under the Rectangular Slice /
   Arbitrary Slice Ordering submodes on the encode side (the decoder
   composes them — §K.1 rules 1/3 confine the predictors and OBMC

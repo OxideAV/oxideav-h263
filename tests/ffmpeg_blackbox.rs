@@ -19,7 +19,8 @@ use oxideav_h263::encoder::{
     encode_improved_pb_picture, encode_inter_picture_ap, encode_inter_picture_deblock,
     encode_inter_picture_motion, encode_inter_picture_umv_plus, encode_intra_picture,
     encode_intra_picture_aic_plus, encode_intra_picture_deblock, encode_pb_picture,
-    encode_pb_picture_ap, encode_sequence, DeblockConfig, GopConfig, ImprovedPbConfig, PbConfig,
+    encode_pb_picture_ap, encode_pb_picture_umv, encode_sequence, DeblockConfig, GopConfig,
+    ImprovedPbConfig, PbConfig,
 };
 use oxideav_h263::picture::{decode_sequence, DecodeOptions, YuvFrame};
 use std::path::PathBuf;
@@ -432,6 +433,7 @@ fn improved_pb_frames_agree_with_oracle() {
         forward_search_half: 3,
         allow_backward: true,
         advanced_prediction: false,
+        umv: false,
         intra_refresh: 0,
     };
     let mut prev_tr = 0u8;
@@ -525,6 +527,7 @@ fn improved_pb_intra_refresh_agrees_with_oracle() {
             forward_search_half: 3,
             allow_backward: true,
             advanced_prediction: ap,
+            umv: false,
             intra_refresh: 4,
         };
         let mut prev_tr = 0u8;
@@ -573,6 +576,7 @@ fn oracle_ap_pb_p_part_depends_on_b_content() {
         forward_search_half: 0,
         allow_backward: false,
         advanced_prediction: true,
+        umv: false,
         intra_refresh: 0,
     };
     let mut ours_p = Vec::new();
@@ -597,4 +601,76 @@ fn oracle_ap_pb_p_part_depends_on_b_content() {
         oracle_p[0], oracle_p[1],
         "the oracle's P-part varies with the B-part (documented deviation)"
     );
+}
+
+/// Annex G + UMV (baseline) and Annex M + UMV (Table D.3): wide pans
+/// whose vectors need the extended range, MVDB / forward vectors
+/// included — the oracle must agree on every P-part exactly.
+#[test]
+fn pb_frames_with_umv_agree_with_oracle() {
+    require_oracle!();
+    let base = gradient(176, 144, 37);
+    // Annex G + UMV.
+    let mut stream = encode_intra_picture(&base, 8, 0).unwrap();
+    let mut recon = decode_sequence(&stream, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    let cfg = PbConfig {
+        quant: 8,
+        trb: 1,
+        dbquant: 1,
+        search_half: 24,
+        b_search_half: 2,
+    };
+    let mut prev_tr = 0u8;
+    for k in 1..=2usize {
+        let p = translated(&base, 20 * k, k);
+        let b = translated(&base, 20 * k - 9, k);
+        let tr_p = (2 * k) as u8;
+        let unit = encode_pb_picture_umv(&p, &b, &recon, tr_p, prev_tr, &cfg).unwrap();
+        stream.extend_from_slice(&unit);
+        recon = decode_sequence(&stream, DecodeOptions::default())
+            .unwrap()
+            .pop()
+            .unwrap();
+        prev_tr = tr_p;
+    }
+    cross_check_anchors(&stream, 176, 144, "pb-umv", 0.08, &[0, 2, 4]);
+
+    // Annex M + UMV+ — bidirectional / backward BPB modes only: the
+    // oracle parses a forward-mode MVDB under UMV + PLUSPTYPE with some
+    // table other than the Table D.3 this crate applies (§M.2.2 "coded
+    // in the same way as … MVD", which §5.3.7 / §D.2 switch to Table
+    // D.3 when PLUSPTYPE is present) — its output desynchronises from
+    // the first forward macroblock, and a Table 14 MVDB is rejected by
+    // it outright. The P-part vectors (Table D.3, 20 px pan) agree.
+    let mut stream = encode_intra_picture(&base, 8, 0).unwrap();
+    let mut recon = decode_sequence(&stream, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    let cfg = ImprovedPbConfig {
+        quant: 8,
+        trb: 1,
+        dbquant: 0,
+        search_half: 24,
+        forward_search_half: 0,
+        allow_backward: true,
+        advanced_prediction: false,
+        umv: true,
+        intra_refresh: 0,
+    };
+    let mut prev_tr = 0u8;
+    for k in 1..=2usize {
+        let p = translated(&base, 20 * k, k);
+        let b = translated(&base, 20 * k - 9, k);
+        let tr_p = (2 * k) as u8;
+        let unit = encode_improved_pb_picture(&p, &b, &recon, tr_p, prev_tr, &cfg).unwrap();
+        stream.extend_from_slice(&unit);
+        recon = decode_sequence(&stream, DecodeOptions::default())
+            .unwrap()
+            .pop()
+            .unwrap();
+        prev_tr = tr_p;
+    }
+    cross_check_anchors(&stream, 176, 144, "improved-pb-umv-plus", 0.08, &[0, 2, 4]);
 }

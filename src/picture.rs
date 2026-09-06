@@ -999,6 +999,7 @@ pub fn decode_pb_picture_sac(
             dbquant,
             annex_m: false,
             left_bpb_forward_mv: None,
+            umv: UmvCoding::from_baseline(header.umv_mode),
             b_frame: &mut b_frame,
         }),
     )?;
@@ -3428,6 +3429,11 @@ struct PbPictureCtx<'b> {
     /// to `None` at the start of each macroblock row. Unused under
     /// Annex G (`annex_m == false`).
     left_bpb_forward_mv: Option<MotionVector>,
+    /// §5.3.7 / §D.2 — the motion-vector coding in force for the
+    /// picture: selects the §D.2 pair rule for MVDB under baseline UMV
+    /// (Annex G) and the Table D.3 / range reconstruction of the §M.2.2
+    /// forward vector under UMV+ (Annex M).
+    umv: UmvCoding,
     /// The B-picture under construction (same geometry as the
     /// P-picture).
     b_frame: &'b mut YuvFrame,
@@ -3552,6 +3558,7 @@ pub fn decode_pb_picture(
             dbquant,
             annex_m: false,
             left_bpb_forward_mv: None,
+            umv: UmvCoding::from_baseline(header.umv_mode),
             b_frame: &mut b_frame,
         }),
         None,
@@ -3666,6 +3673,7 @@ pub fn decode_pb_picture_no_gob0_header(
             dbquant,
             annex_m: false,
             left_bpb_forward_mv: None,
+            umv: UmvCoding::from_baseline(header.umv_mode),
             b_frame: &mut b_frame,
         }),
         Some(pquant),
@@ -3714,11 +3722,12 @@ pub fn decode_pb_picture_no_gob0_header(
 ///   picture-type other than Improved PB-frame; any mode
 ///   [`plus_ptype_to_baseline_shim`] refuses (SAC, ISD, Alternative
 ///   INTER VLC, Modified Quantisation, custom PCF, CPM, RRU); the
-///   Slice-Structured submode (Annex K + Improved-PB is unstaged);
-///   UMV (the §M.2.2 over-boundary forward vector under the extended
-///   range is unstaged); or a `reference` of mismatched geometry.
-///   Advanced Prediction composes as for [`decode_pb_picture`]
-///   (round 457).
+///   Slice-Structured submode (Annex K + Improved-PB is unstaged); or a
+///   `reference` of mismatched geometry. Advanced Prediction composes
+///   as for [`decode_pb_picture`], and UMV composes (round 457): the
+///   P-part's vectors and the §M.2.2 forward vector are Table D.3 coded
+///   under the UUI range, the forward fetch reaching over the picture
+///   boundary through the §D.1 edge replication.
 /// * [`Error::BadPbTemporalReference`] — TRB was `0`, or the TR
 ///   increment from `prev_tr` was `0`.
 pub fn decode_improved_pb_picture(
@@ -3785,7 +3794,7 @@ pub fn decode_improved_pb_picture_with_inherited(
         slice_structured,
         improved_pb,
         cpm_psbi: _,
-        umv: _,
+        umv,
         isd,
         dps,
     } = plus_ptype_to_baseline_shim(&extended, options, inherited, /* allow_rps */ false)?;
@@ -3799,10 +3808,9 @@ pub fn decode_improved_pb_picture_with_inherited(
         // [`decode_picture_layer`] for a plain INTRA / INTER picture.
         return Err(Error::NotImplemented);
     }
-    // Annex K + Improved-PB (the §K.2 slice-boundary BPB exclusions) and
-    // UMV + Improved-PB (the §M.2.2 over-boundary forward vector under
-    // the extended range) are unstaged.
-    if slice_structured.is_some() || header.umv_mode {
+    // Annex K + Improved-PB (the §K.2 slice-boundary BPB exclusions) is
+    // unstaged.
+    if slice_structured.is_some() {
         return Err(Error::NotImplemented);
     }
 
@@ -3863,12 +3871,11 @@ pub fn decode_improved_pb_picture_with_inherited(
             dbquant,
             annex_m: true,
             left_bpb_forward_mv: None,
+            umv,
             b_frame: &mut b_frame,
         }),
         Some(pquant),
-        // UMV + Improved-PB is refused above, so the P-part never
-        // carries Annex D vectors here.
-        UmvCoding::Off,
+        umv,
     )?;
     Ok((PbFramePair { p_frame, b_frame }, next_inherited))
 }
@@ -3901,22 +3908,26 @@ fn improved_pb_forward_prediction(
     mb_y: usize,
     mvdb: Option<Mvd>,
     pb: &mut PbPictureCtx<'_>,
-) -> PbBMacroblockPrediction {
+) -> Result<PbBMacroblockPrediction> {
     // §M.2.2 left-neighbour predictor (zero at the row's left edge or
     // when the left macroblock carried no forward vector).
     let predictor = pb.left_bpb_forward_mv.unwrap_or_default();
     // The difference is "VLC coded in the same way as … (MVD)", so the
     // forward vector is reconstructed exactly like a §5.3.7 P-vector:
-    // predictor + delta, with the §6.1.1 modulo wrap into the standard
-    // range. (UMV + Improved-PB is refused by the driver entry, so the
-    // baseline reconstruction applies.)
-    let forward_mv = reconstruct_mv(
+    // predictor + delta with the §6.1.1 modulo wrap outside UMV, or —
+    // Annex M being PLUSPTYPE-only — the single-valued Table D.3
+    // `predictor + difference` under the UUI range in UMV mode (§D.2;
+    // §M.2.2: "concerning motion vectors over picture boundaries
+    // defined in D.1, the described technique also applies for the
+    // forward BPB-vector" — the fetch below edge-replicates).
+    let forward_mv = reconstruct_mv_coded(
+        pb.umv,
         predictor,
         mvdb.unwrap_or(Mvd {
             dx_half: 0,
             dy_half: 0,
         }),
-    );
+    )?;
     pb.left_bpb_forward_mv = Some(forward_mv);
 
     // Forward-only fetch of the four 8 × 8 luma blocks (one 16 × 16
@@ -3942,7 +3953,7 @@ fn improved_pb_forward_prediction(
         cb[j].copy_from_slice(&cb_flat[j * 8..j * 8 + 8]);
         cr[j].copy_from_slice(&cr_flat[j * 8..j * 8 + 8]);
     }
-    PbBMacroblockPrediction { luma, cb, cr }
+    Ok(PbBMacroblockPrediction { luma, cb, cr })
 }
 
 /// §M.2.3 — backward prediction for one Improved-PB BPB-macroblock.
@@ -4150,7 +4161,7 @@ fn reconstruct_pb_b_part(
             // the §M.2.2 left-neighbour predictor, forward prediction
             // only from the previous reference picture.
             BpbCodingMode::Forward => {
-                improved_pb_forward_prediction(&planes, mb_x, mb_y, mb.mvdb, pb)
+                improved_pb_forward_prediction(&planes, mb_x, mb_y, mb.mvdb, pb)?
             }
             // §M.2.3 — "the prediction of the BPB macroblock is
             // identical to PREC". No MVDB, and the forward-vector
@@ -4165,12 +4176,21 @@ fn reconstruct_pb_b_part(
         // §G.4 + §G.5 whole-macroblock prediction. `mb.mvdb` is `None`
         // whenever MODB signalled no MVDB ("If MVDB is not present,
         // MVD is set to zero", §G.4) — including the skipped case.
-        pb_b_predict_macroblock(
+        // Under baseline UMV the Table 14 MVDB codeword resolves per
+        // block through the §D.2 pair rule with `Pc = (TRB × MV)/TRD`.
+        let deltas = crate::pb_layer::pb_b_effective_deltas(
+            mvs4,
+            mb.mvdb,
+            pb.trb,
+            pb.trd,
+            matches!(pb.umv, UmvCoding::Wrap),
+        );
+        crate::pb_layer::pb_b_predict_macroblock_deltas(
             &planes,
             mb_x,
             mb_y,
             mvs4,
-            mb.mvdb,
+            &deltas,
             pb.trb,
             pb.trd,
             RCONTROL_DEFAULT,

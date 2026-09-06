@@ -34,13 +34,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `ImprovedPbConfig::intra_refresh` (INTRA macroblocks inside PB
   pictures, carrying the §G.2 / §M.2.1 MVD; Annex M keeps them
   bidirectional so the vector is always on the wire).
+- **Unrestricted Motion Vectors + PB-frames**, both annexes, both
+  directions. Annex G + Annex D (baseline header): the §D.2 Table 14
+  pair rule applies to MVDB with the predictor `Pc = (TRB × MV)/TRD`,
+  resolved **per luminance block** (`pb_layer::pb_b_effective_deltas`
+  / `pb_b_predict_macroblock_deltas`) — decoder and the new
+  `encode_pb_picture_umv` share the resolution, so a 22 px pan codes
+  in a ninth of the default-range bytes. Annex M + UMV (PLUSPTYPE):
+  the P-part vectors and the §M.2.2 forward vector are Table D.3
+  single-valued differences under the UUI range, the forward fetch
+  reaching over the picture boundary (§D.1 / §M.2.2);
+  `ImprovedPbConfig::umv` on the encode side, the Improved-PB decode
+  driver no longer refuses UMV.
 - Black-box finding (pinned by `tests/ffmpeg_blackbox.rs`): the oracle
   decoder's P-part output for an AP + PB picture depends on the B-part's
   content (§G.3 / §G.5 forbid that), and it zeroes an INTRA
   macroblock's candidate predictor in PB-frames mode (§6.1.1 rule 1
   exempts it). The crate's decoder follows the text; the PB encoders
   send a zero INTRA vector so their plain (non-AP) streams decode
-  identically on both.
+  identically on both. Under UMV + PLUSPTYPE the oracle reads a
+  forward-mode MVDB with a table other than the Table D.3 this crate
+  applies (§M.2.2 → §5.3.7 / §D.2) and rejects a Table 14 one outright;
+  the Annex G + UMV MVDB (Table 14, §D.2 pair rule) agrees exactly.
 
 ### Fixed
 

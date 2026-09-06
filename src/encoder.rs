@@ -39,7 +39,8 @@ pub use crate::encoder_deblock::{
 };
 pub use crate::encoder_pb::{
     encode_improved_pb_picture, encode_improved_pb_picture_stats, encode_pb_picture_ap,
-    encode_pb_picture_ap_stats, ImprovedPbConfig, ImprovedPbStats,
+    encode_pb_picture_ap_stats, encode_pb_picture_umv, encode_pb_picture_umv_stats,
+    ImprovedPbConfig, ImprovedPbStats,
 };
 pub use crate::encoder_rc::{
     encode_inter_picture_adaptive, encode_intra_picture_adaptive, AdaptiveQuantConfig,

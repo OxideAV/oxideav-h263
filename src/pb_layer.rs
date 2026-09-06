@@ -1172,6 +1172,63 @@ pub fn pb_b_predict_macroblock(
     trd: i32,
     rcontrol: i32,
 ) -> PbBMacroblockPrediction {
+    pb_b_predict_macroblock_deltas(planes, mb_x, mb_y, p_mvs, &[mvd; 4], trb, trd, rcontrol)
+}
+
+/// §D.2 under the **Unrestricted Motion Vector mode with PLUSPTYPE
+/// absent** (Annex G + Annex D): "the interpretation of Table 14 for
+/// MVD, MVD2-4 and MVDB is as follows: if the predictor … is in the
+/// range [–15.5, 16], only the first column of vector differences
+/// applies; [otherwise] the vector difference from Table 14 shall be
+/// used that results in a vector component inside the range [−31.5,
+/// 31.5] with the same sign as the predictor (including zero). … For
+/// MVDB, the predictor Pc = (TRB × MV)/TRD, where MV represents a
+/// vector component for an 8 * 8 luminance block". The pair selection
+/// therefore resolves **per luminance block** (each block has its own
+/// Pc under §F.2 four vectors) — this returns the effective §G.4 delta
+/// of every block: the raw Table 14 value outside UMV, or the pair
+/// member the §D.2 rule selects for that block's Pc under it.
+pub fn pb_b_effective_deltas(
+    p_mvs: &[MotionVector; 4],
+    mvd: Option<Mvd>,
+    trb: i32,
+    trd: i32,
+    umv_wrap: bool,
+) -> [Option<Mvd>; 4] {
+    let Some(raw) = mvd else {
+        return [None; 4];
+    };
+    if !umv_wrap {
+        return [Some(raw); 4];
+    }
+    let resolve = |mv_comp: i32, delta: i32| -> i16 {
+        let pc = (trb * mv_comp) / trd;
+        (crate::motion::reconstruct_mv_component_umv(pc, delta) - pc) as i16
+    };
+    let mut out = [None; 4];
+    for (slot, mv) in out.iter_mut().zip(p_mvs.iter()) {
+        *slot = Some(Mvd {
+            dx_half: resolve(mv.dx_half, raw.dx_half as i32),
+            dy_half: resolve(mv.dy_half, raw.dy_half as i32),
+        });
+    }
+    out
+}
+
+/// [`pb_b_predict_macroblock`] with a per-luminance-block §G.4 delta
+/// (see [`pb_b_effective_deltas`]); block `n`'s delta drives its own
+/// `(MVF, MVB)` pair, the chroma pair still summing the four.
+#[allow(clippy::too_many_arguments)]
+pub fn pb_b_predict_macroblock_deltas(
+    planes: &PbBReferencePlanes<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    p_mvs: &[MotionVector; 4],
+    deltas: &[Option<Mvd>; 4],
+    trb: i32,
+    trd: i32,
+    rcontrol: i32,
+) -> PbBMacroblockPrediction {
     assert!(
         planes.prec_y.width == 16 && planes.prec_y.height == 16,
         "§G.5 PREC luma must be one 16 × 16 macroblock"
@@ -1189,11 +1246,12 @@ pub fn pb_b_predict_macroblock(
         "macroblock position must sit on the §4.2.3 16-pixel grid"
     );
 
-    // §G.4: per-luma-block (MVF, MVB), same MVD for all four blocks.
+    // §G.4: per-luma-block (MVF, MVB) — the same MVD for all four
+    // blocks outside UMV, the §D.2-resolved per-block member under it.
     let mut luma_mvf = [MotionVector::default(); 4];
     let mut luma_mvb = [MotionVector::default(); 4];
     for n in 0..4 {
-        let (mvf, mvb) = pb_b_vector(p_mvs[n], mvd, trb, trd);
+        let (mvf, mvb) = pb_b_vector(p_mvs[n], deltas[n], trb, trd);
         luma_mvf[n] = mvf;
         luma_mvb[n] = mvb;
     }

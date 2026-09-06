@@ -56,8 +56,8 @@ use crate::motion::{
     RemoteMv, RCONTROL_DEFAULT,
 };
 use crate::pb_layer::{
-    pb_b_predict_macroblock, pb_bquant, write_modb_annex_m, BpbCodingMode, ModbAnnexM,
-    PbBMacroblockPrediction, PbBReferencePlanes,
+    pb_bquant, write_modb_annex_m, BpbCodingMode, ModbAnnexM, PbBMacroblockPrediction,
+    PbBReferencePlanes,
 };
 use crate::picture::YuvFrame;
 use crate::{Error, Result};
@@ -85,6 +85,12 @@ pub struct ImprovedPbConfig {
     /// §F.2 vectors per macroblock through the §F.3 OBMC blend, with
     /// the B-part's §G.4 vectors scaled per 8 × 8 block.
     pub advanced_prediction: bool,
+    /// Annex D Unrestricted Motion Vector mode on the PLUSPTYPE header
+    /// (OPPTYPE bit 5, UUI = "1"): the P-part vectors, the INTRA
+    /// macroblocks' §G.2 MVD and the §M.2.2 forward vectors are Table
+    /// D.3 coded over the Tables-D.1/D.2 range, the forward fetch
+    /// reaching over the picture boundary through §D.1.
+    pub umv: bool,
     /// INTRA-code every `intra_refresh`-th macroblock (raster order,
     /// starting with the first); `0` disables the refresh. A PB-frame
     /// INTRA macroblock still carries the vector its B-blocks use
@@ -108,6 +114,7 @@ impl Default for ImprovedPbConfig {
             forward_search_half: 4,
             allow_backward: true,
             advanced_prediction: false,
+            umv: false,
             intra_refresh: 0,
         }
     }
@@ -150,6 +157,20 @@ enum PbFlavour {
     },
 }
 
+/// Which §5.3.7 / §D.2 motion-vector coding the core emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UmvMode {
+    /// Table 14 with the default §6.1.1 wrap.
+    Off,
+    /// Annex D on a baseline header (Annex G only): Table 14 with the
+    /// §D.2 predictor-dependent pair rule — for MVDB too, per block
+    /// with `Pc = (TRB × MV)/TRD`.
+    Wrap,
+    /// Annex D on a PLUSPTYPE header (Annex M only): Table D.3
+    /// single-valued differences under the UUI = "1" range.
+    Plus,
+}
+
 /// The flavour-independent knobs of the shared core.
 #[derive(Debug, Clone, Copy)]
 struct PbCore {
@@ -158,6 +179,7 @@ struct PbCore {
     dbquant: u8,
     search_half: i32,
     advanced_prediction: bool,
+    umv: UmvMode,
     intra_refresh: usize,
 }
 
@@ -212,6 +234,7 @@ pub fn encode_improved_pb_picture_stats(
             dbquant: cfg.dbquant,
             search_half: cfg.search_half,
             advanced_prediction: cfg.advanced_prediction,
+            umv: if cfg.umv { UmvMode::Plus } else { UmvMode::Off },
             intra_refresh: cfg.intra_refresh,
         },
         PbFlavour::AnnexM {
@@ -265,6 +288,58 @@ pub fn encode_pb_picture_ap_stats(
             dbquant: cfg.dbquant,
             search_half: cfg.search_half,
             advanced_prediction: true,
+            umv: UmvMode::Off,
+            intra_refresh: 0,
+        },
+        PbFlavour::AnnexG {
+            b_search_half: cfg.b_search_half,
+        },
+    )
+}
+
+/// Encode an Annex G **PB-frame in the Unrestricted Motion Vector
+/// mode** (baseline PTYPE bits 10 + 13): the P-part vectors are
+/// searched over the §D.2 extended `[-31.5, 31.5]` range with the
+/// predictor-dependent Table 14 pair rule, and the §5.3.9 MVDB delta
+/// ([`PbConfig::b_search_half`]) is interpreted per §D.2 with the
+/// predictor `Pc = (TRB × MV)/TRD` — resolved per luminance block
+/// exactly as the decoder does. Same contract as
+/// [`crate::encoder::encode_pb_picture`] otherwise.
+pub fn encode_pb_picture_umv(
+    p_source: &YuvFrame,
+    b_source: &YuvFrame,
+    reference: &YuvFrame,
+    tr_p: u8,
+    prev_tr: u8,
+    cfg: &PbConfig,
+) -> Result<Vec<u8>> {
+    encode_pb_picture_umv_stats(p_source, b_source, reference, tr_p, prev_tr, cfg)
+        .map(|(bytes, _)| bytes)
+}
+
+/// As [`encode_pb_picture_umv`], additionally returning the
+/// per-picture [`ImprovedPbStats`] census.
+pub fn encode_pb_picture_umv_stats(
+    p_source: &YuvFrame,
+    b_source: &YuvFrame,
+    reference: &YuvFrame,
+    tr_p: u8,
+    prev_tr: u8,
+    cfg: &PbConfig,
+) -> Result<(Vec<u8>, ImprovedPbStats)> {
+    encode_pb_core(
+        p_source,
+        b_source,
+        reference,
+        tr_p,
+        prev_tr,
+        PbCore {
+            quant: cfg.quant,
+            trb: cfg.trb,
+            dbquant: cfg.dbquant,
+            search_half: cfg.search_half,
+            advanced_prediction: false,
+            umv: UmvMode::Wrap,
             intra_refresh: 0,
         },
         PbFlavour::AnnexG {
@@ -336,6 +411,55 @@ fn encode_pb_core(
     let bquant = pb_bquant(core.dbquant, quant);
     let trb = i32::from(core.trb);
     let ap = core.advanced_prediction;
+    let lambda = 2 * quant as u32;
+    if ap && core.umv == UmvMode::Wrap {
+        // UMV + AP on a baseline header is not staged (the §D.2 pair
+        // rule per block vector); the PLUSPTYPE form is.
+        return Err(Error::NotImplemented);
+    }
+    // Vector search + difference coding under the picture's UMV mode.
+    let search_mb =
+        |src: &YuvFrame, mb_col: usize, mb_row: usize, predictor: MotionVector| match core.umv {
+            UmvMode::Off => estimate_motion(
+                src,
+                reference,
+                mb_col,
+                mb_row,
+                predictor,
+                core.search_half,
+                lambda,
+            ),
+            UmvMode::Wrap => crate::encoder_motion::estimate_motion_umv(
+                src,
+                reference,
+                mb_col,
+                mb_row,
+                predictor,
+                core.search_half,
+                lambda,
+            ),
+            UmvMode::Plus => crate::encoder_motion::estimate_motion_umv_plus(
+                src,
+                reference,
+                mb_col,
+                mb_row,
+                predictor,
+                core.search_half,
+                lambda,
+            ),
+        };
+    let diff_for = |mv: MotionVector, predictor: MotionVector| -> Mvd {
+        match core.umv {
+            UmvMode::Off => mvd_for(mv, predictor),
+            // `estimate_motion_umv` only admits §D.2-reachable vectors.
+            UmvMode::Wrap => crate::encoder_motion::umv_mvd_for(mv, predictor)
+                .expect("UMV search admits only §D.2-reachable vectors"),
+            UmvMode::Plus => Mvd {
+                dx_half: (mv.dx_half - predictor.dx_half) as i16,
+                dy_half: (mv.dy_half - predictor.dy_half) as i16,
+            },
+        }
+    };
     let mut stats = ImprovedPbStats::default();
 
     let lw = p_source.luma_width;
@@ -344,7 +468,6 @@ fn encode_pb_core(
     let ch = p_source.chroma_height();
     let mb_cols = lw / 16;
     let mb_rows = lh / 16;
-    let lambda = 2 * quant as u32;
     let is_intra_mb =
         |idx: usize| -> bool { core.intra_refresh > 0 && idx % core.intra_refresh == 0 };
 
@@ -359,6 +482,7 @@ fn encode_pb_core(
             /* is_inter */ true,
             PtypeFlags {
                 advanced_prediction: ap,
+                umv: core.umv == UmvMode::Wrap,
                 ..PtypeFlags::default()
             },
             Some((core.trb, core.dbquant)),
@@ -371,6 +495,7 @@ fn encode_pb_core(
             /* is_inter */ true,
             PlusModes {
                 advanced_prediction: ap,
+                umv: core.umv == UmvMode::Plus,
                 improved_pb: Some((core.trb, core.dbquant)),
                 ..PlusModes::default()
             },
@@ -398,24 +523,36 @@ fn encode_pb_core(
                     // (see `intra_refresh`); MVD still codes it against
                     // the §F.2 block-1 predictor.
                     let predictor = grid4.predict_block(mb_col, mb_row, LumaBlockIndex::B1, &cur);
-                    mvds[0] = mvd_for(MotionVector::new(0, 0), predictor);
+                    mvds[0] = diff_for(MotionVector::new(0, 0), predictor);
                 } else {
                     for &blk in &LumaBlockIndex::ALL {
                         let blk_i = blk.index();
                         let bx = mb_col * 16 + (blk_i % 2) * 8;
                         let by = mb_row * 16 + (blk_i / 2) * 8;
                         let predictor = grid4.predict_block(mb_col, mb_row, blk, &cur);
-                        let mv = estimate_block_motion(
-                            p_source,
-                            reference,
-                            bx,
-                            by,
-                            predictor,
-                            core.search_half,
-                            lambda,
-                        );
+                        let mv = if core.umv == UmvMode::Plus {
+                            crate::encoder_motion::estimate_block_motion_umv_plus(
+                                p_source,
+                                reference,
+                                bx,
+                                by,
+                                predictor,
+                                core.search_half,
+                                lambda,
+                            )
+                        } else {
+                            estimate_block_motion(
+                                p_source,
+                                reference,
+                                bx,
+                                by,
+                                predictor,
+                                core.search_half,
+                                lambda,
+                            )
+                        };
                         cur[blk_i] = mv;
-                        mvds[blk_i] = mvd_for(mv, predictor);
+                        mvds[blk_i] = diff_for(mv, predictor);
                     }
                 }
                 grid4.set(mb_col, mb_row, cur);
@@ -449,21 +586,13 @@ fn encode_pb_core(
                 let mv = if intra {
                     MotionVector::new(0, 0)
                 } else {
-                    estimate_motion(
-                        p_source,
-                        reference,
-                        mb_col,
-                        mb_row,
-                        predictor,
-                        core.search_half,
-                        lambda,
-                    )
+                    search_mb(p_source, mb_col, mb_row, predictor)
                 };
                 let zero = Mvd {
                     dx_half: 0,
                     dy_half: 0,
                 };
-                ([mv; 4], [mvd_for(mv, predictor), zero, zero, zero])
+                ([mv; 4], [diff_for(mv, predictor), zero, zero, zero])
             };
             let single_mv = mvs4[0];
             let all_zero = mvs4.iter().all(|m| m.dx_half == 0 && m.dy_half == 0);
@@ -516,6 +645,7 @@ fn encode_pb_core(
                 mb_col,
                 mb_row,
                 /* bidirectional_only */ intra,
+                core.umv,
             );
 
             // ---- Skip / emit. -----------------------------------------
@@ -589,21 +719,20 @@ fn encode_pb_core(
                 PbFlavour::AnnexG { .. } => true,
                 PbFlavour::AnnexM { .. } => matches!(b_part.mode, BpbCodingMode::Bidirectional),
             };
+            let d3 = core.umv == UmvMode::Plus;
             if !intra || intra_mvd {
-                write_mvd_component(&mut w, mvds[0].dx_half)?;
-                write_mvd_component(&mut w, mvds[0].dy_half)?;
+                write_mv_pair(&mut w, mvds[0], d3)?;
             }
             // §5.3.8 MVD2-4 — INTER4V only ("never used for INTRA", §G.2).
             if ap && !intra {
                 for d in mvds.iter().skip(1) {
-                    write_mvd_component(&mut w, d.dx_half)?;
-                    write_mvd_component(&mut w, d.dy_half)?;
+                    write_mv_pair(&mut w, *d, d3)?;
                 }
             }
-            // §5.3.9 MVDB.
+            // §5.3.9 MVDB — "coded in the same way as MVD" (§M.2.2), so
+            // Table D.3 under UMV+ too.
             if let Some(d) = b_part.mvdb {
-                write_mvd_component(&mut w, d.dx_half)?;
-                write_mvd_component(&mut w, d.dy_half)?;
+                write_mv_pair(&mut w, d, d3)?;
                 if d.dx_half != 0 || d.dy_half != 0 {
                     stats.mvdb += 1;
                 }
@@ -658,6 +787,17 @@ fn encode_pb_core(
 
     w.align_to_byte_zero();
     Ok((w.finish(), stats))
+}
+
+/// One MVD pair: two Table 14 codewords, or the Table D.3 pair (with
+/// its §D.2 emulation-prevention bit) under UMV with PLUSPTYPE.
+fn write_mv_pair(w: &mut BitWriter, mvd: Mvd, table_d3: bool) -> Result<()> {
+    if table_d3 {
+        crate::encoder_vlc::write_mvd_pair_d3(w, mvd)
+    } else {
+        write_mvd_component(w, mvd.dx_half)?;
+        write_mvd_component(w, mvd.dy_half)
+    }
 }
 
 fn to_i16(pred: &[u8; COEFFS_PER_BLOCK]) -> [i16; COEFFS_PER_BLOCK] {
@@ -993,9 +1133,25 @@ fn decide_b_part(
     mb_col: usize,
     mb_row: usize,
     bidirectional_only: bool,
+    umv: UmvMode,
 ) -> BPart {
+    // The decoder-side §G.4 composition: under baseline UMV the Table
+    // 14 MVDB resolves per block through the §D.2 pair rule with
+    // `Pc = (TRB × MV)/TRD`, so the candidate's *effective* deltas are
+    // what the prediction must be built from.
     let predict_at = |delta: Option<Mvd>| {
-        pb_b_predict_macroblock(planes, mb_x, mb_y, mvs4, delta, trb, trd, RCONTROL_DEFAULT)
+        let deltas =
+            crate::pb_layer::pb_b_effective_deltas(mvs4, delta, trb, trd, umv == UmvMode::Wrap);
+        crate::pb_layer::pb_b_predict_macroblock_deltas(
+            planes,
+            mb_x,
+            mb_y,
+            mvs4,
+            &deltas,
+            trb,
+            trd,
+            RCONTROL_DEFAULT,
+        )
     };
     let mut best_pred = predict_at(None);
     let mut best_cost = b_sad(b_src, &best_pred) + lambda;
@@ -1013,9 +1169,14 @@ fn decide_b_part(
             // the pair mate sits exactly 64 half-pels away — outside a
             // range only 64 wide). The zero delta competes with a flat
             // bias so static content never pays the MODB / MVDB bits.
+            // Outside UMV the in-range MVF is what any decoder selects
+            // from the Table 14 pair (the mate sits 64 half-pels away,
+            // outside a range only 64 wide); under baseline UMV the
+            // §D.2 rule resolves the pair per block and `predict_at`
+            // already mirrors that resolution, so every Table-14-codable
+            // delta is a legal candidate there.
             let mvf_in_range = |p_comp: i32, delta: i32| -> bool {
-                let mvf = (trb * p_comp) / trd + delta;
-                (-32..=31).contains(&mvf)
+                umv == UmvMode::Wrap || (-32..=31).contains(&((trb * p_comp) / trd + delta))
             };
             let bw = b_search_half;
             for dy in -bw..=bw {
@@ -1055,17 +1216,40 @@ fn decide_b_part(
             // reference, coded against the left-neighbour predictor.
             if forward_search_half > 0 {
                 let fwd_predictor = left_forward.unwrap_or_default();
-                let fwd_mv = estimate_motion(
-                    b_source,
-                    reference,
-                    mb_col,
-                    mb_row,
-                    fwd_predictor,
-                    forward_search_half,
-                    lambda,
-                );
+                // §M.2.2 — "VLC coded in the same way as … (MVD)": Table
+                // D.3 single-valued differences over the UUI range under
+                // UMV+ (the vector may then reach over the picture
+                // boundary, §D.1), the §6.1.1 wrap otherwise.
+                let (fwd_mv, d) = if umv == UmvMode::Plus {
+                    let mv = crate::encoder_motion::estimate_motion_umv_plus(
+                        b_source,
+                        reference,
+                        mb_col,
+                        mb_row,
+                        fwd_predictor,
+                        forward_search_half,
+                        lambda,
+                    );
+                    (
+                        mv,
+                        Mvd {
+                            dx_half: (mv.dx_half - fwd_predictor.dx_half) as i16,
+                            dy_half: (mv.dy_half - fwd_predictor.dy_half) as i16,
+                        },
+                    )
+                } else {
+                    let mv = estimate_motion(
+                        b_source,
+                        reference,
+                        mb_col,
+                        mb_row,
+                        fwd_predictor,
+                        forward_search_half,
+                        lambda,
+                    );
+                    (mv, mvd_for(mv, fwd_predictor))
+                };
                 let fwd_pred = forward_prediction(planes, mb_x, mb_y, fwd_mv);
-                let d = mvd_for(fwd_mv, fwd_predictor);
                 let bits =
                     3 + (d.dx_half.unsigned_abs() as u32) + (d.dy_half.unsigned_abs() as u32) + 2;
                 let cost = b_sad(b_src, &fwd_pred) + lambda * bits;

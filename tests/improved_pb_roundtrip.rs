@@ -2,7 +2,8 @@
 
 use oxideav_h263::encoder::{
     encode_improved_pb_picture, encode_improved_pb_picture_stats, encode_intra_picture,
-    encode_pb_picture, encode_pb_picture_ap_stats, ImprovedPbConfig, PbConfig, EOS_BYTES,
+    encode_pb_picture, encode_pb_picture_ap_stats, encode_pb_picture_umv_stats, ImprovedPbConfig,
+    PbConfig, EOS_BYTES,
 };
 use oxideav_h263::picture::{
     decode_improved_pb_picture, decode_pb_picture_no_gob0_header, decode_sequence, DecodeOptions,
@@ -135,6 +136,7 @@ fn improved_pb_all_three_modes_round_trip_through_decode_sequence() {
         forward_search_half: 3,
         allow_backward: true,
         advanced_prediction: false,
+        umv: false,
         intra_refresh: 0,
     };
     let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
@@ -366,6 +368,7 @@ fn improved_pb_with_advanced_prediction_and_intra_refresh_round_trips() {
         forward_search_half: 3,
         allow_backward: true,
         advanced_prediction: true,
+        umv: false,
         intra_refresh: 4,
     };
     let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
@@ -396,5 +399,128 @@ fn improved_pb_with_advanced_prediction_and_intra_refresh_round_trips() {
             luma_psnr(src, dec)
         );
         assert!(mae < 3.0, "{name}: luma MAE {mae:.3} too high");
+    }
+}
+
+/// Annex G PB-frames in the Unrestricted Motion Vector mode: a 20 px
+/// pan needs the §D.2 extended range (the predictor slides the
+/// reachable window out), and the MVDB delta is resolved per block
+/// with `Pc = (TRB × MV)/TRD`. Pinned: the UMV pair reconstructs a pan
+/// the default-range pair cannot follow.
+#[test]
+fn annex_g_pb_umv_follows_a_wide_pan() {
+    let base = textured(176, 144, 13);
+    let i_bytes = encode_intra_picture(&base, 6, 0).unwrap();
+    let r0 = decode_sequence(&i_bytes, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    let p = translated(&base, 22, 0);
+    let b = translated(&base, 11, 0);
+    let cfg = PbConfig {
+        quant: 6,
+        trb: 1,
+        dbquant: 0,
+        search_half: 24,
+        b_search_half: 2,
+    };
+    let (umv_bytes, stats) = encode_pb_picture_umv_stats(&p, &b, &r0, 2, 0, &cfg).unwrap();
+    eprintln!("Annex G + UMV census: {stats:?}");
+    let plain_bytes = encode_pb_picture(&p, &b, &r0, 2, 0, &cfg).unwrap();
+    let umv_pair =
+        decode_pb_picture_no_gob0_header(&umv_bytes, &r0, 0, DecodeOptions::default()).unwrap();
+    let plain_pair =
+        decode_pb_picture_no_gob0_header(&plain_bytes, &r0, 0, DecodeOptions::default()).unwrap();
+    let (umv_p, plain_p) = (
+        luma_mae(&umv_pair.p_frame, &p),
+        luma_mae(&plain_pair.p_frame, &p),
+    );
+    let (umv_b, plain_b) = (
+        luma_mae(&umv_pair.b_frame, &b),
+        luma_mae(&plain_pair.b_frame, &b),
+    );
+    eprintln!(
+        "UMV: {} bytes, P MAE {umv_p:.3}, B MAE {umv_b:.3}; plain: {} bytes, P MAE {plain_p:.3}, B MAE {plain_b:.3}",
+        umv_bytes.len(),
+        plain_bytes.len()
+    );
+    assert!(
+        umv_p < 3.0 && umv_b < 3.5,
+        "UMV PB pair reconstructs the wide pan"
+    );
+    assert!(
+        umv_bytes.len() < plain_bytes.len(),
+        "the extended range pays off"
+    );
+    let mut stream = i_bytes;
+    stream.extend_from_slice(&umv_bytes);
+    let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.len(), 3);
+    assert_eq!(decoded[1], umv_pair.b_frame);
+    assert_eq!(decoded[2], umv_pair.p_frame);
+}
+
+/// Annex M + UMV (PLUSPTYPE, Table D.3): the P-part and the §M.2.2
+/// forward vectors are single-valued Table D.3 differences over the
+/// UUI = "1" range; a 20 px pan on the P-part and a forward-mode BPB
+/// whose best vector points over the left picture boundary (§D.1 edge
+/// replication) both reconstruct.
+#[test]
+fn improved_pb_umv_plus_round_trips_with_over_boundary_forward_vectors() {
+    let base = textured(176, 144, 17);
+    let i_bytes = encode_intra_picture(&base, 6, 0).unwrap();
+    let r0 = decode_sequence(&i_bytes, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    // P: 20 px pan (needs UMV). BPB: the reference shifted right by 6 px
+    // with its left 6 columns edge-replicated — the forward vector
+    // (-12, 0) half-pel points 6 px left of the picture edge there.
+    let p = translated(&base, 20, 0);
+    let mut b = translated(&r0, 6, 0);
+    for r in 0..144 {
+        let edge = r0.y[r * 176];
+        for c in 0..6 {
+            b.y[r * 176 + c] = edge;
+        }
+    }
+    for r in 0..72 {
+        let (cb, cr) = (r0.cb[r * 88], r0.cr[r * 88]);
+        for c in 0..3 {
+            b.cb[r * 88 + c] = cb;
+            b.cr[r * 88 + c] = cr;
+        }
+    }
+    for ap in [false, true] {
+        let cfg = ImprovedPbConfig {
+            quant: 6,
+            trb: 1,
+            dbquant: 0,
+            search_half: 22,
+            forward_search_half: 8,
+            allow_backward: true,
+            advanced_prediction: ap,
+            umv: true,
+            intra_refresh: 0,
+        };
+        let (bytes, stats) = encode_improved_pb_picture_stats(&p, &b, &r0, 2, 0, &cfg).unwrap();
+        eprintln!("Improved-PB + UMV+ (ap {ap}) census: {stats:?}");
+        assert!(
+            stats.forward > 0,
+            "the shifted BPB is a forward-mode natural"
+        );
+        let pair = decode_improved_pb_picture(&bytes, &r0, 0, DecodeOptions::default()).unwrap();
+        let (mp, mb) = (luma_mae(&pair.p_frame, &p), luma_mae(&pair.b_frame, &b));
+        eprintln!("ap {ap}: P MAE {mp:.3}, BPB MAE {mb:.3}");
+        assert!(mp < 3.0, "P MAE {mp:.3}");
+        assert!(
+            mb < 1.0,
+            "the BPB is an exact forward copy up to quantisation: MAE {mb:.3}"
+        );
+        // The left-edge macroblocks' forward vectors must reach over the
+        // boundary: their BPB reconstruction equals the edge-replicated
+        // source there.
+        let mut stream = i_bytes.clone();
+        stream.extend_from_slice(&bytes);
+        let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded[1], pair.b_frame);
     }
 }
