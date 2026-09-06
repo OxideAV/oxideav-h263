@@ -91,6 +91,13 @@ pub struct ImprovedPbConfig {
     /// D.3 coded over the Tables-D.1/D.2 range, the forward fetch
     /// reaching over the picture boundary through §D.1.
     pub umv: bool,
+    /// Annex K Slice Structured mode (OPPTYPE bit 10, free-running
+    /// sequential slices): `slice_rows > 0` emits a §K.2 slice every
+    /// `slice_rows` macroblock rows, each its own §6.1.1 / §F.3 video
+    /// picture segment (predictors and OBMC remotes confined per §K.1
+    /// rules 1 / 3, the §M.2.2 forward predictor restarting at every
+    /// slice's left edge). `0` emits the single-segment GOB layout.
+    pub slice_rows: usize,
     /// INTRA-code every `intra_refresh`-th macroblock (raster order,
     /// starting with the first); `0` disables the refresh. A PB-frame
     /// INTRA macroblock still carries the vector its B-blocks use
@@ -115,6 +122,7 @@ impl Default for ImprovedPbConfig {
             allow_backward: true,
             advanced_prediction: false,
             umv: false,
+            slice_rows: 0,
             intra_refresh: 0,
         }
     }
@@ -180,6 +188,9 @@ struct PbCore {
     search_half: i32,
     advanced_prediction: bool,
     umv: UmvMode,
+    /// Annex K row-aligned free-running slices every `slice_rows`
+    /// macroblock rows (`0` = none; Annex M only).
+    slice_rows: usize,
     intra_refresh: usize,
 }
 
@@ -235,6 +246,7 @@ pub fn encode_improved_pb_picture_stats(
             search_half: cfg.search_half,
             advanced_prediction: cfg.advanced_prediction,
             umv: if cfg.umv { UmvMode::Plus } else { UmvMode::Off },
+            slice_rows: cfg.slice_rows,
             intra_refresh: cfg.intra_refresh,
         },
         PbFlavour::AnnexM {
@@ -289,6 +301,7 @@ pub fn encode_pb_picture_ap_stats(
             search_half: cfg.search_half,
             advanced_prediction: true,
             umv: UmvMode::Off,
+            slice_rows: 0,
             intra_refresh: 0,
         },
         PbFlavour::AnnexG {
@@ -340,6 +353,7 @@ pub fn encode_pb_picture_umv_stats(
             search_half: cfg.search_half,
             advanced_prediction: false,
             umv: UmvMode::Wrap,
+            slice_rows: 0,
             intra_refresh: 0,
         },
         PbFlavour::AnnexG {
@@ -406,12 +420,34 @@ fn encode_pb_core(
     }
     let fmt = source_format_for(p_source.luma_width, p_source.luma_height)
         .ok_or(Error::NotImplemented)?;
+    let layout =
+        crate::picture::PictureLayout::for_source_format(fmt).ok_or(Error::NotImplemented)?;
 
     let quant = core.quant;
     let bquant = pb_bquant(core.dbquant, quant);
     let trb = i32::from(core.trb);
     let ap = core.advanced_prediction;
     let lambda = 2 * quant as u32;
+    let mb_rows_total = p_source.luma_height / 16;
+    if core.slice_rows > mb_rows_total
+        || (core.slice_rows > 0 && matches!(flavour, PbFlavour::AnnexG { .. }))
+    {
+        // Annex K is PLUSPTYPE-only (§G.1 bars it from Annex G).
+        return Err(Error::UnsupportedPictureGeometry);
+    }
+    // Annex K free-running sequential slices every `slice_rows` rows.
+    let sss = (core.slice_rows > 0).then_some(crate::plus_ptype::SliceStructuredSubmode {
+        rectangular: false,
+        arbitrary_order: false,
+    });
+    let slice_ctx = sss.map(|sss| {
+        crate::slice_header::SliceHeaderContext::from_picture_layout(
+            &layout,
+            Some(sss),
+            false,
+            false,
+        )
+    });
     if ap && core.umv == UmvMode::Wrap {
         // UMV + AP on a baseline header is not staged (the §D.2 pair
         // rule per block vector); the PLUSPTYPE form is.
@@ -497,10 +533,17 @@ fn encode_pb_core(
                 advanced_prediction: ap,
                 umv: core.umv == UmvMode::Plus,
                 improved_pb: Some((core.trb, core.dbquant)),
+                slice_structured: sss,
                 ..PlusModes::default()
             },
         )?,
     }
+    // §K.2.2 — the reduced first-slice header (MBA 0) follows the
+    // picture header.
+    if let Some(ctx) = slice_ctx.as_ref() {
+        crate::slice_header::write_first_slice_header(&mut w, ctx, 0, None)?;
+    }
+    let gfid = tr_p & 0b11;
 
     // ---- Pass 1 (Advanced Prediction): the whole §F.2 vector field,
     // so every §F.3 remote vector is known before any prediction. An
@@ -509,7 +552,11 @@ fn encode_pb_core(
     let mut field: Vec<Mb4Mv> = Vec::new();
     let mut mvds_field: Vec<[Mvd; 4]> = Vec::new();
     if ap {
-        let mut grid4 = Mv4Grid::new(mb_cols, mb_rows);
+        let mut grid4 = if core.slice_rows > 0 {
+            Mv4Grid::with_row_segments(mb_cols, mb_rows, core.slice_rows)
+        } else {
+            Mv4Grid::new(mb_cols, mb_rows)
+        };
         for mb_row in 0..mb_rows {
             for mb_col in 0..mb_cols {
                 let idx = mb_row * mb_cols + mb_col;
@@ -566,12 +613,28 @@ fn encode_pb_core(
     let y_ref = RefPlane::new(&reference.y, lw, lh);
     let prev_cb = RefPlane::new(&reference.cb, cw, ch);
     let prev_cr = RefPlane::new(&reference.cr, cw, ch);
-    let mut grid = MvGrid::new(mb_cols, mb_rows);
+    let mut grid = if core.slice_rows > 0 {
+        MvGrid::with_gob_headers(mb_cols, mb_rows, core.slice_rows)
+    } else {
+        MvGrid::new(mb_cols, mb_rows)
+    };
 
     for mb_row in 0..mb_rows {
+        // §K.2 — SSTUF + SSC slice header at every slice start after
+        // the first (reduced-header) slice.
+        if let Some(ctx) = slice_ctx.as_ref() {
+            if mb_row > 0 && mb_row % core.slice_rows == 0 {
+                let mba = (mb_row * mb_cols) as u32;
+                crate::slice_header::write_slice_layer(&mut w, ctx, mba, quant, gfid, None)?;
+            }
+        }
         // §M.2.2 — the forward-vector predictor restarts at the far-left
-        // edge of every macroblock row (the decoder resets it per row).
+        // edge of every macroblock row (the decoder resets it per row,
+        // and at every slice's left edge — the same rows here).
         let mut left_forward: Option<MotionVector> = None;
+        // §K.1 rule 3 / §F.3 — a neighbour in another slice is outside
+        // for OBMC purposes (remote = current vector).
+        let above_in_slice = core.slice_rows == 0 || mb_row % core.slice_rows != 0;
         for mb_col in 0..mb_cols {
             let idx = mb_row * mb_cols + mb_col;
             let mb_x = mb_col * 16;
@@ -602,7 +665,7 @@ fn encode_pb_core(
             let p_part = if intra {
                 intra_p_part(&src, quant)
             } else if ap {
-                let above = (mb_row > 0).then(|| field[idx - mb_cols]);
+                let above = (mb_row > 0 && above_in_slice).then(|| field[idx - mb_cols]);
                 let left = (mb_col > 0).then(|| field[idx - 1]);
                 let right = (mb_col + 1 < mb_cols).then(|| field[idx + 1]);
                 inter_p_part_ap(

@@ -434,6 +434,7 @@ fn improved_pb_frames_agree_with_oracle() {
         allow_backward: true,
         advanced_prediction: false,
         umv: false,
+        slice_rows: 0,
         intra_refresh: 0,
     };
     let mut prev_tr = 0u8;
@@ -528,6 +529,7 @@ fn improved_pb_intra_refresh_agrees_with_oracle() {
             allow_backward: true,
             advanced_prediction: ap,
             umv: false,
+            slice_rows: 0,
             intra_refresh: 4,
         };
         let mut prev_tr = 0u8;
@@ -577,6 +579,7 @@ fn oracle_ap_pb_p_part_depends_on_b_content() {
         allow_backward: false,
         advanced_prediction: true,
         umv: false,
+        slice_rows: 0,
         intra_refresh: 0,
     };
     let mut ours_p = Vec::new();
@@ -657,6 +660,7 @@ fn pb_frames_with_umv_agree_with_oracle() {
         allow_backward: true,
         advanced_prediction: false,
         umv: true,
+        slice_rows: 0,
         intra_refresh: 0,
     };
     let mut prev_tr = 0u8;
@@ -673,4 +677,43 @@ fn pb_frames_with_umv_agree_with_oracle() {
         prev_tr = tr_p;
     }
     cross_check_anchors(&stream, 176, 144, "improved-pb-umv-plus", 0.08, &[0, 2, 4]);
+}
+
+/// Annex K slices + Improved PB-frames (plain P-part): every slice
+/// header sits between PB macroblock data, and the oracle must agree on
+/// every P-part exactly.
+#[test]
+fn improved_pb_with_slices_agrees_with_oracle() {
+    require_oracle!();
+    let base = gradient(176, 144, 43);
+    let mut stream = encode_intra_picture(&base, 7, 0).unwrap();
+    let mut recon = decode_sequence(&stream, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    let cfg = ImprovedPbConfig {
+        quant: 7,
+        trb: 1,
+        dbquant: 0,
+        search_half: 6,
+        forward_search_half: 3,
+        allow_backward: true,
+        advanced_prediction: false,
+        umv: false,
+        slice_rows: 2,
+        intra_refresh: 0,
+    };
+    let mut prev_tr = 0u8;
+    for k in 1..=2usize {
+        let p = translated(&base, 4 * k, k);
+        let b = translated(&base, 4 * k - 3, k);
+        let tr_p = (2 * k) as u8;
+        let unit = encode_improved_pb_picture(&p, &b, &recon, tr_p, prev_tr, &cfg).unwrap();
+        stream.extend_from_slice(&unit);
+        recon = decode_sequence(&stream, DecodeOptions::default())
+            .unwrap()
+            .pop()
+            .unwrap();
+        prev_tr = tr_p;
+    }
+    cross_check_anchors(&stream, 176, 144, "improved-pb-slices", 0.08, &[0, 2, 4]);
 }

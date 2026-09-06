@@ -3351,6 +3351,7 @@ pub fn decode_picture_layer_rps(
                 cpm_psbi,
                 rps_slice,
                 umv,
+                None,
             )?
         }
         None => {
@@ -3739,9 +3740,11 @@ pub fn decode_pb_picture_no_gob0_header(
 ///   picture-type other than Improved PB-frame; any mode
 ///   [`plus_ptype_to_baseline_shim`] refuses (SAC, ISD, Alternative
 ///   INTER VLC, Modified Quantisation, custom PCF, CPM, RRU); the
-///   Slice-Structured submode (Annex K + Improved-PB is unstaged); or a
-///   `reference` of mismatched geometry. Advanced Prediction composes
-///   as for [`decode_pb_picture`], and UMV composes (round 457): the
+///   or a `reference` of mismatched geometry. Advanced Prediction
+///   composes as for [`decode_pb_picture`], Annex K slices compose
+///   (round 457 — the §M.2.2 forward predictor restarts at every
+///   slice's left edge, §K.1 rules 1 / 3 confine the predictors and
+///   OBMC remotes), and UMV composes (round 457): the
 ///   P-part's vectors and the §M.2.2 forward vector are Table D.3 coded
 ///   under the UUI range, the forward fetch reaching over the picture
 ///   boundary through the §D.1 edge replication.
@@ -3825,34 +3828,6 @@ pub fn decode_improved_pb_picture_with_inherited(
         // [`decode_picture_layer`] for a plain INTRA / INTER picture.
         return Err(Error::NotImplemented);
     }
-    // Annex K + Improved-PB (the §K.2 slice-boundary BPB exclusions) is
-    // unstaged.
-    if slice_structured.is_some() {
-        return Err(Error::NotImplemented);
-    }
-
-    // §5.1.19 — PQUANT (5 bits). With PLUSPTYPE present the field order
-    // (Figure 6 part 1) places PQUANT immediately after the PLUSPTYPE /
-    // CPFMT block (the layered RPS / RPR fields between are refused by
-    // the shim). It primes the QUANT for the first GOB until the GOB's
-    // GQUANT takes over.
-    let pquant = reader.read_u32(5).map_err(|_| Error::UnexpectedEof)? as u8;
-    if pquant == 0 || pquant > 31 {
-        return Err(Error::InvalidQuantiser);
-    }
-    // §5.1.22 — TRB (3 bits at the standard CIF PCF; the 5-bit form
-    // requires a custom PCF, which the shim refuses). "The codeword is
-    // the natural binary representation of the number of non-transmitted
-    // pictures plus one" — `0` is illegal.
-    let trb = reader.read_u32(3).map_err(|_| Error::UnexpectedEof)? as i32;
-    if trb == 0 {
-        return Err(Error::BadPbTemporalReference);
-    }
-    // §5.1.23 — DBQUANT.
-    let dbquant = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)? as u8;
-    // §5.1.24 / §5.1.25 — PEI + PSUPP extension loop, consumed so the
-    // reader lands on the first bit of GOB-0 macroblock data.
-    skip_pei_psupp(&mut reader)?;
     // §G.4 — TRD (referenced by §M for the bidirectional vectors).
     let mut trd = i32::from(header.temporal_reference) - i32::from(prev_tr);
     if trd < 0 {
@@ -3874,27 +3849,75 @@ pub fn decode_improved_pb_picture_with_inherited(
         luma_width: luma_w,
         luma_height: luma_h,
     };
-    // §5.2.2 — group number 0 carries no GOB header (PQUANT primes its
-    // QUANT); every later GOB header is optional (§5.2).
-    let p_frame = decode_after_picture_header(
-        &mut reader,
-        &header,
-        &layout,
-        Some(reference),
-        shim_options,
-        Some(PbPictureCtx {
-            trb,
-            trd,
-            dbquant,
-            annex_m: true,
-            left_bpb_forward_mv: None,
+
+    let p_frame = match slice_structured {
+        // Annex K — the slice driver reads PQUANT, TRB / DBQUANT and the
+        // PEI loop itself, then walks the §K.2 slices; §K.1 rules 1 / 3
+        // confine the predictors and OBMC remotes per slice and the
+        // §M.2.2 forward predictor restarts at every slice's left edge.
+        Some(sss) => decode_slice_structured_after_header_inner(
+            &mut reader,
+            &header,
+            &layout,
+            sss,
+            Some(reference),
+            shim_options,
+            cpm_psbi,
+            None,
             umv,
-            b_frame: &mut b_frame,
-        }),
-        Some(pquant),
-        umv,
-        cpm_psbi,
-    )?;
+            Some(PbSliceRequest {
+                trd,
+                annex_m: true,
+                umv,
+                b_frame: &mut b_frame,
+            }),
+        )?,
+        None => {
+            // §5.1.19 — PQUANT (5 bits). With PLUSPTYPE present the field
+            // order (Figure 6 part 1) places PQUANT immediately after the
+            // PLUSPTYPE / CPFMT block (the layered RPS / RPR fields
+            // between are refused by the shim). It primes the QUANT for
+            // the first GOB until the GOB's GQUANT takes over.
+            let pquant = reader.read_u32(5).map_err(|_| Error::UnexpectedEof)? as u8;
+            if pquant == 0 || pquant > 31 {
+                return Err(Error::InvalidQuantiser);
+            }
+            // §5.1.22 — TRB (3 bits at the standard CIF PCF; the 5-bit
+            // form requires a custom PCF, which the shim refuses). "The
+            // codeword is the natural binary representation of the number
+            // of non-transmitted pictures plus one" — `0` is illegal.
+            let trb = reader.read_u32(3).map_err(|_| Error::UnexpectedEof)? as i32;
+            if trb == 0 {
+                return Err(Error::BadPbTemporalReference);
+            }
+            // §5.1.23 — DBQUANT.
+            let dbquant = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)? as u8;
+            // §5.1.24 / §5.1.25 — PEI + PSUPP extension loop, consumed so
+            // the reader lands on the first bit of GOB-0 macroblock data.
+            skip_pei_psupp(&mut reader)?;
+            // §5.2.2 — group number 0 carries no GOB header (PQUANT primes
+            // its QUANT); every later GOB header is optional (§5.2).
+            decode_after_picture_header(
+                &mut reader,
+                &header,
+                &layout,
+                Some(reference),
+                shim_options,
+                Some(PbPictureCtx {
+                    trb,
+                    trd,
+                    dbquant,
+                    annex_m: true,
+                    left_bpb_forward_mv: None,
+                    umv,
+                    b_frame: &mut b_frame,
+                }),
+                Some(pquant),
+                umv,
+                cpm_psbi,
+            )?
+        }
+    };
     Ok((PbFramePair { p_frame, b_frame }, next_inherited))
 }
 
@@ -4082,6 +4105,28 @@ struct PendingPbB {
     mvs4: Mb4Mv,
     quant: u8,
     blocks: [Option<H263Block>; 6],
+    /// §M.2.2 — this macroblock sits at the far-left edge of the
+    /// picture or slice: the forward-vector predictor is zero for it.
+    /// Applied when the B-part is reconstructed (which, under Advanced
+    /// Prediction, happens one macroblock later than its parse — after
+    /// the previous macroblock's own forward vector has been consumed).
+    reset_left_forward: bool,
+}
+
+/// Reconstruct a deferred B-part ([`PendingPbB`]) now that its P-part
+/// is final, applying the §M.2.2 left-edge predictor reset first.
+fn reconstruct_pending_pb_b(
+    b: &PendingPbB,
+    reference: &YuvFrame,
+    frame: &YuvFrame,
+    pb: &mut PbPictureCtx<'_>,
+) -> Result<()> {
+    if b.reset_left_forward {
+        pb.left_bpb_forward_mv = None;
+    }
+    reconstruct_pb_b_part(
+        &b.mb, reference, frame, pb, b.col, b.row, &b.mvs4, b.quant, &b.blocks,
+    )
 }
 
 /// Reconstruct the B-part of one PB-macroblock from its already-parsed
@@ -5132,15 +5177,6 @@ fn decode_after_picture_header_inner(
                 break;
             }
             let mut current_quant = gob_quant;
-            // §M.2.2 — the forward-vector predictor for Improved-PB is
-            // "the value of the forward motion vector of the block to
-            // the left" and is reset at the far-left edge of the
-            // picture or slice. A GOB header starts a new segment, so
-            // the predictor restarts at the left of every macroblock
-            // row of the GOB.
-            if let Some(pb) = pb.as_mut() {
-                pb.left_bpb_forward_mv = None;
-            }
 
             for col in 0..mb_cols {
                 // §5.3.2: an MCBPC stuffing code carries no macroblock
@@ -5201,6 +5237,12 @@ fn decode_after_picture_header_inner(
                 let mut pending_b_new: Option<PendingPbB> = None;
                 if let Some(pb) = pb.as_mut() {
                     let prev = reference.ok_or(Error::NotImplemented)?;
+                    // §M.2.2 — the forward-vector predictor for
+                    // Improved-PB is "the value of the forward motion
+                    // vector of the block to the left" and is reset at
+                    // the far-left edge of the picture or slice: every
+                    // macroblock row of the GOB layout starts there.
+                    let reset_left_forward = col == 0;
                     if header.advanced_prediction {
                         // §F.3 defers this macroblock's P-luma until the
                         // right neighbour is known; PREC (§G.5) is that
@@ -5213,8 +5255,12 @@ fn decode_after_picture_header_inner(
                             mvs4,
                             quant: current_quant,
                             blocks: parse_pb_b_blocks(reader, &mb)?,
+                            reset_left_forward,
                         });
                     } else {
+                        if reset_left_forward {
+                            pb.left_bpb_forward_mv = None;
+                        }
                         decode_pb_b_part(
                             reader,
                             &mb,
@@ -5273,9 +5319,7 @@ fn decode_after_picture_header_inner(
                 if let Some(b) = pending_b.take() {
                     let pb = pb.as_mut().ok_or(Error::NotImplemented)?;
                     let prev = reference.ok_or(Error::NotImplemented)?;
-                    reconstruct_pb_b_part(
-                        &b.mb, prev, &frame, pb, b.col, b.row, &b.mvs4, b.quant, &b.blocks,
-                    )?;
+                    reconstruct_pending_pb_b(&b, prev, &frame, pb)?;
                 }
                 pending_ap = pending_new;
                 pending_b = pending_b_new;
@@ -5304,9 +5348,7 @@ fn decode_after_picture_header_inner(
             if let Some(b) = pending_b.take() {
                 let pb = pb.as_mut().ok_or(Error::NotImplemented)?;
                 let prev = reference.ok_or(Error::NotImplemented)?;
-                reconstruct_pb_b_part(
-                    &b.mb, prev, &frame, pb, b.col, b.row, &b.mvs4, b.quant, &b.blocks,
-                )?;
+                reconstruct_pending_pb_b(&b, prev, &frame, pb)?;
             }
             // §5.2 carry-over: a header-less GOB inherits the QUANT in
             // force at the end of the previous GOB (the last macroblock's
@@ -7581,8 +7623,23 @@ fn decode_slice_structured_after_header(
     umv: UmvCoding,
 ) -> Result<YuvFrame> {
     decode_slice_structured_after_header_inner(
-        reader, header, layout, sss, reference, options, cpm_psbi, None, umv,
+        reader, header, layout, sss, reference, options, cpm_psbi, None, umv, None,
     )
+}
+
+/// A PB-frame decode request for the slice driver: the picture is an
+/// Annex G / Annex M PB unit whose §5.1.22 TRB and §5.1.23 DBQUANT sit
+/// between PQUANT and PEI (read by the driver), whose B-part lands in
+/// `b_frame`.
+struct PbSliceRequest<'b> {
+    /// §G.4 TRD, already validated non-zero.
+    trd: i32,
+    /// Annex M (Table M.1 MODB, §M.2 modes) vs Annex G.
+    annex_m: bool,
+    /// The picture's §D.2 motion-vector coding.
+    umv: UmvCoding,
+    /// The B-picture under construction.
+    b_frame: &'b mut YuvFrame,
 }
 
 /// Inner body of [`decode_slice_structured_after_header`] carrying the
@@ -7605,16 +7662,17 @@ fn decode_slice_structured_after_header_inner(
     cpm_psbi: Option<u8>,
     rps_slice: Option<RpsGobContext<'_>>,
     umv: UmvCoding,
+    pb_request: Option<PbSliceRequest<'_>>,
 ) -> Result<YuvFrame> {
-    // Header-signalled modes the slice driver does not stage. PB-frames
-    // and SAC never reach here (the slice routing in
-    // `decode_picture_layer_with_inherited` only fires for a non-PB
-    // PLUSPTYPE picture), but keep the guard explicit. Advanced
-    // Prediction composes: §K.1 rules 1 and 3 confine the §6.1.1
-    // vector prediction and the §F.3 OBMC remote vectors to the
-    // current slice, which the per-segment grid checks and the
-    // segment-filtered deferred-OBMC flush below implement.
-    if header.sac_mode || header.pb_frames {
+    // Header-signalled modes the slice driver does not stage: SAC never
+    // reaches here; a PB picture must arrive with its
+    // [`PbSliceRequest`] (the Improved-PB driver's slice route) and a
+    // non-PB picture without one. Advanced Prediction composes: §K.1
+    // rules 1 and 3 confine the §6.1.1 vector prediction and the §F.3
+    // OBMC remote vectors to the current slice, which the per-segment
+    // grid checks and the segment-filtered deferred-OBMC flush below
+    // implement; under PB the B-part waits for that flush (PREC, §G.5).
+    if header.sac_mode || header.pb_frames != pb_request.is_some() {
         return Err(Error::NotImplemented);
     }
 
@@ -7667,6 +7725,29 @@ fn decode_slice_structured_after_header_inner(
     if pquant == 0 || pquant > 31 {
         return Err(Error::SliceMbaOutOfRange);
     }
+
+    // §5.1.22 / §5.1.23 — TRB + DBQUANT follow PQUANT for a PB unit
+    // (Figure 6); the B-part context is built here.
+    let mut pb: Option<PbPictureCtx<'_>> = match pb_request {
+        Some(req) => {
+            let trb = reader.read_u32(3).map_err(|_| Error::UnexpectedEof)? as i32;
+            if trb == 0 {
+                return Err(Error::BadPbTemporalReference);
+            }
+            let dbquant = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)? as u8;
+            Some(PbPictureCtx {
+                trb,
+                trd: req.trd,
+                dbquant,
+                annex_m: req.annex_m,
+                left_bpb_forward_mv: None,
+                umv: req.umv,
+                b_frame: req.b_frame,
+            })
+        }
+        None => None,
+    };
+    let pb_mode = pb.is_some();
 
     // §5.1.24 / §5.1.25 — PEI + PSUPP extension loop closes the picture
     // header before the first slice. A decoder without the Annex L
@@ -7753,6 +7834,9 @@ fn decode_slice_structured_after_header_inner(
         // out-of-slice remote substitutes the current vector, so the
         // successor's grid entry is always the last dependency).
         let mut pending_ap: Option<PendingApLuma> = None;
+        // PB + Advanced Prediction: the B-part awaiting its P-part's
+        // OBMC flush ([`PendingPbB`]).
+        let mut pending_b: Option<PendingPbB> = None;
 
         // Walk macroblocks in the slice's scanning order until the next
         // SSC or the end of the slice's region.
@@ -7765,6 +7849,12 @@ fn decode_slice_structured_after_header_inner(
                 }
             };
             let mb_addr = row * mb_cols + col;
+            // §M.2.2 — the forward-vector predictor is zero "at the far
+            // left edge of the picture or slice": the slice's first
+            // macroblock, the picture's left column, and (Rectangular
+            // Slice) the rectangle's left column. Applied when the
+            // B-part is reconstructed (deferred under AP).
+            let reset_left_forward = k == 0 || col == 0 || rect_width.is_some_and(|_| col == col0);
 
             if decoded[mb_addr] {
                 // Overlap with an earlier slice — §K.1 forbids it.
@@ -7780,11 +7870,8 @@ fn decode_slice_structured_after_header_inner(
                         advanced_prediction: header.advanced_prediction,
                         deblocking_filter: options.deblock,
                         aic_intra_mode: options.aic,
-                        pb_frames: header.pb_frames,
-                        // The slice-structured driver does not support
-                        // PB / Improved-PB (refused upstream), so the
-                        // Annex M MODB form never engages here.
-                        pb_annex_m: false,
+                        pb_frames: pb_mode,
+                        pb_annex_m: pb.as_ref().is_some_and(|p| p.annex_m),
                         quantiser_before: current_quant,
                         // Annex T Modified Quantization — §T.2 variable-length
                         // DQUANT parse threads through the slice-walked
@@ -7822,13 +7909,46 @@ fn decode_slice_structured_after_header_inner(
                 false,
                 umv,
                 header.advanced_prediction,
-                false,
+                pb_mode,
                 &mut current_quant,
                 options,
                 &mut aic_state,
                 segment,
                 None,
             )?;
+            // PB-frames: the six B-blocks follow the P-blocks (§G.3);
+            // under Advanced Prediction their reconstruction waits for
+            // the P-part's OBMC flush (PREC, §G.5).
+            let mut pending_b_new: Option<PendingPbB> = None;
+            if let Some(pb) = pb.as_mut() {
+                let prev = reference.ok_or(Error::NotImplemented)?;
+                if header.advanced_prediction {
+                    pending_b_new = Some(PendingPbB {
+                        mb,
+                        col,
+                        row,
+                        mvs4,
+                        quant: current_quant,
+                        blocks: parse_pb_b_blocks(reader, &mb)?,
+                        reset_left_forward,
+                    });
+                } else {
+                    if reset_left_forward {
+                        pb.left_bpb_forward_mv = None;
+                    }
+                    decode_pb_b_part(
+                        reader,
+                        &mb,
+                        prev,
+                        &frame,
+                        pb,
+                        col,
+                        row,
+                        &mvs4,
+                        current_quant,
+                    )?;
+                }
+            }
             record_grid(
                 &mut grid,
                 &mut mb_quant,
@@ -7861,7 +7981,13 @@ fn decode_slice_structured_after_header_inner(
                     None,
                 );
             }
+            if let Some(b) = pending_b.take() {
+                let pb = pb.as_mut().ok_or(Error::NotImplemented)?;
+                let prev = reference.ok_or(Error::NotImplemented)?;
+                reconstruct_pending_pb_b(&b, prev, &frame, pb)?;
+            }
             pending_ap = pending_new;
+            pending_b = pending_b_new;
 
             k += 1;
             // Does the slice's scan order have a next position? A
@@ -7897,6 +8023,11 @@ fn decode_slice_structured_after_header_inner(
                 Some(segment),
                 None,
             );
+        }
+        if let Some(b) = pending_b.take() {
+            let pb = pb.as_mut().ok_or(Error::NotImplemented)?;
+            let prev = reference.ok_or(Error::NotImplemented)?;
+            reconstruct_pending_pb_b(&b, prev, &frame, pb)?;
         }
 
         // §K.1 — the picture is complete when every macroblock has been

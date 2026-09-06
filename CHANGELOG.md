@@ -46,6 +46,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   reaching over the picture boundary (§D.1 / §M.2.2);
   `ImprovedPbConfig::umv` on the encode side, the Improved-PB decode
   driver no longer refuses UMV.
+- **Annex K slices + Improved PB-frames**, both directions: the slice
+  driver takes a PB request (TRB / DBQUANT read between PQUANT and
+  PEI, the B-part deferred after the OBMC flush under AP, the §M.2.2
+  forward predictor restarting at every slice's / rectangle's left
+  edge), the Improved-PB driver routes Slice-Structured pictures to it,
+  and `ImprovedPbConfig::slice_rows` emits row-aligned free-running
+  slices (per-slice §K.1 rule-1 predictors and rule-3 OBMC remotes)
+  from the PB encoder core. The oracle agrees exactly on every P-part.
 - **CPM on the GOB path**, both directions: `gob_header::parse_gob_layer_cpm`
   reads the §5.2.4 GSBI between GN and GFID (`GobLayer::gsbi`); the
   baseline / PB / Improved-PB / extended GOB drivers read §5.1.21 PSBI

@@ -137,6 +137,7 @@ fn improved_pb_all_three_modes_round_trip_through_decode_sequence() {
         allow_backward: true,
         advanced_prediction: false,
         umv: false,
+        slice_rows: 0,
         intra_refresh: 0,
     };
     let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
@@ -369,6 +370,7 @@ fn improved_pb_with_advanced_prediction_and_intra_refresh_round_trips() {
         allow_backward: true,
         advanced_prediction: true,
         umv: false,
+        slice_rows: 0,
         intra_refresh: 4,
     };
     let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
@@ -499,6 +501,7 @@ fn improved_pb_umv_plus_round_trips_with_over_boundary_forward_vectors() {
             allow_backward: true,
             advanced_prediction: ap,
             umv: true,
+            slice_rows: 0,
             intra_refresh: 0,
         };
         let (bytes, stats) = encode_improved_pb_picture_stats(&p, &b, &r0, 2, 0, &cfg).unwrap();
@@ -523,4 +526,72 @@ fn improved_pb_umv_plus_round_trips_with_over_boundary_forward_vectors() {
         let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
         assert_eq!(decoded[1], pair.b_frame);
     }
+}
+
+/// Annex K + Improved PB-frames: free-running slices every three
+/// macroblock rows, plain and with Advanced Prediction. Each slice is
+/// its own §6.1.1 / §F.3 segment and the §M.2.2 forward predictor
+/// restarts at every slice's left edge; the pairs reconstruct through
+/// `decode_improved_pb_picture` and `decode_sequence`.
+#[test]
+fn improved_pb_with_annex_k_slices_round_trips() {
+    let base = textured(176, 144, 21);
+    let i_bytes = encode_intra_picture(&base, 6, 0).unwrap();
+    let r0 = decode_sequence(&i_bytes, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    let p1 = translated(&base, 5, 2);
+    let half1 = translated(&base, 3, 1);
+    let b1 = banded_b(&r0, &p1, &half1);
+    for ap in [false, true] {
+        let cfg = ImprovedPbConfig {
+            quant: 6,
+            trb: 1,
+            dbquant: 0,
+            search_half: 6,
+            forward_search_half: 3,
+            allow_backward: true,
+            advanced_prediction: ap,
+            umv: false,
+            slice_rows: 3,
+            intra_refresh: 0,
+        };
+        let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
+        eprintln!("Improved-PB + slices (ap {ap}) census: {stats:?}");
+        assert!(stats.forward > 0 && stats.bidirectional > 0 && stats.backward > 0);
+        let pair1 = decode_improved_pb_picture(&ipb1, &r0, 0, DecodeOptions::default()).unwrap();
+        let p2 = translated(&base, 9, 3);
+        let half2 = translated(&base, 7, 2);
+        let b2 = banded_b(&pair1.p_frame, &p2, &half2);
+        let ipb2 = encode_improved_pb_picture(&p2, &b2, &pair1.p_frame, 4, 2, &cfg).unwrap();
+        let mut stream = i_bytes.clone();
+        stream.extend_from_slice(&ipb1);
+        stream.extend_from_slice(&ipb2);
+        let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.len(), 5);
+        assert_eq!(decoded[1], pair1.b_frame);
+        for (name, src, dec) in [
+            ("BPB1", &b1, &decoded[1]),
+            ("P1", &p1, &decoded[2]),
+            ("BPB2", &b2, &decoded[3]),
+            ("P2", &p2, &decoded[4]),
+        ] {
+            let mae = luma_mae(src, dec);
+            let psnr = luma_psnr(src, dec);
+            eprintln!("ap {ap} {name}: luma MAE {mae:.3}, PSNR {psnr:.2} dB");
+            assert!(mae < 3.0, "ap {ap} {name}: luma MAE {mae:.3} too high");
+            // A single mispredicted macroblock (e.g. a forward predictor
+            // not reset at a slice edge) costs ~15 dB here.
+            assert!(psnr > 35.0, "ap {ap} {name}: PSNR {psnr:.2} dB");
+        }
+    }
+    // Slices taller than the picture are refused.
+    let bad = ImprovedPbConfig {
+        slice_rows: 10,
+        ..ImprovedPbConfig::default()
+    };
+    assert_eq!(
+        encode_improved_pb_picture(&p1, &b1, &r0, 2, 0, &bad).unwrap_err(),
+        Error::UnsupportedPictureGeometry
+    );
 }
