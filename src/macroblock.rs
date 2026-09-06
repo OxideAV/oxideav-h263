@@ -86,7 +86,7 @@ use oxideav_core::bits::BitReader;
 
 use crate::aic::{decode_intra_mode, IntraMode};
 use crate::pb_layer::{
-    parse_cbpb, parse_modb, parse_modb_annex_m, parse_mvdb, ModbAnnexM, ModbPresence,
+    parse_cbpb, parse_modb, parse_modb_annex_m, parse_mvdb, BpbCodingMode, ModbAnnexM, ModbPresence,
 };
 use crate::{Error, H263PictureCodingType, Result};
 
@@ -477,7 +477,16 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
     // for all INTER macroblocks (in PB-frames mode also for INTRA
     // macroblocks)" — the PB-mode INTRA vector is used only for
     // predicting B-blocks (§G.2).
-    let mvd = if mb_type.has_mvd() || (ctx.pb_frames && mb_type.is_intra()) {
+    //
+    // Annex M narrows the INTRA case: "in this mode (and only in this
+    // mode) [bidirectional prediction], Motion Vector Data (MVD) of the
+    // PB-macroblock must be included even if the P-macroblock is INTRA
+    // coded" (§M.2.1) — a forward- or backward-mode INTRA macroblock
+    // carries no MVD.
+    let intra_pb_mvd = ctx.pb_frames
+        && mb_type.is_intra()
+        && !annex_m_modb.is_some_and(|m| !matches!(m.coding_mode(), BpbCodingMode::Bidirectional));
+    let mvd = if mb_type.has_mvd() || intra_pb_mvd {
         Some(read_mvd_pair(reader, ctx.umv_table_d3)?)
     } else {
         None
@@ -2080,6 +2089,47 @@ mod tests {
         assert_eq!(mb.cbpb, None);
         assert_eq!(mb.mvdb, None);
         assert_eq!(r.bit_position(), 11);
+    }
+
+    /// §M.2.1 — under Annex M an INTRA P-macroblock carries MVD only in
+    /// the bidirectional mode. Backward row 4: COD (1) + MCBPC INTRA
+    /// `00011` (5) + MODB `11110` (5) + CBPY `0011` (4) = 15 bits, no
+    /// MVD; bidirectional row 0: COD + MCBPC + MODB `0` + CBPY + MVD
+    /// (1 + 1) = 13 bits with the vector present.
+    #[test]
+    fn improved_pb_intra_mb_mvd_only_in_bidirectional_mode() {
+        let mut w = BitWriter::new();
+        w.write_bit(false); // COD = 0
+        w.write_u32(0b00011, 5); // MCBPC type 3 (INTRA), cbpc 00
+        w.write_u32(0b11110, 5); // Table M.1 row 4 (backward)
+        w.write_u32(0b0011, 4); // CBPY (INTRA) pattern 0000
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let mb = parse_macroblock(&mut r, improved_pb_picture_ctx(8)).expect("mb");
+        assert_eq!(mb.mb_type, Some(MbType::Intra));
+        assert_eq!(mb.annex_m_modb, Some(ModbAnnexM::BackwardNoCbpbNoMvdb));
+        assert_eq!(
+            mb.mvd, None,
+            "§M.2.1: no MVD outside the bidirectional mode"
+        );
+        assert_eq!(r.bit_position(), 15);
+
+        let mut w = BitWriter::new();
+        w.write_bit(false); // COD = 0
+        w.write_u32(0b00011, 5); // MCBPC type 3 (INTRA), cbpc 00
+        w.write_bit(false); // Table M.1 row 0 (bidirectional)
+        w.write_u32(0b0011, 4); // CBPY (INTRA) pattern 0000
+        w.write_bit(true); // MVD dx = 0
+        w.write_bit(true); // MVD dy = 0
+        let data = finish_aligned(w);
+        let mut r = BitReader::new(&data);
+        let mb = parse_macroblock(&mut r, improved_pb_picture_ctx(8)).expect("mb");
+        assert_eq!(mb.annex_m_modb, Some(ModbAnnexM::BidirNoCbpbNoMvdb));
+        assert!(
+            mb.mvd.is_some(),
+            "§M.2.1: MVD present for the bidirectional INTRA case"
+        );
+        assert_eq!(r.bit_position(), 13);
     }
 
     /// Outside PB-frames mode the INTER macroblock wire layout has no

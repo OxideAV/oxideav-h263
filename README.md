@@ -30,7 +30,12 @@ extended-range block vectors on an H.263+ header — round 447),
 `encode_pb_picture` (**Annex G** PB-frames: P-part + §G.4/§G.5
 bidirectionally-predicted B-part with BQUANT residuals and a §5.3.9
 **MVDB** delta-vector search — the full Table 11 MODB row set,
-round 453),
+round 453), `encode_improved_pb_picture` (**Annex M** Improved
+PB-frames on a PLUSPTYPE `"010"` header, round 457: every
+BPB-macroblock picks the §M.2 bidirectional / forward (§M.2.2
+left-neighbour-predicted MVDB search) / backward (= PREC) mode by
+rate-biased SAD — the full Table M.1 MODB row set; the oracle decoder
+agrees on every P-part),
 `encode_intra_picture_dquant` (§5.3.6 per-macroblock DQUANT),
 `encode_intra_picture_gobs` / `encode_inter_picture_gobs` (§5.2 GOB
 headers with per-GOB GQUANT + segmented MV prediction),
@@ -688,9 +693,7 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   row-aligned slices; the rect encoders emit full-height vertical
   stripes); UMV + AP on the *baseline-PTYPE* header (the H.263+ form
   is landed — `encode_inter_picture_ap_umv_plus`); Annex M
-  Improved-PB emission (the §5.3.9 MVDB search landed round 453 —
-  B-part deltas within the §G.4 MVF-range constraint); INTRA-refresh
-  inside the AP and PB paths; AIC INTRA macroblocks inside a
+  INTRA-refresh inside the AP and PB paths; AIC INTRA macroblocks inside a
   P-picture (only whole AIC I-pictures encode so far); per-GOB
   GQUANT / per-slice SQUANT driven by the rate controller (the
   per-MB §5.3.6 DQUANT governor landed round 453 —

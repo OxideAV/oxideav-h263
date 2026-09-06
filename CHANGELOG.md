@@ -6,6 +6,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Annex M **Improved PB-frames encoder** (`encoder_pb` module,
+  re-exported from `encoder`): `encode_improved_pb_picture` /
+  `encode_improved_pb_picture_stats` + `ImprovedPbConfig` emit the
+  PLUSPTYPE `"010"` picture unit with a per-macroblock rate-biased
+  §M.2 mode decision (bidirectional / forward with the §M.2.2
+  left-neighbour predictor and MVDB search / backward = PREC), the
+  Table M.1 MODB writer (`pb_layer::write_modb_annex_m`,
+  `ModbAnnexM::from_parts` / `code`) and BQUANT residuals.
+  `PlusModes::improved_pb` carries the §5.1.22 TRB / §5.1.23 DBQUANT
+  header fields through `write_plus_picture_header`.
+
+### Fixed
+
+- The Improved PB-frame decode driver consumed neither the §5.1.24
+  PEI / PSUPP loop nor the §5.2.2 group-number-0 GOB-header elision:
+  a spec-conformant Improved PB-frame (as any real encoder emits it,
+  now including this crate's) failed with `BadGroupStartCode` through
+  both `decode_improved_pb_picture` and `decode_sequence`. The driver
+  now frames the header tail exactly like the extended INTER path.
+- §M.2.1 — under Annex M an INTRA P-macroblock carries MVD only in
+  the bidirectional mode; the macroblock parser read one for the
+  forward / backward rows too.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-h263/compare/v0.0.9...v0.0.10) - 2026-08-30
 
 ### Other

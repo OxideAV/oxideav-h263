@@ -16,9 +16,10 @@
 //! failing premise behind `#[ignore]`.
 
 use oxideav_h263::encoder::{
-    encode_inter_picture_ap, encode_inter_picture_deblock, encode_inter_picture_motion,
-    encode_inter_picture_umv_plus, encode_intra_picture, encode_intra_picture_aic_plus,
-    encode_intra_picture_deblock, encode_sequence, DeblockConfig, GopConfig,
+    encode_improved_pb_picture, encode_inter_picture_ap, encode_inter_picture_deblock,
+    encode_inter_picture_motion, encode_inter_picture_umv_plus, encode_intra_picture,
+    encode_intra_picture_aic_plus, encode_intra_picture_deblock, encode_sequence, DeblockConfig,
+    GopConfig, ImprovedPbConfig,
 };
 use oxideav_h263::picture::{decode_sequence, DecodeOptions, YuvFrame};
 use std::path::PathBuf;
@@ -187,6 +188,62 @@ fn cross_check(stream: &[u8], lw: usize, lh: usize, name: &str, mean_limit: f64)
     }
 }
 
+/// Luma PSNR of `a` against `b` (dB; 99 when identical).
+fn luma_psnr(a: &YuvFrame, b: &YuvFrame) -> f64 {
+    let n = a.y.len() as f64;
+    let mse =
+        a.y.iter()
+            .zip(b.y.iter())
+            .map(|(&x, &y)| {
+                let d = x as f64 - y as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / n;
+    if mse == 0.0 {
+        99.0
+    } else {
+        10.0 * (255.0f64 * 255.0 / mse).log10()
+    }
+}
+
+/// [`cross_check`] over the pictures the oracle outputs for a PB /
+/// Improved-PB stream: the oracle emits only the anchor (I / P-part)
+/// pictures of such a stream, so `ours_indices` selects the matching
+/// display-order entries of this crate's decode (the B-parts are
+/// validated by the crate's own decoder). The peak bound follows the
+/// same one-IDCT-per-predicted-picture staircase.
+fn cross_check_anchors(
+    stream: &[u8],
+    lw: usize,
+    lh: usize,
+    name: &str,
+    mean_limit: f64,
+    ours_indices: &[usize],
+) {
+    let ours = decode_sequence(stream, DecodeOptions::default()).expect("own decode");
+    let theirs = oracle_decode(stream, lw, lh, name);
+    assert_eq!(
+        theirs.len(),
+        ours_indices.len(),
+        "{name}: oracle picture count"
+    );
+    for (i, (&oi, b)) in ours_indices.iter().zip(theirs.iter()).enumerate() {
+        let a = &ours[oi];
+        let m = max_abs_diff(a, b) as usize;
+        let f = mean_abs_diff(a, b);
+        eprintln!(
+            "{name} anchor {i} (ours #{oi}): max |diff| {m}, mean {f:.4}, luma PSNR vs oracle {:.2} dB",
+            luma_psnr(a, b)
+        );
+        assert!(m <= i + 1, "{name} anchor {i}: max |diff| = {m}");
+        assert!(
+            f <= mean_limit,
+            "{name} anchor {i}: mean |diff| {f:.4} (limit {mean_limit})"
+        );
+    }
+}
+
 macro_rules! require_oracle {
     () => {
         if !ffmpeg_available() {
@@ -313,4 +370,43 @@ fn motion_picture_at_every_quantiser_stays_within_oracle_budget() {
         stream.extend_from_slice(&p_bytes);
         cross_check(&stream, 128, 96, &format!("motion-q{quant}"), 0.08);
     }
+}
+
+/// Annex M Improved PB-frames: the oracle parses the whole picture
+/// unit (P-blocks and BPB-blocks of every macroblock — a misparse of
+/// any MODB / CBPB / MVDB field would desynchronise the P-part that
+/// follows) and outputs the P-part, which must agree with this crate's.
+#[test]
+fn improved_pb_frames_agree_with_oracle() {
+    require_oracle!();
+    let base = gradient(176, 144, 23);
+    let mut stream = encode_intra_picture(&base, 7, 0).unwrap();
+    let mut recon = decode_sequence(&stream, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    let cfg = ImprovedPbConfig {
+        quant: 7,
+        trb: 1,
+        dbquant: 1,
+        search_half: 6,
+        forward_search_half: 3,
+        allow_backward: true,
+    };
+    let mut prev_tr = 0u8;
+    for k in 1..=3usize {
+        // P at 4k px, BPB in between (not exactly halfway, so every
+        // §M.2 mode has a reason to be chosen somewhere).
+        let p = translated(&base, 4 * k, k);
+        let b = translated(&base, 4 * k - 3, k);
+        let tr_p = (2 * k) as u8;
+        let ipb = encode_improved_pb_picture(&p, &b, &recon, tr_p, prev_tr, &cfg).unwrap();
+        stream.extend_from_slice(&ipb);
+        recon = decode_sequence(&stream, DecodeOptions::default())
+            .unwrap()
+            .pop()
+            .unwrap();
+        prev_tr = tr_p;
+    }
+    // Display order: I, BPB1, P1, BPB2, P2, BPB3, P3 — anchors at 0, 2, 4, 6.
+    cross_check_anchors(&stream, 176, 144, "improved-pb", 0.08, &[0, 2, 4, 6]);
 }

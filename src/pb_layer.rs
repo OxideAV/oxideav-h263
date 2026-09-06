@@ -336,6 +336,34 @@ impl ModbAnnexM {
         }
     }
 
+    /// The Table M.1 row for a `(coding mode, CBPB present)` pair — the
+    /// encoder-side inverse of [`Self::coding_mode`] / [`Self::has_cbpb`].
+    /// The MVDB column follows from the mode (present iff forward).
+    pub fn from_parts(mode: BpbCodingMode, cbpb: bool) -> Self {
+        match (mode, cbpb) {
+            (BpbCodingMode::Bidirectional, false) => ModbAnnexM::BidirNoCbpbNoMvdb,
+            (BpbCodingMode::Bidirectional, true) => ModbAnnexM::BidirCbpbNoMvdb,
+            (BpbCodingMode::Forward, false) => ModbAnnexM::ForwardNoCbpbMvdb,
+            (BpbCodingMode::Forward, true) => ModbAnnexM::ForwardCbpbMvdb,
+            (BpbCodingMode::Backward, false) => ModbAnnexM::BackwardNoCbpbNoMvdb,
+            (BpbCodingMode::Backward, true) => ModbAnnexM::BackwardCbpbNoMvdb,
+        }
+    }
+
+    /// The Table M.1 codeword as `(code, bits)`: rows 0..=3 are a run
+    /// of `index` one-bits closed by a zero (`0`, `10`, `110`, `1110`);
+    /// rows 4 / 5 are four one-bits plus a tail bit (`11110` / `11111`).
+    pub fn code(self) -> (u32, u32) {
+        match self {
+            ModbAnnexM::BidirNoCbpbNoMvdb => (0b0, 1),
+            ModbAnnexM::BidirCbpbNoMvdb => (0b10, 2),
+            ModbAnnexM::ForwardNoCbpbMvdb => (0b110, 3),
+            ModbAnnexM::ForwardCbpbMvdb => (0b1110, 4),
+            ModbAnnexM::BackwardNoCbpbNoMvdb => (0b11110, 5),
+            ModbAnnexM::BackwardCbpbNoMvdb => (0b11111, 5),
+        }
+    }
+
     /// Length in bits of the Table M.1 codeword that produced this
     /// tag. Useful for tests and for any caller that needs the
     /// post-parse bit cursor without re-running the bitreader.
@@ -348,6 +376,13 @@ impl ModbAnnexM {
             ModbAnnexM::BackwardNoCbpbNoMvdb | ModbAnnexM::BackwardCbpbNoMvdb => 5,
         }
     }
+}
+
+/// Write an §M.4 / Table M.1 Improved PB-frames MODB codeword — the
+/// encoder-side inverse of [`parse_modb_annex_m`].
+pub fn write_modb_annex_m(w: &mut oxideav_core::bits::BitWriter, modb: ModbAnnexM) {
+    let (code, bits) = modb.code();
+    w.write_bits(code, bits);
 }
 
 /// Decode an §M.4 / Table M.1 Improved PB-frames MODB variable-length

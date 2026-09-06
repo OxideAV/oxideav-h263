@@ -228,6 +228,7 @@ pub mod encoder_block;
 pub mod encoder_deblock;
 pub mod encoder_mb;
 pub mod encoder_motion;
+pub mod encoder_pb;
 pub mod encoder_rc;
 pub mod encoder_vlc;
 pub mod fdct;

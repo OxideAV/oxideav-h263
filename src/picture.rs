@@ -3820,6 +3820,9 @@ pub fn decode_improved_pb_picture_with_inherited(
     }
     // §5.1.23 — DBQUANT.
     let dbquant = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)? as u8;
+    // §5.1.24 / §5.1.25 — PEI + PSUPP extension loop, consumed so the
+    // reader lands on the first bit of GOB-0 macroblock data.
+    skip_pei_psupp(&mut reader)?;
     // §G.4 — TRD (referenced by §M for the bidirectional vectors).
     let mut trd = i32::from(header.temporal_reference) - i32::from(prev_tr);
     if trd < 0 {
@@ -3841,6 +3844,8 @@ pub fn decode_improved_pb_picture_with_inherited(
         luma_width: luma_w,
         luma_height: luma_h,
     };
+    // §5.2.2 — group number 0 carries no GOB header (PQUANT primes its
+    // QUANT); every later GOB header is optional (§5.2).
     let p_frame = decode_after_picture_header(
         &mut reader,
         &header,
@@ -3855,7 +3860,7 @@ pub fn decode_improved_pb_picture_with_inherited(
             left_bpb_forward_mv: None,
             b_frame: &mut b_frame,
         }),
-        None,
+        Some(pquant),
         // UMV + Improved-PB is refused above, so the P-part never
         // carries Annex D vectors here.
         UmvCoding::Off,
@@ -16191,11 +16196,20 @@ mod tests {
         w.write_u32(trb, 3);
         // §5.1.23 — DBQUANT (2 bits).
         w.write_u32(dbquant, 2);
+        // §5.1.24 — PEI = 0.
+        w.write_bit(false);
         for gob in 0..9 {
-            w.write_u32(GBSC_VALUE, GBSC_BITS);
-            w.write_u32(1, GN_BITS);
-            w.write_u32(0, GFID_BITS);
-            w.write_u32(8, GQUANT_BITS); // QUANT = 8
+            // §5.2.2 — group number 0 carries no GOB header; the later
+            // GOBs carry one here (byte-aligned per §5.2.1 GSTUF).
+            if gob > 0 {
+                while !w.is_byte_aligned() {
+                    w.write_bit(false);
+                }
+                w.write_u32(GBSC_VALUE, GBSC_BITS);
+                w.write_u32(gob as u32, GN_BITS);
+                w.write_u32(0, GFID_BITS);
+                w.write_u32(8, GQUANT_BITS); // QUANT = 8
+            }
             for mb in 0..11 {
                 write_mb(&mut w, gob, mb);
             }

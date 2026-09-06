@@ -37,6 +37,9 @@ use oxideav_core::bits::BitWriter;
 pub use crate::encoder_deblock::{
     encode_inter_picture_deblock, encode_intra_picture_deblock, DeblockConfig,
 };
+pub use crate::encoder_pb::{
+    encode_improved_pb_picture, encode_improved_pb_picture_stats, ImprovedPbConfig, ImprovedPbStats,
+};
 pub use crate::encoder_rc::{
     encode_inter_picture_adaptive, encode_intra_picture_adaptive, AdaptiveQuantConfig,
     AdaptiveQuantPicture,
@@ -219,6 +222,12 @@ pub struct PlusModes {
     /// OPPTYPE bit 17 — Annex V Data-Partitioned Slice mode (requires
     /// [`Self::slice_structured`] per §V.3).
     pub data_partitioned_slices: bool,
+    /// `Some((trb, dbquant))` makes the picture an **Annex M Improved
+    /// PB-frame**: MPPTYPE picture type `"010"` (§5.1.4.3), with the
+    /// §5.1.22 TRB (3 bits at the standard picture clock frequency,
+    /// `1..=7`) and §5.1.23 DBQUANT (`0..=3`) fields emitted after
+    /// PQUANT. Requires `is_inter` (the P-part is a P-picture, §M.1).
+    pub improved_pb: Option<(u8, u8)>,
 }
 
 /// Write an extended-PTYPE (PLUSPTYPE, §5.1.4) picture header: PSC, TR,
@@ -316,7 +325,17 @@ pub fn write_plus_picture_header(
     // §5.1.4.3 — MPPTYPE (9 bits): picture type, RPR / RRU / RTYPE = 0,
     // reserved "00", bit 9 = "1".
     let mut mpptype: u32 = 0;
-    if is_inter {
+    if let Some((trb, dbquant)) = modes.improved_pb {
+        // §5.1.4.3 — "010": Improved PB-frame (Annex M). Its P-part is a
+        // P-picture (§M.1), so an INTRA request is contradictory.
+        if !is_inter {
+            return Err(Error::NotImplemented);
+        }
+        if trb == 0 || trb > 7 || dbquant > 3 {
+            return Err(Error::BadPbTemporalReference);
+        }
+        mpptype |= 0b010 << 6;
+    } else if is_inter {
         mpptype |= 0b001 << 6; // "001" P-picture ("000" is I)
     }
     if modes.rru {
@@ -348,6 +367,12 @@ pub fn write_plus_picture_header(
     }
     // §5.1.19 — PQUANT (5 bits).
     w.write_bits(quant as u32, 5);
+    // §5.1.22 / §5.1.23 — TRB (3 bits, standard PCF) and DBQUANT
+    // (2 bits) follow PQUANT when the picture is an Improved PB-frame.
+    if let Some((trb, dbquant)) = modes.improved_pb {
+        w.write_bits(trb as u32, 3);
+        w.write_bits(dbquant as u32, 2);
+    }
     // §5.1.24 — PEI = 0 (no PSUPP extension).
     w.write_bit(false);
     Ok(())
