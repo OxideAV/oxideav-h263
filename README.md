@@ -610,8 +610,10 @@ planar 4:2:0 `YuvFrame`:
 
 The high-level entry point decodes a whole picture in one call:
 
-```rust,ignore
+```rust,no_run
 use oxideav_h263::{decode_picture, DecodeOptions, YuvFrame};
+# let bytes: Vec<u8> = std::fs::read("i.h263")?;
+# let p_bytes: Vec<u8> = std::fs::read("p.h263")?;
 
 // Decode an INTRA (I) picture — no reference frame needed.
 let frame: YuvFrame = decode_picture(&bytes, None, DecodeOptions::default())?;
@@ -624,29 +626,33 @@ let next = decode_picture(
     Some(&frame),
     DecodeOptions { deblock: true, ..DecodeOptions::default() },
 )?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 For a complete baseline elementary stream (one or more pictures, as
 produced by a real encoder), `decode_sequence` splits on Picture Start
 Codes and threads the INTER reference automatically:
 
-```rust,ignore
+```rust,no_run
 use oxideav_h263::{decode_sequence, DecodeOptions};
+# let stream: Vec<u8> = std::fs::read("clip.h263")?;
 
 // `stream` is a raw .h263 elementary stream (I + P + P + ...).
 let frames = decode_sequence(&stream, DecodeOptions::default())?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The lower-level per-layer parsers and per-block reconstruction
 primitives the driver composes remain public for callers that need
 finer control:
 
-```rust,ignore
+```rust,no_run
 use oxideav_core::bits::BitReader;
 use oxideav_h263::{
     parse_block, parse_gob_layer, parse_macroblock, parse_picture_header,
-    reconstruct_intra_block, BlockContext, H263SourceFormat, MbContext,
+    reconstruct_intra_block, BlockContext, MbContext,
 };
+# let bytes: Vec<u8> = std::fs::read("pic.h263")?;
 
 let mut r = BitReader::new(&bytes);
 let pic = parse_picture_header(&mut r)?;
@@ -656,13 +662,20 @@ assert_eq!(pic.source_format.luma_dimensions(), Some((176, 144)));
 let gob = parse_gob_layer(&mut r)?;
 
 // One macroblock per spec §5.3, threading the picture's coding
-// type and the GOB's QUANT through MbContext.
+// type, the GOB's QUANT and the optional-mode flags through MbContext
+// (all annex modes off here: a baseline picture).
 let mb = parse_macroblock(
     &mut r,
     MbContext {
         picture_coding_type: pic.coding_type,
         advanced_prediction: pic.advanced_prediction,
+        deblocking_filter: false,
+        aic_intra_mode: false,
+        pb_frames: pic.pb_frames,
+        pb_annex_m: false,
         quantiser_before: gob.quantiser,
+        modified_quant: false,
+        umv_table_d3: false,
     },
 )?;
 
@@ -673,11 +686,13 @@ let block = parse_block(
     BlockContext {
         has_intradc: mb.mb_type.unwrap().is_intra(),
         has_coefficients: false,
+        modified_quant: false,
     },
 )?;
 
 // §6.1 / §6.2 / §6.3.2 intra-block reconstruction.
 let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ## Not yet implemented
