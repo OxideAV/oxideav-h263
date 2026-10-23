@@ -982,7 +982,7 @@ mod tests {
         w.write_u32(0b0000_011, 7);
         w.write_bit(true); // LAST = 1
         w.write_u32(0, 6); // RUN = 0
-                           // LEVEL = -1 → two's complement 0xFF
+        // LEVEL = -1 → two's complement 0xFF
         w.write_u32(0xFF, 8);
         let bytes = finish_aligned(w);
 
@@ -1313,9 +1313,9 @@ mod tests {
     #[test]
     fn composes_picture_gob_mb_then_one_dc_only_block() {
         use crate::{
+            MbContext, PSC_BITS, PSC_VALUE,
             gob_header::{GBSC_BITS, GBSC_VALUE, GFID_BITS, GN_BITS, GQUANT_BITS},
-            parse_gob_layer, parse_macroblock, parse_picture_header, MbContext, PSC_BITS,
-            PSC_VALUE,
+            parse_gob_layer, parse_macroblock, parse_picture_header,
         };
 
         let mut w = BitWriter::new();
@@ -1333,7 +1333,7 @@ mod tests {
         w.write_bit(false); // Annex E
         w.write_bit(false); // Annex F
         w.write_bit(false); // Annex G
-                            // GOB header (QUANT=8).
+        // GOB header (QUANT=8).
         w.write_u32(GBSC_VALUE, GBSC_BITS);
         w.write_u32(1, GN_BITS);
         w.write_u32(0, GFID_BITS);

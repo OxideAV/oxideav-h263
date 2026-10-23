@@ -65,11 +65,7 @@ fn one_d(near: i32, far: i32) -> i32 {
 /// `j+1` / `i+1` neighbour).
 #[inline]
 fn clamp_idx(i: usize, max: usize) -> usize {
-    if i + 1 < max {
-        i + 1
-    } else {
-        i
-    }
+    if i + 1 < max { i + 1 } else { i }
 }
 
 /// §O.6 / Figures O.8–O.9 — up-sample a `width × height` 8-bit plane by

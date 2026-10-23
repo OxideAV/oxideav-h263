@@ -451,12 +451,12 @@ pub fn write_intra_tcoef_event(
 
     // Dedicated Table-I.2 code-point first (magnitudes 1..=some small
     // bound have rows; the escape covers the rest).
-    if abs_level <= u8::MAX as u16 {
-        if let Some((code, bits)) = intra_tcoef_vlc_codeword(ev.last, ev.run, abs_level as u8) {
-            w.write_bits(code, bits);
-            w.write_bit(sign);
-            return Ok(());
-        }
+    if abs_level <= u8::MAX as u16
+        && let Some((code, bits)) = intra_tcoef_vlc_codeword(ev.last, ev.run, abs_level as u8)
+    {
+        w.write_bits(code, bits);
+        w.write_bit(sign);
+        return Ok(());
     }
 
     if ev.run > 0x3F {

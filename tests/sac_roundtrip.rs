@@ -6,14 +6,14 @@
 //! quantisation stage, so their reconstructions must be
 //! **byte-identical** (only the entropy layer differs).
 
+use oxideav_h263::Error;
 use oxideav_h263::encoder::{
     encode_inter_picture, encode_inter_picture_motion, encode_inter_picture_motion_sac,
     encode_inter_picture_sac, encode_intra_picture, encode_intra_picture_sac,
 };
 use oxideav_h263::picture::{
-    decode_picture_no_gob0_header, decode_picture_sac, decode_sequence, DecodeOptions, YuvFrame,
+    DecodeOptions, YuvFrame, decode_picture_no_gob0_header, decode_picture_sac, decode_sequence,
 };
-use oxideav_h263::Error;
 
 /// A deterministic gradient frame on every plane (the
 /// `encode_roundtrip.rs` convention).
@@ -414,7 +414,7 @@ fn sac_ap_static_picture_is_lossless() {
 /// §G.5 B-prediction are shared.
 #[test]
 fn sac_pb_matches_vlc_pb_reconstruction_exactly() {
-    use oxideav_h263::encoder::{encode_pb_picture, encode_pb_picture_sac, PbConfig};
+    use oxideav_h263::encoder::{PbConfig, encode_pb_picture, encode_pb_picture_sac};
     use oxideav_h263::picture::{decode_pb_picture_no_gob0_header, decode_pb_picture_sac};
 
     let i_bytes = encode_intra_picture_sac(&gradient(176, 144, 0), 6, 3).expect("encode I");
@@ -447,7 +447,7 @@ fn sac_pb_matches_vlc_pb_reconstruction_exactly() {
 /// macroblock skips: zero vector, no P-residual, no B-residual).
 #[test]
 fn sac_pb_static_is_lossless_both_parts() {
-    use oxideav_h263::encoder::{encode_pb_picture_sac, PbConfig};
+    use oxideav_h263::encoder::{PbConfig, encode_pb_picture_sac};
     use oxideav_h263::picture::decode_pb_picture_sac;
 
     let i_bytes = encode_intra_picture_sac(&gradient(176, 144, 11), 9, 0).expect("encode I");
@@ -475,7 +475,7 @@ fn sac_pb_static_is_lossless_both_parts() {
 /// every frame tracking its source.
 #[test]
 fn sac_ap_and_pb_stream_decodes_through_decode_sequence() {
-    use oxideav_h263::encoder::{encode_inter_picture_ap_sac, encode_pb_picture_sac, PbConfig};
+    use oxideav_h263::encoder::{PbConfig, encode_inter_picture_ap_sac, encode_pb_picture_sac};
 
     fn luma_mae(a: &YuvFrame, b: &YuvFrame) -> f64 {
         let sum: u64 =
@@ -525,7 +525,7 @@ fn sac_ap_and_pb_stream_decodes_through_decode_sequence() {
 /// refuses a non-PB SAC picture — the two entry points route apart.
 #[test]
 fn sac_pb_and_single_picture_drivers_route_apart() {
-    use oxideav_h263::encoder::{encode_pb_picture_sac, PbConfig};
+    use oxideav_h263::encoder::{PbConfig, encode_pb_picture_sac};
     use oxideav_h263::picture::decode_pb_picture_sac;
 
     let i_bytes = encode_intra_picture_sac(&gradient(176, 144, 1), 8, 0).expect("encode I");

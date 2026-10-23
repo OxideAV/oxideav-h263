@@ -704,10 +704,10 @@ pub fn write_psupp(functions: &[SeiFunction]) -> Result<Vec<u8>> {
     // §L.3 — whenever the last five or more bits of the final octet
     // are all zero and no further functions follow, a Do Nothing
     // function shall be inserted to prevent start-code emulation.
-    if let Some(&last) = out.last() {
-        if last & 0x1F == 0 {
-            out.push(0x10);
-        }
+    if let Some(&last) = out.last()
+        && last & 0x1F == 0
+    {
+        out.push(0x10);
     }
     Ok(out)
 }

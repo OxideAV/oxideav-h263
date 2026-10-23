@@ -54,15 +54,15 @@ use oxideav_core::{
 };
 
 use crate::encoder::{
-    encode_inter_picture_deblock, encode_inter_picture_motion, encode_inter_picture_umv,
-    encode_intra_picture, encode_intra_picture_deblock, DeblockConfig, EOS_BYTES,
+    DeblockConfig, EOS_BYTES, encode_inter_picture_deblock, encode_inter_picture_motion,
+    encode_inter_picture_umv, encode_intra_picture, encode_intra_picture_deblock,
 };
 use crate::encoder_rc::{
-    encode_inter_picture_adaptive, encode_intra_picture_adaptive, AdaptiveQuantConfig,
+    AdaptiveQuantConfig, encode_inter_picture_adaptive, encode_intra_picture_adaptive,
 };
 use crate::picture::{
-    decode_picture_no_gob0_header, decode_sequence_step, next_picture_start_code, DecodeOptions,
-    SequenceState, YuvFrame,
+    DecodeOptions, SequenceState, YuvFrame, decode_picture_no_gob0_header, decode_sequence_step,
+    next_picture_start_code,
 };
 use crate::rate_control::RateController;
 
@@ -661,13 +661,13 @@ impl H263StreamEncoder {
         let mut opts: H263EncoderOptions = oxideav_core::parse_options(&params.options)?;
         // Derive a per-picture bit target from the stream parameters
         // when the option is not set explicitly.
-        if opts.picture_bits == 0 {
-            if let (Some(bps), Some(fr)) = (params.bit_rate, params.frame_rate) {
-                if fr.num > 0 && fr.den > 0 {
-                    opts.picture_bits = (bps.saturating_mul(fr.den as u64) / fr.num as u64)
-                        .min(u32::MAX as u64) as u32;
-                }
-            }
+        if opts.picture_bits == 0
+            && let (Some(bps), Some(fr)) = (params.bit_rate, params.frame_rate)
+            && fr.num > 0
+            && fr.den > 0
+        {
+            opts.picture_bits =
+                (bps.saturating_mul(fr.den as u64) / fr.num as u64).min(u32::MAX as u64) as u32;
         }
         if opts.picture_bits != 0 && (opts.deblock || opts.umv) {
             return Err(CoreError::unsupported(
@@ -686,7 +686,7 @@ impl H263StreamEncoder {
             _ => {
                 return Err(CoreError::invalid(
                     "oxideav-h263: encoder needs width and height in CodecParameters",
-                ))
+                ));
             }
         };
         const STANDARD_FORMATS: [(usize, usize); 5] =
@@ -697,12 +697,12 @@ impl H263StreamEncoder {
                  (sub-QCIF/QCIF/CIF/4CIF/16CIF)"
             )));
         }
-        if let Some(pf) = params.pixel_format {
-            if pf != PixelFormat::Yuv420P {
-                return Err(CoreError::unsupported(format!(
-                    "oxideav-h263: encoder input must be Yuv420P, got {pf:?}"
-                )));
-            }
+        if let Some(pf) = params.pixel_format
+            && pf != PixelFormat::Yuv420P
+        {
+            return Err(CoreError::unsupported(format!(
+                "oxideav-h263: encoder input must be Yuv420P, got {pf:?}"
+            )));
         }
         let mut out_params = CodecParameters::video(CodecId::new(CODEC_ID));
         out_params.width = Some(width as u32);
@@ -745,13 +745,14 @@ impl Encoder for H263StreamEncoder {
             _ => {
                 return Err(CoreError::invalid(
                     "oxideav-h263: encoder accepts video frames only",
-                ))
+                ));
             }
         };
         let yuv = video_frame_to_yuv(video, self.width, self.height)?;
         let tr = (self.frame_index & 0xFF) as u8;
         let gop = self.opts.gop as usize;
-        let force_intra = self.recon.is_none() || (gop != 0 && self.frame_index % gop == 0);
+        let force_intra =
+            self.recon.is_none() || (gop != 0 && self.frame_index.is_multiple_of(gop));
         let quant = self.opts.quant as u8;
         let search = self.opts.search as i32;
         let bytes = if let Some(rc) = self.rc.as_mut() {

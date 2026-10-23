@@ -15,15 +15,15 @@
 //! (`cbpy ^ 0b1111`) per §5.3.5, matching the decoder's `is_intra`
 //! branch.
 
+use crate::Result;
 use crate::block::COEFFS_PER_BLOCK;
 use crate::encoder_block::{
-    encode_intra_block, write_inter_block_coeffs, write_intra_block, EncodedInterBlock,
+    EncodedInterBlock, encode_intra_block, write_inter_block_coeffs, write_intra_block,
 };
 use crate::encoder_vlc::{
     write_cbpy, write_dquant, write_mcbpc_i, write_mcbpc_p, write_mvd_component,
 };
 use crate::macroblock::{MbType, Mvd};
-use crate::Result;
 use oxideav_core::bits::BitWriter;
 
 /// The six 8×8 luma + chroma sample blocks of a macroblock, in the
@@ -392,7 +392,7 @@ pub fn macroblock_samples_from_u8(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macroblock::{parse_macroblock, MbContext};
+    use crate::macroblock::{MbContext, parse_macroblock};
     use crate::{H263PictureCodingType, MbType};
     use oxideav_core::bits::BitReader;
 
@@ -526,7 +526,7 @@ mod tests {
     /// differential and advances QUANT.
     #[test]
     fn inter_q_mb_dquant_round_trips() {
-        use crate::encoder_block::{encode_inter_block, EncodedInterBlock};
+        use crate::encoder_block::{EncodedInterBlock, encode_inter_block};
         // A residual that survives quantisation so the MB is coded.
         let mut residual = [0i16; COEFFS_PER_BLOCK];
         for (i, r) in residual.iter_mut().enumerate() {

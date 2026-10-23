@@ -1,12 +1,12 @@
 //! Annex K Rectangular Slice / Arbitrary Slice Ordering + Annex F
 //! Advanced Prediction on the encode side (§K.1 rules 1 / 3 per stripe).
 
-use oxideav_h263::encoder::{
-    encode_inter_picture_ap, encode_inter_picture_ap_slices_rect, encode_intra_picture_slices_rect,
-    EOS_BYTES,
-};
-use oxideav_h263::picture::{decode_picture_layer, decode_sequence, DecodeOptions, YuvFrame};
 use oxideav_h263::Error;
+use oxideav_h263::encoder::{
+    EOS_BYTES, encode_inter_picture_ap, encode_inter_picture_ap_slices_rect,
+    encode_intra_picture_slices_rect,
+};
+use oxideav_h263::picture::{DecodeOptions, YuvFrame, decode_picture_layer, decode_sequence};
 
 fn textured(lw: usize, lh: usize, seed: usize) -> YuvFrame {
     let cw = lw / 2;

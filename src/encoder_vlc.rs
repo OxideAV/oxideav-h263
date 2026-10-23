@@ -298,12 +298,12 @@ pub fn write_tcoef(w: &mut BitWriter, ev: TcoefEvent) -> Result<()> {
     let sign = ev.level < 0;
 
     // Try the dedicated VLC code-point first.
-    if abs_level <= u8::MAX as u16 {
-        if let Some((bits, code)) = tcoef_vlc_codeword(ev.last, ev.run, abs_level as u8) {
-            w.write_bits(code, bits);
-            w.write_bit(sign);
-            return Ok(());
-        }
+    if abs_level <= u8::MAX as u16
+        && let Some((bits, code)) = tcoef_vlc_codeword(ev.last, ev.run, abs_level as u8)
+    {
+        w.write_bits(code, bits);
+        w.write_bit(sign);
+        return Ok(());
     }
 
     // ESCAPE form. §5.4.2: 7-bit prefix `0000 011`, then 1-bit LAST,
@@ -471,7 +471,7 @@ fn tcoef_vlc_codeword(last: bool, run: u8, abs_level: u8) -> Option<(u32, u32)> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{parse_block, BlockContext};
+    use crate::block::{BlockContext, parse_block};
     use crate::macroblock::{decode_cbpy, decode_mvd_component};
     use oxideav_core::bits::BitReader;
 
@@ -575,7 +575,7 @@ mod tests {
     /// (+0.5, +0.5) emulation-prevention bit.
     #[test]
     fn mvd_pair_d3_round_trips_including_epb() {
-        use crate::macroblock::{read_mvd_pair, Mvd};
+        use crate::macroblock::{Mvd, read_mvd_pair};
         let pairs = [
             (0i16, 0i16),
             (1, 1), // the six-zero EPB case

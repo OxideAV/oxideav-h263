@@ -3,9 +3,9 @@
 //! conformance fixtures) into payload-budgeted packets, and the
 //! depacketizer reassembles a byte-exact stream that still decodes.
 
-use oxideav_h263::picture::{decode_sequence, DecodeOptions, YuvFrame};
+use oxideav_h263::picture::{DecodeOptions, YuvFrame, decode_sequence};
 use oxideav_h263::rtp::{
-    depacketize_payloads, packetize_stream, parse_payload_header, PacketizeConfig,
+    PacketizeConfig, depacketize_payloads, packetize_stream, parse_payload_header,
 };
 
 /// A deterministic gradient frame on every plane.
@@ -117,7 +117,7 @@ fn single_picture_single_packet() {
 /// decodes to the same frames as the original.
 #[test]
 fn gop_stream_round_trips_at_every_budget() {
-    use oxideav_h263::encoder::{encode_sequence, GopConfig};
+    use oxideav_h263::encoder::{GopConfig, encode_sequence};
 
     let frames = vec![
         gradient(176, 144, 0),
@@ -236,7 +236,7 @@ fn conformance_fixtures_round_trip() {
 fn redundant_picture_header_attachment() {
     use oxideav_core::bits::BitReader;
     use oxideav_h263::encoder::encode_intra_picture_gobs;
-    use oxideav_h263::picture_header::{parse_picture_layer, H263PictureLayer};
+    use oxideav_h263::picture_header::{H263PictureLayer, parse_picture_layer};
     use oxideav_h263::plus_ptype::InheritedExtendedState;
     use oxideav_h263::rtp::assemble_picture_header;
 
@@ -387,7 +387,7 @@ fn rfc2190_mode_a_round_trips() {
 /// byte-exactly.
 #[test]
 fn rfc2190_mode_a_pb_fields_and_mode_c_fragmentation() {
-    use oxideav_h263::encoder::{encode_intra_picture, encode_pb_picture, PbConfig};
+    use oxideav_h263::encoder::{PbConfig, encode_intra_picture, encode_pb_picture};
     use oxideav_h263::picture::decode_picture_no_gob0_header;
     use oxideav_h263::rtp::{
         depacketize_payloads_rfc2190, packetize_stream_rfc2190, parse_rfc2190_mode_a,
@@ -563,8 +563,8 @@ fn rfc2190_mode_b_fragments_round_trip() {
 #[test]
 fn rfc2190_mode_b_c_headers_round_trip() {
     use oxideav_h263::rtp::{
-        parse_rfc2190_mode_b, parse_rfc2190_mode_c, write_rfc2190_mode_b, write_rfc2190_mode_c,
-        Rfc2190ModeB, Rfc2190ModeC,
+        Rfc2190ModeB, Rfc2190ModeC, parse_rfc2190_mode_b, parse_rfc2190_mode_c,
+        write_rfc2190_mode_b, write_rfc2190_mode_c,
     };
 
     let b = Rfc2190ModeB {

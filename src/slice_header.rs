@@ -1176,7 +1176,7 @@ mod tests {
         let mut w = BitWriter::new();
         w.write_u32(SSC_VALUE, SSC_BITS);
         w.write_bit(false); // SEPB1 = 0 — illegal
-                            // Pad with arbitrary bits.
+        // Pad with arbitrary bits.
         for _ in 0..32 {
             w.write_bit(false);
         }
@@ -1223,7 +1223,7 @@ mod tests {
         let ctx = ctx_qcif();
         let mut w = BitWriter::new();
         w.write_u32(SSC_VALUE ^ 0b1, SSC_BITS); // Flip the trailing "1".
-                                                // Pad enough for the SSC check to bite.
+        // Pad enough for the SSC check to bite.
         w.write_u32(0, 16);
         while !w.is_byte_aligned() {
             w.write_bit(false);

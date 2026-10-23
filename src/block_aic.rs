@@ -85,7 +85,7 @@
 
 use oxideav_core::bits::BitReader;
 
-use crate::block::{H263Block, COEFFS_PER_BLOCK};
+use crate::block::{COEFFS_PER_BLOCK, H263Block};
 use crate::intra_tcoef::decode_intra_tcoef_event;
 use crate::{Error, Result};
 

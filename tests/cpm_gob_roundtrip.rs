@@ -2,14 +2,14 @@
 //! GOB path: CPM = "1" + PSBI in the picture header, GSBI in every GOB
 //! header, both directions.
 
+use oxideav_h263::Error;
 use oxideav_h263::encoder::{
-    encode_inter_picture_gobs, encode_inter_picture_gobs_cpm, encode_intra_picture_gobs,
-    encode_intra_picture_gobs_cpm, EOS_BYTES,
+    EOS_BYTES, encode_inter_picture_gobs, encode_inter_picture_gobs_cpm, encode_intra_picture_gobs,
+    encode_intra_picture_gobs_cpm,
 };
 use oxideav_h263::picture::{
-    decode_picture_no_gob0_header, decode_sequence, DecodeOptions, YuvFrame,
+    DecodeOptions, YuvFrame, decode_picture_no_gob0_header, decode_sequence,
 };
-use oxideav_h263::Error;
 
 fn textured(lw: usize, lh: usize, seed: usize) -> YuvFrame {
     let cw = lw / 2;

@@ -3,8 +3,8 @@
 //! content, with **measured rate accuracy** assertions — the point of
 //! a rate controller is a number, so the tests pin it.
 
-use oxideav_h263::encoder::{encode_sequence_rate_controlled, RateControlConfig};
-use oxideav_h263::picture::{decode_sequence, DecodeOptions, YuvFrame};
+use oxideav_h263::encoder::{RateControlConfig, encode_sequence_rate_controlled};
+use oxideav_h263::picture::{DecodeOptions, YuvFrame, decode_sequence};
 use oxideav_h263::rate_control::HrdParams;
 
 /// A deterministic gradient frame on every plane.

@@ -5,7 +5,7 @@
 //! redundancy structure.
 
 use oxideav_h263::encoder::{encode_inter_picture_dps, encode_intra_picture_dps};
-use oxideav_h263::picture::{decode_sequence, DecodeOptions, YuvFrame};
+use oxideav_h263::picture::{DecodeOptions, YuvFrame, decode_sequence};
 
 fn textured(seed: usize) -> YuvFrame {
     let mut f = YuvFrame::grey(176, 144);

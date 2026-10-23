@@ -36,20 +36,20 @@
 
 use crate::block::COEFFS_PER_BLOCK;
 use crate::encoder::{
-    extract_macroblock, motion_compensated_block, residual_of, source_format_for,
-    write_plus_picture_header, PlusModes,
+    PlusModes, extract_macroblock, motion_compensated_block, residual_of, source_format_for,
+    write_plus_picture_header,
 };
-use crate::encoder_block::{encode_inter_block, EncodedInterBlock};
+use crate::encoder_block::{EncodedInterBlock, encode_inter_block};
 use crate::encoder_mb::{
-    encode_inter4v_macroblock, encode_inter4v_macroblock_umv_plus, encode_inter_macroblock,
-    encode_inter_macroblock_umv_plus, encode_intra_macroblock, encode_skipped_macroblock,
+    encode_inter_macroblock, encode_inter_macroblock_umv_plus, encode_inter4v_macroblock,
+    encode_inter4v_macroblock_umv_plus, encode_intra_macroblock, encode_skipped_macroblock,
 };
 use crate::encoder_motion::{
-    estimate_block_motion, estimate_block_motion_umv_plus, estimate_motion,
-    estimate_motion_umv_plus, mvd_for, Mv4Grid,
+    Mv4Grid, estimate_block_motion, estimate_block_motion_umv_plus, estimate_motion,
+    estimate_motion_umv_plus, mvd_for,
 };
 use crate::macroblock::Mvd;
-use crate::motion::{chroma_mv, chroma_mv_4mv, LumaBlockIndex, Mb4Mv, MotionVector};
+use crate::motion::{LumaBlockIndex, Mb4Mv, MotionVector, chroma_mv, chroma_mv_4mv};
 use crate::picture::YuvFrame;
 use crate::{Error, Result};
 use oxideav_core::bits::BitWriter;
@@ -415,8 +415,8 @@ pub fn encode_inter_picture_deblock(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picture::{decode_picture_layer, DecodeOptions};
-    use crate::picture_header::{parse_picture_layer, H263PictureLayer};
+    use crate::picture::{DecodeOptions, decode_picture_layer};
+    use crate::picture_header::{H263PictureLayer, parse_picture_layer};
     use crate::plus_ptype::InheritedExtendedState;
     use oxideav_core::bits::BitReader;
 

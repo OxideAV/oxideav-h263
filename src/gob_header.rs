@@ -444,7 +444,7 @@ mod tests {
         // parse_gob_layer succeeds.
         let mut w = BitWriter::new();
         w.write_u32(0b101011, 6); // pretend MB data (must be non-zero-run)
-                                  // GSTUF: 2 zero bits to reach the next byte boundary.
+        // GSTUF: 2 zero bits to reach the next byte boundary.
         w.write_bit(false);
         w.write_bit(false);
         // Now byte-aligned; emit a real header.
@@ -500,7 +500,7 @@ mod tests {
         // GBSC as a header (that 1 bit is macroblock data).
         let mut w = BitWriter::new();
         w.write_u32(0b100000, 6); // 6 bits, leading 1 — first bit is data
-                                  // 2 bits to byte boundary, but make one of them a 1.
+        // 2 bits to byte boundary, but make one of them a 1.
         w.write_bit(true);
         w.write_bit(false);
         w.write_u32(GBSC_VALUE, GBSC_BITS);
@@ -565,7 +565,7 @@ mod tests {
         // Round-1 picture header followed immediately by a round-2
         // GOB header. Verifies that the GOB parser picks up where the
         // picture parser left off, with no realignment.
-        use crate::{parse_picture_header, PSC_BITS, PSC_VALUE};
+        use crate::{PSC_BITS, PSC_VALUE, parse_picture_header};
 
         let mut w = BitWriter::new();
         // PSC + TR=0 + minimal QCIF intra PTYPE.

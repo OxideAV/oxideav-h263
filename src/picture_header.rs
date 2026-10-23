@@ -36,7 +36,7 @@
 
 use oxideav_core::bits::BitReader;
 
-use crate::plus_ptype::{parse_plus_ptype, InheritedExtendedState, PlusPtypeHeader};
+use crate::plus_ptype::{InheritedExtendedState, PlusPtypeHeader, parse_plus_ptype};
 use crate::{Error, Result};
 
 /// Length in bits of the Picture Start Code (§5.1.1).
@@ -618,7 +618,7 @@ mod tests {
         w.write_bit(false); // doc-cam
         w.write_bit(false); // freeze
         w.write_u32(0b111, 3); // extended PTYPE
-                               // PLUSPTYPE: UFEP=001.
+        // PLUSPTYPE: UFEP=001.
         w.write_u32(UFEP_FULL, 3);
         // OPPTYPE QCIF, all modes off, SCE guard set.
         w.write_u32(0b010, 3);

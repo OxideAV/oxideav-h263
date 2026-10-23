@@ -1080,7 +1080,7 @@ mod tests {
         );
         write_mpptype(&mut w, 0b001, false, false, false);
         w.write_bit(false); // CPM
-                            // CPFMT: par=1111, PWI=87, guard=1, PHI=72.
+        // CPFMT: par=1111, PWI=87, guard=1, PHI=72.
         w.write_u32(PAR_CODE_EXTENDED, 4);
         w.write_u32(87, 9);
         w.write_bit(true); // SCE guard
@@ -1112,7 +1112,7 @@ mod tests {
         );
         write_mpptype(&mut w, 0b001, false, false, false);
         w.write_bit(false); // CPM
-                            // CPCFC: conversion=1 (1001), divisor=30.
+        // CPCFC: conversion=1 (1001), divisor=30.
         w.write_bit(true);
         w.write_u32(30, 7);
         // ETR (2 bits) since custom PCF in use.
@@ -1429,7 +1429,7 @@ mod tests {
         );
         write_mpptype(&mut w, 0b001, true, false, false); // INTER, RPR on
         w.write_bit(false); // CPM
-                            // RPRP: WDA = "11" (1/16-pixel).
+        // RPRP: WDA = "11" (1/16-pixel).
         w.write_u32(0b11, 2);
         // Eight all-zero warping parameters: four pairs of (zero, zero).
         for _pair in 0..4 {

@@ -252,34 +252,35 @@ pub mod slice_header;
 pub mod w_idct;
 
 pub use aic::{
-    decode_intra_mode, scan_for_intra_mode, write_intra_mode, IntraMode,
-    ALT_HORIZONTAL_TO_BLOCK_POS, ALT_VERTICAL_TO_BLOCK_POS,
+    ALT_HORIZONTAL_TO_BLOCK_POS, ALT_VERTICAL_TO_BLOCK_POS, IntraMode, decode_intra_mode,
+    scan_for_intra_mode, write_intra_mode,
 };
 pub use aic_dequant::{
-    aic_dequant_coefficient, clip_ac, oddify_clip_dc, AIC_AC_REC_MAX, AIC_AC_REC_MIN,
-    AIC_DC_REC_MAX, AIC_DC_REC_MIN,
+    AIC_AC_REC_MAX, AIC_AC_REC_MIN, AIC_DC_REC_MAX, AIC_DC_REC_MIN, aic_dequant_coefficient,
+    clip_ac, oddify_clip_dc,
 };
 pub use aic_predict::{
-    aic_intra_reconstruct_coefficients, aic_intra_reconstruct_samples, reconstruct_intra_block_aic,
-    Neighbour, AIC_FALLBACK_DC_PREDICTOR,
+    AIC_FALLBACK_DC_PREDICTOR, Neighbour, aic_intra_reconstruct_coefficients,
+    aic_intra_reconstruct_samples, reconstruct_intra_block_aic,
 };
 pub use annex_l::{
-    parse_psupp, read_pei_psupp, write_pei_psupp, write_psupp, ChromaKeyingInfo, MessageType,
-    PictureMessage, PictureRect, SeiFunction,
+    ChromaKeyingInfo, MessageType, PictureMessage, PictureRect, SeiFunction, parse_psupp,
+    read_pei_psupp, write_pei_psupp, write_psupp,
 };
-pub use annex_t::{parse_modified_dquant, quant_c_from_quant, ModifiedDquant};
-pub use block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
+pub use annex_t::{ModifiedDquant, parse_modified_dquant, quant_c_from_quant};
+pub use block::{BlockContext, COEFFS_PER_BLOCK, H263Block, ZIGZAG_TO_BLOCK_POS, parse_block};
 pub use block_aic::parse_intra_block_aic;
 pub use codec::{
-    make_decoder, make_encoder, register, H263DecoderOptions, H263EncoderOptions,
-    H263StreamDecoder, H263StreamEncoder, CODEC_ID,
+    CODEC_ID, H263DecoderOptions, H263EncoderOptions, H263StreamDecoder, H263StreamEncoder,
+    make_decoder, make_encoder, register,
 };
 pub use deblock::{
-    apply_edge_samples, clipd1, deblock_plane, filter_edge_samples, strength_for_quant,
-    up_down_ramp, EdgeCondition, STRENGTH_RRU_INFINITE,
+    EdgeCondition, STRENGTH_RRU_INFINITE, apply_edge_samples, clipd1, deblock_plane,
+    filter_edge_samples, strength_for_quant, up_down_ramp,
 };
-pub use dequant::{dequantise_ac, scatter_into_block, AC_REC_MAX, AC_REC_MIN};
+pub use dequant::{AC_REC_MAX, AC_REC_MIN, dequantise_ac, scatter_into_block};
 pub use encoder::{
+    EOS_BYTES, GopConfig, PbConfig, PlusModes, RateControlConfig, RateControlledStream,
     encode_inter_picture, encode_inter_picture_ap, encode_inter_picture_ap_sac,
     encode_inter_picture_ap_slices, encode_inter_picture_ap_umv_plus, encode_inter_picture_dps,
     encode_inter_picture_gobs, encode_inter_picture_isd, encode_inter_picture_motion,
@@ -293,105 +294,104 @@ pub use encoder::{
     encode_intra_picture_sac, encode_intra_picture_slices, encode_intra_picture_slices_aic,
     encode_intra_picture_slices_aic_mq, encode_intra_picture_slices_rect, encode_intra_sequence,
     encode_intra_sequence_aic, encode_pb_picture, encode_pb_picture_sac, encode_sequence,
-    encode_sequence_rate_controlled, write_plus_picture_header, GopConfig, PbConfig, PlusModes,
-    RateControlConfig, RateControlledStream, EOS_BYTES,
+    encode_sequence_rate_controlled, write_plus_picture_header,
 };
-pub use encoder_aic::{plan_intra_block_aic, write_intra_block_aic, AicBlockPlan};
+pub use encoder_aic::{AicBlockPlan, plan_intra_block_aic, write_intra_block_aic};
 pub use encoder_block::{
-    block_has_ac, encode_inter_block, encode_intra_block, tcoef_events, write_inter_block_coeffs,
-    write_intra_block, EncodedInterBlock, EncodedIntraBlock,
+    EncodedInterBlock, EncodedIntraBlock, block_has_ac, encode_inter_block, encode_intra_block,
+    tcoef_events, write_inter_block_coeffs, write_intra_block,
 };
 pub use encoder_deblock::{
-    encode_inter_picture_deblock, encode_intra_picture_deblock, DeblockConfig,
+    DeblockConfig, encode_inter_picture_deblock, encode_intra_picture_deblock,
 };
 pub use encoder_mb::{
-    encode_inter4v_macroblock, encode_inter_macroblock, encode_inter_macroblock_dq,
-    encode_intra_macroblock, encode_intra_macroblock_dq, encode_skipped_macroblock,
-    macroblock_samples_from_u8, MacroblockSamples,
+    MacroblockSamples, encode_inter_macroblock, encode_inter_macroblock_dq,
+    encode_inter4v_macroblock, encode_intra_macroblock, encode_intra_macroblock_dq,
+    encode_skipped_macroblock, macroblock_samples_from_u8,
 };
 pub use encoder_motion::{
-    estimate_block_motion, estimate_motion, estimate_motion_umv, mvd_for, umv_mvd_component_for,
-    umv_mvd_for, Mv4Grid, MvGrid,
+    Mv4Grid, MvGrid, estimate_block_motion, estimate_motion, estimate_motion_umv, mvd_for,
+    umv_mvd_component_for, umv_mvd_for,
 };
 pub use encoder_vlc::{
-    write_cbpy, write_dquant, write_intradc, write_mcbpc_i, write_mcbpc_p, write_mvd_component,
-    write_tcoef, TcoefEvent,
+    TcoefEvent, write_cbpy, write_dquant, write_intradc, write_mcbpc_i, write_mcbpc_p,
+    write_mvd_component, write_tcoef,
 };
 pub use fdct::{fdct_8x8, forward_quantise_block, quantise_ac_coefficient, quantise_intradc};
 pub use gob_header::{
-    gob_header_present, parse_gob_layer, parse_gob_layer_from_bytes, GobLayer, GBSC_BITS,
-    GBSC_VALUE, GFID_BITS, GN_BITS, GOB_HEADER_BITS_NO_CPM, GQUANT_BITS,
+    GBSC_BITS, GBSC_VALUE, GFID_BITS, GN_BITS, GOB_HEADER_BITS_NO_CPM, GQUANT_BITS, GobLayer,
+    gob_header_present, parse_gob_layer, parse_gob_layer_from_bytes,
 };
-pub use idct::{idct_8x8, reconstruct_intra_samples, BLOCK_DIM, IDCT_OUT_MAX, IDCT_OUT_MIN};
+pub use idct::{BLOCK_DIM, IDCT_OUT_MAX, IDCT_OUT_MIN, idct_8x8, reconstruct_intra_samples};
 pub use intra_tcoef::{
-    decode_intra_tcoef_event, write_intra_tcoef_event, IntraTcoefEvent, INTRA_TCOEF_REGULAR_ENTRIES,
+    INTRA_TCOEF_REGULAR_ENTRIES, IntraTcoefEvent, decode_intra_tcoef_event, write_intra_tcoef_event,
 };
-pub use macroblock::{parse_macroblock, H263Macroblock, MbContext, MbType, Mvd};
+pub use macroblock::{H263Macroblock, MbContext, MbType, Mvd, parse_macroblock};
 pub use motion::{
-    chroma_mv, chroma_mv_4mv, chroma_mv_component, chroma_mv_component_4mv, median3,
-    motion_compensate_block, obmc_predict_block, predict_mv_median, reconstruct_inter_block,
-    reconstruct_mv, reconstruct_mv_component, reconstruct_mv_component_umv, reconstruct_mv_umv,
-    rru_actual_component, rru_actual_mv, rru_pseudo_component, rru_pseudo_mv,
-    select_4mv_candidates, LumaBlockIndex, Mb4Mv, Mb4MvNeighbourhood, MotionVector, RefPlane,
-    RemoteMv, H0, H1, H2, MV_HALF_MAX, MV_HALF_MIN, MV_HALF_SPAN, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN,
-    OBMC_WEIGHT_SUM, RCONTROL_DEFAULT,
+    H0, H1, H2, LumaBlockIndex, MV_HALF_MAX, MV_HALF_MIN, MV_HALF_SPAN, MV_UMV_HALF_MAX,
+    MV_UMV_HALF_MIN, Mb4Mv, Mb4MvNeighbourhood, MotionVector, OBMC_WEIGHT_SUM, RCONTROL_DEFAULT,
+    RefPlane, RemoteMv, chroma_mv, chroma_mv_4mv, chroma_mv_component, chroma_mv_component_4mv,
+    median3, motion_compensate_block, obmc_predict_block, predict_mv_median,
+    reconstruct_inter_block, reconstruct_mv, reconstruct_mv_component,
+    reconstruct_mv_component_umv, reconstruct_mv_umv, rru_actual_component, rru_actual_mv,
+    rru_pseudo_component, rru_pseudo_mv, select_4mv_candidates,
 };
 pub use pb_layer::{
-    cbpb_block_present, parse_cbpb, parse_modb, parse_modb_annex_m, parse_mvdb,
-    pb_b_bidir_chroma_extent, pb_b_bidir_extent_component, pb_b_bidir_luma_block_extent,
-    pb_b_bidir_pixel, pb_b_blend_block, pb_b_chroma_vector, pb_b_vector, pb_b_vectors, pb_bquant,
-    BpbCodingMode, ModbAnnexM, ModbPresence, CBPB_BITS,
+    BpbCodingMode, CBPB_BITS, ModbAnnexM, ModbPresence, cbpb_block_present, parse_cbpb, parse_modb,
+    parse_modb_annex_m, parse_mvdb, pb_b_bidir_chroma_extent, pb_b_bidir_extent_component,
+    pb_b_bidir_luma_block_extent, pb_b_bidir_pixel, pb_b_blend_block, pb_b_chroma_vector,
+    pb_b_vector, pb_b_vectors, pb_bquant,
 };
 pub use picture::{
-    decode_b_picture, decode_b_picture_layer, decode_ep_picture_layer, decode_improved_pb_picture,
-    decode_improved_pb_picture_with_inherited, decode_pb_picture, decode_pb_picture_no_gob0_header,
-    decode_pb_picture_sac, decode_picture, decode_picture_layer,
+    BPictureTemporal, DecodeOptions, DecodePictureOutcome, MbBoundaryInfo, PbFramePair,
+    PictureLayout, YuvFrame, decode_b_picture, decode_b_picture_layer, decode_ep_picture_layer,
+    decode_improved_pb_picture, decode_improved_pb_picture_with_inherited, decode_pb_picture,
+    decode_pb_picture_no_gob0_header, decode_pb_picture_sac, decode_picture, decode_picture_layer,
     decode_picture_layer_with_inherited, decode_picture_no_gob0_header, decode_picture_sac,
-    decode_sequence, enumerate_mb_boundaries, BPictureTemporal, DecodeOptions,
-    DecodePictureOutcome, MbBoundaryInfo, PbFramePair, PictureLayout, YuvFrame,
+    decode_sequence, enumerate_mb_boundaries,
 };
 pub use picture_header::{
-    parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
-    H263PictureHeader, H263PictureLayer, H263SourceFormat, PSC_BITS, PSC_VALUE,
+    H263ExtendedPicture, H263PictureCodingType, H263PictureHeader, H263PictureLayer,
+    H263SourceFormat, PSC_BITS, PSC_VALUE, parse_picture_header, parse_picture_layer,
 };
 pub use plus_ptype::{
-    parse_plus_ptype, CustomPcf, CustomPictureFormat, ExtendedPar, InheritedExtendedState, Mpptype,
-    Opptype, PlusPictureType, PlusPtypeHeader, PlusSourceFormat, SliceStructuredSubmode, Uui,
-    CPCFC_BITS, CPFMT_BITS, EPAR_BITS, ETR_BITS, MPPTYPE_BITS, OPPTYPE_BITS, SSS_BITS, UFEP_BITS,
-    UFEP_FULL, UFEP_MANDATORY_ONLY,
+    CPCFC_BITS, CPFMT_BITS, CustomPcf, CustomPictureFormat, EPAR_BITS, ETR_BITS, ExtendedPar,
+    InheritedExtendedState, MPPTYPE_BITS, Mpptype, OPPTYPE_BITS, Opptype, PlusPictureType,
+    PlusPtypeHeader, PlusSourceFormat, SSS_BITS, SliceStructuredSubmode, UFEP_BITS, UFEP_FULL,
+    UFEP_MANDATORY_ONLY, Uui, parse_plus_ptype,
 };
 pub use rate_control::{HrdModel, HrdParams, HrdPictureOutcome, RateController};
 pub use rru_filter::{
-    rru_default_tap, rru_filter_plane, RruEdgeCondition, RruFilterMode, RRU_BLOCK_DIM,
+    RRU_BLOCK_DIM, RruEdgeCondition, RruFilterMode, rru_default_tap, rru_filter_plane,
 };
 pub use rru_upsample::{
-    upsample_prediction_error, RRU_IN_DIM, RRU_IN_LEN, RRU_OUT_DIM, RRU_OUT_LEN,
+    RRU_IN_DIM, RRU_IN_LEN, RRU_OUT_DIM, RRU_OUT_LEN, upsample_prediction_error,
 };
 pub use rtp::{
-    assemble_picture_header, depacketize_payloads, depacketize_payloads_rfc2190, packetize_stream,
-    packetize_stream_rfc2190, parse_payload_header, parse_rfc2190_mode_a, parse_rfc2190_mode_b,
-    parse_rfc2190_mode_c, redundant_picture_header, write_payload_header, write_rfc2190_mode_a,
-    write_rfc2190_mode_b, write_rfc2190_mode_c, H263PayloadHeader, PacketizeConfig, Rfc2190ModeA,
-    Rfc2190ModeB, Rfc2190ModeC, VrcHeader, PAYLOAD_HEADER_BYTES, PLEN_MAX, RFC2190_MODE_A_BYTES,
-    RFC2190_MODE_B_BYTES, RFC2190_MODE_C_BYTES, VRC_HEADER_BYTES,
+    H263PayloadHeader, PAYLOAD_HEADER_BYTES, PLEN_MAX, PacketizeConfig, RFC2190_MODE_A_BYTES,
+    RFC2190_MODE_B_BYTES, RFC2190_MODE_C_BYTES, Rfc2190ModeA, Rfc2190ModeB, Rfc2190ModeC,
+    VRC_HEADER_BYTES, VrcHeader, assemble_picture_header, depacketize_payloads,
+    depacketize_payloads_rfc2190, packetize_stream, packetize_stream_rfc2190, parse_payload_header,
+    parse_rfc2190_mode_a, parse_rfc2190_mode_b, parse_rfc2190_mode_c, redundant_picture_header,
+    write_payload_header, write_rfc2190_mode_a, write_rfc2190_mode_b, write_rfc2190_mode_c,
 };
 pub use sac::{
-    decode_cbpb_sac, decode_cbpy_sac, decode_cod, decode_dquant_sac, decode_intradc_sac,
-    decode_mcbpc_i_sac, decode_mcbpc_p_sac, decode_modb_sac, decode_mvd_component_sac,
-    encode_cbpb_sac, encode_cbpy_sac, encode_cod, encode_dquant_sac, encode_inter4v_macroblock_sac,
-    encode_inter_macroblock_sac, encode_intra_macroblock_sac, encode_intradc_sac,
-    encode_mcbpc_i_sac, encode_mcbpc_p_sac, encode_modb_sac, encode_mvd_component_sac,
-    encode_skipped_macroblock_sac, parse_block_sac, parse_macroblock_sac, write_block_sac,
-    SacDecoder, SacEncoder,
+    SacDecoder, SacEncoder, decode_cbpb_sac, decode_cbpy_sac, decode_cod, decode_dquant_sac,
+    decode_intradc_sac, decode_mcbpc_i_sac, decode_mcbpc_p_sac, decode_modb_sac,
+    decode_mvd_component_sac, encode_cbpb_sac, encode_cbpy_sac, encode_cod, encode_dquant_sac,
+    encode_inter_macroblock_sac, encode_inter4v_macroblock_sac, encode_intra_macroblock_sac,
+    encode_intradc_sac, encode_mcbpc_i_sac, encode_mcbpc_p_sac, encode_modb_sac,
+    encode_mvd_component_sac, encode_skipped_macroblock_sac, parse_block_sac, parse_macroblock_sac,
+    write_block_sac,
 };
 pub use scal_upsample::{
     upsample_plane_1d_horizontal, upsample_plane_1d_vertical, upsample_plane_2d,
 };
 pub use slice_header::{
-    parse_first_slice_header, parse_slice_layer, skip_sstuf, skip_sstuf_at, ssbi_to_subbitstream,
-    subbitstream_to_ssbi, write_first_slice_header, write_slice_layer, write_slice_layer_cpm,
-    FirstSliceLayer, SliceHeaderContext, SliceLayer, SEPB_BITS, SQUANT_BITS, SSBI_BITS, SSC_BITS,
-    SSC_VALUE, SSTUF_MAX_BITS,
+    FirstSliceLayer, SEPB_BITS, SQUANT_BITS, SSBI_BITS, SSC_BITS, SSC_VALUE, SSTUF_MAX_BITS,
+    SliceHeaderContext, SliceLayer, parse_first_slice_header, parse_slice_layer, skip_sstuf,
+    skip_sstuf_at, ssbi_to_subbitstream, subbitstream_to_ssbi, write_first_slice_header,
+    write_slice_layer, write_slice_layer_cpm,
 };
 pub use w_idct::{fdct_w0, idct_w0};
 
@@ -691,10 +691,9 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-h263: Annex O MBTYPE/MCBPC code not found in Table O.1/O.2/O.3"
             ),
-            Error::BadScalabilityCbpc => write!(
-                f,
-                "oxideav-h263: Annex O CBPC code not found in Table O.4"
-            ),
+            Error::BadScalabilityCbpc => {
+                write!(f, "oxideav-h263: Annex O CBPC code not found in Table O.4")
+            }
             Error::BadScalabilityReferenceGeometry => write!(
                 f,
                 "oxideav-h263: Annex O enhancement-layer reference geometry incompatible (SNR-scalability path needs identical reference-layer dimensions)"

@@ -77,40 +77,40 @@
 use oxideav_core::bits::BitReader;
 
 use crate::aic_predict::{
-    aic_intra_reconstruct_coefficients, aic_intra_reconstruct_samples, Neighbour,
+    Neighbour, aic_intra_reconstruct_coefficients, aic_intra_reconstruct_samples,
 };
-use crate::block::{parse_block, BlockContext, H263Block, COEFFS_PER_BLOCK};
+use crate::block::{BlockContext, COEFFS_PER_BLOCK, H263Block, parse_block};
 use crate::block_aic::parse_intra_block_aic;
-use crate::deblock::{deblock_plane, strength_for_quant, EdgeCondition};
+use crate::deblock::{EdgeCondition, deblock_plane, strength_for_quant};
 use crate::gob_header::parse_gob_layer;
 use crate::idct::BLOCK_DIM;
 use crate::macroblock::{
-    decode_mvd_component, parse_macroblock, H263Macroblock, MbContext, MbType, Mvd,
+    H263Macroblock, MbContext, MbType, Mvd, decode_mvd_component, parse_macroblock,
 };
 use crate::motion::{
+    LumaBlockIndex, Mb4Mv, Mb4MvNeighbourhood, MotionVector, RCONTROL_DEFAULT, RefPlane, RemoteMv,
     chroma_mv, chroma_mv_4mv, motion_compensate_block, obmc_predict_block, predict_mv_median,
-    reconstruct_mv, reconstruct_mv_umv, select_4mv_candidates, LumaBlockIndex, Mb4Mv,
-    Mb4MvNeighbourhood, MotionVector, RefPlane, RemoteMv, RCONTROL_DEFAULT,
+    reconstruct_mv, reconstruct_mv_umv, select_4mv_candidates,
 };
 use crate::pb_layer::{
-    cbpb_block_present, pb_b_bidir_pixel, pb_b_predict_macroblock, pb_b_vector, pb_bquant,
-    BpbCodingMode, PbBMacroblockPrediction, PbBReferencePlanes,
+    BpbCodingMode, PbBMacroblockPrediction, PbBReferencePlanes, cbpb_block_present,
+    pb_b_bidir_pixel, pb_b_predict_macroblock, pb_b_vector, pb_bquant,
 };
 use crate::picture_header::{
-    parse_picture_header, parse_picture_layer, H263ExtendedPicture, H263PictureCodingType,
-    H263PictureHeader, H263PictureLayer, H263SourceFormat, PSC_BITS, PSC_VALUE,
+    H263ExtendedPicture, H263PictureCodingType, H263PictureHeader, H263PictureLayer,
+    H263SourceFormat, PSC_BITS, PSC_VALUE, parse_picture_header, parse_picture_layer,
 };
 use crate::plus_ptype::{
     InheritedExtendedState, PlusPictureType, PlusSourceFormat, SliceStructuredSubmode, Uui,
 };
 use crate::scalability::{
-    decode_mb_header_b_ep, decode_mb_header_ei, ScalabilityPictureType, ScalabilityPredType,
+    ScalabilityPictureType, ScalabilityPredType, decode_mb_header_b_ep, decode_mb_header_ei,
 };
 use crate::slice_header::{
-    parse_first_slice_header, parse_slice_layer, skip_sstuf, SliceHeaderContext, SQUANT_BITS,
-    SSC_BITS, SSC_VALUE,
+    SQUANT_BITS, SSC_BITS, SSC_VALUE, SliceHeaderContext, parse_first_slice_header,
+    parse_slice_layer, skip_sstuf,
 };
-use crate::{reconstruct_inter_block_with_prediction, reconstruct_intra_block, Error, Result};
+use crate::{Error, Result, reconstruct_inter_block_with_prediction, reconstruct_intra_block};
 
 /// A decoded planar YUV 4:2:0 frame produced by [`decode_picture`].
 ///
@@ -315,10 +315,10 @@ impl PictureLayout {
     /// successfully but [`Self::for_custom_dimensions`] returns
     /// `None` to keep the boundary at the driver layer.
     pub fn for_custom_dimensions(luma_width: u32, luma_height: u32) -> Option<PictureLayout> {
-        if !(4..=2048).contains(&luma_width) || luma_width % 16 != 0 {
+        if !(4..=2048).contains(&luma_width) || !luma_width.is_multiple_of(16) {
             return None;
         }
-        if !(4..=1152).contains(&luma_height) || luma_height % 16 != 0 {
+        if !(4..=1152).contains(&luma_height) || !luma_height.is_multiple_of(16) {
             return None;
         }
         // §4.2.1 / Table 4 — parameter k for the GOB size definition.
@@ -1054,7 +1054,7 @@ fn decode_sac_macroblock_stream(
     header_zero_run: u32,
     mut pb: Option<PbPictureCtx<'_>>,
 ) -> Result<YuvFrame> {
-    use crate::sac::{parse_block_sac, parse_macroblock_sac, SacDecoder};
+    use crate::sac::{SacDecoder, parse_block_sac, parse_macroblock_sac};
 
     let luma_w = layout.luma_width as usize;
     let luma_h = layout.luma_height as usize;
@@ -1711,7 +1711,7 @@ fn decode_rru_picture_body(
     options: DecodeOptions,
 ) -> Result<YuvFrame> {
     use crate::motion::{rru_actual_mv, rru_pseudo_mv};
-    use crate::rru_filter::{rru_filter_plane, RruEdgeCondition, RruFilterMode};
+    use crate::rru_filter::{RruEdgeCondition, RruFilterMode, rru_filter_plane};
     use crate::rru_upsample::upsample_prediction_error;
 
     let plus = &extended.plus;
@@ -2682,12 +2682,12 @@ fn scan_isd_segment_bands(data: &[u8], from: usize, layout: &PictureLayout) -> V
         // Byte-aligned GBSC pre-filter: 16 zero bits then a "1".
         if data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] & 0x80 != 0 {
             let mut probe = BitReader::with_position(data, i);
-            if matches!(probe.read_u32(GBSC_BITS), Ok(v) if v == GBSC_VALUE) {
-                if let Ok(gn) = probe.read_u32(5) {
-                    if gn >= 1 && gn < num_gobs {
-                        tops.push(gn as usize * rows_per_gob);
-                    }
-                }
+            if matches!(probe.read_u32(GBSC_BITS), Ok(v) if v == GBSC_VALUE)
+                && let Ok(gn) = probe.read_u32(5)
+                && gn >= 1
+                && gn < num_gobs
+            {
+                tops.push(gn as usize * rows_per_gob);
             }
         }
         i += 1;
@@ -5091,10 +5091,10 @@ fn decode_after_picture_header_inner(
     // another sub-bitstream cannot be decoded into this picture.
     let parse_gob = |reader: &mut BitReader<'_>| -> Result<crate::gob_header::GobLayer> {
         let gob = crate::gob_header::parse_gob_layer_cpm(reader, cpm_psbi.is_some())?;
-        if let (Some(psbi), Some(gsbi)) = (cpm_psbi, gob.gsbi) {
-            if psbi != gsbi {
-                return Err(Error::NotImplemented);
-            }
+        if let (Some(psbi), Some(gsbi)) = (cpm_psbi, gob.gsbi)
+            && psbi != gsbi
+        {
+            return Err(Error::NotImplemented);
         }
         Ok(gob)
     };
@@ -5159,24 +5159,25 @@ fn decode_after_picture_header_inner(
         // data; GOB 0 carries no GOB header (§5.2.2), so its reference
         // stays the picture-layer §N.5 selection. A header-less GOB keeps
         // the reference in force from the previous segment.
-        if let Some(rps) = rps_gob.as_ref() {
-            if gob_header_present && gob_index != 0 {
-                let fields = crate::annex_n::parse_gob_newpred_fields(
-                    reader,
-                    rps.custom_pcf,
-                    rps.is_intra_or_ei,
-                )?;
-                // §N.4.1.4 / §N.5 — when TRP is present, predict from the
-                // stored picture whose TR equals TRP; when absent, keep
-                // the most-recent / picture-layer reference unchanged.
-                if let Some(trp) = fields.segment_trp() {
-                    match rps.store.select_reference(Some(true), Some(trp)) {
-                        Some(r) => active_reference = Some(r),
-                        // §N.5 forced-INTRA-update case: the requested TRP
-                        // is not in the store. An INTER segment cannot be
-                        // reconstructed without its reference.
-                        None => return Err(Error::NotImplemented),
-                    }
+        if let Some(rps) = rps_gob.as_ref()
+            && gob_header_present
+            && gob_index != 0
+        {
+            let fields = crate::annex_n::parse_gob_newpred_fields(
+                reader,
+                rps.custom_pcf,
+                rps.is_intra_or_ei,
+            )?;
+            // §N.4.1.4 / §N.5 — when TRP is present, predict from the
+            // stored picture whose TR equals TRP; when absent, keep
+            // the most-recent / picture-layer reference unchanged.
+            if let Some(trp) = fields.segment_trp() {
+                match rps.store.select_reference(Some(true), Some(trp)) {
+                    Some(r) => active_reference = Some(r),
+                    // §N.5 forced-INTRA-update case: the requested TRP
+                    // is not in the store. An INTER segment cannot be
+                    // reconstructed without its reference.
+                    None => return Err(Error::NotImplemented),
                 }
             }
         }
@@ -5835,7 +5836,7 @@ fn copy_macroblock_blocks(
 trait BlockPredictor {
     /// Predict the 8×8 luma block whose top-left is `(bx, by)`.
     fn predict_luma(&self, reference_stride: usize, bx: usize, by: usize)
-        -> [u8; COEFFS_PER_BLOCK];
+    -> [u8; COEFFS_PER_BLOCK];
     /// Predict the 8×8 Cb block whose top-left is `(cx, cy)`.
     fn predict_cb(&self, cx: usize, cy: usize) -> [u8; COEFFS_PER_BLOCK];
     /// Predict the 8×8 Cr block whose top-left is `(cx, cy)`.
@@ -7309,8 +7310,9 @@ fn decode_dps_after_header(
     options: DecodeOptions,
 ) -> Result<YuvFrame> {
     use crate::annex_v::{
-        read_dps_mb_header, DpsMbHeader, MvdEmulationState, HEADER_MARKER, HEADER_MARKER_BITS,
-        MOTION_VECTOR_MARKER, MOTION_VECTOR_MARKER_BITS, TABLE_V1_INTRA, TABLE_V2_INTER,
+        DpsMbHeader, HEADER_MARKER, HEADER_MARKER_BITS, MOTION_VECTOR_MARKER,
+        MOTION_VECTOR_MARKER_BITS, MvdEmulationState, TABLE_V1_INTRA, TABLE_V2_INTER,
+        read_dps_mb_header,
     };
     use crate::macroblock::{decode_cbpy, read_dquant_baseline};
 
@@ -7883,12 +7885,11 @@ fn decode_slice_structured_after_header_inner(
     loop {
         // §K.1: enforce strictly-increasing MBA — waived under the
         // Arbitrary Slice Ordering submode.
-        if !sss.arbitrary_order {
-            if let Some(p) = prev_mba {
-                if slice_mba <= p {
-                    return Err(Error::BadSliceCoverage);
-                }
-            }
+        if !sss.arbitrary_order
+            && let Some(p) = prev_mba
+            && slice_mba <= p
+        {
+            return Err(Error::BadSliceCoverage);
         }
         prev_mba = Some(slice_mba);
         if slice_mba as usize >= mb_count {
@@ -9730,10 +9731,10 @@ fn apply_deblocking(
                 let seg = |m: (usize, usize)| -> Option<u32> {
                     (m.0 < mb_cols && m.1 < mb_rows).then(|| grid[m.1 * mb_cols + m.0].segment)
                 };
-                if let (Some(s1), Some(s2)) = (seg(mb1), seg(mb2)) {
-                    if s1 != s2 {
-                        return EdgeCondition::Skip;
-                    }
+                if let (Some(s1), Some(s2)) = (seg(mb1), seg(mb2))
+                    && s1 != s2
+                {
+                    return EdgeCondition::Skip;
                 }
             }
             let coded = |m: (usize, usize)| -> bool {
@@ -9966,7 +9967,7 @@ mod tests {
         // current MB at the rightmost column (10, 1).
         set(&mut grid, 9, 1, 10, 10); // left
         set(&mut grid, 10, 0, 20, 20); // above
-                                       // above-right (11,0) is outside -> rule 4 zero.
+        // above-right (11,0) is outside -> rule 4 zero.
         let p = predict_mv(&grid, 11, 10, 1, 0, false, false, 0);
         // candidates: MV1=(10,10), MV2=(20,20), MV3=(0,0).
         // median dx of (10,20,0)=10; dy=10.
@@ -10075,7 +10076,7 @@ mod tests {
         w.write_bit(false); // sac
         w.write_bit(false); // ap
         w.write_bit(false); // pb
-                            // §5.1.19 PQUANT (5 bits) + §5.1.20 CPM = "0".
+        // §5.1.19 PQUANT (5 bits) + §5.1.20 CPM = "0".
         w.write_u32(pquant as u32, 5);
         w.write_bit(false); // CPM off
         w.write_bit(false); // §5.1.24 PEI = "0" (no PSUPP)
@@ -10423,8 +10424,8 @@ mod tests {
         w.write_bit(true); // LAST = 1
         w.write_u32(0, 6); // RUN = 0
         w.write_u32(1, 8); // LEVEL = +1 (8-bit two's complement)
-                           // After RUN=0 from scan_pos 1 (INTRA), this lands at zigzag
-                           // slot 1 = block position 1.
+        // After RUN=0 from scan_pos 1 (INTRA), this lands at zigzag
+        // slot 1 = block position 1.
         let _ = ZIGZAG_TO_BLOCK_POS; // referenced for documentation.
     }
 
@@ -10651,7 +10652,7 @@ mod tests {
         w.write_u32(0b000, 3); // PTYPE bits 3-5
         w.write_u32(0b111, 3); // PTYPE bits 6-8 → extended
         w.write_u32(0b001, 3); // UFEP = 001
-                               // OPPTYPE (18 bits).
+        // OPPTYPE (18 bits).
         w.write_u32(0b010, 3); // source format = QCIF
         w.write_bit(false); // custom_pcf
         w.write_bit(true); // UMV = ON
@@ -10666,7 +10667,7 @@ mod tests {
         w.write_bit(mq); // MQ
         w.write_bit(true); // SCE-guard
         w.write_u32(0b000, 3); // reserved
-                               // MPPTYPE (9 bits).
+        // MPPTYPE (9 bits).
         w.write_u32(0b001, 3); // picture type INTER
         w.write_bit(false); // RPR
         w.write_bit(false); // RRU
@@ -10675,7 +10676,7 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
         w.write_bit(false); // CPM = 0
-                            // §5.1.9 UUI: "1" = Limited (Tables D.1/D.2), "01" = Unlimited.
+        // §5.1.9 UUI: "1" = Limited (Tables D.1/D.2), "01" = Unlimited.
         if unlimited_uui {
             w.write_bit(false);
             w.write_bit(true);
@@ -10810,7 +10811,7 @@ mod tests {
         crate::annex_p::write_table_d3(&mut w, 1).unwrap();
         crate::annex_p::write_table_d3(&mut w, 1).unwrap();
         w.write_bit(true); // §D.2 EPB
-                           // MB(1,0): MVD (−4, 0) — parses only if the EPB was consumed.
+        // MB(1,0): MVD (−4, 0) — parses only if the EPB was consumed.
         w.write_bit(false);
         w.write_bit(true);
         w.write_u32(0b11, 2);
@@ -12404,7 +12405,7 @@ mod tests {
         // §5.1.1 / §5.1.2 — PSC + TR.
         w.write_u32(PSC_VALUE, PSC_BITS);
         w.write_u32(0, 8); // TR
-                           // §5.1.3 — PTYPE bits 1-2 = "10".
+        // §5.1.3 — PTYPE bits 1-2 = "10".
         w.write_bit(true);
         w.write_bit(false);
         // PTYPE bits 3-5 = "000" (no split-screen / doc-camera / freeze).
@@ -12454,7 +12455,7 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
-                           // §5.1.20 — CPM = 0.
+        // §5.1.20 — CPM = 0.
         w.write_bit(false);
         // §5.1.19 PQUANT (QUANT = 8) + §5.1.24 PEI = "0". On the PLUSPTYPE
         // wire these follow the CPM bit (Figure 6 part 1); the GOB-layer
@@ -12483,7 +12484,7 @@ mod tests {
         // §5.1.1 / §5.1.2 — PSC + TR.
         w.write_u32(PSC_VALUE, PSC_BITS);
         w.write_u32(0, 8); // TR
-                           // §5.1.3 — PTYPE bits 1-2 = "10".
+        // §5.1.3 — PTYPE bits 1-2 = "10".
         w.write_bit(true);
         w.write_bit(false);
         // PTYPE bits 3-5 = "000".
@@ -12507,8 +12508,8 @@ mod tests {
         w.write_bit(false); // bit 14 MQ
         w.write_bit(true); // bit 15 SCE-guard
         w.write_u32(0b000, 3); // bits 16-18 reserved
-                               // §5.1.4.3 — MPPTYPE (9 bits): picture type "100" (EI),
-                               // RPR=0, RRU=0, RTYPE=0, reserved "00", SCE-guard "1".
+        // §5.1.4.3 — MPPTYPE (9 bits): picture type "100" (EI),
+        // RPR=0, RRU=0, RTYPE=0, reserved "00", SCE-guard "1".
         w.write_u32(0b100, 3); // picture type EI
         w.write_bit(false); // RPR
         w.write_bit(false); // RRU
@@ -12516,7 +12517,7 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
-                           // §5.1.11 — ELNUM (4 bits): first enhancement layer = 2.
+        // §5.1.11 — ELNUM (4 bits): first enhancement layer = 2.
         w.write_u32(2, 4);
         // §5.1.12 — RLNUM (4 bits, present at UFEP=001): base layer = 1.
         w.write_u32(1, 4);
@@ -12682,7 +12683,7 @@ mod tests {
             }
             for _mb in 0..11 {
                 w.write_bit(false); // COD = 0 (coded)
-                                    // MCBPC = `1` -> Upward, CBPC 00.
+                // MCBPC = `1` -> Upward, CBPC 00.
                 w.write_bit(true);
                 // CBPY = `0011` (Table 12 index 0): CBPY(INTRA) = 0000,
                 // no luma AC. EI Upward uses the INTRA CBPY column, so
@@ -12732,7 +12733,7 @@ mod tests {
             }
             for _mb in 0..11 {
                 w.write_bit(false); // COD = 0 (coded)
-                                    // MCBPC = `00000001` -> INTRA, CBPC 00.
+                // MCBPC = `00000001` -> INTRA, CBPC 00.
                 w.write_u32(0b00000001, 8);
                 // CBPY = `0011` (Table 12 index 0): CBPY(INTRA) = 0000,
                 // no luma AC.
@@ -12923,8 +12924,8 @@ mod tests {
             }
             for _mb in 0..11 {
                 w.write_bit(false); // COD = 0 (coded)
-                                    // MBTYPE = `010` -> Upward (no texture):
-                                    // no CBPC, no CBPY, no MVD, no blocks.
+                // MBTYPE = `010` -> Upward (no texture):
+                // no CBPC, no CBPY, no MVD, no blocks.
                 w.write_bit(false);
                 w.write_bit(true);
                 w.write_bit(false);
@@ -12971,7 +12972,7 @@ mod tests {
             }
             for _mb in 0..11 {
                 w.write_bit(false); // COD = 0 (coded)
-                                    // MBTYPE = `1` -> Forward (CBPC + CBPY + MVDFW).
+                // MBTYPE = `1` -> Forward (CBPC + CBPY + MVDFW).
                 w.write_bit(true);
                 // CBPC = `0` -> 00 (no chroma AC).
                 w.write_bit(false);
@@ -13188,8 +13189,8 @@ mod tests {
             }
             for _mb in 0..11 {
                 w.write_bit(false); // COD = 0 (coded)
-                                    // MBTYPE = `00010` -> Bi-dir (no texture):
-                                    // no MVD (zero vectors), no blocks.
+                // MBTYPE = `00010` -> Bi-dir (no texture):
+                // no MVD (zero vectors), no blocks.
                 w.write_u32(0b00010, 5);
             }
         }
@@ -13235,7 +13236,7 @@ mod tests {
             }
             for _mb in 0..11 {
                 w.write_bit(false); // COD = 0
-                                    // MBTYPE = `0000001` -> INTRA (Table O.2).
+                // MBTYPE = `0000001` -> INTRA (Table O.2).
                 w.write_u32(0b0000001, 7);
                 // CBPC = `0` -> 00 (no chroma AC).
                 w.write_bit(false);
@@ -13479,8 +13480,8 @@ mod tests {
             }
             for _mb in 0..11 {
                 w.write_bit(false); // COD = 0 (coded)
-                                    // MBTYPE `100` = Forward (no texture): MVDFW present,
-                                    // no CBP.
+                // MBTYPE `100` = Forward (no texture): MVDFW present,
+                // no CBP.
                 w.write_bit(true);
                 w.write_bit(false);
                 w.write_bit(false);
@@ -13529,8 +13530,8 @@ mod tests {
             }
             for _mb in 0..11 {
                 w.write_bit(false); // COD = 0
-                                    // MBTYPE `010` = Backward (no texture): MVDBW present,
-                                    // no CBP.
+                // MBTYPE `010` = Backward (no texture): MVDBW present,
+                // no CBP.
                 w.write_bit(false);
                 w.write_bit(true);
                 w.write_bit(false);
@@ -13580,8 +13581,8 @@ mod tests {
             }
             for _mb in 0..11 {
                 w.write_bit(false); // COD = 0
-                                    // MBTYPE `00100` = Bi-dir (no texture): MVDFW + MVDBW,
-                                    // no CBP.
+                // MBTYPE `00100` = Bi-dir (no texture): MVDFW + MVDBW,
+                // no CBP.
                 w.write_bit(false);
                 w.write_bit(false);
                 w.write_bit(true);
@@ -13750,7 +13751,7 @@ mod tests {
         // §5.1.1 / §5.1.2 — PSC + TR.
         w.write_u32(PSC_VALUE, PSC_BITS);
         w.write_u32(0, 8); // TR
-                           // §5.1.3 — PTYPE bits 1-2 = "10".
+        // §5.1.3 — PTYPE bits 1-2 = "10".
         w.write_bit(true);
         w.write_bit(false);
         // PTYPE bits 3-5 = "000".
@@ -13774,9 +13775,9 @@ mod tests {
         w.write_bit(false); // bit 14 MQ
         w.write_bit(true); // bit 15 SCE-guard
         w.write_u32(0b000, 3); // bits 16-18 reserved
-                               // §5.1.4.3 — MPPTYPE (9 bits): picture type "001"
-                               // (INTER), RPR=0, RRU=0, RTYPE=0, reserved "00",
-                               // SCE-guard "1".
+        // §5.1.4.3 — MPPTYPE (9 bits): picture type "001"
+        // (INTER), RPR=0, RRU=0, RTYPE=0, reserved "00",
+        // SCE-guard "1".
         w.write_u32(0b001, 3); // picture type INTER
         w.write_bit(false); // RPR
         w.write_bit(false); // RRU
@@ -13784,7 +13785,7 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
-                           // §5.1.20 — CPM = 0.
+        // §5.1.20 — CPM = 0.
         w.write_bit(false);
         write_plus_pquant_pei(w, 8);
     }
@@ -13799,7 +13800,7 @@ mod tests {
     /// The two chroma blocks carry a single in-range event each.
     fn write_inter_annex_s_mb(w: &mut BitWriter) {
         w.write_bit(false); // COD = 0 (coded)
-                            // MCBPC idx 3 = "000101" (INTER type 0, CBPC 11).
+        // MCBPC idx 3 = "000101" (INTER type 0, CBPC 11).
         w.write_u32(0b000101, 6);
         // §S.3 — with AIV + CBPC = 11 the CBPY codeword is the INTRA
         // pattern. We want luma pattern `1000` (block 0 only): Table-12
@@ -13815,9 +13816,9 @@ mod tests {
         }
         w.write_u32(0b0111, 4); // idx 58 (LAST=1)
         w.write_bit(false); // sign +
-                            // Cb + Cr — one in-range event each (idx 58, LAST=1, +1). These
-                            // stay inside the block under the INTER table, so §S.2.2 step 2
-                            // keeps the INTER interpretation.
+        // Cb + Cr — one in-range event each (idx 58, LAST=1, +1). These
+        // stay inside the block under the INTER table, so §S.2.2 step 2
+        // keeps the INTER interpretation.
         for _ in 0..2 {
             w.write_u32(0b0111, 4);
             w.write_bit(false);
@@ -13895,7 +13896,7 @@ mod tests {
         w.write_u32(0b000, 3); // PTYPE bits 3-5
         w.write_u32(0b111, 3); // PTYPE bits 6-8 → extended
         w.write_u32(0b001, 3); // UFEP = 001
-                               // OPPTYPE (18 bits).
+        // OPPTYPE (18 bits).
         w.write_u32(0b010, 3); // source format = QCIF
         w.write_bit(false); // custom_pcf
         w.write_bit(false); // UMV
@@ -13910,7 +13911,7 @@ mod tests {
         w.write_bit(false); // MQ
         w.write_bit(true); // SCE-guard
         w.write_u32(0b000, 3); // reserved
-                               // MPPTYPE (9 bits): INTER, RPR=0, RRU=0, RTYPE, rsvd, guard.
+        // MPPTYPE (9 bits): INTER, RPR=0, RRU=0, RTYPE, rsvd, guard.
         w.write_u32(0b001, 3); // picture type INTER
         w.write_bit(false); // RPR off
         w.write_bit(false); // RRU
@@ -13957,7 +13958,7 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
         w.write_bit(false); // CPM = 0
-                            // §5.1.18 RPRP — WDA (2 bits).
+        // §5.1.18 RPRP — WDA (2 bits).
         w.write_u32(wda_bits, 2);
         // Eight warping parameters as four pairs of zero codewords.
         // §P.2.2 — the emulation-prevention bit follows only a pair of
@@ -14136,7 +14137,7 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
         w.write_bit(false); // CPM = 0
-                            // §5.1.13 RPSMF (UFEP=001): "100" = Neither.
+        // §5.1.13 RPSMF (UFEP=001): "100" = Neither.
         w.write_u32(0b100, crate::plus_ptype::RPSMF_BITS);
         // §5.1.14 TRPI.
         w.write_bit(trp.is_some());
@@ -14212,7 +14213,7 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
         w.write_bit(false); // CPM = 0
-                            // §5.1.13 RPSMF (UFEP=001): "100" = Neither.
+        // §5.1.13 RPSMF (UFEP=001): "100" = Neither.
         w.write_u32(0b100, crate::plus_ptype::RPSMF_BITS);
         // §5.1.14 picture-layer TRPI = 0 (GOB 0 → most recent anchor).
         w.write_bit(false);
@@ -14708,7 +14709,7 @@ mod tests {
         w.write_bit(false); // MQ
         w.write_bit(true); // SCE
         w.write_u32(0, 3); // reserved
-                           // MPPTYPE INTRA, RTYPE 0, SCE 1.
+        // MPPTYPE INTRA, RTYPE 0, SCE 1.
         w.write_u32(0b000, 3);
         w.write_bit(false);
         w.write_bit(false);
@@ -14771,7 +14772,7 @@ mod tests {
         write_qcif_rs_inter_header(&mut w, 0b10); // RS, sequential
         w.write_u32(8, SQUANT_BITS); // PQUANT
         w.write_bit(false); // PEI = "0"
-                            // First slice (reduced form, RS): SEPB1 + MBA + SEPB2 + SWI + SEPB3.
+        // First slice (reduced form, RS): SEPB1 + MBA + SEPB2 + SWI + SEPB3.
         w.write_u32(1, SEPB_BITS); // SEPB1
         w.write_u32(0, 7); // MBA 0 (upper-left of stripe A)
         w.write_u32(1, SEPB_BITS); // SEPB2 (first slice, RS in use)
@@ -14818,7 +14819,7 @@ mod tests {
         write_qcif_rs_inter_header(&mut w, 0b11); // RS + ASO
         w.write_u32(8, SQUANT_BITS); // PQUANT
         w.write_bit(false); // PEI = "0"
-                            // First slice in the bitstream = stripe B (cols 6..11).
+        // First slice in the bitstream = stripe B (cols 6..11).
         w.write_u32(1, SEPB_BITS); // SEPB1
         w.write_u32(6, 7); // MBA 6
         w.write_u32(1, SEPB_BITS); // SEPB2
@@ -14861,7 +14862,7 @@ mod tests {
         write_qcif_rs_inter_header(&mut w, 0b10); // RS, sequential order
         w.write_u32(8, SQUANT_BITS); // PQUANT
         w.write_bit(false); // PEI
-                            // First slice = stripe B (MBA 6) — legal only under ASO.
+        // First slice = stripe B (MBA 6) — legal only under ASO.
         w.write_u32(1, SEPB_BITS);
         w.write_u32(6, 7);
         w.write_u32(1, SEPB_BITS);
@@ -14929,7 +14930,7 @@ mod tests {
         // §5.1.1 / §5.1.2 — PSC + TR.
         w.write_u32(PSC_VALUE, PSC_BITS);
         w.write_u32(0, 8); // TR
-                           // §5.1.3 PTYPE bits 1-2 = "10".
+        // §5.1.3 PTYPE bits 1-2 = "10".
         w.write_bit(true);
         w.write_bit(false);
         // PTYPE bits 3-5: split-screen / doc-camera / freeze off.
@@ -14964,7 +14965,7 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
-                           // §5.1.20 — CPM = 0.
+        // §5.1.20 — CPM = 0.
         w.write_bit(false);
         // §5.1.10 — SSS (2 bits): rectangular = 0, arbitrary_order = 0.
         w.write_u32(0b00, 2);
@@ -14992,11 +14993,11 @@ mod tests {
         // §5.1.19 — PQUANT (5 bits) = 8, then §5.1.24 PEI = "0".
         w.write_u32(8, SQUANT_BITS);
         w.write_bit(false); // PEI
-                            // First slice reduced header: SEPB1=1, MBA=0 (7 bits), SEPB3=1.
+        // First slice reduced header: SEPB1=1, MBA=0 (7 bits), SEPB3=1.
         w.write_u32(1, SEPB_BITS);
         w.write_u32(0, 7); // MBA
         w.write_u32(1, SEPB_BITS); // SEPB3
-                                   // 99 INTRA DC macroblocks in raster order.
+        // 99 INTRA DC macroblocks in raster order.
         for _ in 0..99 {
             write_intra_dc_mb(&mut w, dc_byte);
         }
@@ -15043,7 +15044,7 @@ mod tests {
         write_qcif_ss_intra_header(&mut w);
         w.write_u32(8, SQUANT_BITS); // PQUANT = 8
         w.write_bit(false); // §5.1.24 PEI = "0"
-                            // Slice 0 reduced header (MBA 0).
+        // Slice 0 reduced header (MBA 0).
         w.write_u32(1, SEPB_BITS);
         w.write_u32(0, 7);
         w.write_u32(1, SEPB_BITS);
@@ -15170,7 +15171,7 @@ mod tests {
         w.write_bit(false); // freeze
         w.write_u32(0b111, 3); // extended PTYPE
         w.write_u32(0b001, 3); // UFEP = 001
-                               // OPPTYPE: source QCIF + SS bit 10 set, rest off.
+        // OPPTYPE: source QCIF + SS bit 10 set, rest off.
         w.write_u32(0b010, 3);
         for _ in 0..6 {
             w.write_bit(false);
@@ -15181,7 +15182,7 @@ mod tests {
         }
         w.write_bit(true); // bit 15 SCE-guard
         w.write_u32(0b000, 3); // bits 16-18
-                               // MPPTYPE: INTER (001).
+        // MPPTYPE: INTER (001).
         w.write_u32(0b001, 3);
         w.write_bit(false); // RPR
         w.write_bit(false); // RRU
@@ -15250,8 +15251,8 @@ mod tests {
         w.write_u32(8, SQUANT_BITS); // SQUANT
         w.write_u32(1, SEPB_BITS); // SEPB3
         w.write_u32(0, K_GFID_BITS); // GFID
-                                     // Slice 1 head: one coded INTER MB with MVD = (0,0), then
-                                     // the rest skipped.
+        // Slice 1 head: one coded INTER MB with MVD = (0,0), then
+        // the rest skipped.
         write_inter_single_mv_zero(&mut w);
         for _ in (split + 1)..99 {
             write_skipped_mb(&mut w);
@@ -15303,7 +15304,7 @@ mod tests {
         w.write_bit(true); // SCE-guard
         w.write_bit(false); // CPM
         w.write_u32(0b00, 2); // SSS: free-running
-                              // §5.1.13 RPSMF (UFEP=001): "100".
+        // §5.1.13 RPSMF (UFEP=001): "100".
         w.write_u32(0b100, crate::plus_ptype::RPSMF_BITS);
         w.write_bit(false); // §5.1.14 picture-layer TRPI = 0
         w.write_bit(false); // §5.1.16 BCI "0"
@@ -15339,7 +15340,7 @@ mod tests {
         write_qcif_ss_rps_inter_header(&mut w);
         w.write_u32(8, SQUANT_BITS); // PQUANT
         w.write_bit(false); // §5.1.24 PEI = "0"
-                            // Slice 0 reduced header (MBA 0), no NEWPRED fields.
+        // Slice 0 reduced header (MBA 0), no NEWPRED fields.
         w.write_u32(1, SEPB_BITS); // SEPB1
         w.write_u32(0, 7); // MBA 0
         w.write_u32(1, SEPB_BITS); // SEPB3
@@ -15356,7 +15357,7 @@ mod tests {
         w.write_u32(8, SQUANT_BITS); // SQUANT
         w.write_u32(1, SEPB_BITS); // SEPB3
         w.write_u32(0, K_GFID_BITS); // GFID
-                                     // §N.4.1 NEWPRED: TRI = 0, TRPI = 1, TRP = 10, BCI = "01".
+        // §N.4.1 NEWPRED: TRI = 0, TRPI = 1, TRP = 10, BCI = "01".
         w.write_bit(false); // TRI
         w.write_bit(true); // TRPI
         w.write_u32(10, crate::annex_n::NEWPRED_TRP_BITS); // TRP
@@ -15412,12 +15413,12 @@ mod tests {
     /// all off; UFEP=001. The reader is left positioned at the first
     /// bit of the first GOB header.
     fn write_plus_custom_intra_header(w: &mut BitWriter, luma_width: u32, luma_height: u32) {
-        assert!(luma_width % 4 == 0 && (4..=2048).contains(&luma_width));
-        assert!(luma_height % 4 == 0 && (4..=1152).contains(&luma_height));
+        assert!(luma_width.is_multiple_of(4) && (4..=2048).contains(&luma_width));
+        assert!(luma_height.is_multiple_of(4) && (4..=1152).contains(&luma_height));
         // §5.1.1 / §5.1.2 — PSC + TR.
         w.write_u32(PSC_VALUE, PSC_BITS);
         w.write_u32(0, 8); // TR
-                           // §5.1.3 PTYPE bits 1-2 = "10".
+        // §5.1.3 PTYPE bits 1-2 = "10".
         w.write_bit(true);
         w.write_bit(false);
         // PTYPE bits 3-5: split-screen / doc-camera / freeze all off.
@@ -15447,7 +15448,7 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
-                           // §5.1.20 — CPM = 0.
+        // §5.1.20 — CPM = 0.
         w.write_bit(false);
         // §5.1.5 — CPFMT (23 bits): PAR = "0001" (1:1, Table 5),
         // PWI = (luma_width / 4) - 1, SCE = "1", PHI = luma_height / 4.
@@ -15535,28 +15536,28 @@ mod tests {
         let l = PictureLayout::for_custom_dimensions(176, 400).expect("176x400 legal");
         assert_eq!(l.mb_rows_per_gob, 1);
         assert_eq!(l.num_gobs, 25); // 400 / 16
-                                    // k = 2 at the lower boundary (404 lines is the table's
-                                    // first row of the k=2 column; round to 16-aligned 416).
+        // k = 2 at the lower boundary (404 lines is the table's
+        // first row of the k=2 column; round to 16-aligned 416).
         let l = PictureLayout::for_custom_dimensions(176, 416).expect("176x416 legal");
         assert_eq!(l.mb_rows_per_gob, 2);
         assert_eq!(l.num_gobs, 13); // ceil(416 / 32)
-                                    // k = 2 upper boundary (≤ 800 lines, 16-aligned 800).
+        // k = 2 upper boundary (≤ 800 lines, 16-aligned 800).
         let l = PictureLayout::for_custom_dimensions(176, 800).expect("176x800 legal");
         assert_eq!(l.mb_rows_per_gob, 2);
         assert_eq!(l.num_gobs, 25); // 800 / 32
-                                    // k = 4 at the lower boundary (804 lines round to
-                                    // 16-aligned 816).
+        // k = 4 at the lower boundary (804 lines round to
+        // 16-aligned 816).
         let l = PictureLayout::for_custom_dimensions(176, 816).expect("176x816 legal");
         assert_eq!(l.mb_rows_per_gob, 4);
         assert_eq!(l.num_gobs, 13); // ceil(816 / 64)
-                                    // k = 4 upper boundary (1152 lines, exactly 18 GOBs).
+        // k = 4 upper boundary (1152 lines, exactly 18 GOBs).
         let l = PictureLayout::for_custom_dimensions(176, 1152).expect("176x1152 legal");
         assert_eq!(l.mb_rows_per_gob, 4);
         assert_eq!(l.num_gobs, 18); // 1152 / 64
-                                    // §4.2.1 truncated-bottom-GOB rule. A 432-line picture in
-                                    // the k = 2 (`32`-line GOB) region yields
-                                    // `ceil(432 / 32) = 14` GOBs of which the last covers only
-                                    // `432 - 13 * 32 = 16` lines.
+        // §4.2.1 truncated-bottom-GOB rule. A 432-line picture in
+        // the k = 2 (`32`-line GOB) region yields
+        // `ceil(432 / 32) = 14` GOBs of which the last covers only
+        // `432 - 13 * 32 = 16` lines.
         let l = PictureLayout::for_custom_dimensions(176, 432).expect("176x432 legal");
         assert_eq!(l.mb_rows_per_gob, 2);
         assert_eq!(l.num_gobs, 14);
@@ -15651,7 +15652,7 @@ mod tests {
         let mut w = BitWriter::new();
         w.write_u32(PSC_VALUE, PSC_BITS);
         w.write_u32(0, 8); // TR
-                           // PTYPE bits 1-5.
+        // PTYPE bits 1-5.
         w.write_bit(true);
         w.write_bit(false);
         w.write_bit(false);
@@ -15659,7 +15660,7 @@ mod tests {
         w.write_bit(false);
         w.write_u32(0b111, 3); // extended PTYPE
         w.write_u32(0b000, 3); // UFEP = "000"
-                               // MPPTYPE: INTRA (000), all off, SCE-guard bit 9.
+        // MPPTYPE: INTRA (000), all off, SCE-guard bit 9.
         w.write_u32(0b000, 3);
         w.write_bit(false);
         w.write_bit(false);
@@ -15770,8 +15771,8 @@ mod tests {
         w.write_bit(false);
         w.write_u32(0b111, 3); // extended PTYPE
         w.write_u32(0b000, 3); // UFEP = "000" (no OPPTYPE)
-                               // MPPTYPE: INTRA, RPR=0, RRU=0, RTYPE=0, reserved 0,0,
-                               // SCE-guard bit 9 = 1.
+        // MPPTYPE: INTRA, RPR=0, RRU=0, RTYPE=0, reserved 0,0,
+        // SCE-guard bit 9 = 1.
         w.write_u32(0b000, 3);
         w.write_bit(false);
         w.write_bit(false);
@@ -15807,8 +15808,8 @@ mod tests {
         w.write_bit(false);
         w.write_u32(0b111, 3); // extended PTYPE
         w.write_u32(0b000, 3); // UFEP = "000" — no OPPTYPE
-                               // MPPTYPE: INTRA, RPR=0, RRU=0, RTYPE=0, reserved 0,0,
-                               // SCE-guard bit 9 = 1.
+        // MPPTYPE: INTRA, RPR=0, RRU=0, RTYPE=0, reserved 0,0,
+        // SCE-guard bit 9 = 1.
         w.write_u32(0b000, 3); // picture type
         w.write_bit(false); // RPR
         w.write_bit(false); // RRU
@@ -15817,10 +15818,10 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
         w.write_bit(false); // CPM
-                            // No CPFMT / EPAR / CPCFC / ETR / UUI / SSS — those are
-                            // UFEP=001-only or gated off in this configuration.
-                            //
-                            // §5.1.19 PQUANT = 8 + §5.1.24 PEI, then 9 GOBs × 11 MBs.
+        // No CPFMT / EPAR / CPCFC / ETR / UUI / SSS — those are
+        // UFEP=001-only or gated off in this configuration.
+        //
+        // §5.1.19 PQUANT = 8 + §5.1.24 PEI, then 9 GOBs × 11 MBs.
         write_plus_pquant_pei(&mut w, 8);
         for gob in 0..9 {
             // §5.2.2 — GOB 0 carries no header (QUANT = PQUANT = 8).
@@ -16036,11 +16037,13 @@ mod tests {
             uui: None,
             independent_segment_decoding: false,
         };
-        let outcome =
-            decode_picture_layer_with_inherited(&data, None, DecodeOptions::default(), inherited)
-                .expect(
-                "UFEP=000 INTRA picture inheriting UMV=on should still decode (rule 1 override)",
-            );
+        let outcome = decode_picture_layer_with_inherited(
+            &data,
+            None,
+            DecodeOptions::default(),
+            inherited,
+        )
+        .expect("UFEP=000 INTRA picture inheriting UMV=on should still decode (rule 1 override)");
         assert_eq!(outcome.frame.y[0], 130, "AIC prediction footprint intact");
         // Snapshot preserved un-overridden (so the next P-picture
         // re-enables UMV / AP without needing another UFEP=001).
@@ -16501,7 +16504,7 @@ mod tests {
         w.write_u32(trb, 3); // §5.1.22 TRB
         w.write_u32(dbquant, 2); // §5.1.23 DBQUANT
         w.write_bit(false); // §5.1.24 PEI = "0"
-                            // GOB 0: NO header (§5.2.2).
+        // GOB 0: NO header (§5.2.2).
         for mb in 0..11 {
             write_mb(&mut w, 0, mb);
         }
@@ -16600,7 +16603,7 @@ mod tests {
         w.write_u32(pquant as u32, 5); // §5.1.19 PQUANT
         w.write_bit(false); // §5.1.20 CPM = "0"
         w.write_bit(false); // §5.1.24 PEI = "0"
-                            // GOB 0: no header; GOBs 1..8: full headers.
+        // GOB 0: no header; GOBs 1..8: full headers.
         for mb in 0..11 {
             let _ = mb;
             write_skipped_mb(&mut w);
@@ -16733,9 +16736,9 @@ mod tests {
         }
         w.write_bit(true); // bit 15 SCE-guard
         w.write_u32(0b000, 3); // bits 16-18 reserved
-                               // §5.1.4.3 — MPPTYPE (9 bits): picture type "010"
-                               // (Improved PB), RPR/RRU/RTYPE = 0, reserved "00",
-                               // SCE-guard = 1.
+        // §5.1.4.3 — MPPTYPE (9 bits): picture type "010"
+        // (Improved PB), RPR/RRU/RTYPE = 0, reserved "00",
+        // SCE-guard = 1.
         w.write_u32(0b010, 3);
         w.write_bit(false); // RPR
         w.write_bit(false); // RRU
@@ -16743,7 +16746,7 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
-                           // §5.1.20 — CPM = 0.
+        // §5.1.20 — CPM = 0.
         w.write_bit(false);
         // §5.1.19 — PQUANT (5 bits) = 8.
         w.write_u32(8, 5);
@@ -17010,9 +17013,9 @@ mod tests {
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
         w.write_bit(false); // CPM
-                            // §5.1.19 PQUANT + §5.1.24 PEI are written by the caller (the MQ
-                            // bodies use varying GOB-0 QUANT — 16 / 8 / 4 — so the builder
-                            // supplies the matching PQUANT after this header).
+        // §5.1.19 PQUANT + §5.1.24 PEI are written by the caller (the MQ
+        // bodies use varying GOB-0 QUANT — 16 / 8 / 4 — so the builder
+        // supplies the matching PQUANT after this header).
     }
 
     /// Body shared by the §T.3 MQ-on/MQ-off comparison: a QCIF INTRA
@@ -17225,7 +17228,7 @@ mod tests {
                     // Per Table 7 the INTRA+Q codeword is "0001".
                     w.write_u32(0b0001, 4);
                     w.write_u32(0b0011, 4); // CBPY(INTRA) "0000"
-                                            // §T.2.2 arbitrary DQUANT: first bit 0 + "00110" = 6.
+                    // §T.2.2 arbitrary DQUANT: first bit 0 + "00110" = 6.
                     w.write_bit(false);
                     w.write_u32(0b00110, 5);
                 } else {

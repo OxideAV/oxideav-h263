@@ -414,7 +414,7 @@ mod tests {
         assert_eq!(ALT_HORIZONTAL_TO_BLOCK_POS[2], 2); // scan 3 -> (0,2)
         assert_eq!(ALT_HORIZONTAL_TO_BLOCK_POS[3], 3); // scan 4 -> (0,3)
         assert_eq!(ALT_HORIZONTAL_TO_BLOCK_POS[10], 4); // scan 11 -> (0,4)
-                                                        // Grid last row: `53 54 55 56 61 62 63 64`. Scan 64 -> (7,7)=63.
+        // Grid last row: `53 54 55 56 61 62 63 64`. Scan 64 -> (7,7)=63.
         assert_eq!(ALT_HORIZONTAL_TO_BLOCK_POS[63], 63);
     }
 

@@ -210,7 +210,7 @@ fn start_code_kind(data: &[u8], pos: usize) -> StartCodeKind {
 /// bytes (see [`assemble_picture_header`]) reconstitutes a parseable
 /// byte-aligned picture header.
 pub fn redundant_picture_header(picture: &[u8]) -> Result<Option<(Vec<u8>, u8)>> {
-    use crate::picture_header::{parse_picture_layer, H263PictureLayer};
+    use crate::picture_header::{H263PictureLayer, parse_picture_layer};
     use crate::plus_ptype::InheritedExtendedState;
     use oxideav_core::bits::BitReader;
 
@@ -361,8 +361,8 @@ pub fn packetize_stream(stream: &[u8], cfg: PacketizeConfig) -> Result<Vec<Vec<u
     // first two zero bytes still present in `stream` at `pos`).
     let mut at_boundary = true;
     let mut boundary_idx = 0usize; // index into `boundaries` of `pos`
-                                   // §6.1.2 — the current picture's redundant header, refreshed at
-                                   // every Picture Start Code when attachment is enabled.
+    // §6.1.2 — the current picture's redundant header, refreshed at
+    // every Picture Start Code when attachment is enabled.
     let mut redundant: Option<(Vec<u8>, u8)> = None;
 
     while pos < stream.len() {
@@ -820,7 +820,7 @@ pub fn parse_rfc2190_mode_a(payload: &[u8]) -> Result<(Rfc2190ModeA, usize)> {
 /// yields [`Error::NotImplemented`] — use the RFC 4629 packetizer
 /// ([`packetize_stream`]) for H.263+ streams.
 fn rfc2190_fields_for_picture(picture: &[u8]) -> Result<Rfc2190ModeA> {
-    use crate::picture_header::{parse_picture_layer, H263PictureCodingType, H263PictureLayer};
+    use crate::picture_header::{H263PictureCodingType, H263PictureLayer, parse_picture_layer};
     use crate::plus_ptype::InheritedExtendedState;
     use oxideav_core::bits::BitReader;
 
@@ -928,7 +928,7 @@ pub fn packetize_stream_rfc2190(stream: &[u8], cfg: PacketizeConfig) -> Result<V
     let end_bits = stream.len() as u64 * 8;
 
     while pos_bits < end_bits {
-        let at_byte = pos_bits % 8 == 0;
+        let at_byte = pos_bits.is_multiple_of(8);
         let byte_pos = (pos_bits / 8) as usize;
         let starts_at_code = at_byte && is_start_code_at(stream, byte_pos);
         // Refresh the per-picture state at every PSC.

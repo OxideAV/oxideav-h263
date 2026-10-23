@@ -7,8 +7,8 @@ use oxideav_core::{
     CodecId, CodecOptions, CodecParameters, CodecTag, Error as CoreError, Frame, Packet,
     ProbeContext, TimeBase,
 };
-use oxideav_h263::encoder::{encode_sequence, GopConfig};
-use oxideav_h263::picture::{decode_sequence, DecodeOptions, YuvFrame};
+use oxideav_h263::encoder::{GopConfig, encode_sequence};
+use oxideav_h263::picture::{DecodeOptions, YuvFrame, decode_sequence};
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(format!("tests/fixtures/{name}/input.h263")).expect("fixture stream")

@@ -84,9 +84,9 @@
 
 use oxideav_core::bits::BitReader;
 
-use crate::aic::{decode_intra_mode, IntraMode};
+use crate::aic::{IntraMode, decode_intra_mode};
 use crate::pb_layer::{
-    parse_cbpb, parse_modb, parse_modb_annex_m, parse_mvdb, BpbCodingMode, ModbAnnexM, ModbPresence,
+    BpbCodingMode, ModbAnnexM, ModbPresence, parse_cbpb, parse_modb, parse_modb_annex_m, parse_mvdb,
 };
 use crate::{Error, H263PictureCodingType, Result};
 
@@ -805,28 +805,16 @@ pub(crate) fn decode_cbpy(reader: &mut BitReader<'_>) -> Result<u8> {
                 0b0000
             } else {
                 let b2 = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
-                if b2 {
-                    0b0001
-                } else {
-                    0b0010
-                }
+                if b2 { 0b0001 } else { 0b0010 }
             }
         }
         3 => {
             let b = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
-            if b {
-                0b0100
-            } else {
-                0b1000
-            }
+            if b { 0b0100 } else { 0b1000 }
         }
         4 => {
             let b = reader.read_bit().map_err(|_| Error::UnexpectedEof)?;
-            if b {
-                0b1001
-            } else {
-                0b0110
-            }
+            if b { 0b1001 } else { 0b0110 }
         }
         _ => return Err(Error::BadCbpyCode),
     })
@@ -1349,7 +1337,7 @@ mod tests {
         w.write_bit(false); // COD = 0
         w.write_bit(true); // MCBPC "1"
         w.write_u32(0b0011, 4); // CBPY idx 0
-                                // MVD horizontal "1" (idx 32, vector 0)
+        // MVD horizontal "1" (idx 32, vector 0)
         w.write_bit(true);
         // MVD vertical "1"
         w.write_bit(true);
@@ -1379,7 +1367,7 @@ mod tests {
         w.write_bit(false); // COD = 0
         w.write_u32(0b010, 3); // MCBPC idx 8
         w.write_u32(0b11, 2); // CBPY idx 15 pattern 1111
-                              // Four MVDs (each = (0,0) = "1","1")
+        // Four MVDs (each = (0,0) = "1","1")
         for _ in 0..4 {
             w.write_bit(true); // dx = 0
             w.write_bit(true); // dy = 0
@@ -1431,7 +1419,7 @@ mod tests {
         w.write_bit(false); // COD = 0
         w.write_bit(true); // MCBPC "1"
         w.write_u32(0b0011, 4); // CBPY pattern 0000
-                                // MVD dx = +1 (code "010"), dy = -1 (code "011")
+        // MVD dx = +1 (code "010"), dy = -1 (code "011")
         w.write_u32(0b010, 3);
         w.write_u32(0b011, 3);
         let bytes = finish_aligned(w);
@@ -1456,7 +1444,7 @@ mod tests {
         w.write_bit(false); // COD
         w.write_bit(true); // MCBPC "1"
         w.write_u32(0b0011, 4); // CBPY pattern 0000
-                                // dx = -16 (half -32)
+        // dx = -16 (half -32)
         w.write_u32(0b0_0000_0000_0010_1, 13);
         // dy = +15.5 (half +31)
         w.write_u32(0b0_0000_0000_0011_0, 13);
@@ -1798,8 +1786,9 @@ mod tests {
     #[test]
     fn composes_with_gob_layer_header_then_one_intra_mb() {
         use crate::{
+            PSC_BITS, PSC_VALUE,
             gob_header::{GBSC_BITS, GBSC_VALUE, GFID_BITS, GN_BITS, GQUANT_BITS},
-            parse_gob_layer, parse_picture_header, PSC_BITS, PSC_VALUE,
+            parse_gob_layer, parse_picture_header,
         };
 
         let mut w = BitWriter::new();
@@ -1822,7 +1811,7 @@ mod tests {
         w.write_u32(1, GN_BITS);
         w.write_u32(0, GFID_BITS);
         w.write_u32(5, GQUANT_BITS); // QUANT=5
-                                     // One intra MB: MCBPC "1", CBPY "0011" (pattern 0000).
+        // One intra MB: MCBPC "1", CBPY "0011" (pattern 0000).
         w.write_bit(true);
         w.write_u32(0b0011, 4);
         while !w.is_byte_aligned() {

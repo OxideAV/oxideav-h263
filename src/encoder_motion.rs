@@ -34,9 +34,9 @@
 //! search scores is bit-identical to what the decoder will reconstruct.
 
 use crate::motion::{
-    median3, motion_compensate_block, predict_mv_median, reconstruct_mv_component_umv,
-    select_4mv_candidates, LumaBlockIndex, Mb4Mv, Mb4MvNeighbourhood, MotionVector, RefPlane,
-    MV_HALF_MAX, MV_HALF_MIN, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN, RCONTROL_DEFAULT,
+    LumaBlockIndex, MV_HALF_MAX, MV_HALF_MIN, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN, Mb4Mv,
+    Mb4MvNeighbourhood, MotionVector, RCONTROL_DEFAULT, RefPlane, median3, motion_compensate_block,
+    predict_mv_median, reconstruct_mv_component_umv, select_4mv_candidates,
 };
 use crate::picture::YuvFrame;
 
@@ -132,7 +132,7 @@ impl MvGrid {
         // carries a header — the top macroblock row of each GOB (the
         // §6.1.1 rule-3 "outside the GOB at the top" case the decoder
         // applies whenever `gob_header_present` held for that GOB).
-        let top_border = row == 0 || self.rows_per_gob.is_some_and(|k| row % k == 0);
+        let top_border = row == 0 || self.rows_per_gob.is_some_and(|k| row.is_multiple_of(k));
 
         // MV2 — above neighbour; = MV1 at the top border.
         let mv2 = if top_border {
@@ -921,7 +921,7 @@ mod tests {
     /// is refused.
     #[test]
     fn umv_mvd_component_inverts_reconstruction_exhaustively() {
-        use crate::motion::{reconstruct_mv_component_umv, MV_UMV_HALF_MAX, MV_UMV_HALF_MIN};
+        use crate::motion::{MV_UMV_HALF_MAX, MV_UMV_HALF_MIN, reconstruct_mv_component_umv};
         for pred in MV_UMV_HALF_MIN..=MV_UMV_HALF_MAX {
             // §D.2 reachable set for this predictor.
             let reachable = |mv: i32| -> bool {

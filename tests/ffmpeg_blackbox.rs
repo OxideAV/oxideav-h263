@@ -16,13 +16,13 @@
 //! failing premise behind `#[ignore]`.
 
 use oxideav_h263::encoder::{
-    encode_improved_pb_picture, encode_inter_picture_aic_plus, encode_inter_picture_ap,
-    encode_inter_picture_deblock, encode_inter_picture_motion, encode_inter_picture_umv_plus,
-    encode_intra_picture, encode_intra_picture_aic_plus, encode_intra_picture_deblock,
-    encode_pb_picture, encode_pb_picture_ap, encode_pb_picture_umv, encode_sequence, DeblockConfig,
-    GopConfig, ImprovedPbConfig, PbConfig,
+    DeblockConfig, GopConfig, ImprovedPbConfig, PbConfig, encode_improved_pb_picture,
+    encode_inter_picture_aic_plus, encode_inter_picture_ap, encode_inter_picture_deblock,
+    encode_inter_picture_motion, encode_inter_picture_umv_plus, encode_intra_picture,
+    encode_intra_picture_aic_plus, encode_intra_picture_deblock, encode_pb_picture,
+    encode_pb_picture_ap, encode_pb_picture_umv, encode_sequence,
 };
-use oxideav_h263::picture::{decode_sequence, DecodeOptions, YuvFrame};
+use oxideav_h263::picture::{DecodeOptions, YuvFrame, decode_sequence};
 use std::path::PathBuf;
 use std::process::Command;
 

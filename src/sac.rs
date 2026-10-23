@@ -34,7 +34,7 @@
 //! and — when PLUSPTYPE is present — not with Unrestricted Motion
 //! Vector mode either. The picture drivers enforce these.
 
-use crate::block::{tcoef_table_index, tcoef_table_row, H263Block, TCOEF_ESCAPE_INDEX};
+use crate::block::{H263Block, TCOEF_ESCAPE_INDEX, tcoef_table_index, tcoef_table_row};
 use crate::macroblock::MbType;
 use crate::{Error, Result};
 use oxideav_core::bits::{BitReader, BitWriter};
@@ -894,12 +894,12 @@ fn encode_tcoef_event_sac(
     }
     let model = tcoef_model(event_ordinal, mb_is_intra);
     let abs_level = level.unsigned_abs();
-    if abs_level <= u8::MAX as u16 {
-        if let Some(index) = tcoef_table_index(last, run, abs_level as u8) {
-            enc.encode_symbol(index, model);
-            enc.encode_symbol(if level < 0 { 1 } else { 0 }, &CUMF_SIGN);
-            return Ok(());
-        }
+    if abs_level <= u8::MAX as u16
+        && let Some(index) = tcoef_table_index(last, run, abs_level as u8)
+    {
+        enc.encode_symbol(index, model);
+        enc.encode_symbol(if level < 0 { 1 } else { 0 }, &CUMF_SIGN);
+        return Ok(());
     }
     // ESCAPE: LAST / RUN / LEVEL models. §5.4.2 bounds LEVEL to
     // [-127, +127] \ {0} (no Annex T extension in SAC — §5.1.4.6 bars

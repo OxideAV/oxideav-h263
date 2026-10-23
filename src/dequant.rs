@@ -29,7 +29,7 @@
 //! applies the [`crate::ZIGZAG_TO_BLOCK_POS`] permutation to produce
 //! an 8×8 row-major block ready for IDCT.
 
-use crate::block::{H263Block, COEFFS_PER_BLOCK, ZIGZAG_TO_BLOCK_POS};
+use crate::block::{COEFFS_PER_BLOCK, H263Block, ZIGZAG_TO_BLOCK_POS};
 
 /// §6.2.2 AC reconstruction-level clip bounds.
 pub const AC_REC_MIN: i16 = -2048;

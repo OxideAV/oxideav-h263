@@ -5,8 +5,8 @@
 //! rises monotonically as QP coarsens — and prints the measured table
 //! (run with `--nocapture`) so the README numbers stay reproducible.
 
-use oxideav_h263::encoder::{encode_sequence, GopConfig};
-use oxideav_h263::picture::{decode_sequence, DecodeOptions, YuvFrame};
+use oxideav_h263::encoder::{GopConfig, encode_sequence};
+use oxideav_h263::picture::{DecodeOptions, YuvFrame, decode_sequence};
 
 fn textured(lw: usize, lh: usize, seed: usize) -> YuvFrame {
     let mut y = vec![0u8; lw * lh];

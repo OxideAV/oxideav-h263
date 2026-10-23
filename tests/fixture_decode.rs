@@ -22,7 +22,7 @@
 //! checked byte-for-byte against the reference SHA-256 recorded in the
 //! fixture's `notes.md`.
 
-use oxideav_h263::picture::{decode_sequence, DecodeOptions, YuvFrame};
+use oxideav_h263::picture::{DecodeOptions, YuvFrame, decode_sequence};
 
 /// Concatenate a frame's Y, Cb, Cr planes into the planar layout the
 /// reference `expected.yuv` files use (full Y plane, then Cb, then Cr).
@@ -387,7 +387,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             *word = u32::from_be_bytes([

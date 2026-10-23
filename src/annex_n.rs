@@ -93,11 +93,7 @@ impl GobNewpredFields {
     /// reference (§N.4.1.4 TRP present), else `None` (the caller falls
     /// back to "the most recent temporally previous anchor picture").
     pub fn segment_trp(&self) -> Option<u16> {
-        if self.trpi {
-            self.trp
-        } else {
-            None
-        }
+        if self.trpi { self.trp } else { None }
     }
 }
 

@@ -7,10 +7,10 @@ use oxideav_h263::encoder::{
     encode_inter_picture_motion, encode_intra_picture, encode_intra_picture_sac,
 };
 use oxideav_h263::picture::{
-    decode_picture_no_gob0_header, decode_picture_sac, decode_sequence, extract_psupp,
-    insert_psupp, DecodeOptions, YuvFrame,
+    DecodeOptions, YuvFrame, decode_picture_no_gob0_header, decode_picture_sac, decode_sequence,
+    extract_psupp, insert_psupp,
 };
-use oxideav_h263::{parse_psupp, write_psupp, PictureMessage, PictureRect, SeiFunction};
+use oxideav_h263::{PictureMessage, PictureRect, SeiFunction, parse_psupp, write_psupp};
 
 fn gradient(seed: usize) -> YuvFrame {
     let mut f = YuvFrame::grey(176, 144);

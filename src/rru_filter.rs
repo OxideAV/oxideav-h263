@@ -68,7 +68,7 @@
 //! callers that reconstruct an RRU picture invoke [`rru_filter_plane`]
 //! on each reconstructed plane before storing it as a reference.
 
-use crate::deblock::{apply_edge_samples, Sample, STRENGTH_RRU_INFINITE};
+use crate::deblock::{STRENGTH_RRU_INFINITE, Sample, apply_edge_samples};
 
 /// Side length, in pixels, of an RRU reconstructed block. The §Q.7
 /// boundary filter runs along the edges of these 16 × 16 blocks (the
@@ -243,12 +243,12 @@ pub fn rru_filter_plane<F>(
     F: FnMut((usize, usize), (usize, usize)) -> RruEdgeCondition,
 {
     assert!(
-        width % RRU_BLOCK_DIM == 0,
+        width.is_multiple_of(RRU_BLOCK_DIM),
         "rru_filter_plane: width must be a multiple of 16, got {}",
         width
     );
     assert!(
-        height % RRU_BLOCK_DIM == 0,
+        height.is_multiple_of(RRU_BLOCK_DIM),
         "rru_filter_plane: height must be a multiple of 16, got {}",
         height
     );
@@ -362,7 +362,7 @@ mod tests {
             // Column 15 (block1 last) and 16 (block2 first) filtered.
             assert_eq!(plane[y * w + 15], rru_default_tap(40, 80)); // (120+80+2)/4=50
             assert_eq!(plane[y * w + 16], rru_default_tap(80, 40)); // (240+40+2)/4=70
-                                                                    // Interior columns away from the boundary are untouched.
+            // Interior columns away from the boundary are untouched.
             assert_eq!(plane[y * w + 14], 40);
             assert_eq!(plane[y * w + 17], 80);
             assert_eq!(plane[y * w], 40);
@@ -453,7 +453,7 @@ mod tests {
             assert_eq!(plane[y * w + 15], 107, "B1"); // B
             assert_eq!(plane[y * w + 16], 113, "C1"); // C
             assert_eq!(plane[y * w + 17], 117, "D1"); // D
-                                                      // Beyond the four-pixel filter window: untouched.
+            // Beyond the four-pixel filter window: untouched.
             assert_eq!(plane[y * w + 13], 100);
             assert_eq!(plane[y * w + 18], 120);
         }

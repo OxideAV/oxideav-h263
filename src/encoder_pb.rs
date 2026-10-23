@@ -39,25 +39,25 @@
 //! inside an elementary stream — [`crate::picture::decode_sequence`],
 //! which splices the decoded pair in display order (B before P).
 
-use crate::block::{H263Block, COEFFS_PER_BLOCK};
+use crate::block::{COEFFS_PER_BLOCK, H263Block};
 use crate::encoder::{
-    extract_macroblock, motion_compensated_block, residual_of, source_format_for,
-    write_picture_header, write_plus_picture_header, PbConfig, PlusModes, PtypeFlags,
+    PbConfig, PlusModes, PtypeFlags, extract_macroblock, motion_compensated_block, residual_of,
+    source_format_for, write_picture_header, write_plus_picture_header,
 };
 use crate::encoder_block::{
-    encode_inter_block, encode_intra_block, write_inter_block_coeffs, write_intra_block,
-    EncodedInterBlock, EncodedIntraBlock,
+    EncodedInterBlock, EncodedIntraBlock, encode_inter_block, encode_intra_block,
+    write_inter_block_coeffs, write_intra_block,
 };
-use crate::encoder_motion::{estimate_block_motion, estimate_motion, mvd_for, Mv4Grid, MvGrid};
+use crate::encoder_motion::{Mv4Grid, MvGrid, estimate_block_motion, estimate_motion, mvd_for};
 use crate::encoder_vlc::{write_cbpy, write_mcbpc_p, write_mvd_component};
 use crate::macroblock::{MbType, Mvd};
 use crate::motion::{
-    chroma_mv, chroma_mv_4mv, obmc_predict_block, LumaBlockIndex, Mb4Mv, MotionVector, RefPlane,
-    RemoteMv, RCONTROL_DEFAULT,
+    LumaBlockIndex, Mb4Mv, MotionVector, RCONTROL_DEFAULT, RefPlane, RemoteMv, chroma_mv,
+    chroma_mv_4mv, obmc_predict_block,
 };
 use crate::pb_layer::{
-    pb_bquant, write_modb_annex_m, BpbCodingMode, ModbAnnexM, PbBMacroblockPrediction,
-    PbBReferencePlanes,
+    BpbCodingMode, ModbAnnexM, PbBMacroblockPrediction, PbBReferencePlanes, pb_bquant,
+    write_modb_annex_m,
 };
 use crate::picture::YuvFrame;
 use crate::{Error, Result};
@@ -525,7 +525,7 @@ fn encode_pb_core(
     let mb_cols = lw / 16;
     let mb_rows = lh / 16;
     let is_intra_mb =
-        |idx: usize| -> bool { core.intra_refresh > 0 && idx % core.intra_refresh == 0 };
+        |idx: usize| -> bool { core.intra_refresh > 0 && idx.is_multiple_of(core.intra_refresh) };
 
     // ---- Header. ------------------------------------------------------
     let mut w = BitWriter::new();
@@ -643,11 +643,12 @@ fn encode_pb_core(
     for mb_row in 0..mb_rows {
         // §K.2 — SSTUF + SSC slice header at every slice start after
         // the first (reduced-header) slice.
-        if let Some(ctx) = slice_ctx.as_ref() {
-            if mb_row > 0 && mb_row % core.slice_rows == 0 {
-                let mba = (mb_row * mb_cols) as u32;
-                crate::slice_header::write_slice_layer(&mut w, ctx, mba, quant, gfid, None)?;
-            }
+        if let Some(ctx) = slice_ctx.as_ref()
+            && mb_row > 0
+            && mb_row % core.slice_rows == 0
+        {
+            let mba = (mb_row * mb_cols) as u32;
+            crate::slice_header::write_slice_layer(&mut w, ctx, mba, quant, gfid, None)?;
         }
         // §M.2.2 — the forward-vector predictor restarts at the far-left
         // edge of every macroblock row (the decoder resets it per row,

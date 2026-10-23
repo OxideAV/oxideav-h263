@@ -16,7 +16,7 @@
 //! coefficients.
 
 use crate::block::COEFFS_PER_BLOCK;
-use crate::encoder_vlc::{write_intradc, write_tcoef, TcoefEvent};
+use crate::encoder_vlc::{TcoefEvent, write_intradc, write_tcoef};
 use crate::fdct::{fdct_8x8, forward_quantise_block, quantise_intradc};
 use crate::{Error, Result};
 use oxideav_core::bits::BitWriter;
@@ -164,7 +164,7 @@ pub fn encode_inter_block(residual: &[i16; COEFFS_PER_BLOCK], quant: u8) -> Enco
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{parse_block, BlockContext};
+    use crate::block::{BlockContext, parse_block};
     use crate::{reconstruct_inter_block_with_prediction, reconstruct_intra_block};
     use oxideav_core::bits::BitReader;
 

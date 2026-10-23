@@ -8,7 +8,7 @@ use oxideav_h263::encoder::{
     encode_intra_picture_rru, encode_intra_picture_rru_deblock,
 };
 use oxideav_h263::motion::{rru_actual_component, rru_pseudo_component};
-use oxideav_h263::picture::{decode_picture_layer, decode_sequence, DecodeOptions, YuvFrame};
+use oxideav_h263::picture::{DecodeOptions, YuvFrame, decode_picture_layer, decode_sequence};
 
 /// A deterministic gradient frame on every plane.
 fn gradient(lw: usize, lh: usize, seed: u8) -> YuvFrame {

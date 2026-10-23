@@ -5,7 +5,7 @@
 //! reconstruction).
 
 use oxideav_h263::encoder::{encode_inter_picture_isd, encode_intra_picture_isd};
-use oxideav_h263::picture::{decode_sequence, DecodeOptions, YuvFrame};
+use oxideav_h263::picture::{DecodeOptions, YuvFrame, decode_sequence};
 
 /// A frame with strong horizontal banding plus a diagonal gradient, so
 /// vertical motion crosses GOB-segment boundaries with high-contrast
@@ -120,7 +120,7 @@ fn isd_stream_decodes_through_streaming_step_api() {
     // Decode the stream picture by picture through the streaming step
     // API (which threads the cross-picture state exactly like
     // decode_sequence) — the registry decoder's path.
-    use oxideav_h263::picture::{decode_sequence_step, next_picture_start_code, SequenceState};
+    use oxideav_h263::picture::{SequenceState, decode_sequence_step, next_picture_start_code};
     let (stream, recons) = encode_isd_stream();
     let mut state = SequenceState::default();
     let mut frames: Vec<YuvFrame> = Vec::new();

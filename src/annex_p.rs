@@ -718,7 +718,7 @@ mod tests {
         // takes none.
         let mut w = BitWriter::new();
         w.write_u32(0b11, 2); // WDA = 1/16
-                              // Pair 1: (+1, +1) => "000000" + EPB "1".
+        // Pair 1: (+1, +1) => "000000" + EPB "1".
         write_table_d3(&mut w, 1).unwrap();
         write_table_d3(&mut w, 1).unwrap();
         w.write_bit(true);

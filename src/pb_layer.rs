@@ -170,8 +170,8 @@
 
 use oxideav_core::bits::BitReader;
 
-use crate::macroblock::{decode_mvd_component, Mvd};
-use crate::motion::{chroma_mv_component_4mv, motion_compensate_block, MotionVector, RefPlane};
+use crate::macroblock::{Mvd, decode_mvd_component};
+use crate::motion::{MotionVector, RefPlane, chroma_mv_component_4mv, motion_compensate_block};
 use crate::{Error, Result};
 
 /// Field width of the §5.3.4 CBPB Coded Block Pattern for B-blocks.
@@ -769,11 +769,7 @@ pub fn pb_b_bidir_extent_component(
     // truncation toward zero, the same as Rust's signed `/`.
     let lo = block_lo.max((-mvb_component + 1) / 2);
     let hi = block_hi.min(ref_max - (mvb_component + 1) / 2);
-    if lo <= hi {
-        Some((lo, hi))
-    } else {
-        None
-    }
+    if lo <= hi { Some((lo, hi)) } else { None }
 }
 
 /// §G.5 bidirectional-prediction rectangle for one 8 × 8 luma
@@ -1242,7 +1238,7 @@ pub fn pb_b_predict_macroblock_deltas(
         "§G.5 PREC Cr must be one 8 × 8 block"
     );
     assert!(
-        mb_x % 16 == 0 && mb_y % 16 == 0,
+        mb_x.is_multiple_of(16) && mb_y.is_multiple_of(16),
         "macroblock position must sit on the §4.2.3 16-pixel grid"
     );
 
@@ -2148,9 +2144,9 @@ mod tests {
     fn pb_b_vector_chained_after_modb_annex_m_and_mvdb_parse() {
         let mut w = BitWriter::new();
         w.write_u32(0b110, 3); // §M.4 Table M.1 row 2 (forward + MVDB)
-                               // MVDB dx = +1 — Table 14 entry "+1 in half-pel" sits at
-                               // VLC `010` per the established §5.3.7 transcription used in
-                               // earlier MVDB tests of this module.
+        // MVDB dx = +1 — Table 14 entry "+1 in half-pel" sits at
+        // VLC `010` per the established §5.3.7 transcription used in
+        // earlier MVDB tests of this module.
         w.write_u32(0b010, 3);
         // MVDB dy = -1 — Table 14 entry "-1 in half-pel" is VLC `011`.
         w.write_u32(0b011, 3);
@@ -2625,7 +2621,7 @@ mod tests {
         }
     }
 
-    use crate::motion::{RefPlane, RCONTROL_DEFAULT};
+    use crate::motion::{RCONTROL_DEFAULT, RefPlane};
 
     /// Build a 16 × 16 uniform-fill reference plane.
     fn uniform_plane(fill: u8) -> Vec<u8> {

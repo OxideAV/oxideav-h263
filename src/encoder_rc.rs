@@ -23,14 +23,14 @@
 //! [`crate::encoder::RateControlConfig::mb_adaptive`] is set.
 
 use crate::encoder::{
-    extract_macroblock, motion_compensated_block, residual_of, source_format_for,
-    write_picture_header, PtypeFlags,
+    PtypeFlags, extract_macroblock, motion_compensated_block, residual_of, source_format_for,
+    write_picture_header,
 };
-use crate::encoder_block::{encode_inter_block, EncodedInterBlock};
+use crate::encoder_block::{EncodedInterBlock, encode_inter_block};
 use crate::encoder_mb::{
     encode_inter_macroblock_dq, encode_intra_macroblock_dq, encode_skipped_macroblock,
 };
-use crate::encoder_motion::{estimate_motion, mvd_for, MvGrid};
+use crate::encoder_motion::{MvGrid, estimate_motion, mvd_for};
 use crate::motion::chroma_mv;
 use crate::picture::YuvFrame;
 use crate::{Error, Result};
@@ -322,7 +322,7 @@ pub fn encode_inter_picture_adaptive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picture::{decode_picture_no_gob0_header, DecodeOptions};
+    use crate::picture::{DecodeOptions, decode_picture_no_gob0_header};
 
     fn textured(lw: usize, lh: usize, seed: usize) -> YuvFrame {
         let mut y = vec![0u8; lw * lh];

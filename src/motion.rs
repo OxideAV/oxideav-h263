@@ -401,11 +401,11 @@ pub fn chroma_mv_component(l: i32) -> i32 {
     // symmetrically about zero (Table 18 is symmetric for ±).
     let sign = if l < 0 { -1 } else { 1 };
     let mag = l.unsigned_abs() as i32; // luma half-pel magnitude
-                                       // quarter-pel magnitude = mag (because 1 luma half-pel == 1 chroma
-                                       // quarter-pel after the /2). Express in chroma half-pel units:
-                                       //   full pixels  = mag / 4   (each pixel is 4 quarter-pels)
-                                       //   remainder    = mag % 4   (0..3 quarter-pels)
-                                       // Table 18: remainder 0 -> +0 half-pel, remainder 1/2/3 -> +1 half-pel.
+    // quarter-pel magnitude = mag (because 1 luma half-pel == 1 chroma
+    // quarter-pel after the /2). Express in chroma half-pel units:
+    //   full pixels  = mag / 4   (each pixel is 4 quarter-pels)
+    //   remainder    = mag % 4   (0..3 quarter-pels)
+    // Table 18: remainder 0 -> +0 half-pel, remainder 1/2/3 -> +1 half-pel.
     let full_pixels = mag / 4;
     let rem = mag % 4;
     let frac_half = if rem == 0 { 0 } else { 1 };

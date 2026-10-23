@@ -22,11 +22,11 @@
 //! (sub-QCIF .. 16CIF) are supported. A frame whose dimensions do not
 //! match a standard source format is rejected.
 
-use crate::aic::{write_intra_mode, IntraMode};
+use crate::aic::{IntraMode, write_intra_mode};
 use crate::aic_predict::Neighbour;
 use crate::block::COEFFS_PER_BLOCK;
-use crate::encoder_aic::{plan_intra_block_aic, write_intra_block_aic, AicBlockPlan};
-use crate::encoder_mb::{encode_intra_macroblock, MacroblockSamples};
+use crate::encoder_aic::{AicBlockPlan, plan_intra_block_aic, write_intra_block_aic};
+use crate::encoder_mb::{MacroblockSamples, encode_intra_macroblock};
 use crate::encoder_vlc::{write_cbpy, write_mcbpc_i};
 use crate::macroblock::MbType;
 use crate::picture::YuvFrame;
@@ -35,16 +35,16 @@ use crate::{Error, Result};
 use oxideav_core::bits::BitWriter;
 
 pub use crate::encoder_deblock::{
-    encode_inter_picture_deblock, encode_intra_picture_deblock, DeblockConfig,
+    DeblockConfig, encode_inter_picture_deblock, encode_intra_picture_deblock,
 };
 pub use crate::encoder_pb::{
-    encode_improved_pb_picture, encode_improved_pb_picture_stats, encode_pb_picture_ap,
-    encode_pb_picture_ap_stats, encode_pb_picture_umv, encode_pb_picture_umv_stats,
-    ImprovedPbConfig, ImprovedPbStats,
+    ImprovedPbConfig, ImprovedPbStats, encode_improved_pb_picture,
+    encode_improved_pb_picture_stats, encode_pb_picture_ap, encode_pb_picture_ap_stats,
+    encode_pb_picture_umv, encode_pb_picture_umv_stats,
 };
 pub use crate::encoder_rc::{
-    encode_inter_picture_adaptive, encode_intra_picture_adaptive, AdaptiveQuantConfig,
-    AdaptiveQuantPicture,
+    AdaptiveQuantConfig, AdaptiveQuantPicture, encode_inter_picture_adaptive,
+    encode_intra_picture_adaptive,
 };
 
 /// Map standard luma dimensions to the §5.1.3 source-format selector.
@@ -163,7 +163,7 @@ pub(crate) fn write_picture_header(
     w.write_bit(flags.sac); // SAC (Annex E)
     w.write_bit(flags.advanced_prediction); // AP (Annex F)
     w.write_bit(pb_fields.is_some()); // PB (Annex G)
-                                      // §5.1.19 — PQUANT (5 bits).
+    // §5.1.19 — PQUANT (5 bits).
     w.write_bits(quant as u32, 5);
     // §5.1.20 — CPM (1 bit); §5.1.21 — PSBI (2 bits) follows a set CPM.
     match flags.cpm_psbi {
@@ -533,7 +533,7 @@ where
     F: FnMut(usize) -> u8,
 {
     use crate::plus_ptype::SliceStructuredSubmode;
-    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+    use crate::slice_header::{SliceHeaderContext, write_first_slice_header, write_slice_layer};
 
     let fmt =
         source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
@@ -624,7 +624,7 @@ where
 {
     use crate::plus_ptype::SliceStructuredSubmode;
     use crate::slice_header::{
-        write_first_slice_header, write_slice_layer_cpm, SliceHeaderContext,
+        SliceHeaderContext, write_first_slice_header, write_slice_layer_cpm,
     };
 
     if sub_bitstream > 3 {
@@ -769,7 +769,7 @@ fn encode_intra_picture_rru_impl(
     tr: u8,
     deblock: bool,
 ) -> Result<Vec<u8>> {
-    use crate::encoder_mb::{encode_intra_macroblock, MacroblockSamples};
+    use crate::encoder_mb::{MacroblockSamples, encode_intra_macroblock};
 
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -907,7 +907,7 @@ fn encode_inter_picture_rru_impl(
     umv: bool,
     deblock: bool,
 ) -> Result<Vec<u8>> {
-    use crate::motion::{rru_actual_mv, rru_pseudo_mv, MotionVector};
+    use crate::motion::{MotionVector, rru_actual_mv, rru_pseudo_mv};
 
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -1189,10 +1189,10 @@ pub fn encode_inter_picture_ap_slices_rect(
     stripe_width_mbs: usize,
     arbitrary_order: bool,
 ) -> Result<Vec<u8>> {
-    use crate::encoder_motion::{estimate_block_motion, mvd_for, Mv4Grid};
-    use crate::motion::{chroma_mv_4mv, LumaBlockIndex, Mb4Mv, MotionVector, RemoteMv};
+    use crate::encoder_motion::{Mv4Grid, estimate_block_motion, mvd_for};
+    use crate::motion::{LumaBlockIndex, Mb4Mv, MotionVector, RemoteMv, chroma_mv_4mv};
     use crate::plus_ptype::SliceStructuredSubmode;
-    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+    use crate::slice_header::{SliceHeaderContext, write_first_slice_header, write_slice_layer};
 
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -1440,7 +1440,7 @@ fn encode_picture_slices_rect_impl(
     arbitrary_order: bool,
 ) -> Result<Vec<u8>> {
     use crate::plus_ptype::SliceStructuredSubmode;
-    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+    use crate::slice_header::{SliceHeaderContext, write_first_slice_header, write_slice_layer};
 
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -1605,7 +1605,7 @@ fn encode_intra_picture_slices_aic_core(
     modified_quant: bool,
 ) -> Result<Vec<u8>> {
     use crate::plus_ptype::SliceStructuredSubmode;
-    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+    use crate::slice_header::{SliceHeaderContext, write_first_slice_header, write_slice_layer};
 
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -1742,7 +1742,7 @@ pub fn encode_intra_picture(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u
 /// entropy layer differs. Decodes through
 /// [`crate::picture::decode_picture_sac`] (and [`decode_sequence`]).
 pub fn encode_intra_picture_sac(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
-    use crate::sac::{encode_intra_macroblock_sac, SacEncoder};
+    use crate::sac::{SacEncoder, encode_intra_macroblock_sac};
 
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -1806,7 +1806,7 @@ pub fn encode_inter_picture_sac(
     quant: u8,
     tr: u8,
 ) -> Result<Vec<u8>> {
-    use crate::sac::{encode_inter_macroblock_sac, encode_skipped_macroblock_sac, SacEncoder};
+    use crate::sac::{SacEncoder, encode_inter_macroblock_sac, encode_skipped_macroblock_sac};
 
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -1913,8 +1913,8 @@ pub fn encode_inter_picture_motion_sac(
     search_half: i32,
 ) -> Result<Vec<u8>> {
     use crate::sac::{
-        encode_inter_macroblock_sac, encode_intra_macroblock_sac, encode_skipped_macroblock_sac,
-        SacEncoder,
+        SacEncoder, encode_inter_macroblock_sac, encode_intra_macroblock_sac,
+        encode_skipped_macroblock_sac,
     };
 
     if quant == 0 || quant > 31 {
@@ -2095,9 +2095,9 @@ pub fn encode_inter_picture_ap_sac(
     tr: u8,
     search_half: i32,
 ) -> Result<Vec<u8>> {
-    use crate::encoder_motion::{estimate_block_motion, mvd_for, Mv4Grid};
-    use crate::motion::{chroma_mv_4mv, LumaBlockIndex, Mb4Mv, MotionVector, RemoteMv};
-    use crate::sac::{encode_inter4v_macroblock_sac, SacEncoder};
+    use crate::encoder_motion::{Mv4Grid, estimate_block_motion, mvd_for};
+    use crate::motion::{LumaBlockIndex, Mb4Mv, MotionVector, RemoteMv, chroma_mv_4mv};
+    use crate::sac::{SacEncoder, encode_inter4v_macroblock_sac};
 
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -2298,10 +2298,10 @@ pub fn encode_pb_picture_sac(
     prev_tr: u8,
     cfg: &PbConfig,
 ) -> Result<Vec<u8>> {
-    use crate::pb_layer::{pb_b_predict_macroblock, pb_bquant, ModbPresence, PbBReferencePlanes};
+    use crate::pb_layer::{ModbPresence, PbBReferencePlanes, pb_b_predict_macroblock, pb_bquant};
     use crate::sac::{
-        encode_cbpb_sac, encode_cbpy_sac, encode_cod, encode_mcbpc_p_sac, encode_modb_sac,
-        encode_mvd_component_sac, encode_skipped_macroblock_sac, write_block_sac, SacEncoder,
+        SacEncoder, encode_cbpb_sac, encode_cbpy_sac, encode_cod, encode_mcbpc_p_sac,
+        encode_modb_sac, encode_mvd_component_sac, encode_skipped_macroblock_sac, write_block_sac,
     };
 
     if cfg.quant == 0 || cfg.quant > 31 {
@@ -3153,7 +3153,7 @@ pub fn encode_inter_picture_aic_plus(
     intra_refresh: usize,
 ) -> Result<Vec<u8>> {
     use crate::encoder_block::encode_inter_block;
-    use crate::encoder_motion::{estimate_motion, mvd_for, MvGrid};
+    use crate::encoder_motion::{MvGrid, estimate_motion, mvd_for};
     use crate::encoder_vlc::write_mvd_component;
 
     if quant == 0 || quant > 31 {
@@ -3197,7 +3197,7 @@ pub fn encode_inter_picture_aic_plus(
         for mb_col in 0..mb_cols {
             let idx = mb_row * mb_cols + mb_col;
             let src = extract_macroblock(frame, mb_col, mb_row);
-            if intra_refresh > 0 && idx % intra_refresh == 0 {
+            if intra_refresh > 0 && idx.is_multiple_of(intra_refresh) {
                 // COD = 0, then the §I macroblock: MCBPC (Table 8, INTRA),
                 // INTRA_MODE, CBPY, the six Table-I.2 block streams.
                 let plan =
@@ -3886,9 +3886,9 @@ fn encode_inter_picture_ap_impl(
     umv_plus: bool,
 ) -> Result<Vec<u8>> {
     use crate::encoder_motion::{
-        estimate_block_motion, estimate_block_motion_umv_plus, mvd_for, Mv4Grid,
+        Mv4Grid, estimate_block_motion, estimate_block_motion_umv_plus, mvd_for,
     };
-    use crate::motion::{chroma_mv_4mv, LumaBlockIndex, Mb4Mv, MotionVector, RemoteMv};
+    use crate::motion::{LumaBlockIndex, Mb4Mv, MotionVector, RemoteMv, chroma_mv_4mv};
 
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -4129,10 +4129,10 @@ pub fn encode_inter_picture_ap_slices(
     search_half: i32,
     mb_rows_per_slice: usize,
 ) -> Result<Vec<u8>> {
-    use crate::encoder_motion::{estimate_block_motion, mvd_for, Mv4Grid};
-    use crate::motion::{chroma_mv_4mv, LumaBlockIndex, Mb4Mv, MotionVector, RemoteMv};
+    use crate::encoder_motion::{Mv4Grid, estimate_block_motion, mvd_for};
+    use crate::motion::{LumaBlockIndex, Mb4Mv, MotionVector, RemoteMv, chroma_mv_4mv};
     use crate::plus_ptype::SliceStructuredSubmode;
-    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+    use crate::slice_header::{SliceHeaderContext, write_first_slice_header, write_slice_layer};
 
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -4470,10 +4470,10 @@ pub fn encode_intra_picture_dps(
     mb_rows_per_slice: usize,
 ) -> Result<Vec<u8>> {
     use crate::annex_v::{
-        write_dps_mb_header, DpsMbHeader, HEADER_MARKER, HEADER_MARKER_BITS, TABLE_V1_INTRA,
+        DpsMbHeader, HEADER_MARKER, HEADER_MARKER_BITS, TABLE_V1_INTRA, write_dps_mb_header,
     };
     use crate::encoder_vlc::write_cbpy;
-    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+    use crate::slice_header::{SliceHeaderContext, write_first_slice_header, write_slice_layer};
 
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -4588,11 +4588,11 @@ pub fn encode_inter_picture_dps(
     mb_rows_per_slice: usize,
 ) -> Result<Vec<u8>> {
     use crate::annex_v::{
-        write_dps_mb_header, DpsMbHeader, MvdEmulationState, HEADER_MARKER, HEADER_MARKER_BITS,
-        MOTION_VECTOR_MARKER, MOTION_VECTOR_MARKER_BITS, TABLE_V2_INTER,
+        DpsMbHeader, HEADER_MARKER, HEADER_MARKER_BITS, MOTION_VECTOR_MARKER,
+        MOTION_VECTOR_MARKER_BITS, MvdEmulationState, TABLE_V2_INTER, write_dps_mb_header,
     };
     use crate::encoder_vlc::write_cbpy;
-    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+    use crate::slice_header::{SliceHeaderContext, write_first_slice_header, write_slice_layer};
 
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -4837,7 +4837,7 @@ fn encode_inter_picture_motion_impl(
     isd: bool,
 ) -> Result<Vec<u8>> {
     use crate::plus_ptype::SliceStructuredSubmode;
-    use crate::slice_header::{write_first_slice_header, write_slice_layer, SliceHeaderContext};
+    use crate::slice_header::{SliceHeaderContext, write_first_slice_header, write_slice_layer};
 
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -5219,7 +5219,7 @@ pub fn encode_pb_picture(
     prev_tr: u8,
     cfg: &PbConfig,
 ) -> Result<Vec<u8>> {
-    use crate::pb_layer::{pb_b_predict_macroblock, pb_bquant, PbBReferencePlanes};
+    use crate::pb_layer::{PbBReferencePlanes, pb_b_predict_macroblock, pb_bquant};
 
     if cfg.quant == 0 || cfg.quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -5630,7 +5630,7 @@ impl Default for GopConfig {
 /// (byte-aligned, [`EOS_BYTES`]) terminates the stream — decoders
 /// ignore it (it is not a Picture Start Code).
 pub fn encode_sequence(frames: &[YuvFrame], cfg: &GopConfig, tr0: u8) -> Result<Vec<u8>> {
-    use crate::picture::{decode_picture_no_gob0_header, DecodeOptions};
+    use crate::picture::{DecodeOptions, decode_picture_no_gob0_header};
 
     if cfg.quant == 0 || cfg.quant > 31 {
         return Err(Error::InvalidQuantiser);
@@ -5769,7 +5769,7 @@ pub fn encode_sequence_rate_controlled(
     cfg: &RateControlConfig,
     tr0: u8,
 ) -> Result<RateControlledStream> {
-    use crate::picture::{decode_picture_no_gob0_header, DecodeOptions};
+    use crate::picture::{DecodeOptions, decode_picture_no_gob0_header};
     use crate::rate_control::{HrdModel, RateController};
 
     if cfg.initial_quant == 0 || cfg.initial_quant > 31 {
@@ -5923,8 +5923,8 @@ pub fn encode_intra_sequence_aic(frames: &[YuvFrame], quant: u8, tr0: u8) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picture::{decode_picture_no_gob0_header, DecodeOptions};
-    use crate::picture_header::{parse_picture_layer, H263PictureLayer};
+    use crate::picture::{DecodeOptions, decode_picture_no_gob0_header};
+    use crate::picture_header::{H263PictureLayer, parse_picture_layer};
     use crate::plus_ptype::{
         InheritedExtendedState, PlusPictureType, PlusSourceFormat, SliceStructuredSubmode, Uui,
     };
@@ -6156,11 +6156,7 @@ mod tests {
                 pquant,
                 0,
                 |col, _row| {
-                    if col < mb_cols / 2 {
-                        4
-                    } else {
-                        16
-                    }
+                    if col < mb_cols / 2 { 4 } else { 16 }
                 },
             )
             .unwrap();

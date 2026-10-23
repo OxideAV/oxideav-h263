@@ -1,15 +1,15 @@
 //! Annex M Improved PB-frames: encoder → own decoder round trips.
 
+use oxideav_h263::Error;
 use oxideav_h263::encoder::{
-    encode_improved_pb_picture, encode_improved_pb_picture_stats, encode_intra_picture,
-    encode_pb_picture, encode_pb_picture_ap_stats, encode_pb_picture_umv_stats, ImprovedPbConfig,
-    PbConfig, EOS_BYTES,
+    EOS_BYTES, ImprovedPbConfig, PbConfig, encode_improved_pb_picture,
+    encode_improved_pb_picture_stats, encode_intra_picture, encode_pb_picture,
+    encode_pb_picture_ap_stats, encode_pb_picture_umv_stats,
 };
 use oxideav_h263::picture::{
-    decode_improved_pb_picture, decode_pb_picture_no_gob0_header, decode_sequence, DecodeOptions,
-    YuvFrame,
+    DecodeOptions, YuvFrame, decode_improved_pb_picture, decode_pb_picture_no_gob0_header,
+    decode_sequence,
 };
-use oxideav_h263::Error;
 
 fn textured(lw: usize, lh: usize, seed: usize) -> YuvFrame {
     let cw = lw / 2;

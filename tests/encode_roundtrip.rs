@@ -12,13 +12,13 @@
 
 use oxideav_h263::aic::IntraMode;
 use oxideav_h263::encoder::{
-    encode_inter_picture, encode_inter_picture_ap, encode_inter_picture_motion,
-    encode_inter_picture_umv, encode_intra_picture, encode_intra_picture_aic,
-    encode_intra_picture_aic_auto, encode_intra_picture_aic_mq, encode_intra_sequence,
-    encode_intra_sequence_aic, encode_pb_picture, encode_sequence, GopConfig, PbConfig, EOS_BYTES,
+    EOS_BYTES, GopConfig, PbConfig, encode_inter_picture, encode_inter_picture_ap,
+    encode_inter_picture_motion, encode_inter_picture_umv, encode_intra_picture,
+    encode_intra_picture_aic, encode_intra_picture_aic_auto, encode_intra_picture_aic_mq,
+    encode_intra_sequence, encode_intra_sequence_aic, encode_pb_picture, encode_sequence,
 };
 use oxideav_h263::picture::{
-    decode_picture_no_gob0_header, decode_sequence, DecodeOptions, YuvFrame,
+    DecodeOptions, YuvFrame, decode_picture_no_gob0_header, decode_sequence,
 };
 
 /// A deterministic gradient frame on every plane.
@@ -1076,12 +1076,12 @@ fn cpm_slices_reconstruct_identically_to_cpm_off() {
 #[test]
 fn cpm_slice_subbitstream_mismatch_is_refused() {
     use oxideav_core::bits::BitWriter;
-    use oxideav_h263::encoder::{write_plus_picture_header, PlusModes};
-    use oxideav_h263::encoder_mb::{encode_intra_macroblock, MacroblockSamples};
-    use oxideav_h263::picture::{decode_picture_layer, PictureLayout};
+    use oxideav_h263::encoder::{PlusModes, write_plus_picture_header};
+    use oxideav_h263::encoder_mb::{MacroblockSamples, encode_intra_macroblock};
+    use oxideav_h263::picture::{PictureLayout, decode_picture_layer};
     use oxideav_h263::plus_ptype::SliceStructuredSubmode;
     use oxideav_h263::slice_header::{
-        write_first_slice_header, write_slice_layer_cpm, SliceHeaderContext,
+        SliceHeaderContext, write_first_slice_header, write_slice_layer_cpm,
     };
     use oxideav_h263::{Error, H263SourceFormat};
 
@@ -1136,7 +1136,7 @@ fn cpm_slice_subbitstream_mismatch_is_refused() {
 /// still decodes as a PB pair through `decode_sequence`.
 #[test]
 fn pb_mvdb_search_improves_nonlinear_b_prediction() {
-    use oxideav_h263::encoder::{encode_intra_picture, encode_pb_picture, PbConfig};
+    use oxideav_h263::encoder::{PbConfig, encode_intra_picture, encode_pb_picture};
 
     let base = gradient(176, 144, 31);
     // Reference at t=0, B at t=1 moved 1 px, P at t=2 moved 6 px:

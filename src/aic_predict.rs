@@ -78,9 +78,9 @@
 //!   frequency-domain coefficients. [`crate::idct::idct_8x8`] consumes
 //!   them.
 
-use crate::aic::{scan_for_intra_mode, IntraMode};
+use crate::aic::{IntraMode, scan_for_intra_mode};
 use crate::aic_dequant::{aic_dequant_coefficient, clip_ac, oddify_clip_dc};
-use crate::block::{H263Block, COEFFS_PER_BLOCK};
+use crate::block::{COEFFS_PER_BLOCK, H263Block};
 use crate::idct::idct_8x8;
 
 /// Predictor source for one of the two §I.3 reference blocks (block A

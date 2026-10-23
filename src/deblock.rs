@@ -133,11 +133,7 @@ pub fn up_down_ramp(x: i32, strength: i32) -> i32 {
     let ax = x.unsigned_abs() as i32; // |x|, fits in i32
     let inner = (2 * (ax - strength)).max(0);
     let magnitude = (ax - inner).max(0);
-    if x > 0 {
-        magnitude
-    } else {
-        -magnitude
-    }
+    if x > 0 { magnitude } else { -magnitude }
 }
 
 /// §J.3 `clipd1(x, lim)`: clips `x` to `±|lim|`.
@@ -340,12 +336,12 @@ pub fn deblock_plane<F>(
     F: FnMut((usize, usize), (usize, usize)) -> EdgeCondition,
 {
     assert!(
-        width % BLOCK_DIM == 0,
+        width.is_multiple_of(BLOCK_DIM),
         "deblock_plane: width must be a multiple of 8, got {}",
         width
     );
     assert!(
-        height % BLOCK_DIM == 0,
+        height.is_multiple_of(BLOCK_DIM),
         "deblock_plane: height must be a multiple of 8, got {}",
         height
     );

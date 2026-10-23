@@ -27,14 +27,14 @@
 //! module therefore reports each block's coded/not-coded state up to the
 //! macroblock encoder, which packs the CBPY / CBPC codewords.
 
-use crate::aic::{scan_for_intra_mode, IntraMode};
-use crate::aic_predict::{
-    aic_intra_reconstruct_coefficients, reconstruct_intra_block_aic, Neighbour,
-};
-use crate::block::{H263Block, COEFFS_PER_BLOCK};
-use crate::fdct::fdct_8x8;
-use crate::intra_tcoef::{write_intra_tcoef_event, IntraTcoefEvent};
 use crate::Result;
+use crate::aic::{IntraMode, scan_for_intra_mode};
+use crate::aic_predict::{
+    Neighbour, aic_intra_reconstruct_coefficients, reconstruct_intra_block_aic,
+};
+use crate::block::{COEFFS_PER_BLOCK, H263Block};
+use crate::fdct::fdct_8x8;
+use crate::intra_tcoef::{IntraTcoefEvent, write_intra_tcoef_event};
 use oxideav_core::bits::BitWriter;
 
 /// The maximum LEVEL magnitude representable without Modified
@@ -347,10 +347,11 @@ mod tests {
             levels,
             rec,
         };
-        assert!(plan
-            .levels
-            .iter()
-            .any(|&l| (l as i32).abs() > MAX_LEVEL_BASELINE));
+        assert!(
+            plan.levels
+                .iter()
+                .any(|&l| (l as i32).abs() > MAX_LEVEL_BASELINE)
+        );
 
         let mut w = BitWriter::new();
         write_intra_block_aic(&mut w, &plan, true).unwrap();
