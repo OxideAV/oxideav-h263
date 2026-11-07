@@ -15,10 +15,6 @@ fuzz_target!(|data: &[u8]| {
     let _ = decode_sequence(data, DecodeOptions::default());
     let _ = decode_sequence(
         data,
-        DecodeOptions {
-            deblock: true,
-            obmc_skip_zero_right: true,
-            ..DecodeOptions::default()
-        },
+        DecodeOptions::default().with_deblock(true).with_obmc_skip_zero_right(true),
     );
 });

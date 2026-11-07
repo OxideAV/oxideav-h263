@@ -56,6 +56,7 @@ use oxideav_core::bits::BitWriter;
 
 /// Configuration for [`encode_inter_picture_deblock`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct DeblockConfig {
     /// Motion-search window (± whole pixels around the §F.2 predictor).
     pub search_half: i32,
@@ -69,6 +70,29 @@ pub struct DeblockConfig {
     /// D.1/D.2 range and every difference is written as a Table D.3
     /// codeword (§5.3.7 — PLUSPTYPE is present).
     pub umv: bool,
+}
+
+impl DeblockConfig {
+    /// Set [`DeblockConfig::search_half`].
+    #[must_use]
+    pub fn with_search_half(mut self, v: i32) -> Self {
+        self.search_half = v;
+        self
+    }
+
+    /// Set [`DeblockConfig::four_mv`].
+    #[must_use]
+    pub fn with_four_mv(mut self, v: bool) -> Self {
+        self.four_mv = v;
+        self
+    }
+
+    /// Set [`DeblockConfig::umv`].
+    #[must_use]
+    pub fn with_umv(mut self, v: bool) -> Self {
+        self.umv = v;
+        self
+    }
 }
 
 impl Default for DeblockConfig {

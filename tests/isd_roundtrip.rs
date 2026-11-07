@@ -159,10 +159,7 @@ fn deblock_skips_segment_boundaries_under_isd() {
     // reconstruction on a boundary row.
     let src = banded_frame(2);
     let coded = encode_intra_picture_isd(&src, 6, 0).expect("I");
-    let deblock = DecodeOptions {
-        deblock: true,
-        ..DecodeOptions::default()
-    };
+    let deblock = DecodeOptions::default().with_deblock(true);
     let plain = decode_sequence(&coded, DecodeOptions::default()).expect("plain")[0].clone();
     let isd_deblocked = decode_sequence(&coded, deblock).expect("ISD deblock")[0].clone();
 

@@ -209,75 +209,117 @@
 
 use oxideav_core::bits::BitReader;
 
+#[doc(hidden)]
 pub mod aic;
+#[doc(hidden)]
 pub mod aic_dequant;
+#[doc(hidden)]
 pub mod aic_predict;
+#[doc(hidden)]
 pub mod annex_l;
+#[doc(hidden)]
 pub mod annex_n;
+#[doc(hidden)]
 pub mod annex_p;
+#[doc(hidden)]
 pub mod annex_t;
+#[doc(hidden)]
 pub mod annex_v;
+#[doc(hidden)]
 pub mod block;
+#[doc(hidden)]
 pub mod block_aic;
 pub mod codec;
+#[doc(hidden)]
 pub mod deblock;
+#[doc(hidden)]
 pub mod dequant;
 pub mod encoder;
+#[doc(hidden)]
 pub mod encoder_aic;
+#[doc(hidden)]
 pub mod encoder_block;
 pub mod encoder_deblock;
+#[doc(hidden)]
 pub mod encoder_mb;
+#[doc(hidden)]
 pub mod encoder_motion;
 pub mod encoder_pb;
 pub mod encoder_rc;
+#[doc(hidden)]
 pub mod encoder_vlc;
+#[doc(hidden)]
 pub mod fdct;
+#[doc(hidden)]
 pub mod gob_header;
+#[doc(hidden)]
 pub mod idct;
+#[doc(hidden)]
 pub mod intra_tcoef;
+#[doc(hidden)]
 pub mod macroblock;
+#[doc(hidden)]
 pub mod motion;
+#[doc(hidden)]
 pub mod pb_layer;
 pub mod picture;
+#[doc(hidden)]
 pub mod picture_header;
+#[doc(hidden)]
 pub mod plus_ptype;
 pub mod rate_control;
+#[doc(hidden)]
 pub mod rru_filter;
+#[doc(hidden)]
 pub mod rru_upsample;
 pub mod rtp;
+#[doc(hidden)]
 pub mod sac;
+#[doc(hidden)]
 pub mod scal_upsample;
+#[doc(hidden)]
 pub mod scalability;
+#[doc(hidden)]
 pub mod slice_header;
+#[doc(hidden)]
 pub mod w_idct;
 
+#[doc(hidden)]
 pub use aic::{
     ALT_HORIZONTAL_TO_BLOCK_POS, ALT_VERTICAL_TO_BLOCK_POS, IntraMode, decode_intra_mode,
     scan_for_intra_mode, write_intra_mode,
 };
+#[doc(hidden)]
 pub use aic_dequant::{
     AIC_AC_REC_MAX, AIC_AC_REC_MIN, AIC_DC_REC_MAX, AIC_DC_REC_MIN, aic_dequant_coefficient,
     clip_ac, oddify_clip_dc,
 };
+#[doc(hidden)]
 pub use aic_predict::{
     AIC_FALLBACK_DC_PREDICTOR, Neighbour, aic_intra_reconstruct_coefficients,
     aic_intra_reconstruct_samples, reconstruct_intra_block_aic,
 };
+#[doc(hidden)]
 pub use annex_l::{
     ChromaKeyingInfo, MessageType, PictureMessage, PictureRect, SeiFunction, parse_psupp,
     read_pei_psupp, write_pei_psupp, write_psupp,
 };
+#[doc(hidden)]
 pub use annex_t::{ModifiedDquant, parse_modified_dquant, quant_c_from_quant};
+#[doc(hidden)]
 pub use block::{BlockContext, COEFFS_PER_BLOCK, H263Block, ZIGZAG_TO_BLOCK_POS, parse_block};
+#[doc(hidden)]
 pub use block_aic::parse_intra_block_aic;
 pub use codec::{
     CODEC_ID, H263DecoderOptions, H263EncoderOptions, H263StreamDecoder, H263StreamEncoder,
     make_decoder, make_encoder, register,
 };
+#[doc(hidden)]
 pub use deblock::{
     EdgeCondition, STRENGTH_RRU_INFINITE, apply_edge_samples, clipd1, deblock_plane,
     filter_edge_samples, strength_for_quant, up_down_ramp,
 };
+#[doc(hidden)]
 pub use dequant::{AC_REC_MAX, AC_REC_MIN, dequantise_ac, scatter_into_block};
 pub use encoder::{
     EOS_BYTES, GopConfig, PbConfig, PlusModes, RateControlConfig, RateControlledStream,
@@ -296,7 +338,9 @@ pub use encoder::{
     encode_intra_sequence_aic, encode_pb_picture, encode_pb_picture_sac, encode_sequence,
     encode_sequence_rate_controlled, write_plus_picture_header,
 };
+#[doc(hidden)]
 pub use encoder_aic::{AicBlockPlan, plan_intra_block_aic, write_intra_block_aic};
+#[doc(hidden)]
 pub use encoder_block::{
     EncodedInterBlock, EncodedIntraBlock, block_has_ac, encode_inter_block, encode_intra_block,
     tcoef_events, write_inter_block_coeffs, write_intra_block,
@@ -304,29 +348,38 @@ pub use encoder_block::{
 pub use encoder_deblock::{
     DeblockConfig, encode_inter_picture_deblock, encode_intra_picture_deblock,
 };
+#[doc(hidden)]
 pub use encoder_mb::{
     MacroblockSamples, encode_inter_macroblock, encode_inter_macroblock_dq,
     encode_inter4v_macroblock, encode_intra_macroblock, encode_intra_macroblock_dq,
     encode_skipped_macroblock, macroblock_samples_from_u8,
 };
+#[doc(hidden)]
 pub use encoder_motion::{
     Mv4Grid, MvGrid, estimate_block_motion, estimate_motion, estimate_motion_umv, mvd_for,
     umv_mvd_component_for, umv_mvd_for,
 };
+#[doc(hidden)]
 pub use encoder_vlc::{
     TcoefEvent, write_cbpy, write_dquant, write_intradc, write_mcbpc_i, write_mcbpc_p,
     write_mvd_component, write_tcoef,
 };
+#[doc(hidden)]
 pub use fdct::{fdct_8x8, forward_quantise_block, quantise_ac_coefficient, quantise_intradc};
+#[doc(hidden)]
 pub use gob_header::{
     GBSC_BITS, GBSC_VALUE, GFID_BITS, GN_BITS, GOB_HEADER_BITS_NO_CPM, GQUANT_BITS, GobLayer,
     gob_header_present, parse_gob_layer, parse_gob_layer_from_bytes,
 };
+#[doc(hidden)]
 pub use idct::{BLOCK_DIM, IDCT_OUT_MAX, IDCT_OUT_MIN, idct_8x8, reconstruct_intra_samples};
+#[doc(hidden)]
 pub use intra_tcoef::{
     INTRA_TCOEF_REGULAR_ENTRIES, IntraTcoefEvent, decode_intra_tcoef_event, write_intra_tcoef_event,
 };
+#[doc(hidden)]
 pub use macroblock::{H263Macroblock, MbContext, MbType, Mvd, parse_macroblock};
+#[doc(hidden)]
 pub use motion::{
     H0, H1, H2, LumaBlockIndex, MV_HALF_MAX, MV_HALF_MIN, MV_HALF_SPAN, MV_UMV_HALF_MAX,
     MV_UMV_HALF_MIN, Mb4Mv, Mb4MvNeighbourhood, MotionVector, OBMC_WEIGHT_SUM, RCONTROL_DEFAULT,
@@ -336,6 +389,7 @@ pub use motion::{
     reconstruct_mv_component_umv, reconstruct_mv_umv, rru_actual_component, rru_actual_mv,
     rru_pseudo_component, rru_pseudo_mv, select_4mv_candidates,
 };
+#[doc(hidden)]
 pub use pb_layer::{
     BpbCodingMode, CBPB_BITS, ModbAnnexM, ModbPresence, cbpb_block_present, parse_cbpb, parse_modb,
     parse_modb_annex_m, parse_mvdb, pb_b_bidir_chroma_extent, pb_b_bidir_extent_component,
@@ -350,10 +404,12 @@ pub use picture::{
     decode_picture_layer_with_inherited, decode_picture_no_gob0_header, decode_picture_sac,
     decode_sequence, enumerate_mb_boundaries,
 };
+#[doc(hidden)]
 pub use picture_header::{
     H263ExtendedPicture, H263PictureCodingType, H263PictureHeader, H263PictureLayer,
     H263SourceFormat, PSC_BITS, PSC_VALUE, parse_picture_header, parse_picture_layer,
 };
+#[doc(hidden)]
 pub use plus_ptype::{
     CPCFC_BITS, CPFMT_BITS, CustomPcf, CustomPictureFormat, EPAR_BITS, ETR_BITS, ExtendedPar,
     InheritedExtendedState, MPPTYPE_BITS, Mpptype, OPPTYPE_BITS, Opptype, PlusPictureType,
@@ -361,9 +417,11 @@ pub use plus_ptype::{
     UFEP_MANDATORY_ONLY, Uui, parse_plus_ptype,
 };
 pub use rate_control::{HrdModel, HrdParams, HrdPictureOutcome, RateController};
+#[doc(hidden)]
 pub use rru_filter::{
     RRU_BLOCK_DIM, RruEdgeCondition, RruFilterMode, rru_default_tap, rru_filter_plane,
 };
+#[doc(hidden)]
 pub use rru_upsample::{
     RRU_IN_DIM, RRU_IN_LEN, RRU_OUT_DIM, RRU_OUT_LEN, upsample_prediction_error,
 };
@@ -375,6 +433,7 @@ pub use rtp::{
     parse_rfc2190_mode_a, parse_rfc2190_mode_b, parse_rfc2190_mode_c, redundant_picture_header,
     write_payload_header, write_rfc2190_mode_a, write_rfc2190_mode_b, write_rfc2190_mode_c,
 };
+#[doc(hidden)]
 pub use sac::{
     SacDecoder, SacEncoder, decode_cbpb_sac, decode_cbpy_sac, decode_cod, decode_dquant_sac,
     decode_intradc_sac, decode_mcbpc_i_sac, decode_mcbpc_p_sac, decode_modb_sac,
@@ -384,21 +443,25 @@ pub use sac::{
     encode_mvd_component_sac, encode_skipped_macroblock_sac, parse_block_sac, parse_macroblock_sac,
     write_block_sac,
 };
+#[doc(hidden)]
 pub use scal_upsample::{
     upsample_plane_1d_horizontal, upsample_plane_1d_vertical, upsample_plane_2d,
 };
+#[doc(hidden)]
 pub use slice_header::{
     FirstSliceLayer, SEPB_BITS, SQUANT_BITS, SSBI_BITS, SSC_BITS, SSC_VALUE, SSTUF_MAX_BITS,
     SliceHeaderContext, SliceLayer, parse_first_slice_header, parse_slice_layer, skip_sstuf,
     skip_sstuf_at, ssbi_to_subbitstream, subbitstream_to_ssbi, write_first_slice_header,
     write_slice_layer, write_slice_layer_cpm,
 };
+#[doc(hidden)]
 pub use w_idct::{fdct_w0, idct_w0};
 
 /// Crate-local error type. The orphan-rebuild scaffold returns
 /// [`Error::NotImplemented`] for any decode path that is not yet wired
 /// up; the picture-header parser returns the variants below directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The crate is partially scaffolded; the path the caller invoked
     /// is not yet implemented.

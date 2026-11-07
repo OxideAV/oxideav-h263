@@ -192,14 +192,8 @@ fn registry_decoder_honours_decoder_options() {
     );
 
     let stream = fixture("i-frame-then-p-frame-qcif");
-    let deblocked_direct = decode_sequence(
-        &stream,
-        DecodeOptions {
-            deblock: true,
-            ..DecodeOptions::default()
-        },
-    )
-    .expect("direct deblocked decode");
+    let deblocked_direct = decode_sequence(&stream, DecodeOptions::default().with_deblock(true))
+        .expect("direct deblocked decode");
     let mut params = video_params();
     params.options = CodecOptions::new().set("deblock", "true");
     let mut dec = ctx
@@ -255,14 +249,12 @@ fn registry_encoder_stream_matches_encode_sequence() {
             f
         })
         .collect();
-    let cfg = GopConfig {
-        quant: 6,
-        intra_period: 3,
-        search_half: 8,
-        umv: false,
-        eos: true,
-        ..GopConfig::default()
-    };
+    let cfg = GopConfig::default()
+        .with_quant(6)
+        .with_intra_period(3)
+        .with_search_half(8)
+        .with_umv(false)
+        .with_eos(true);
     let direct = encode_sequence(&frames, &cfg, 0).expect("encode_sequence");
 
     let ctx = registered_context();
@@ -381,14 +373,12 @@ fn registry_encoder_deblock_option_matches_gop_driver() {
             f
         })
         .collect();
-    let cfg = GopConfig {
-        quant: 9,
-        intra_period: 4,
-        search_half: 6,
-        deblock: true,
-        four_mv: true,
-        ..GopConfig::default()
-    };
+    let cfg = GopConfig::default()
+        .with_quant(9)
+        .with_intra_period(4)
+        .with_search_half(6)
+        .with_deblock(true)
+        .with_four_mv(true);
     let direct = encode_sequence(&frames, &cfg, 0).expect("encode_sequence");
 
     let ctx = registered_context();

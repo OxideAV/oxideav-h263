@@ -9,6 +9,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - edition 2024, MSRV 1.95
+- API hygiene: `#[non_exhaustive]` on the `Error` enum and on the
+  option / config / stats / outcome records listed under Added. Build
+  them with `Default` + `with_*` (or `new(..)`) instead of struct
+  literals.
+- The bitstream-syntax and DSP-kernel modules are now `#[doc(hidden)]`,
+  together with their crate-root re-exports: `aic`, `aic_dequant`,
+  `aic_predict`, `annex_l`, `annex_n`, `annex_p`, `annex_t`, `annex_v`,
+  `block`, `block_aic`, `deblock`, `dequant`, `encoder_aic`,
+  `encoder_block`, `encoder_mb`, `encoder_motion`, `encoder_vlc`, `fdct`,
+  `gob_header`, `idct`, `intra_tcoef`, `macroblock`, `motion`,
+  `pb_layer`, `picture_header`, `plus_ptype`, `rru_filter`,
+  `rru_upsample`, `sac`, `scal_upsample`, `scalability`, `slice_header`,
+  `w_idct`. The documented surface is `codec`, `encoder`,
+  `encoder_deblock`, `encoder_pb`, `encoder_rc`, `picture`,
+  `rate_control` and `rtp`. The `YuvFrame` plane buffer and the
+  fixed-layout RTP payload headers stay exhaustive.
 
 ### Added
 
@@ -122,6 +138,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   forward-mode MVDB with a table other than the Table D.3 this crate
   applies (§M.2.2 → §5.3.7 / §D.2) and rejects a Table 14 one outright;
   the Annex G + UMV MVDB (Table 14, §D.2 pair rule) agrees exactly.
+- `with_*` setters for every field of `H263DecoderOptions`,
+  `H263EncoderOptions`, `PlusModes`, `PbConfig`, `GopConfig`,
+  `RateControlConfig`, `DeblockConfig`, `ImprovedPbConfig`,
+  `ImprovedPbStats`, `AdaptiveQuantConfig`, `DecodeOptions` and
+  `PacketizeConfig` (start from `Default`); `HrdParams::new(..)` plus
+  `with_*`; all-field `new(..)` constructors for `RateControlledStream`,
+  `AdaptiveQuantPicture`, `DecodePictureOutcome`, `HrdPictureOutcome`,
+  `PbFramePair`, `BPictureTemporal`, `MbBoundaryInfo` and `PictureLayout`.
 
 ### Fixed
 

@@ -34,12 +34,37 @@
 /// picture clock). `b_max` is the §B.2 bound `B = 4 · Rmax / PCF`
 /// (a minimum; a larger negotiated value may be supplied).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HrdParams {
     /// Channel bits arriving per picture clock interval (`R / PCF`).
     pub bits_per_tick: u64,
     /// §B.2 `B` — the occupancy that must not be reached immediately
     /// after a picture's removal (§B.4).
     pub b_max: u64,
+}
+
+impl HrdParams {
+    /// Build a [`HrdParams`] from all of its fields.
+    pub fn new(bits_per_tick: u64, b_max: u64) -> Self {
+        Self {
+            bits_per_tick,
+            b_max,
+        }
+    }
+
+    /// Set [`HrdParams::bits_per_tick`].
+    #[must_use]
+    pub fn with_bits_per_tick(mut self, v: u64) -> Self {
+        self.bits_per_tick = v;
+        self
+    }
+
+    /// Set [`HrdParams::b_max`].
+    #[must_use]
+    pub fn with_b_max(mut self, v: u64) -> Self {
+        self.b_max = v;
+        self
+    }
 }
 
 impl HrdParams {
@@ -57,6 +82,7 @@ impl HrdParams {
 
 /// Outcome of feeding one coded picture through the [`HrdModel`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HrdPictureOutcome {
     /// Buffer occupancy in bits immediately after this picture's
     /// removal (§B.4's `b(n)`).
@@ -68,6 +94,17 @@ pub struct HrdPictureOutcome {
     /// complete in the buffer (1 when the picture's bits fit one
     /// interval's channel budget plus the carried occupancy).
     pub ticks_waited: u64,
+}
+
+impl HrdPictureOutcome {
+    /// Build a [`HrdPictureOutcome`] from all of its fields.
+    pub fn new(occupancy_after_removal: u64, conformant: bool, ticks_waited: u64) -> Self {
+        Self {
+            occupancy_after_removal,
+            conformant,
+            ticks_waited,
+        }
+    }
 }
 
 /// The Annex B HRD buffer simulation (encoder-side mirror).

@@ -249,10 +249,7 @@ fn advanced_prediction_mode_within_idct_tolerance() {
     // no COD distinction — the spec-default decode differs only in
     // those skipped-macroblock right halves).
     let (input, expected) = fixture!("advanced-prediction-mode");
-    let options = DecodeOptions {
-        obmc_skip_zero_right: true,
-        ..DecodeOptions::default()
-    };
+    let options = DecodeOptions::default().with_obmc_skip_zero_right(true);
     let frames = decode_sequence(input, options).expect("decode_sequence advanced-prediction");
     assert_eq!(frames.len(), 3, "advanced-prediction-mode is I + P + P");
     let mut got = Vec::new();

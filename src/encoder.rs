@@ -209,6 +209,7 @@ fn write_gob_header(w: &mut BitWriter, gn: u32, gsbi: Option<u8>, gfid: u8, gqua
 /// custom source formats) are not exposed — the writer cannot emit a
 /// header the crate's own decoder would reject.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct PlusModes {
     /// OPPTYPE bit 5 — Annex D Unrestricted Motion Vector mode. The
     /// §5.1.9 UUI codeword `"1"` (motion-vector range limited per
@@ -244,6 +245,95 @@ pub struct PlusModes {
     /// `1..=7`) and §5.1.23 DBQUANT (`0..=3`) fields emitted after
     /// PQUANT. Requires `is_inter` (the P-part is a P-picture, §M.1).
     pub improved_pb: Option<(u8, u8)>,
+}
+
+impl PlusModes {
+    /// Set [`PlusModes::umv`].
+    #[must_use]
+    pub fn with_umv(mut self, v: bool) -> Self {
+        self.umv = v;
+        self
+    }
+
+    /// Set [`PlusModes::advanced_prediction`].
+    #[must_use]
+    pub fn with_advanced_prediction(mut self, v: bool) -> Self {
+        self.advanced_prediction = v;
+        self
+    }
+
+    /// Set [`PlusModes::advanced_intra`].
+    #[must_use]
+    pub fn with_advanced_intra(mut self, v: bool) -> Self {
+        self.advanced_intra = v;
+        self
+    }
+
+    /// Set [`PlusModes::deblocking`].
+    #[must_use]
+    pub fn with_deblocking(mut self, v: bool) -> Self {
+        self.deblocking = v;
+        self
+    }
+
+    /// Set [`PlusModes::slice_structured`].
+    #[must_use]
+    pub fn with_slice_structured(
+        mut self,
+        v: Option<crate::plus_ptype::SliceStructuredSubmode>,
+    ) -> Self {
+        self.slice_structured = v;
+        self
+    }
+
+    /// Set [`PlusModes::alt_inter_vlc`].
+    #[must_use]
+    pub fn with_alt_inter_vlc(mut self, v: bool) -> Self {
+        self.alt_inter_vlc = v;
+        self
+    }
+
+    /// Set [`PlusModes::modified_quant`].
+    #[must_use]
+    pub fn with_modified_quant(mut self, v: bool) -> Self {
+        self.modified_quant = v;
+        self
+    }
+
+    /// Set [`PlusModes::cpm_psbi`].
+    #[must_use]
+    pub fn with_cpm_psbi(mut self, v: Option<u8>) -> Self {
+        self.cpm_psbi = v;
+        self
+    }
+
+    /// Set [`PlusModes::rru`].
+    #[must_use]
+    pub fn with_rru(mut self, v: bool) -> Self {
+        self.rru = v;
+        self
+    }
+
+    /// Set [`PlusModes::independent_segment_decoding`].
+    #[must_use]
+    pub fn with_independent_segment_decoding(mut self, v: bool) -> Self {
+        self.independent_segment_decoding = v;
+        self
+    }
+
+    /// Set [`PlusModes::data_partitioned_slices`].
+    #[must_use]
+    pub fn with_data_partitioned_slices(mut self, v: bool) -> Self {
+        self.data_partitioned_slices = v;
+        self
+    }
+
+    /// Set [`PlusModes::improved_pb`].
+    #[must_use]
+    pub fn with_improved_pb(mut self, v: Option<(u8, u8)>) -> Self {
+        self.improved_pb = v;
+        self
+    }
 }
 
 /// Write an extended-PTYPE (PLUSPTYPE, §5.1.4) picture header: PSC, TR,
@@ -5154,6 +5244,7 @@ fn encode_inter_picture_motion_impl(
 
 /// Configuration for [`encode_pb_picture`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct PbConfig {
     /// Quantiser for the P-blocks (`1..=31`); the B-blocks run at the
     /// §5.1.23 / Table-6 BQUANT derived from it and `dbquant`.
@@ -5175,6 +5266,43 @@ pub struct PbConfig {
     /// — the constraint that disambiguates the Table 14 codeword's
     /// value pair for any decoder — and be Table 14 codable itself.
     pub b_search_half: i32,
+}
+
+impl PbConfig {
+    /// Set [`PbConfig::quant`].
+    #[must_use]
+    pub fn with_quant(mut self, v: u8) -> Self {
+        self.quant = v;
+        self
+    }
+
+    /// Set [`PbConfig::trb`].
+    #[must_use]
+    pub fn with_trb(mut self, v: u8) -> Self {
+        self.trb = v;
+        self
+    }
+
+    /// Set [`PbConfig::dbquant`].
+    #[must_use]
+    pub fn with_dbquant(mut self, v: u8) -> Self {
+        self.dbquant = v;
+        self
+    }
+
+    /// Set [`PbConfig::search_half`].
+    #[must_use]
+    pub fn with_search_half(mut self, v: i32) -> Self {
+        self.search_half = v;
+        self
+    }
+
+    /// Set [`PbConfig::b_search_half`].
+    #[must_use]
+    pub fn with_b_search_half(mut self, v: i32) -> Self {
+        self.b_search_half = v;
+        self
+    }
 }
 
 impl Default for PbConfig {
@@ -5569,6 +5697,7 @@ pub const EOS_BYTES: [u8; 3] = [0x00, 0x00, 0xFC];
 
 /// Configuration for [`encode_sequence`] — the closed-loop GOP encoder.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct GopConfig {
     /// Quantiser for every picture (`1..=31`).
     pub quant: u8,
@@ -5595,6 +5724,57 @@ pub struct GopConfig {
     /// Allow four motion vectors per macroblock (INTER4V) in
     /// deblocking-mode P-pictures (ignored without [`Self::deblock`]).
     pub four_mv: bool,
+}
+
+impl GopConfig {
+    /// Set [`GopConfig::quant`].
+    #[must_use]
+    pub fn with_quant(mut self, v: u8) -> Self {
+        self.quant = v;
+        self
+    }
+
+    /// Set [`GopConfig::intra_period`].
+    #[must_use]
+    pub fn with_intra_period(mut self, v: usize) -> Self {
+        self.intra_period = v;
+        self
+    }
+
+    /// Set [`GopConfig::search_half`].
+    #[must_use]
+    pub fn with_search_half(mut self, v: i32) -> Self {
+        self.search_half = v;
+        self
+    }
+
+    /// Set [`GopConfig::umv`].
+    #[must_use]
+    pub fn with_umv(mut self, v: bool) -> Self {
+        self.umv = v;
+        self
+    }
+
+    /// Set [`GopConfig::eos`].
+    #[must_use]
+    pub fn with_eos(mut self, v: bool) -> Self {
+        self.eos = v;
+        self
+    }
+
+    /// Set [`GopConfig::deblock`].
+    #[must_use]
+    pub fn with_deblock(mut self, v: bool) -> Self {
+        self.deblock = v;
+        self
+    }
+
+    /// Set [`GopConfig::four_mv`].
+    #[must_use]
+    pub fn with_four_mv(mut self, v: bool) -> Self {
+        self.four_mv = v;
+        self
+    }
 }
 
 impl Default for GopConfig {
@@ -5685,6 +5865,7 @@ pub fn encode_sequence(frames: &[YuvFrame], cfg: &GopConfig, tr0: u8) -> Result<
 
 /// Configuration for [`encode_sequence_rate_controlled`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct RateControlConfig {
     /// Bit budget per coded picture (the [`crate::rate_control::RateController`]
     /// target). For a CBR channel of `R` bits/s at `PCF` pictures/s
@@ -5712,6 +5893,57 @@ pub struct RateControlConfig {
     pub max_reencodes: u8,
 }
 
+impl RateControlConfig {
+    /// Set [`RateControlConfig::target_bits_per_picture`].
+    #[must_use]
+    pub fn with_target_bits_per_picture(mut self, v: u32) -> Self {
+        self.target_bits_per_picture = v;
+        self
+    }
+
+    /// Set [`RateControlConfig::initial_quant`].
+    #[must_use]
+    pub fn with_initial_quant(mut self, v: u8) -> Self {
+        self.initial_quant = v;
+        self
+    }
+
+    /// Set [`RateControlConfig::intra_period`].
+    #[must_use]
+    pub fn with_intra_period(mut self, v: usize) -> Self {
+        self.intra_period = v;
+        self
+    }
+
+    /// Set [`RateControlConfig::search_half`].
+    #[must_use]
+    pub fn with_search_half(mut self, v: i32) -> Self {
+        self.search_half = v;
+        self
+    }
+
+    /// Set [`RateControlConfig::hrd`].
+    #[must_use]
+    pub fn with_hrd(mut self, v: Option<crate::rate_control::HrdParams>) -> Self {
+        self.hrd = v;
+        self
+    }
+
+    /// Set [`RateControlConfig::mb_adaptive`].
+    #[must_use]
+    pub fn with_mb_adaptive(mut self, v: bool) -> Self {
+        self.mb_adaptive = v;
+        self
+    }
+
+    /// Set [`RateControlConfig::max_reencodes`].
+    #[must_use]
+    pub fn with_max_reencodes(mut self, v: u8) -> Self {
+        self.max_reencodes = v;
+        self
+    }
+}
+
 impl Default for RateControlConfig {
     fn default() -> Self {
         RateControlConfig {
@@ -5729,6 +5961,7 @@ impl Default for RateControlConfig {
 /// Output of [`encode_sequence_rate_controlled`]: the elementary
 /// stream plus the per-picture measurements the regulation produced.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RateControlledStream {
     /// The H.263 elementary stream (decodes through
     /// [`crate::picture::decode_sequence`]).
@@ -5742,6 +5975,25 @@ pub struct RateControlledStream {
     pub hrd_conformant: bool,
     /// Largest §B.4 post-removal occupancy observed (0 without HRD).
     pub hrd_max_occupancy: u64,
+}
+
+impl RateControlledStream {
+    /// Build a [`RateControlledStream`] from all of its fields.
+    pub fn new(
+        bytes: Vec<u8>,
+        picture_bits: Vec<u32>,
+        picture_quants: Vec<u8>,
+        hrd_conformant: bool,
+        hrd_max_occupancy: u64,
+    ) -> Self {
+        Self {
+            bytes,
+            picture_bits,
+            picture_quants,
+            hrd_conformant,
+            hrd_max_occupancy,
+        }
+    }
 }
 
 /// Encode a sequence of frames as a **rate-controlled** I + P GOP

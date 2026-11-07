@@ -38,6 +38,7 @@ use oxideav_core::bits::BitWriter;
 
 /// Configuration for the adaptive-quantisation picture encoders.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct AdaptiveQuantConfig {
     /// Bit budget for the whole coded picture (header included).
     pub target_bits: u32,
@@ -45,6 +46,29 @@ pub struct AdaptiveQuantConfig {
     pub initial_quant: u8,
     /// Motion-search window for the INTER encoder (± whole pixels).
     pub search_half: i32,
+}
+
+impl AdaptiveQuantConfig {
+    /// Set [`AdaptiveQuantConfig::target_bits`].
+    #[must_use]
+    pub fn with_target_bits(mut self, v: u32) -> Self {
+        self.target_bits = v;
+        self
+    }
+
+    /// Set [`AdaptiveQuantConfig::initial_quant`].
+    #[must_use]
+    pub fn with_initial_quant(mut self, v: u8) -> Self {
+        self.initial_quant = v;
+        self
+    }
+
+    /// Set [`AdaptiveQuantConfig::search_half`].
+    #[must_use]
+    pub fn with_search_half(mut self, v: i32) -> Self {
+        self.search_half = v;
+        self
+    }
 }
 
 impl Default for AdaptiveQuantConfig {
@@ -61,11 +85,19 @@ impl Default for AdaptiveQuantConfig {
 /// macroblock was quantised at (the governor's trace, in scanning
 /// order — a skipped macroblock reports the QUANT it held).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AdaptiveQuantPicture {
     /// The coded picture (byte-aligned, PSTUF-padded).
     pub bytes: Vec<u8>,
     /// Per-macroblock QUANT in scanning order.
     pub mb_quants: Vec<u8>,
+}
+
+impl AdaptiveQuantPicture {
+    /// Build a [`AdaptiveQuantPicture`] from all of its fields.
+    pub fn new(bytes: Vec<u8>, mb_quants: Vec<u8>) -> Self {
+        Self { bytes, mb_quants }
+    }
 }
 
 /// The governor: given the bits spent so far, the pro-rata budget at

@@ -65,6 +65,7 @@ use oxideav_core::bits::BitWriter;
 
 /// Configuration for [`encode_improved_pb_picture`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ImprovedPbConfig {
     /// Quantiser for the P-blocks (`1..=31`); the BPB-blocks run at the
     /// §5.1.23 / Table-6 BQUANT derived from it and `dbquant`.
@@ -117,6 +118,85 @@ pub struct ImprovedPbConfig {
     pub intra_refresh: usize,
 }
 
+impl ImprovedPbConfig {
+    /// Set [`ImprovedPbConfig::quant`].
+    #[must_use]
+    pub fn with_quant(mut self, v: u8) -> Self {
+        self.quant = v;
+        self
+    }
+
+    /// Set [`ImprovedPbConfig::trb`].
+    #[must_use]
+    pub fn with_trb(mut self, v: u8) -> Self {
+        self.trb = v;
+        self
+    }
+
+    /// Set [`ImprovedPbConfig::dbquant`].
+    #[must_use]
+    pub fn with_dbquant(mut self, v: u8) -> Self {
+        self.dbquant = v;
+        self
+    }
+
+    /// Set [`ImprovedPbConfig::search_half`].
+    #[must_use]
+    pub fn with_search_half(mut self, v: i32) -> Self {
+        self.search_half = v;
+        self
+    }
+
+    /// Set [`ImprovedPbConfig::forward_search_half`].
+    #[must_use]
+    pub fn with_forward_search_half(mut self, v: i32) -> Self {
+        self.forward_search_half = v;
+        self
+    }
+
+    /// Set [`ImprovedPbConfig::allow_backward`].
+    #[must_use]
+    pub fn with_allow_backward(mut self, v: bool) -> Self {
+        self.allow_backward = v;
+        self
+    }
+
+    /// Set [`ImprovedPbConfig::advanced_prediction`].
+    #[must_use]
+    pub fn with_advanced_prediction(mut self, v: bool) -> Self {
+        self.advanced_prediction = v;
+        self
+    }
+
+    /// Set [`ImprovedPbConfig::umv`].
+    #[must_use]
+    pub fn with_umv(mut self, v: bool) -> Self {
+        self.umv = v;
+        self
+    }
+
+    /// Set [`ImprovedPbConfig::slice_rows`].
+    #[must_use]
+    pub fn with_slice_rows(mut self, v: usize) -> Self {
+        self.slice_rows = v;
+        self
+    }
+
+    /// Set [`ImprovedPbConfig::aic`].
+    #[must_use]
+    pub fn with_aic(mut self, v: bool) -> Self {
+        self.aic = v;
+        self
+    }
+
+    /// Set [`ImprovedPbConfig::intra_refresh`].
+    #[must_use]
+    pub fn with_intra_refresh(mut self, v: usize) -> Self {
+        self.intra_refresh = v;
+        self
+    }
+}
+
 impl Default for ImprovedPbConfig {
     fn default() -> Self {
         ImprovedPbConfig {
@@ -137,6 +217,7 @@ impl Default for ImprovedPbConfig {
 
 /// Per-picture mode census returned by the `_stats` encoder forms.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ImprovedPbStats {
     /// Macroblocks emitted with COD = 1 (their B-part is the
     /// zero-vector bidirectional prediction).
@@ -155,6 +236,57 @@ pub struct ImprovedPbStats {
     /// Macroblocks that carried a non-zero MVDB (Annex G delta search
     /// hits, or Annex M forward vectors).
     pub mvdb: usize,
+}
+
+impl ImprovedPbStats {
+    /// Set [`ImprovedPbStats::skipped`].
+    #[must_use]
+    pub fn with_skipped(mut self, v: usize) -> Self {
+        self.skipped = v;
+        self
+    }
+
+    /// Set [`ImprovedPbStats::bidirectional`].
+    #[must_use]
+    pub fn with_bidirectional(mut self, v: usize) -> Self {
+        self.bidirectional = v;
+        self
+    }
+
+    /// Set [`ImprovedPbStats::forward`].
+    #[must_use]
+    pub fn with_forward(mut self, v: usize) -> Self {
+        self.forward = v;
+        self
+    }
+
+    /// Set [`ImprovedPbStats::backward`].
+    #[must_use]
+    pub fn with_backward(mut self, v: usize) -> Self {
+        self.backward = v;
+        self
+    }
+
+    /// Set [`ImprovedPbStats::b_residual`].
+    #[must_use]
+    pub fn with_b_residual(mut self, v: usize) -> Self {
+        self.b_residual = v;
+        self
+    }
+
+    /// Set [`ImprovedPbStats::intra`].
+    #[must_use]
+    pub fn with_intra(mut self, v: usize) -> Self {
+        self.intra = v;
+        self
+    }
+
+    /// Set [`ImprovedPbStats::mvdb`].
+    #[must_use]
+    pub fn with_mvdb(mut self, v: usize) -> Self {
+        self.mvdb = v;
+        self
+    }
 }
 
 /// Which PB-frame flavour the shared core emits.

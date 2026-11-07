@@ -237,13 +237,12 @@ fn mixed_mode_stream_decodes_end_to_end() {
     // Annex G PB pair: B at 5 px, P at 6 px (TR 3 -> 5, TRB 1).
     let fb = translated(&r0, 5);
     let fp = translated(&r0, 6);
-    let cfg = PbConfig {
-        quant: 5,
-        trb: 1,
-        dbquant: 0,
-        search_half: 3,
-        b_search_half: 0,
-    };
+    let cfg = PbConfig::default()
+        .with_quant(5)
+        .with_trb(1)
+        .with_dbquant(0)
+        .with_search_half(3)
+        .with_b_search_half(0);
     let pb = encode_pb_picture(&fp, &fb, &r3, 5, 3, &cfg).unwrap();
 
     let mut stream = Vec::new();
@@ -270,14 +269,12 @@ fn mixed_mode_stream_decodes_end_to_end() {
 fn gop_driver_public_api_round_trips() {
     let base = gradient(176, 144, 10);
     let frames: Vec<YuvFrame> = (0..5).map(|k| translated(&base, k)).collect();
-    let cfg = GopConfig {
-        quant: 6,
-        intra_period: 4,
-        search_half: 2,
-        umv: false,
-        eos: true,
-        ..GopConfig::default()
-    };
+    let cfg = GopConfig::default()
+        .with_quant(6)
+        .with_intra_period(4)
+        .with_search_half(2)
+        .with_umv(false)
+        .with_eos(true);
     let stream = encode_sequence(&frames, &cfg, 0).unwrap();
     assert!(stream.ends_with(&EOS_BYTES));
     let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
@@ -294,10 +291,7 @@ fn gop_driver_public_api_round_trips() {
 /// several standard picture sizes / quantisers.
 #[test]
 fn aic_intra_picture_round_trips_within_tolerance() {
-    let opts = DecodeOptions {
-        aic: true,
-        ..DecodeOptions::default()
-    };
+    let opts = DecodeOptions::default().with_aic(true);
     for &mode in &[
         IntraMode::DcOnly,
         IntraMode::VerticalDcAc,
@@ -322,10 +316,7 @@ fn aic_intra_picture_round_trips_within_tolerance() {
 /// grid, so the round-trip is byte-exact on all three planes.
 #[test]
 fn aic_flat_picture_is_exact() {
-    let opts = DecodeOptions {
-        aic: true,
-        ..DecodeOptions::default()
-    };
+    let opts = DecodeOptions::default().with_aic(true);
     let src = YuvFrame::grey(176, 144);
     for &mode in &[
         IntraMode::DcOnly,
@@ -349,10 +340,7 @@ fn aic_flat_picture_is_exact() {
 /// help). Also exercised on directional content where mode 1 / 2 pay off.
 #[test]
 fn aic_auto_mode_round_trips_and_is_not_worse() {
-    let opts = DecodeOptions {
-        aic: true,
-        ..DecodeOptions::default()
-    };
+    let opts = DecodeOptions::default().with_aic(true);
     // A frame with strong horizontal banding (rows constant, columns
     // vary) plus a smooth luma gradient.
     let lw = 176;
@@ -397,11 +385,9 @@ fn aic_auto_mode_round_trips_and_is_not_worse() {
 /// quantisers including low ones where the widened LEVEL range matters.
 #[test]
 fn aic_mq_intra_picture_round_trips() {
-    let opts = DecodeOptions {
-        aic: true,
-        modified_quant: true,
-        ..DecodeOptions::default()
-    };
+    let opts = DecodeOptions::default()
+        .with_aic(true)
+        .with_modified_quant(true);
     for &q in &[3u8, 8, 16, 25] {
         let src = gradient(176, 144, 4);
         let bytes = encode_intra_picture_aic_mq(&src, q, 0).expect("encode AIC+MQ");
@@ -416,10 +402,7 @@ fn aic_mq_intra_picture_round_trips() {
 /// frames, each within the §I.3 round-trip tolerance.
 #[test]
 fn aic_intra_sequence_decodes_all_frames() {
-    let opts = DecodeOptions {
-        aic: true,
-        ..DecodeOptions::default()
-    };
+    let opts = DecodeOptions::default().with_aic(true);
     let frames = vec![
         gradient(176, 144, 0),
         gradient(176, 144, 40),
@@ -480,15 +463,9 @@ fn plus_aic_picture_signals_aic_on_the_wire() {
 
     let from_plus =
         decode_picture_layer(&plus, None, DecodeOptions::default()).expect("decode plus AIC");
-    let from_base = decode_picture_no_gob0_header(
-        &base,
-        None,
-        DecodeOptions {
-            aic: true,
-            ..DecodeOptions::default()
-        },
-    )
-    .expect("decode base AIC");
+    let from_base =
+        decode_picture_no_gob0_header(&base, None, DecodeOptions::default().with_aic(true))
+            .expect("decode base AIC");
     assert_eq!(from_plus.y, from_base.y);
     assert_eq!(from_plus.cb, from_base.cb);
     assert_eq!(from_plus.cr, from_base.cr);
@@ -515,11 +492,9 @@ fn plus_aic_mq_picture_signals_both_modes_on_the_wire() {
         let from_base = decode_picture_no_gob0_header(
             &base,
             None,
-            DecodeOptions {
-                aic: true,
-                modified_quant: true,
-                ..DecodeOptions::default()
-            },
+            DecodeOptions::default()
+                .with_aic(true)
+                .with_modified_quant(true),
         )
         .expect("decode base AIC+MQ");
         assert_eq!(from_plus.y, from_base.y, "q{q} luma mismatch");
@@ -1096,11 +1071,9 @@ fn cpm_slice_subbitstream_mismatch_is_refused() {
         8,
         0,
         /* is_inter */ false,
-        PlusModes {
-            slice_structured: Some(sss),
-            cpm_psbi: Some(1),
-            ..PlusModes::default()
-        },
+        PlusModes::default()
+            .with_slice_structured(Some(sss))
+            .with_cpm_psbi(Some(1)),
     )
     .unwrap();
     let layout = PictureLayout::for_source_format(H263SourceFormat::Qcif).unwrap();
@@ -1149,13 +1122,12 @@ fn pb_mvdb_search_improves_nonlinear_b_prediction() {
     let recon = decode_picture_no_gob0_header(&i_bytes, None, DecodeOptions::default()).unwrap();
 
     let encode_with = |b_search_half: i32| {
-        let cfg = PbConfig {
-            quant: 8,
-            trb: 1,
-            dbquant: 0,
-            search_half: 8,
-            b_search_half,
-        };
+        let cfg = PbConfig::default()
+            .with_quant(8)
+            .with_trb(1)
+            .with_dbquant(0)
+            .with_search_half(8)
+            .with_b_search_half(b_search_half);
         encode_pb_picture(&p_src, &b_src, &recon, 2, 0, &cfg).unwrap()
     };
     let plain = encode_with(0);

@@ -260,15 +260,8 @@ fn rru_deblocking_filter_variant_round_trips() {
     let r_df = decode_picture_layer(&df, None, DecodeOptions::default()).unwrap();
     // The same wire under `deblock` forced on the plain stream selects
     // the §Q.7.2 variant too.
-    let r_forced = decode_picture_layer(
-        &plain,
-        None,
-        DecodeOptions {
-            deblock: true,
-            ..DecodeOptions::default()
-        },
-    )
-    .unwrap();
+    let r_forced =
+        decode_picture_layer(&plain, None, DecodeOptions::default().with_deblock(true)).unwrap();
     assert_eq!(r_df, r_forced);
     assert!(r_df.y != r_plain.y, "§Q.7.2 and §Q.7.1 filter differently");
     let (m_plain, m_df) = (luma_mae(&r_plain, &src), luma_mae(&r_df, &src));

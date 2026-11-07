@@ -128,19 +128,18 @@ fn improved_pb_all_three_modes_round_trip_through_decode_sequence() {
     let p1 = translated(&base, 4, 0);
     let half1 = translated(&base, 2, 0);
     let b1 = banded_b(&r0, &p1, &half1);
-    let cfg = ImprovedPbConfig {
-        quant: 6,
-        trb: 1,
-        dbquant: 0,
-        search_half: 6,
-        forward_search_half: 3,
-        allow_backward: true,
-        advanced_prediction: false,
-        umv: false,
-        slice_rows: 0,
-        aic: false,
-        intra_refresh: 0,
-    };
+    let cfg = ImprovedPbConfig::default()
+        .with_quant(6)
+        .with_trb(1)
+        .with_dbquant(0)
+        .with_search_half(6)
+        .with_forward_search_half(3)
+        .with_allow_backward(true)
+        .with_advanced_prediction(false)
+        .with_umv(false)
+        .with_slice_rows(0)
+        .with_aic(false)
+        .with_intra_refresh(0);
     let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
     eprintln!("Improved-PB #1 mode census: {stats:?}");
     assert!(stats.forward > 0, "forward band must select §M.2.2");
@@ -185,10 +184,7 @@ fn improved_pb_static_content_is_lossless_and_mostly_skipped() {
     let r0 = decode_sequence(&i_bytes, DecodeOptions::default())
         .unwrap()
         .remove(0);
-    let cfg = ImprovedPbConfig {
-        quant: 4,
-        ..ImprovedPbConfig::default()
-    };
+    let cfg = ImprovedPbConfig::default().with_quant(4);
     let (ipb, stats) = encode_improved_pb_picture_stats(&r0, &r0, &r0, 3, 0, &cfg).unwrap();
     assert_eq!(
         stats.skipped, 48,
@@ -207,12 +203,10 @@ fn improved_pb_mode_restrictions_are_honoured() {
     let p = translated(&base, 4, 0);
     // Halfway content is the bidirectional natural (TRB / TRD = 1 / 2).
     let b_half = translated(&base, 2, 0);
-    let no_forward = ImprovedPbConfig {
-        quant: 5,
-        forward_search_half: 0,
-        allow_backward: true,
-        ..ImprovedPbConfig::default()
-    };
+    let no_forward = ImprovedPbConfig::default()
+        .with_quant(5)
+        .with_forward_search_half(0)
+        .with_allow_backward(true);
     let (bytes, stats) =
         encode_improved_pb_picture_stats(&p, &b_half, &base, 2, 0, &no_forward).unwrap();
     assert_eq!(stats.forward, 0);
@@ -223,12 +217,10 @@ fn improved_pb_mode_restrictions_are_honoured() {
     // A +1 px BPB is a forward-mode natural (one whole-pel vector).
     let b = translated(&base, 1, 0);
 
-    let no_backward = ImprovedPbConfig {
-        quant: 5,
-        forward_search_half: 3,
-        allow_backward: false,
-        ..ImprovedPbConfig::default()
-    };
+    let no_backward = ImprovedPbConfig::default()
+        .with_quant(5)
+        .with_forward_search_half(3)
+        .with_allow_backward(false);
     let (bytes, stats) =
         encode_improved_pb_picture_stats(&p, &b, &base, 2, 0, &no_backward).unwrap();
     assert_eq!(stats.backward, 0);
@@ -241,27 +233,18 @@ fn improved_pb_mode_restrictions_are_honoured() {
 #[test]
 fn improved_pb_rejects_bad_parameters() {
     let f = textured(128, 96, 2);
-    let bad_q = ImprovedPbConfig {
-        quant: 0,
-        ..ImprovedPbConfig::default()
-    };
+    let bad_q = ImprovedPbConfig::default().with_quant(0);
     assert_eq!(
         encode_improved_pb_picture(&f, &f, &f, 2, 0, &bad_q).unwrap_err(),
         Error::InvalidQuantiser
     );
-    let bad_trb = ImprovedPbConfig {
-        trb: 2,
-        ..ImprovedPbConfig::default()
-    };
+    let bad_trb = ImprovedPbConfig::default().with_trb(2);
     // TRB must be smaller than TRD (= 2 here).
     assert_eq!(
         encode_improved_pb_picture(&f, &f, &f, 2, 0, &bad_trb).unwrap_err(),
         Error::BadPbTemporalReference
     );
-    let bad_dbq = ImprovedPbConfig {
-        dbquant: 4,
-        ..ImprovedPbConfig::default()
-    };
+    let bad_dbq = ImprovedPbConfig::default().with_dbquant(4);
     assert_eq!(
         encode_improved_pb_picture(&f, &f, &f, 2, 0, &bad_dbq).unwrap_err(),
         Error::BadPbTemporalReference
@@ -299,13 +282,12 @@ fn annex_g_pb_with_advanced_prediction_round_trips() {
     for r in 0..144 {
         b.y[r * 176 + 88..r * 176 + 176].copy_from_slice(&b_right.y[r * 176 + 88..r * 176 + 176]);
     }
-    let cfg = PbConfig {
-        quant: 6,
-        trb: 1,
-        dbquant: 0,
-        search_half: 6,
-        b_search_half: 2,
-    };
+    let cfg = PbConfig::default()
+        .with_quant(6)
+        .with_trb(1)
+        .with_dbquant(0)
+        .with_search_half(6)
+        .with_b_search_half(2);
     let (ap_bytes, stats) = encode_pb_picture_ap_stats(&p, &b, &r0, 2, 0, &cfg).unwrap();
     eprintln!("Annex G + AP census: {stats:?}");
     assert_eq!(
@@ -362,19 +344,18 @@ fn improved_pb_with_advanced_prediction_and_intra_refresh_round_trips() {
     let p1 = translated(&base, 5, 2);
     let half1 = translated(&base, 3, 1);
     let b1 = banded_b(&r0, &p1, &half1);
-    let cfg = ImprovedPbConfig {
-        quant: 5,
-        trb: 1,
-        dbquant: 0,
-        search_half: 6,
-        forward_search_half: 3,
-        allow_backward: true,
-        advanced_prediction: true,
-        umv: false,
-        slice_rows: 0,
-        aic: false,
-        intra_refresh: 4,
-    };
+    let cfg = ImprovedPbConfig::default()
+        .with_quant(5)
+        .with_trb(1)
+        .with_dbquant(0)
+        .with_search_half(6)
+        .with_forward_search_half(3)
+        .with_allow_backward(true)
+        .with_advanced_prediction(true)
+        .with_umv(false)
+        .with_slice_rows(0)
+        .with_aic(false)
+        .with_intra_refresh(4);
     let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
     eprintln!("Improved-PB + AP census: {stats:?}");
     assert_eq!(stats.intra, 99usize.div_ceil(4));
@@ -420,13 +401,12 @@ fn annex_g_pb_umv_follows_a_wide_pan() {
         .remove(0);
     let p = translated(&base, 22, 0);
     let b = translated(&base, 11, 0);
-    let cfg = PbConfig {
-        quant: 6,
-        trb: 1,
-        dbquant: 0,
-        search_half: 24,
-        b_search_half: 2,
-    };
+    let cfg = PbConfig::default()
+        .with_quant(6)
+        .with_trb(1)
+        .with_dbquant(0)
+        .with_search_half(24)
+        .with_b_search_half(2);
     let (umv_bytes, stats) = encode_pb_picture_umv_stats(&p, &b, &r0, 2, 0, &cfg).unwrap();
     eprintln!("Annex G + UMV census: {stats:?}");
     let plain_bytes = encode_pb_picture(&p, &b, &r0, 2, 0, &cfg).unwrap();
@@ -494,19 +474,18 @@ fn improved_pb_umv_plus_round_trips_with_over_boundary_forward_vectors() {
         }
     }
     for ap in [false, true] {
-        let cfg = ImprovedPbConfig {
-            quant: 6,
-            trb: 1,
-            dbquant: 0,
-            search_half: 22,
-            forward_search_half: 8,
-            allow_backward: true,
-            advanced_prediction: ap,
-            umv: true,
-            slice_rows: 0,
-            aic: false,
-            intra_refresh: 0,
-        };
+        let cfg = ImprovedPbConfig::default()
+            .with_quant(6)
+            .with_trb(1)
+            .with_dbquant(0)
+            .with_search_half(22)
+            .with_forward_search_half(8)
+            .with_allow_backward(true)
+            .with_advanced_prediction(ap)
+            .with_umv(true)
+            .with_slice_rows(0)
+            .with_aic(false)
+            .with_intra_refresh(0);
         let (bytes, stats) = encode_improved_pb_picture_stats(&p, &b, &r0, 2, 0, &cfg).unwrap();
         eprintln!("Improved-PB + UMV+ (ap {ap}) census: {stats:?}");
         assert!(
@@ -547,19 +526,18 @@ fn improved_pb_with_annex_k_slices_round_trips() {
     let half1 = translated(&base, 3, 1);
     let b1 = banded_b(&r0, &p1, &half1);
     for ap in [false, true] {
-        let cfg = ImprovedPbConfig {
-            quant: 6,
-            trb: 1,
-            dbquant: 0,
-            search_half: 6,
-            forward_search_half: 3,
-            allow_backward: true,
-            advanced_prediction: ap,
-            umv: false,
-            slice_rows: 3,
-            aic: false,
-            intra_refresh: 0,
-        };
+        let cfg = ImprovedPbConfig::default()
+            .with_quant(6)
+            .with_trb(1)
+            .with_dbquant(0)
+            .with_search_half(6)
+            .with_forward_search_half(3)
+            .with_allow_backward(true)
+            .with_advanced_prediction(ap)
+            .with_umv(false)
+            .with_slice_rows(3)
+            .with_aic(false)
+            .with_intra_refresh(0);
         let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
         eprintln!("Improved-PB + slices (ap {ap}) census: {stats:?}");
         assert!(stats.forward > 0 && stats.bidirectional > 0 && stats.backward > 0);
@@ -590,10 +568,7 @@ fn improved_pb_with_annex_k_slices_round_trips() {
         }
     }
     // Slices taller than the picture are refused.
-    let bad = ImprovedPbConfig {
-        slice_rows: 10,
-        ..ImprovedPbConfig::default()
-    };
+    let bad = ImprovedPbConfig::default().with_slice_rows(10);
     assert_eq!(
         encode_improved_pb_picture(&p1, &b1, &r0, 2, 0, &bad).unwrap_err(),
         Error::UnsupportedPictureGeometry
@@ -647,19 +622,18 @@ fn aic_intra_macroblocks_inside_p_and_improved_pb_pictures_round_trip() {
     let half1 = translated(&base, 2, 0);
     let b1 = banded_b(&r0, &p1, &half1);
     for slice_rows in [0usize, 3] {
-        let cfg = ImprovedPbConfig {
-            quant: 6,
-            trb: 1,
-            dbquant: 0,
-            search_half: 6,
-            forward_search_half: 3,
-            allow_backward: true,
-            advanced_prediction: false,
-            umv: false,
-            slice_rows,
-            aic: true,
-            intra_refresh: 3,
-        };
+        let cfg = ImprovedPbConfig::default()
+            .with_quant(6)
+            .with_trb(1)
+            .with_dbquant(0)
+            .with_search_half(6)
+            .with_forward_search_half(3)
+            .with_allow_backward(true)
+            .with_advanced_prediction(false)
+            .with_umv(false)
+            .with_slice_rows(slice_rows)
+            .with_aic(true)
+            .with_intra_refresh(3);
         let (ipb, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
         eprintln!("Improved-PB + AIC (slices {slice_rows}) census: {stats:?}");
         assert_eq!(stats.intra, 33);

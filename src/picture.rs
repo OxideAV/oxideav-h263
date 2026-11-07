@@ -170,6 +170,7 @@ impl YuvFrame {
 /// to this driver — callers that want to feed an AIC-enabled picture
 /// through must set [`Self::aic`] explicitly.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct DecodeOptions {
     /// Run the Annex J §J.3 deblocking filter on the reconstructed
     /// planes after macroblock reconstruction. Off by default.
@@ -235,6 +236,43 @@ pub struct DecodeOptions {
     pub obmc_skip_zero_right: bool,
 }
 
+impl DecodeOptions {
+    /// Set [`DecodeOptions::deblock`].
+    #[must_use]
+    pub fn with_deblock(mut self, v: bool) -> Self {
+        self.deblock = v;
+        self
+    }
+
+    /// Set [`DecodeOptions::aic`].
+    #[must_use]
+    pub fn with_aic(mut self, v: bool) -> Self {
+        self.aic = v;
+        self
+    }
+
+    /// Set [`DecodeOptions::modified_quant`].
+    #[must_use]
+    pub fn with_modified_quant(mut self, v: bool) -> Self {
+        self.modified_quant = v;
+        self
+    }
+
+    /// Set [`DecodeOptions::alt_inter_vlc`].
+    #[must_use]
+    pub fn with_alt_inter_vlc(mut self, v: bool) -> Self {
+        self.alt_inter_vlc = v;
+        self
+    }
+
+    /// Set [`DecodeOptions::obmc_skip_zero_right`].
+    #[must_use]
+    pub fn with_obmc_skip_zero_right(mut self, v: bool) -> Self {
+        self.obmc_skip_zero_right = v;
+        self
+    }
+}
+
 /// Picture-level layout the §4.2.1 GOB walker needs: total luma
 /// dimensions and the GOB grid the bitstream is divided into.
 ///
@@ -261,6 +299,7 @@ pub struct DecodeOptions {
 /// handles the truncated last GOB by clamping its row iteration to the
 /// picture's bottom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PictureLayout {
     /// Luma plane width in pixels (divisible by 16 for the baseline
     /// formats; divisible by 4 in the §4.2.1 custom-format range).
@@ -277,6 +316,18 @@ pub struct PictureLayout {
     /// 404..=800 line range it is `2`; for 16CIF and every custom
     /// format above 800 lines it is `4`.
     pub mb_rows_per_gob: u32,
+}
+
+impl PictureLayout {
+    /// Build a [`PictureLayout`] from all of its fields.
+    pub fn new(luma_width: u32, luma_height: u32, num_gobs: u32, mb_rows_per_gob: u32) -> Self {
+        Self {
+            luma_width,
+            luma_height,
+            num_gobs,
+            mb_rows_per_gob,
+        }
+    }
 }
 
 impl PictureLayout {
@@ -2119,6 +2170,7 @@ fn decode_rru_picture_body(
 /// bitstream up at this macroblock without the preceding packets
 /// (RFC 2190 §5.2 — QUANT / GOBN / MBA / motion-vector predictors).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MbBoundaryInfo {
     /// Absolute bit offset of the macroblock's first bit within the
     /// picture buffer (bit 0 = MSB of byte 0).
@@ -2137,6 +2189,19 @@ pub struct MbBoundaryInfo {
     /// macroblock (block 1), in half-pel units — the RFC 2190 §5.2
     /// `HMV1` / `VMV1` fields.
     pub pred1: (i16, i16),
+}
+
+impl MbBoundaryInfo {
+    /// Build a [`MbBoundaryInfo`] from all of its fields.
+    pub fn new(bit_offset: u64, gobn: u8, mba_in_gob: u16, quant: u8, pred1: (i16, i16)) -> Self {
+        Self {
+            bit_offset,
+            gobn,
+            mba_in_gob,
+            quant,
+            pred1,
+        }
+    }
 }
 
 /// Walk one **baseline-PTYPE** picture (the §5.2.2 GOB-0-elided /
@@ -2983,12 +3048,20 @@ pub fn decode_picture_layer(
 /// baseline-PTYPE picture it is reset to the spec default (§5.1.4.5
 /// rule 3 — a non-PLUSPTYPE picture clears all inferred mode state).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodePictureOutcome {
     /// The decoded planar YUV 4:2:0 frame.
     pub frame: YuvFrame,
     /// The inherited-state snapshot the next picture in this bitstream
     /// should be decoded with (§5.1.4.4).
     pub inherited: InheritedExtendedState,
+}
+
+impl DecodePictureOutcome {
+    /// Build a [`DecodePictureOutcome`] from all of its fields.
+    pub fn new(frame: YuvFrame, inherited: InheritedExtendedState) -> Self {
+        Self { frame, inherited }
+    }
 }
 
 /// Decode a single H.263 picture from `data`, threading caller-supplied
@@ -3425,12 +3498,20 @@ pub fn decode_picture_layer_rps(
 /// display-only (nothing is ever predicted from it, §G.1 /
 /// Figure G.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PbFramePair {
     /// The P-picture part — the next prediction reference.
     pub p_frame: YuvFrame,
     /// The B-picture part — displayed before `p_frame`, never used
     /// as a prediction reference.
     pub b_frame: YuvFrame,
+}
+
+impl PbFramePair {
+    /// Build a [`PbFramePair`] from all of its fields.
+    pub fn new(p_frame: YuvFrame, b_frame: YuvFrame) -> Self {
+        Self { p_frame, b_frame }
+    }
 }
 
 /// Per-picture Annex G PB-frames context threaded into
@@ -6669,11 +6750,19 @@ pub fn decode_ep_picture_layer_rpr(
 /// fields are always the post-wrap positive spans the §G.4 formulas
 /// require.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BPictureTemporal {
     /// §5.1.22 TRB — previous-anchor → this-B-picture increment.
     pub trb: i32,
     /// §G.4 TRD — previous-anchor → subsequent-anchor increment.
     pub trd: i32,
+}
+
+impl BPictureTemporal {
+    /// Build a [`BPictureTemporal`] from all of its fields.
+    pub fn new(trb: i32, trd: i32) -> Self {
+        Self { trb, trd }
+    }
 }
 
 /// Decode and reconstruct an Annex O temporal-scalability **B-picture**

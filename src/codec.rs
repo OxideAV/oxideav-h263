@@ -91,6 +91,7 @@ fn core_error(e: crate::Error) -> CoreError {
 /// need no options. `obmc_skip_zero_right` is the documented
 /// ecosystem-compatibility deviation for Advanced-Prediction streams.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct H263DecoderOptions {
     /// Annex J §J.3 in-loop deblocking filter (baseline streams only —
     /// PLUSPTYPE streams auto-enable it from OPPTYPE).
@@ -106,6 +107,43 @@ pub struct H263DecoderOptions {
     /// ecosystem-compatibility deviation some encoder families
     /// require — see [`DecodeOptions::obmc_skip_zero_right`]).
     pub obmc_skip_zero_right: bool,
+}
+
+impl H263DecoderOptions {
+    /// Set [`H263DecoderOptions::deblock`].
+    #[must_use]
+    pub fn with_deblock(mut self, v: bool) -> Self {
+        self.deblock = v;
+        self
+    }
+
+    /// Set [`H263DecoderOptions::aic`].
+    #[must_use]
+    pub fn with_aic(mut self, v: bool) -> Self {
+        self.aic = v;
+        self
+    }
+
+    /// Set [`H263DecoderOptions::modified_quant`].
+    #[must_use]
+    pub fn with_modified_quant(mut self, v: bool) -> Self {
+        self.modified_quant = v;
+        self
+    }
+
+    /// Set [`H263DecoderOptions::alt_inter_vlc`].
+    #[must_use]
+    pub fn with_alt_inter_vlc(mut self, v: bool) -> Self {
+        self.alt_inter_vlc = v;
+        self
+    }
+
+    /// Set [`H263DecoderOptions::obmc_skip_zero_right`].
+    #[must_use]
+    pub fn with_obmc_skip_zero_right(mut self, v: bool) -> Self {
+        self.obmc_skip_zero_right = v;
+        self
+    }
 }
 
 impl H263DecoderOptions {
@@ -171,6 +209,7 @@ impl CodecOptionsStruct for H263DecoderOptions {
 
 /// Encoder tuning knobs recognised in [`CodecParameters::options`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct H263EncoderOptions {
     /// Quantiser for every picture (`1..=31`).
     pub quant: u32,
@@ -202,6 +241,64 @@ pub struct H263EncoderOptions {
     /// [`CodecParameters::frame_rate`] when both are set. Baseline
     /// pictures only — combining with `deblock` or `umv` is refused.
     pub picture_bits: u32,
+}
+
+impl H263EncoderOptions {
+    /// Set [`H263EncoderOptions::quant`].
+    #[must_use]
+    pub fn with_quant(mut self, v: u32) -> Self {
+        self.quant = v;
+        self
+    }
+
+    /// Set [`H263EncoderOptions::gop`].
+    #[must_use]
+    pub fn with_gop(mut self, v: u32) -> Self {
+        self.gop = v;
+        self
+    }
+
+    /// Set [`H263EncoderOptions::search`].
+    #[must_use]
+    pub fn with_search(mut self, v: u32) -> Self {
+        self.search = v;
+        self
+    }
+
+    /// Set [`H263EncoderOptions::umv`].
+    #[must_use]
+    pub fn with_umv(mut self, v: bool) -> Self {
+        self.umv = v;
+        self
+    }
+
+    /// Set [`H263EncoderOptions::eos`].
+    #[must_use]
+    pub fn with_eos(mut self, v: bool) -> Self {
+        self.eos = v;
+        self
+    }
+
+    /// Set [`H263EncoderOptions::deblock`].
+    #[must_use]
+    pub fn with_deblock(mut self, v: bool) -> Self {
+        self.deblock = v;
+        self
+    }
+
+    /// Set [`H263EncoderOptions::four_mv`].
+    #[must_use]
+    pub fn with_four_mv(mut self, v: bool) -> Self {
+        self.four_mv = v;
+        self
+    }
+
+    /// Set [`H263EncoderOptions::picture_bits`].
+    #[must_use]
+    pub fn with_picture_bits(mut self, v: u32) -> Self {
+        self.picture_bits = v;
+        self
+    }
 }
 
 impl Default for H263EncoderOptions {

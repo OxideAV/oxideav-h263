@@ -40,10 +40,7 @@ fn gradient(lw: usize, lh: usize, seed: u8) -> YuvFrame {
 fn packetize_check(stream: &[u8], max_payload: usize) -> Vec<u8> {
     let payloads = packetize_stream(
         stream,
-        PacketizeConfig {
-            max_payload,
-            ..PacketizeConfig::default()
-        },
+        PacketizeConfig::default().with_max_payload(max_payload),
     )
     .expect("packetize");
     assert!(!payloads.is_empty());
@@ -125,14 +122,12 @@ fn gop_stream_round_trips_at_every_budget() {
         gradient(176, 144, 24),
         gradient(176, 144, 36),
     ];
-    let cfg = GopConfig {
-        quant: 7,
-        intra_period: 2,
-        search_half: 4,
-        umv: false,
-        eos: true,
-        ..GopConfig::default()
-    };
+    let cfg = GopConfig::default()
+        .with_quant(7)
+        .with_intra_period(2)
+        .with_search_half(4)
+        .with_umv(false)
+        .with_eos(true);
     let stream = encode_sequence(&frames, &cfg, 0).expect("encode GOP");
     let reference_frames = decode_sequence(&stream, DecodeOptions::default()).expect("decode");
 
@@ -158,14 +153,8 @@ fn gob_stream_prefers_segment_cuts() {
     let src = gradient(176, 144, 9);
     let stream = encode_intra_picture_gobs(&src, 0, |_| 6).expect("encode GOBs");
     // QCIF at q=6: each GOB is well under 600 bytes.
-    let payloads = packetize_stream(
-        &stream,
-        PacketizeConfig {
-            max_payload: 600,
-            ..PacketizeConfig::default()
-        },
-    )
-    .expect("packetize");
+    let payloads = packetize_stream(&stream, PacketizeConfig::default().with_max_payload(600))
+        .expect("packetize");
     assert!(payloads.len() > 1, "expected a multi-packet split");
     for (i, p) in payloads.iter().enumerate() {
         let (header, _) = parse_payload_header(p).unwrap();
@@ -183,14 +172,8 @@ fn slice_stream_round_trips() {
 
     let src = gradient(176, 144, 40);
     let stream = encode_intra_picture_slices(&src, 0, 2, |_| 8).expect("encode slices");
-    let payloads = packetize_stream(
-        &stream,
-        PacketizeConfig {
-            max_payload: 500,
-            ..PacketizeConfig::default()
-        },
-    )
-    .expect("packetize");
+    let payloads = packetize_stream(&stream, PacketizeConfig::default().with_max_payload(500))
+        .expect("packetize");
     assert!(payloads.len() > 1);
     for p in &payloads {
         let (header, _) = parse_payload_header(p).unwrap();
@@ -254,10 +237,9 @@ fn redundant_picture_header_attachment() {
 
     let payloads = packetize_stream(
         &stream,
-        PacketizeConfig {
-            max_payload: 600,
-            attach_picture_header: true,
-        },
+        PacketizeConfig::default()
+            .with_max_payload(600)
+            .with_attach_picture_header(true),
     )
     .expect("packetize");
     assert!(payloads.len() > 1);
@@ -308,10 +290,9 @@ fn redundant_header_on_h263p_slices() {
 
     let payloads = packetize_stream(
         &stream,
-        PacketizeConfig {
-            max_payload: 500,
-            attach_picture_header: true,
-        },
+        PacketizeConfig::default()
+            .with_max_payload(500)
+            .with_attach_picture_header(true),
     )
     .expect("packetize");
     let mut saw_attached = 0;
@@ -348,14 +329,9 @@ fn rfc2190_mode_a_round_trips() {
     let mut stream = i_bytes.clone();
     stream.extend_from_slice(&p_bytes);
 
-    let payloads = packetize_stream_rfc2190(
-        &stream,
-        PacketizeConfig {
-            max_payload: 512,
-            ..PacketizeConfig::default()
-        },
-    )
-    .expect("packetize 2190");
+    let payloads =
+        packetize_stream_rfc2190(&stream, PacketizeConfig::default().with_max_payload(512))
+            .expect("packetize 2190");
     assert!(payloads.len() > 1);
 
     let mut saw_intra = false;
@@ -406,24 +382,18 @@ fn rfc2190_mode_a_pb_fields_and_mode_c_fragmentation() {
         &anchor,
         /* tr_p */ 8,
         /* prev_tr */ 0,
-        &PbConfig {
-            quant: 6,
-            dbquant: 1,
-            trb: 4,
-            search_half: 4,
-            b_search_half: 0,
-        },
+        &PbConfig::default()
+            .with_quant(6)
+            .with_dbquant(1)
+            .with_trb(4)
+            .with_search_half(4)
+            .with_b_search_half(0),
     )
     .expect("PB");
 
-    let payloads = packetize_stream_rfc2190(
-        &pb,
-        PacketizeConfig {
-            max_payload: 65_000,
-            ..PacketizeConfig::default()
-        },
-    )
-    .expect("packetize PB");
+    let payloads =
+        packetize_stream_rfc2190(&pb, PacketizeConfig::default().with_max_payload(65_000))
+            .expect("packetize PB");
     assert_eq!(payloads.len(), 1);
     let (h, _) = parse_rfc2190_mode_a(&payloads[0]).unwrap();
     assert!(h.pb_frames && h.inter);
@@ -437,14 +407,8 @@ fn rfc2190_mode_a_pb_fields_and_mode_c_fragmentation() {
     // A), every later one at a macroblock boundary (Mode C, F=1 P=1,
     // with the PB DBQ/TRB/TR fields mirrored). Bit-level reassembly is
     // byte-exact.
-    let payloads = packetize_stream_rfc2190(
-        &pb,
-        PacketizeConfig {
-            max_payload: 64,
-            ..PacketizeConfig::default()
-        },
-    )
-    .expect("packetize PB fragments");
+    let payloads = packetize_stream_rfc2190(&pb, PacketizeConfig::default().with_max_payload(64))
+        .expect("packetize PB fragments");
     assert!(payloads.len() > 1);
     let mut saw_mode_c = 0usize;
     for (i, p) in payloads.iter().enumerate() {
@@ -507,14 +471,9 @@ fn rfc2190_mode_b_fragments_round_trip() {
     // bytes, so budgets from 192 exercise Mode B fragmentation while
     // always fitting at least one macroblock per packet.
     for &budget in &[192usize, 256, 512] {
-        let payloads = packetize_stream_rfc2190(
-            &stream,
-            PacketizeConfig {
-                max_payload: budget,
-                ..PacketizeConfig::default()
-            },
-        )
-        .expect("packetize");
+        let payloads =
+            packetize_stream_rfc2190(&stream, PacketizeConfig::default().with_max_payload(budget))
+                .expect("packetize");
         assert!(payloads.len() > 2);
 
         let mut saw_mode_b = 0usize;

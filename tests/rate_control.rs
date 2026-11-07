@@ -71,15 +71,14 @@ fn luma_mae(a: &YuvFrame, b: &YuvFrame) -> f64 {
 fn rate_controller_holds_long_run_average() {
     let frames = moving_clip(24);
     let target = 4_000u32;
-    let cfg = RateControlConfig {
-        target_bits_per_picture: target,
-        initial_quant: 10,
-        intra_period: 0, // one I then all P — steady-state measurement
-        search_half: 8,
-        hrd: None,
-        max_reencodes: 1,
-        mb_adaptive: false,
-    };
+    let cfg = RateControlConfig::default()
+        .with_target_bits_per_picture(target)
+        .with_initial_quant(10)
+        .with_intra_period(0)
+        .with_search_half(8)
+        .with_hrd(None)
+        .with_max_reencodes(1)
+        .with_mb_adaptive(false);
     let rcs = encode_sequence_rate_controlled(&frames, &cfg, 0).expect("encode");
     assert_eq!(rcs.picture_bits.len(), frames.len());
 
@@ -108,15 +107,14 @@ fn rate_controller_holds_long_run_average() {
 fn rate_controller_scales_with_target() {
     let frames = moving_clip(16);
     let encode_at = |target: u32| {
-        let cfg = RateControlConfig {
-            target_bits_per_picture: target,
-            initial_quant: 12,
-            intra_period: 0,
-            search_half: 8,
-            hrd: None,
-            max_reencodes: 1,
-            mb_adaptive: false,
-        };
+        let cfg = RateControlConfig::default()
+            .with_target_bits_per_picture(target)
+            .with_initial_quant(12)
+            .with_intra_period(0)
+            .with_search_half(8)
+            .with_hrd(None)
+            .with_max_reencodes(1)
+            .with_mb_adaptive(false);
         encode_sequence_rate_controlled(&frames, &cfg, 0).expect("encode")
     };
     let fat = encode_at(5_000);
@@ -154,19 +152,15 @@ fn rate_controller_scales_with_target() {
 fn rate_controlled_stream_is_hrd_conformant() {
     let frames = moving_clip(20);
     let target = 4_000u32;
-    let hrd = HrdParams {
-        bits_per_tick: target as u64,
-        b_max: 4 * target as u64,
-    };
-    let cfg = RateControlConfig {
-        target_bits_per_picture: target,
-        initial_quant: 10,
-        intra_period: 10,
-        search_half: 8,
-        hrd: Some(hrd),
-        max_reencodes: 2,
-        mb_adaptive: false,
-    };
+    let hrd = HrdParams::new(target as u64, 4 * target as u64);
+    let cfg = RateControlConfig::default()
+        .with_target_bits_per_picture(target)
+        .with_initial_quant(10)
+        .with_intra_period(10)
+        .with_search_half(8)
+        .with_hrd(Some(hrd))
+        .with_max_reencodes(2)
+        .with_mb_adaptive(false);
     let rcs = encode_sequence_rate_controlled(&frames, &cfg, 0).expect("encode");
     assert!(
         rcs.hrd_conformant,
@@ -186,15 +180,14 @@ fn rate_controlled_stream_is_hrd_conformant() {
 fn intra_bursts_are_absorbed() {
     let frames = moving_clip(20);
     let target = 3_000u32;
-    let cfg = RateControlConfig {
-        target_bits_per_picture: target,
-        initial_quant: 10,
-        intra_period: 8,
-        search_half: 8,
-        hrd: None,
-        max_reencodes: 1,
-        mb_adaptive: false,
-    };
+    let cfg = RateControlConfig::default()
+        .with_target_bits_per_picture(target)
+        .with_initial_quant(10)
+        .with_intra_period(8)
+        .with_search_half(8)
+        .with_hrd(None)
+        .with_max_reencodes(1)
+        .with_mb_adaptive(false);
     let rcs = encode_sequence_rate_controlled(&frames, &cfg, 0).expect("encode");
     // The I-pictures (0, 8, 16) overshoot...
     assert!(rcs.picture_bits[8] as f64 > 1.2 * target as f64);
@@ -217,15 +210,14 @@ fn mb_adaptive_regulation_tightens_per_picture_spread() {
     let frames = moving_clip(12);
     let target = 3_000u32;
     let run = |mb_adaptive: bool| {
-        let cfg = RateControlConfig {
-            target_bits_per_picture: target,
-            initial_quant: 10,
-            intra_period: 0,
-            search_half: 8,
-            hrd: None,
-            mb_adaptive,
-            max_reencodes: 1,
-        };
+        let cfg = RateControlConfig::default()
+            .with_target_bits_per_picture(target)
+            .with_initial_quant(10)
+            .with_intra_period(0)
+            .with_search_half(8)
+            .with_hrd(None)
+            .with_mb_adaptive(mb_adaptive)
+            .with_max_reencodes(1);
         encode_sequence_rate_controlled(&frames, &cfg, 0).expect("encode")
     };
     let frame_level = run(false);

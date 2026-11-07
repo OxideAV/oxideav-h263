@@ -329,13 +329,11 @@ fn baseline_gop_agrees_with_oracle() {
     let base = gradient(176, 144, 9);
     let frames: Vec<YuvFrame> = (0..6).map(|i| translated(&base, 2 * i, i)).collect();
     for umv in [false, true] {
-        let cfg = GopConfig {
-            quant: 10,
-            intra_period: 0,
-            search_half: 7,
-            umv,
-            ..GopConfig::default()
-        };
+        let cfg = GopConfig::default()
+            .with_quant(10)
+            .with_intra_period(0)
+            .with_search_half(7)
+            .with_umv(umv);
         let stream = encode_sequence(&frames, &cfg, 0).unwrap();
         cross_check(&stream, 176, 144, &format!("gop-umv{umv}"), 0.08);
     }
@@ -381,11 +379,10 @@ fn deblocking_filter_pictures_agree_with_oracle() {
         .remove(0);
     for (i, four_mv) in [false, true, true].iter().enumerate() {
         let src = translated(&base, 3 * (i + 1), i + 1);
-        let cfg = DeblockConfig {
-            search_half: 6,
-            four_mv: *four_mv,
-            umv: false,
-        };
+        let cfg = DeblockConfig::default()
+            .with_search_half(6)
+            .with_four_mv(*four_mv)
+            .with_umv(false);
         let p = encode_inter_picture_deblock(&src, &recon, 12, (i + 1) as u8, &cfg).unwrap();
         stream.extend_from_slice(&p);
         recon = decode_sequence(&stream, DecodeOptions::default())
@@ -425,19 +422,18 @@ fn improved_pb_frames_agree_with_oracle() {
     let mut recon = decode_sequence(&stream, DecodeOptions::default())
         .unwrap()
         .remove(0);
-    let cfg = ImprovedPbConfig {
-        quant: 7,
-        trb: 1,
-        dbquant: 1,
-        search_half: 6,
-        forward_search_half: 3,
-        allow_backward: true,
-        advanced_prediction: false,
-        umv: false,
-        slice_rows: 0,
-        aic: false,
-        intra_refresh: 0,
-    };
+    let cfg = ImprovedPbConfig::default()
+        .with_quant(7)
+        .with_trb(1)
+        .with_dbquant(1)
+        .with_search_half(6)
+        .with_forward_search_half(3)
+        .with_allow_backward(true)
+        .with_advanced_prediction(false)
+        .with_umv(false)
+        .with_slice_rows(0)
+        .with_aic(false)
+        .with_intra_refresh(0);
     let mut prev_tr = 0u8;
     for k in 1..=3usize {
         // P at 4k px, BPB in between (not exactly halfway, so every
@@ -470,13 +466,12 @@ fn pb_frames_plain_and_advanced_prediction_agree_with_oracle() {
         let mut recon = decode_sequence(&stream, DecodeOptions::default())
             .unwrap()
             .remove(0);
-        let cfg = PbConfig {
-            quant: 8,
-            trb: 1,
-            dbquant: 2,
-            search_half: 6,
-            b_search_half: 2,
-        };
+        let cfg = PbConfig::default()
+            .with_quant(8)
+            .with_trb(1)
+            .with_dbquant(2)
+            .with_search_half(6)
+            .with_b_search_half(2);
         let mut prev_tr = 0u8;
         for k in 1..=2usize {
             let p = translated(&base, 4 * k, 2 * k);
@@ -521,19 +516,18 @@ fn improved_pb_intra_refresh_agrees_with_oracle() {
         let mut recon = decode_sequence(&stream, DecodeOptions::default())
             .unwrap()
             .remove(0);
-        let cfg = ImprovedPbConfig {
-            quant: 7,
-            trb: 1,
-            dbquant: 0,
-            search_half: 6,
-            forward_search_half: 3,
-            allow_backward: true,
-            advanced_prediction: ap,
-            umv: false,
-            slice_rows: 0,
-            aic: false,
-            intra_refresh: 4,
-        };
+        let cfg = ImprovedPbConfig::default()
+            .with_quant(7)
+            .with_trb(1)
+            .with_dbquant(0)
+            .with_search_half(6)
+            .with_forward_search_half(3)
+            .with_allow_backward(true)
+            .with_advanced_prediction(ap)
+            .with_umv(false)
+            .with_slice_rows(0)
+            .with_aic(false)
+            .with_intra_refresh(4);
         let mut prev_tr = 0u8;
         for k in 1..=2usize {
             let p = translated(&base, 5 * k, k);
@@ -572,19 +566,18 @@ fn oracle_ap_pb_p_part_depends_on_b_content() {
         .unwrap()
         .remove(0);
     let p = translated(&base, 5, 1);
-    let cfg = ImprovedPbConfig {
-        quant: 7,
-        trb: 1,
-        dbquant: 0,
-        search_half: 6,
-        forward_search_half: 0,
-        allow_backward: false,
-        advanced_prediction: true,
-        umv: false,
-        slice_rows: 0,
-        aic: false,
-        intra_refresh: 0,
-    };
+    let cfg = ImprovedPbConfig::default()
+        .with_quant(7)
+        .with_trb(1)
+        .with_dbquant(0)
+        .with_search_half(6)
+        .with_forward_search_half(0)
+        .with_allow_backward(false)
+        .with_advanced_prediction(true)
+        .with_umv(false)
+        .with_slice_rows(0)
+        .with_aic(false)
+        .with_intra_refresh(0);
     let mut ours_p = Vec::new();
     let mut oracle_p = Vec::new();
     for (k, b) in [translated(&base, 3, 1), base.clone()].iter().enumerate() {
@@ -621,13 +614,12 @@ fn pb_frames_with_umv_agree_with_oracle() {
     let mut recon = decode_sequence(&stream, DecodeOptions::default())
         .unwrap()
         .remove(0);
-    let cfg = PbConfig {
-        quant: 8,
-        trb: 1,
-        dbquant: 1,
-        search_half: 24,
-        b_search_half: 2,
-    };
+    let cfg = PbConfig::default()
+        .with_quant(8)
+        .with_trb(1)
+        .with_dbquant(1)
+        .with_search_half(24)
+        .with_b_search_half(2);
     let mut prev_tr = 0u8;
     for k in 1..=2usize {
         let p = translated(&base, 20 * k, k);
@@ -654,19 +646,18 @@ fn pb_frames_with_umv_agree_with_oracle() {
     let mut recon = decode_sequence(&stream, DecodeOptions::default())
         .unwrap()
         .remove(0);
-    let cfg = ImprovedPbConfig {
-        quant: 8,
-        trb: 1,
-        dbquant: 0,
-        search_half: 24,
-        forward_search_half: 0,
-        allow_backward: true,
-        advanced_prediction: false,
-        umv: true,
-        slice_rows: 0,
-        aic: false,
-        intra_refresh: 0,
-    };
+    let cfg = ImprovedPbConfig::default()
+        .with_quant(8)
+        .with_trb(1)
+        .with_dbquant(0)
+        .with_search_half(24)
+        .with_forward_search_half(0)
+        .with_allow_backward(true)
+        .with_advanced_prediction(false)
+        .with_umv(true)
+        .with_slice_rows(0)
+        .with_aic(false)
+        .with_intra_refresh(0);
     let mut prev_tr = 0u8;
     for k in 1..=2usize {
         let p = translated(&base, 20 * k, k);
@@ -694,19 +685,18 @@ fn improved_pb_with_slices_agrees_with_oracle() {
     let mut recon = decode_sequence(&stream, DecodeOptions::default())
         .unwrap()
         .remove(0);
-    let cfg = ImprovedPbConfig {
-        quant: 7,
-        trb: 1,
-        dbquant: 0,
-        search_half: 6,
-        forward_search_half: 3,
-        allow_backward: true,
-        advanced_prediction: false,
-        umv: false,
-        slice_rows: 2,
-        aic: false,
-        intra_refresh: 0,
-    };
+    let cfg = ImprovedPbConfig::default()
+        .with_quant(7)
+        .with_trb(1)
+        .with_dbquant(0)
+        .with_search_half(6)
+        .with_forward_search_half(3)
+        .with_allow_backward(true)
+        .with_advanced_prediction(false)
+        .with_umv(false)
+        .with_slice_rows(2)
+        .with_aic(false)
+        .with_intra_refresh(0);
     let mut prev_tr = 0u8;
     for k in 1..=2usize {
         let p = translated(&base, 4 * k, k);
@@ -749,19 +739,18 @@ fn aic_intra_macroblocks_in_p_and_improved_pb_agree_with_oracle() {
     let mut recon = decode_sequence(&stream, DecodeOptions::default())
         .unwrap()
         .remove(0);
-    let cfg = ImprovedPbConfig {
-        quant: 8,
-        trb: 1,
-        dbquant: 0,
-        search_half: 6,
-        forward_search_half: 3,
-        allow_backward: true,
-        advanced_prediction: false,
-        umv: false,
-        slice_rows: 0,
-        aic: true,
-        intra_refresh: 3,
-    };
+    let cfg = ImprovedPbConfig::default()
+        .with_quant(8)
+        .with_trb(1)
+        .with_dbquant(0)
+        .with_search_half(6)
+        .with_forward_search_half(3)
+        .with_allow_backward(true)
+        .with_advanced_prediction(false)
+        .with_umv(false)
+        .with_slice_rows(0)
+        .with_aic(true)
+        .with_intra_refresh(3);
     let mut prev_tr = 0u8;
     for k in 1..=2usize {
         let p = translated(&base, 4 * k, k);

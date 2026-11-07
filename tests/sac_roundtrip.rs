@@ -166,18 +166,9 @@ fn sac_refuses_barred_mode_combinations() {
     let src = gradient(176, 144, 1);
     let sac = encode_intra_picture_sac(&src, 8, 0).expect("SAC encode");
     for options in [
-        DecodeOptions {
-            modified_quant: true,
-            ..DecodeOptions::default()
-        },
-        DecodeOptions {
-            alt_inter_vlc: true,
-            ..DecodeOptions::default()
-        },
-        DecodeOptions {
-            aic: true,
-            ..DecodeOptions::default()
-        },
+        DecodeOptions::default().with_modified_quant(true),
+        DecodeOptions::default().with_alt_inter_vlc(true),
+        DecodeOptions::default().with_aic(true),
     ] {
         assert_eq!(
             decode_picture_sac(&sac, None, options).unwrap_err(),
@@ -421,13 +412,12 @@ fn sac_pb_matches_vlc_pb_reconstruction_exactly() {
     let recon = decode_picture_sac(&i_bytes, None, DecodeOptions::default()).expect("decode I");
     let fb = translated(&recon, 2);
     let fp = translated(&recon, 4);
-    let cfg = PbConfig {
-        quant: 6,
-        trb: 1,
-        dbquant: 1,
-        search_half: 3,
-        b_search_half: 0,
-    };
+    let cfg = PbConfig::default()
+        .with_quant(6)
+        .with_trb(1)
+        .with_dbquant(1)
+        .with_search_half(3)
+        .with_b_search_half(0);
     let vlc = encode_pb_picture(&fp, &fb, &recon, 5, 3, &cfg).expect("VLC PB");
     let sac = encode_pb_picture_sac(&fp, &fb, &recon, 5, 3, &cfg).expect("SAC PB");
 
@@ -452,13 +442,12 @@ fn sac_pb_static_is_lossless_both_parts() {
 
     let i_bytes = encode_intra_picture_sac(&gradient(176, 144, 11), 9, 0).expect("encode I");
     let recon = decode_picture_sac(&i_bytes, None, DecodeOptions::default()).expect("decode I");
-    let cfg = PbConfig {
-        quant: 9,
-        trb: 1,
-        dbquant: 0,
-        search_half: 3,
-        b_search_half: 0,
-    };
+    let cfg = PbConfig::default()
+        .with_quant(9)
+        .with_trb(1)
+        .with_dbquant(0)
+        .with_search_half(3)
+        .with_b_search_half(0);
     let pb = encode_pb_picture_sac(&recon, &recon, &recon, 2, 0, &cfg).expect("encode PB");
     let pair = decode_pb_picture_sac(&pb, &recon, 0, DecodeOptions::default()).expect("decode PB");
     assert_eq!(pair.p_frame.y, recon.y);
@@ -498,13 +487,12 @@ fn sac_ap_and_pb_stream_decodes_through_decode_sequence() {
     // SAC PB pair: B at 3 px, P at 4 px (TR 1 -> 3, TRB 1).
     let fb = translated(&r0, 3);
     let fp = translated(&r0, 4);
-    let cfg = PbConfig {
-        quant: 5,
-        trb: 1,
-        dbquant: 0,
-        search_half: 3,
-        b_search_half: 0,
-    };
+    let cfg = PbConfig::default()
+        .with_quant(5)
+        .with_trb(1)
+        .with_dbquant(0)
+        .with_search_half(3)
+        .with_b_search_half(0);
     let pb = encode_pb_picture_sac(&fp, &fb, &r1, 3, 1, &cfg).unwrap();
 
     let mut stream = Vec::new();

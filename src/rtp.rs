@@ -279,6 +279,7 @@ pub fn assemble_picture_header(header: &H263PayloadHeader) -> Option<Vec<u8>> {
 
 /// Configuration for [`packetize_stream`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct PacketizeConfig {
     /// Maximum size, in bytes, of one returned payload **including**
     /// its payload header (the RTP transport header is not counted).
@@ -294,6 +295,22 @@ pub struct PacketizeConfig {
     /// packets. Attachment is skipped for a picture whose header is
     /// incomplete (`UFEP = "000"`) or too long for PLEN.
     pub attach_picture_header: bool,
+}
+
+impl PacketizeConfig {
+    /// Set [`PacketizeConfig::max_payload`].
+    #[must_use]
+    pub fn with_max_payload(mut self, v: usize) -> Self {
+        self.max_payload = v;
+        self
+    }
+
+    /// Set [`PacketizeConfig::attach_picture_header`].
+    #[must_use]
+    pub fn with_attach_picture_header(mut self, v: bool) -> Self {
+        self.attach_picture_header = v;
+        self
+    }
 }
 
 impl Default for PacketizeConfig {

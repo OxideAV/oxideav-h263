@@ -69,12 +69,10 @@ fn luma_psnr(clips: &[YuvFrame], decs: &[YuvFrame]) -> f64 {
 fn ladder(frames: &[YuvFrame], qps: &[u8]) -> Vec<(u8, f64, f64)> {
     qps.iter()
         .map(|&qp| {
-            let cfg = GopConfig {
-                quant: qp,
-                intra_period: 0,
-                search_half: 7,
-                ..GopConfig::default()
-            };
+            let cfg = GopConfig::default()
+                .with_quant(qp)
+                .with_intra_period(0)
+                .with_search_half(7);
             let stream = encode_sequence(frames, &cfg, 0).expect("encode");
             let decs = decode_sequence(&stream, DecodeOptions::default()).expect("decode");
             assert_eq!(decs.len(), frames.len());
