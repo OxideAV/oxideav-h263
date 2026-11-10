@@ -490,10 +490,13 @@ planar 4:2:0 `YuvFrame`:
   composes** (round 457): the P-part's OBMC luminance stays deferred
   until the right neighbour is known and the B-part waits for that
   final PREC (§G.5); the §G.2 INTRA-remote rule and the §6.1.1 rule-1
-  PB exception thread through the §F.2 / §F.3 paths. **UMV composes**
-  (round 457): the Table 14 MVDB resolves through the §D.2 pair rule
-  with `Pc = (TRB × MV)/TRD` per luminance block. SAC / AIC
-  combinations are refused (§G.1 bars the PLUSPTYPE-gated modes).
+  PB exception thread through the §F.2 / §F.3 paths. **UMV composes**:
+  MVDB is decoded once per macroblock as the first Table 14 column and
+  added to every 8 × 8 block's scaled vector, the §G.4 "MVD = 0"
+  backward-vector choice made per component. The reference-coder
+  tracer fixture `umv-pb-frames-4mv` (Annex D + F + G, INTER4V
+  P-macroblocks) decodes **byte-exact**, all 9 display pictures. SAC /
+  AIC combinations are refused (§G.1 bars the PLUSPTYPE-gated modes).
 * **Annex M §M.1–§M.4** — Improved PB-frames decode end-to-end, both
   through the per-layer `decode_improved_pb_picture` driver and — new this
   round — through `decode_sequence`: an extended-PTYPE picture whose
@@ -510,7 +513,16 @@ planar 4:2:0 `YuvFrame`:
   fetch edge-replicating over the picture boundary per §D.1) and Annex
   K slices (the §M.2.2 forward predictor restarts at every slice's or
   rectangle's left edge; §K.1 rules 1 / 3 confine predictors and OBMC
-  remotes) all compose — round 457.
+  remotes) all compose — round 457. The §M.2.2 forward predictor is the
+  left macroblock's forward vector only when that macroblock is
+  forward-predicted (a skipped, bidirectional or backward neighbour
+  resets it to zero), MVDB under UMV is a Table D.3 pair with its own
+  emulation-prevention bit, and the P-part interpolates with the
+  MPPTYPE RTYPE rounding (§6.1.2; the BPB-part always with
+  RCONTROL = 0). The reference-coder tracer fixture
+  `umvplus-improved-pb-4mv` (PLUSPTYPE + UMV/UUI + Annex F + every
+  Table M.1 mode, RTYPE alternating) decodes **byte-exact**, all 19
+  display pictures.
 * **Annex O §O.4 / §O.5** — temporal-scalability **B-pictures** decode
   end-to-end (`decode_b_picture` / `decode_b_picture_layer`): the Table
   O.1 MBTYPE layer drives Forward / Backward / Bi-dir / INTRA
@@ -787,7 +799,7 @@ macroblock's candidate predictor in PB-frames mode (§6.1.1 rule 1
 exempts it — the PB encoders send a zero INTRA vector so their plain
 streams agree); (3) it reads a forward-mode MVDB under UMV +
 PLUSPTYPE with a table other than Table D.3 (§M.2.2 → §5.3.7 /
-§D.2); (4) it does not apply the §F.3 Slice-Structured remote-vector
+§D.2 — the reference-coder trace confirms Table D.3); (4) it does not apply the §F.3 Slice-Structured remote-vector
 substitution ("set to the motion vector of the current block") — with
 that rule disabled our decoder matches it byte-for-byte on AP +
 slice streams; (5) it does not frame CPM = "1" and refuses
@@ -847,7 +859,12 @@ baseline Annex F stream (`advanced-prediction-mode` — 4MV + OBMC,
 including OBMC of skipped macroblocks), an H.263+ Annex J stream
 (`deblocking-filter`) and an H.263+ Annex D stream
 (`unrestricted-mv-mode` — UMV+ Table D.3 motion + slice-structured +
-custom PCF, round 447).
+custom PCF, round 447). Two further fixtures come from the ITU-T
+reference coder run as a black box with its double-precision inverse
+transform (`umv-pb-frames-4mv`: Annex D + F + G on the version-1
+header; `umvplus-improved-pb-4mv`: PLUSPTYPE + Annex D/UUI + F + M);
+the crate's f64 transform rounds identically there, so both are
+asserted **byte-exact** (I-, P- and B-parts) with SHA-256 guards.
 Because §6.2 leaves the inverse-transform arithmetic undefined
 and Annex A.7 only bounds the per-pixel peak error at 1, AC-bearing
 output is asserted within that ±1 tolerance; the flat sub-QCIF keyframe

@@ -615,6 +615,33 @@ fn tracer_fixtures_match_recorded_sha256() {
     }
 }
 
+/// Truncated and bit-flipped copies of the two tracer streams (PB /
+/// Improved-PB layers with UMV, INTER4V, MVDB and MODB under both
+/// header forms) must decode or fail with an error — never panic.
+#[test]
+fn tracer_fixtures_survive_truncation_and_bit_flips() {
+    for input in [
+        &include_bytes!("fixtures/umv-pb-frames-4mv/input.h263")[..],
+        &include_bytes!("fixtures/umvplus-improved-pb-4mv/input.h263")[..],
+    ] {
+        for cut in (1..input.len()).step_by(input.len() / 12) {
+            let _ = decode_sequence(&input[..cut], DecodeOptions::default());
+        }
+        let mut state = 0x9e37_79b9u32;
+        for _ in 0..16 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let mut v = input.to_vec();
+            // Leave the first picture start code intact so the decode
+            // reaches the macroblock layers.
+            let at = 4 + (state as usize) % (v.len() - 4);
+            v[at] ^= 1 << (state >> 29);
+            let _ = decode_sequence(&v, DecodeOptions::default());
+        }
+    }
+}
+
 #[test]
 fn sha256_self_test() {
     // FIPS 180-4 worked example: SHA-256("abc").
