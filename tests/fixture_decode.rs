@@ -513,6 +513,108 @@ fn vendored_fixture_expected_yuv_sha256() {
     }
 }
 
+// ---- Reference-coder tracer fixtures (byte-exact) ---------------------
+//
+// Both streams were encoded *and* decoded by the ITU-T H.263+ reference
+// coder run as a black box with its double-precision inverse transform;
+// `expected.yuv` is that decoder's output, byte-identical to the
+// encoder's own reconstruction. Our f64 reference-DCT kernel rounds
+// identically, so these two fixtures are held to byte equality — every
+// I-, P- and B-part sample. The rulings they pin are recorded in the
+// docs collaborator's `h263-annex-clarifications.md`:
+//
+// * §6.1.2 RCONTROL = the MPPTYPE RTYPE bit for P-pictures and the
+//   P-part of Improved PB-frames (the stream alternates RTYPE), but `0`
+//   for the BPB-part;
+// * MVDB under PLUSPTYPE + UMV is a Table D.3 pair with its own §D.2
+//   emulation-prevention bit (item 1, item 4b);
+// * the §M.2.2 forward predictor is the left macroblock's forward
+//   vector only when that macroblock is forward-predicted — a skipped,
+//   bidirectional or backward left neighbour resets it to zero (item 2);
+// * Annex G with INTER4V: MVDB decoded once per macroblock, added to
+//   every 8 × 8 block's scaled vector, and the §G.4 "MVD = 0" backward
+//   vector choice made per component (item 4a).
+
+/// Assert byte equality frame by frame, naming the first diverging
+/// frame / plane / macroblock so a regression is localised at once.
+fn assert_byte_exact(name: &str, got: &[u8], expected: &[u8], w: usize, h: usize) {
+    let fsz = w * h * 3 / 2;
+    assert_eq!(got.len(), expected.len(), "{name}: byte count");
+    for (fi, (g, e)) in got.chunks(fsz).zip(expected.chunks(fsz)).enumerate() {
+        if let Some(k) = g.iter().zip(e.iter()).position(|(a, b)| a != b) {
+            let where_ = if k < w * h {
+                format!("Y macroblock ({}, {})", (k % w) / 16, (k / w) / 16)
+            } else {
+                "chroma".to_string()
+            };
+            let n = g.iter().zip(e.iter()).filter(|(a, b)| a != b).count();
+            panic!("{name}: display frame {fi} differs in {n} samples, first in {where_}");
+        }
+    }
+}
+
+#[test]
+fn tracer_umv_pb_frames_4mv_is_byte_exact() {
+    // H.263 v1 header: Annex D (Table 14, no emulation bit) + Annex F
+    // (INTER4V P-macroblocks, OBMC) + Annex G PB-frames. Decoding
+    // order I, P, 3 x PB, P = 9 display pictures.
+    let (input, expected) = fixture!("umv-pb-frames-4mv");
+    let frames = decode_sequence(input, DecodeOptions::default()).expect("decode umv-pb");
+    assert_eq!(frames.len(), 9, "I + P + 3 PB-frames (2 pictures each) + P");
+    let mut got = Vec::new();
+    for f in &frames {
+        got.extend_from_slice(&frame_bytes(f));
+    }
+    assert_byte_exact("umv-pb-frames-4mv", &got, expected, 176, 144);
+}
+
+#[test]
+fn tracer_umvplus_improved_pb_4mv_is_byte_exact() {
+    // PLUSPTYPE throughout, UMV with UUI (Table D.3 for MVD, MVD2-4 and
+    // MVDB), Annex F, Annex M with every Table M.1 MODB mode, RTYPE
+    // alternating per picture. Decoding order I, P, 8 x Improved-PB, P
+    // = 19 display pictures.
+    let (input, expected) = fixture!("umvplus-improved-pb-4mv");
+    let frames = decode_sequence(input, DecodeOptions::default()).expect("decode umvplus-ipb");
+    assert_eq!(
+        frames.len(),
+        19,
+        "I + P + 8 Improved-PB (2 pictures each) + P"
+    );
+    let mut got = Vec::new();
+    for f in &frames {
+        got.extend_from_slice(&frame_bytes(f));
+    }
+    assert_byte_exact("umvplus-improved-pb-4mv", &got, expected, 176, 144);
+}
+
+#[test]
+fn tracer_fixtures_match_recorded_sha256() {
+    for (name, input, expected, want_in, want_out) in [
+        (
+            "umv-pb-frames-4mv",
+            &include_bytes!("fixtures/umv-pb-frames-4mv/input.h263")[..],
+            &include_bytes!("fixtures/umv-pb-frames-4mv/expected.yuv")[..],
+            "23ef1cec8c7431df9e23ea60f0a75c982135b5e6060301eaa25f0dbb323df649",
+            "ad81f3e4d7a008806985cdacaeffbe8bd4560569e59e13d96915f0cb6b228a51",
+        ),
+        (
+            "umvplus-improved-pb-4mv",
+            &include_bytes!("fixtures/umvplus-improved-pb-4mv/input.h263")[..],
+            &include_bytes!("fixtures/umvplus-improved-pb-4mv/expected.yuv")[..],
+            "e510c3fcc461591b441bee6b81134aae47d923a718e64cf05470d8e35025c5d9",
+            "a38305c17e2b64e75c7cf10f5eb772b7be669225e7b29362e90003b1639a3bf5",
+        ),
+    ] {
+        assert_eq!(sha256_hex(input), want_in, "{name} input.h263 SHA-256");
+        assert_eq!(
+            sha256_hex(expected),
+            want_out,
+            "{name} expected.yuv SHA-256"
+        );
+    }
+}
+
 #[test]
 fn sha256_self_test() {
     // FIPS 180-4 worked example: SHA-256("abc").

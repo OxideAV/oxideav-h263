@@ -310,8 +310,9 @@ enum UmvMode {
     /// Table 14 with the default §6.1.1 wrap.
     Off,
     /// Annex D on a baseline header (Annex G only): Table 14 with the
-    /// §D.2 predictor-dependent pair rule — for MVDB too, per block
-    /// with `Pc = (TRB × MV)/TRD`.
+    /// §D.2 predictor-dependent pair rule for MVD / MVD2-4; MVDB is a
+    /// first-column value applied once per macroblock (§G.4), chosen
+    /// so a per-block `Pc = (TRB × MV)/TRD` resolution agrees.
     Wrap,
     /// Annex D on a PLUSPTYPE header (Annex M only): Table D.3
     /// single-valued differences under the UUI = "1" range.
@@ -882,8 +883,9 @@ fn encode_pb_core(
 
             // ---- Skip / emit. -----------------------------------------
             // A skipped macroblock (COD = 1) carries no MODB: its B-part
-            // is the zero-vector bidirectional prediction and the §M.2.2
-            // predictor state is left untouched. Under Advanced
+            // is the zero-vector bidirectional prediction, which has no
+            // forward vector, so the §M.2.2 predictor of the macroblock
+            // to its right resets to zero. Under Advanced
             // Prediction the decoder still OBMC-blends a skipped
             // macroblock (§5.3.1 NOTE) with zero vectors — which is what
             // the field holds when `all_zero`.
@@ -895,6 +897,7 @@ fn encode_pb_core(
                 grid.set_zero_candidate(mb_col, mb_row);
                 aic_grid.record_non_intra(mb_col, mb_row, segment);
                 stats.skipped += 1;
+                left_forward = None;
                 continue;
             }
 
@@ -983,7 +986,13 @@ fn encode_pb_core(
                     left_forward = None;
                     stats.backward += 1;
                 }
-                BpbCodingMode::Bidirectional => stats.bidirectional += 1,
+                // §M.2.2 — only a forward-predicted left neighbour
+                // supplies the predictor; a bidirectional one resets it
+                // to zero (no older forward vector is carried along).
+                BpbCodingMode::Bidirectional => {
+                    left_forward = None;
+                    stats.bidirectional += 1;
+                }
             }
             if intra {
                 stats.intra += 1;
@@ -1413,10 +1422,8 @@ fn decide_b_part(
     bidirectional_only: bool,
     umv: UmvMode,
 ) -> BPart {
-    // The decoder-side §G.4 composition: under baseline UMV the Table
-    // 14 MVDB resolves per block through the §D.2 pair rule with
-    // `Pc = (TRB × MV)/TRD`, so the candidate's *effective* deltas are
-    // what the prediction must be built from.
+    // The decoder-side §G.4 composition: one MVDB delta per
+    // macroblock, added to every luminance block's scaled vector.
     let predict_at = |delta: Option<Mvd>| {
         let deltas =
             crate::pb_layer::pb_b_effective_deltas(mvs4, delta, trb, trd, umv == UmvMode::Wrap);
@@ -1449,10 +1456,11 @@ fn decide_b_part(
             // bias so static content never pays the MODB / MVDB bits.
             // Outside UMV the in-range MVF is what any decoder selects
             // from the Table 14 pair (the mate sits 64 half-pels away,
-            // outside a range only 64 wide); under baseline UMV the
-            // §D.2 rule resolves the pair per block and `predict_at`
-            // already mirrors that resolution, so every Table-14-codable
-            // delta is a legal candidate there.
+            // outside a range only 64 wide). Under baseline UMV the
+            // delta is the first-column value applied once per
+            // macroblock; candidates are further restricted (below) to
+            // those a per-block §D.2 pair resolution would also pick,
+            // so both readings of the clause decode the stream alike.
             let mvf_in_range = |p_comp: i32, delta: i32| -> bool {
                 umv == UmvMode::Wrap || (-32..=31).contains(&((trb * p_comp) / trd + delta))
             };
@@ -1472,6 +1480,13 @@ fn decide_b_part(
                         dx_half: dx as i16,
                         dy_half: dy as i16,
                     };
+                    if umv == UmvMode::Wrap
+                        && !crate::pb_layer::pb_mvdb_first_column_is_unambiguous(
+                            mvs4, delta, trb, trd,
+                        )
+                    {
+                        continue;
+                    }
                     let cand = predict_at(Some(delta));
                     let cost = b_sad(b_src, &cand)
                         + lambda * (dx.unsigned_abs() + dy.unsigned_abs())

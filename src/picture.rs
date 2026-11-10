@@ -234,6 +234,13 @@ pub struct DecodeOptions {
     /// `advanced-prediction-mode` conformance fixture decodes
     /// byte-exactly only with it).
     pub obmc_skip_zero_right: bool,
+    /// §6.1.2 `RCONTROL` for the P-picture (or Improved-PB P-part)
+    /// half-pel interpolation: the MPPTYPE `RTYPE` bit (§5.1.4.3) when
+    /// the picture carries PLUSPTYPE, otherwise `0`. Set by the
+    /// PLUSPTYPE driver from the wire; never caller-controlled. The
+    /// B-part of an Improved PB-frame always uses `0` (§6.1.2 last
+    /// sentence), which its dedicated prediction paths hard-wire.
+    pub(crate) rcontrol: i32,
 }
 
 impl DecodeOptions {
@@ -1322,6 +1329,7 @@ fn decode_one_macroblock_sac(
             c_x,
             c_y,
             MotionVector::new(0, 0),
+            RCONTROL_DEFAULT,
         );
         let zero = MotionVector::new(0, 0);
         let pending = advanced_prediction.then_some(PendingApLuma {
@@ -1331,6 +1339,7 @@ fn decode_one_macroblock_sac(
             mvs4: [zero; 4],
             blocks: [None, None, None, None],
             zero_right_remote: obmc_skip_zero_right,
+            rcontrol: RCONTROL_DEFAULT,
             intra_remote_vector: pb_mode,
         });
         return Ok((zero, [zero; 4], pending));
@@ -1415,6 +1424,7 @@ fn decode_one_macroblock_sac(
             mvs4,
             blocks,
             zero_right_remote: false,
+            rcontrol: RCONTROL_DEFAULT,
             intra_remote_vector: pb_mode,
         });
 
@@ -1468,6 +1478,7 @@ fn decode_one_macroblock_sac(
             mvs4: [luma_mv; 4],
             blocks,
             zero_right_remote: false,
+            rcontrol: RCONTROL_DEFAULT,
             intra_remote_vector: pb_mode,
         });
     } else {
@@ -4298,19 +4309,25 @@ fn reconstruct_pb_b_part(
             // §M.2.1 / §M.3 — "the scaled forward and backward vectors
             // are calculated as described in Annex G when MVD = 0". No
             // MVDB is on the wire for a bidirectional row (Table M.1
-            // rows 0 / 1), so the §G.4 delta is `None`. The left
-            // forward-vector predictor is left untouched (only the
-            // forward mode updates it, §M.2.2).
-            BpbCodingMode::Bidirectional => pb_b_predict_macroblock(
-                &planes,
-                mb_x,
-                mb_y,
-                mvs4,
-                None,
-                pb.trb,
-                pb.trd,
-                RCONTROL_DEFAULT,
-            ),
+            // rows 0 / 1), so the §G.4 delta is `None`. This
+            // macroblock carries no forward vector, so the §M.2.2
+            // predictor of the macroblock to its right is zero: the
+            // predictor resets rather than carrying an older forward
+            // vector from further left in the row (the same holds for a
+            // skipped macroblock, which lands here with no MODB).
+            BpbCodingMode::Bidirectional => {
+                pb.left_bpb_forward_mv = None;
+                pb_b_predict_macroblock(
+                    &planes,
+                    mb_x,
+                    mb_y,
+                    mvs4,
+                    None,
+                    pb.trb,
+                    pb.trd,
+                    RCONTROL_DEFAULT,
+                )
+            }
             // §M.2.2 — a single 16 × 16 forward vector from MVDB plus
             // the §M.2.2 left-neighbour predictor, forward prediction
             // only from the previous reference picture.
@@ -4330,8 +4347,9 @@ fn reconstruct_pb_b_part(
         // §G.4 + §G.5 whole-macroblock prediction. `mb.mvdb` is `None`
         // whenever MODB signalled no MVDB ("If MVDB is not present,
         // MVD is set to zero", §G.4) — including the skipped case.
-        // Under baseline UMV the Table 14 MVDB codeword resolves per
-        // block through the §D.2 pair rule with `Pc = (TRB × MV)/TRD`.
+        // MVDB is decoded once per macroblock (first Table 14 column
+        // under baseline UMV) and the same delta drives all four
+        // luminance B-blocks (§G.4).
         let deltas = crate::pb_layer::pb_b_effective_deltas(
             mvs4,
             mb.mvdb,
@@ -4899,6 +4917,8 @@ fn plus_ptype_to_baseline_shim(
         alt_inter_vlc: options.alt_inter_vlc || alt_inter_vlc_effective,
         // Caller-only compatibility deviation — no wire signal exists.
         obmc_skip_zero_right: options.obmc_skip_zero_right,
+        // §6.1.2 — RCONTROL is the MPPTYPE RTYPE bit under PLUSPTYPE.
+        rcontrol: extended.plus.mpptype.rounding_type as i32,
     };
 
     Ok(PlusShimOutcome {
@@ -5947,6 +5967,10 @@ impl BlockPredictor for UpwardPredictor<'_> {
 struct ForwardPredictor<'a> {
     forward_ref: &'a YuvFrame,
     mv: MotionVector,
+    /// §6.1.2 `RCONTROL`: the EP-picture's RTYPE bit; `0` for
+    /// B-pictures (RTYPE is "0" for every non-P/EP/Improved-PB type,
+    /// §5.1.4.3).
+    rcontrol: i32,
 }
 
 impl BlockPredictor for ForwardPredictor<'_> {
@@ -5956,7 +5980,7 @@ impl BlockPredictor for ForwardPredictor<'_> {
             self.forward_ref.luma_width,
             self.forward_ref.luma_height,
         );
-        motion_compensate_block(&plane, bx, by, self.mv, RCONTROL_DEFAULT)
+        motion_compensate_block(&plane, bx, by, self.mv, self.rcontrol)
     }
     fn predict_cb(&self, cx: usize, cy: usize) -> [u8; COEFFS_PER_BLOCK] {
         let plane = RefPlane::new(
@@ -5964,7 +5988,7 @@ impl BlockPredictor for ForwardPredictor<'_> {
             self.forward_ref.chroma_width(),
             self.forward_ref.chroma_height(),
         );
-        motion_compensate_block(&plane, cx, cy, chroma_mv(self.mv), RCONTROL_DEFAULT)
+        motion_compensate_block(&plane, cx, cy, chroma_mv(self.mv), self.rcontrol)
     }
     fn predict_cr(&self, cx: usize, cy: usize) -> [u8; COEFFS_PER_BLOCK] {
         let plane = RefPlane::new(
@@ -5972,7 +5996,7 @@ impl BlockPredictor for ForwardPredictor<'_> {
             self.forward_ref.chroma_width(),
             self.forward_ref.chroma_height(),
         );
-        motion_compensate_block(&plane, cx, cy, chroma_mv(self.mv), RCONTROL_DEFAULT)
+        motion_compensate_block(&plane, cx, cy, chroma_mv(self.mv), self.rcontrol)
     }
 }
 
@@ -5986,6 +6010,8 @@ struct BidirPredictor<'a> {
     upward_ref: &'a YuvFrame,
     forward_mv: MotionVector,
     backward_mv: MotionVector,
+    /// §6.1.2 `RCONTROL` (see [`ForwardPredictor::rcontrol`]).
+    rcontrol: i32,
 }
 
 impl BidirPredictor<'_> {
@@ -6010,8 +6036,8 @@ impl BlockPredictor for BidirPredictor<'_> {
             self.upward_ref.luma_width,
             self.upward_ref.luma_height,
         );
-        let fwd = motion_compensate_block(&fwd_plane, bx, by, self.forward_mv, RCONTROL_DEFAULT);
-        let bwd = motion_compensate_block(&bwd_plane, bx, by, self.backward_mv, RCONTROL_DEFAULT);
+        let fwd = motion_compensate_block(&fwd_plane, bx, by, self.forward_mv, self.rcontrol);
+        let bwd = motion_compensate_block(&bwd_plane, bx, by, self.backward_mv, self.rcontrol);
         Self::blend(fwd, bwd)
     }
     fn predict_cb(&self, cx: usize, cy: usize) -> [u8; COEFFS_PER_BLOCK] {
@@ -6030,14 +6056,14 @@ impl BlockPredictor for BidirPredictor<'_> {
             cx,
             cy,
             chroma_mv(self.forward_mv),
-            RCONTROL_DEFAULT,
+            self.rcontrol,
         );
         let bwd = motion_compensate_block(
             &bwd_plane,
             cx,
             cy,
             chroma_mv(self.backward_mv),
-            RCONTROL_DEFAULT,
+            self.rcontrol,
         );
         Self::blend(fwd, bwd)
     }
@@ -6057,14 +6083,14 @@ impl BlockPredictor for BidirPredictor<'_> {
             cx,
             cy,
             chroma_mv(self.forward_mv),
-            RCONTROL_DEFAULT,
+            self.rcontrol,
         );
         let bwd = motion_compensate_block(
             &bwd_plane,
             cx,
             cy,
             chroma_mv(self.backward_mv),
-            RCONTROL_DEFAULT,
+            self.rcontrol,
         );
         Self::blend(fwd, bwd)
     }
@@ -6399,6 +6425,8 @@ pub fn decode_ep_picture_rpr(
                     luma_stride,
                     chroma_stride,
                     &mut current_quant,
+                    // §6.1.2 — RCONTROL is the EP-picture's RTYPE bit.
+                    plus.mpptype.rounding_type as i32,
                 )?;
                 entry.segment = segment;
                 fwd_grid[row * mb_cols + col] = entry;
@@ -6428,6 +6456,7 @@ fn decode_ep_macroblock(
     luma_stride: usize,
     chroma_stride: usize,
     current_quant: &mut u8,
+    rcontrol: i32,
 ) -> Result<MbGridEntry> {
     let mb_x = col * 16;
     let mb_y = row * 16;
@@ -6549,6 +6578,7 @@ fn decode_ep_macroblock(
                 &ForwardPredictor {
                     forward_ref,
                     mv: forward_mv,
+                    rcontrol,
                 },
                 quant,
                 cbpy,
@@ -6577,6 +6607,7 @@ fn decode_ep_macroblock(
                     // EP "backward" is the upward (reference-layer)
                     // prediction with a zero motion vector (§O.4).
                     backward_mv: MotionVector::new(0, 0),
+                    rcontrol,
                 },
                 quant,
                 cbpy,
@@ -7134,6 +7165,7 @@ fn decode_b_macroblock(
                 &ForwardPredictor {
                     forward_ref: refs.forward_ref,
                     mv: forward_mv,
+                    rcontrol: RCONTROL_DEFAULT,
                 },
                 quant,
                 cbpy,
@@ -7158,6 +7190,7 @@ fn decode_b_macroblock(
                 &ForwardPredictor {
                     forward_ref: refs.backward_ref,
                     mv: backward_mv,
+                    rcontrol: RCONTROL_DEFAULT,
                 },
                 quant,
                 cbpy,
@@ -7180,6 +7213,7 @@ fn decode_b_macroblock(
                     upward_ref: refs.backward_ref,
                     forward_mv,
                     backward_mv,
+                    rcontrol: RCONTROL_DEFAULT,
                 },
                 quant,
                 cbpy,
@@ -7264,6 +7298,7 @@ fn reconstruct_b_direct_macroblock(
         upward_ref: refs.backward_ref,
         forward_mv,
         backward_mv,
+        rcontrol: RCONTROL_DEFAULT,
     };
 
     if coded {
@@ -7590,6 +7625,7 @@ fn decode_dps_after_header(
                         c_x,
                         c_y,
                         MotionVector::new(0, 0),
+                        options.rcontrol,
                     );
                     grid[idx] = MbGridEntry {
                         intra: false,
@@ -7657,7 +7693,7 @@ fn decode_dps_after_header(
                         let has_coef = (inter_cbpy >> (3 - blk)) & 1 == 1;
                         let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
                         let prediction =
-                            motion_compensate_block(&y_ref, bx, by, mv, RCONTROL_DEFAULT);
+                            motion_compensate_block(&y_ref, bx, by, mv, options.rcontrol);
                         let samples = if has_coef {
                             let block = parse_block(
                                 reader,
@@ -7682,7 +7718,7 @@ fn decode_dps_after_header(
                             reference.chroma_height(),
                         );
                         let pred =
-                            motion_compensate_block(&rp, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+                            motion_compensate_block(&rp, c_x, c_y, chroma_vec, options.rcontrol);
                         let samples = if cbpc & plane_bit != 0 {
                             let block = parse_block(
                                 reader,
@@ -8370,6 +8406,7 @@ fn decode_one_macroblock(
             c_x,
             c_y,
             MotionVector::new(0, 0),
+            options.rcontrol,
         );
         if options.aic {
             aic_state.record_non_intra_macroblock(col, row, aic_segment);
@@ -8390,6 +8427,7 @@ fn decode_one_macroblock(
             mvs4: [zero; 4],
             blocks: [None, None, None, None],
             zero_right_remote: options.obmc_skip_zero_right,
+            rcontrol: options.rcontrol,
             intra_remote_vector: pb_mode,
         });
         return Ok((zero, [zero; 4], pending));
@@ -8640,6 +8678,7 @@ fn decode_one_macroblock(
             mvs4: [luma_mv; 4],
             blocks,
             zero_right_remote: false,
+            rcontrol: options.rcontrol,
             intra_remote_vector: pb_mode,
         });
     } else {
@@ -8652,7 +8691,7 @@ fn decode_one_macroblock(
         for blk in 0..4 {
             let has_coef = (inter_cbpy >> (3 - blk)) & 1 == 1;
             let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
-            let prediction = motion_compensate_block(&y_ref, bx, by, luma_mv, RCONTROL_DEFAULT);
+            let prediction = motion_compensate_block(&y_ref, bx, by, luma_mv, options.rcontrol);
             let samples = if has_coef {
                 // §S.2 — Alternative INTER VLC for coefficients.
                 let block = if options.alt_inter_vlc {
@@ -8683,7 +8722,7 @@ fn decode_one_macroblock(
         reference.chroma_height(),
         chroma_band,
     );
-    let cb_pred = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cb_pred = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, options.rcontrol);
     let cb_samples = if cbpc & 0b10 != 0 {
         // §S.2 — Alternative INTER VLC applies to every INTER block,
         // including chrominance.
@@ -8711,7 +8750,7 @@ fn decode_one_macroblock(
         reference.chroma_height(),
         chroma_band,
     );
-    let cr_pred = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cr_pred = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, options.rcontrol);
     let cr_samples = if cbpc & 0b01 != 0 {
         // §S.2 — Alternative INTER VLC applies to every INTER block,
         // including chrominance.
@@ -9023,6 +9062,8 @@ struct PendingApLuma {
     /// macroblock: its right-half remote vectors are zero instead of
     /// the right neighbour's actual vector.
     zero_right_remote: bool,
+    /// §6.1.2 `RCONTROL` of the picture the luminance is predicted for.
+    rcontrol: i32,
     /// §G.2 — PB-frames mode: "when in both the Advanced Prediction
     /// mode and the PB-frames mode, and one of the surrounding blocks
     /// was coded in INTRA mode, the corresponding remote motion vector
@@ -9152,7 +9193,7 @@ fn reconstruct_pending_ap_luma(
             r_bot,
             s_left,
             s_right,
-            RCONTROL_DEFAULT,
+            pending.rcontrol,
         );
         let samples = match &pending.blocks[blk_i] {
             Some(block) => {
@@ -9266,6 +9307,7 @@ fn decode_inter4v_macroblock(
             mvs4,
             blocks,
             zero_right_remote: false,
+            rcontrol: options.rcontrol,
             intra_remote_vector: pb_mode,
         });
     } else {
@@ -9277,7 +9319,7 @@ fn decode_inter4v_macroblock(
             let blk_i = blk.index();
             let (bx, by) = luma_block_origin(mb_x, mb_y, blk_i);
             let q_mv = mvs4[blk_i];
-            let prediction = motion_compensate_block(&y_ref, bx, by, q_mv, RCONTROL_DEFAULT);
+            let prediction = motion_compensate_block(&y_ref, bx, by, q_mv, options.rcontrol);
             let has_coef = (inter_cbpy >> (3 - blk_i)) & 1 == 1;
             let samples = if has_coef {
                 let block = parse_block(
@@ -9306,7 +9348,7 @@ fn decode_inter4v_macroblock(
         reference.chroma_width(),
         reference.chroma_height(),
     );
-    let cb_pred = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cb_pred = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, options.rcontrol);
     let cb_samples = if cbpc & 0b10 != 0 {
         let block = parse_block(
             reader,
@@ -9327,7 +9369,7 @@ fn decode_inter4v_macroblock(
         reference.chroma_width(),
         reference.chroma_height(),
     );
-    let cr_pred = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cr_pred = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, options.rcontrol);
     let cr_samples = if cbpc & 0b01 != 0 {
         let block = parse_block(
             reader,
@@ -9739,6 +9781,7 @@ fn current_or_zero(nb: Option<MbGridEntry>, cell: LumaBlockIndex) -> MotionVecto
 /// Copy an entire macroblock (4 luma + 2 chroma blocks) from the
 /// reference frame, motion-compensated by `luma_mv` (§5.3.1 skip path
 /// uses a zero vector).
+#[allow(clippy::too_many_arguments)]
 fn copy_inter_macroblock(
     reference: &YuvFrame,
     frame: &mut YuvFrame,
@@ -9747,6 +9790,7 @@ fn copy_inter_macroblock(
     c_x: usize,
     c_y: usize,
     luma_mv: MotionVector,
+    rcontrol: i32,
 ) {
     let luma_stride = frame.luma_width;
     let chroma_stride = frame.chroma_width();
@@ -9755,7 +9799,7 @@ fn copy_inter_macroblock(
     let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
     for blk in 0..4 {
         let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
-        let pred = motion_compensate_block(&y_ref, bx, by, luma_mv, RCONTROL_DEFAULT);
+        let pred = motion_compensate_block(&y_ref, bx, by, luma_mv, rcontrol);
         blit_block(&mut frame.y, luma_stride, bx, by, &pred);
     }
     let cb_ref = RefPlane::new(
@@ -9763,14 +9807,14 @@ fn copy_inter_macroblock(
         reference.chroma_width(),
         reference.chroma_height(),
     );
-    let cb = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cb = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, rcontrol);
     blit_block(&mut frame.cb, chroma_stride, c_x, c_y, &cb);
     let cr_ref = RefPlane::new(
         &reference.cr,
         reference.chroma_width(),
         reference.chroma_height(),
     );
-    let cr = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cr = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, rcontrol);
     blit_block(&mut frame.cr, chroma_stride, c_x, c_y, &cr);
 }
 
@@ -10301,6 +10345,7 @@ mod tests {
                 modified_quant: false,
                 alt_inter_vlc: false,
                 obmc_skip_zero_right: false,
+                ..Default::default()
             },
         )
         .expect("decode");
@@ -12286,6 +12331,7 @@ mod tests {
                 modified_quant: false,
                 alt_inter_vlc: false,
                 obmc_skip_zero_right: false,
+                ..Default::default()
             },
         )
         .expect("AIC driver should decode the zero-residual picture");
@@ -12385,6 +12431,7 @@ mod tests {
                 modified_quant: false,
                 alt_inter_vlc: false,
                 obmc_skip_zero_right: false,
+                ..Default::default()
             },
         )
         .expect("AIC driver should decode the +1-DC picture");
@@ -12458,6 +12505,7 @@ mod tests {
                 modified_quant: false,
                 alt_inter_vlc: false,
                 obmc_skip_zero_right: false,
+                ..Default::default()
             },
         )
         .expect("decode");
@@ -12896,13 +12944,14 @@ mod tests {
     /// header except the §5.1.4.3 MPPTYPE picture-type field is "101"
     /// (EP) rather than "100" (EI).
     fn write_plus_qcif_ep_header(w: &mut BitWriter) {
-        write_plus_qcif_ep_header_with(w, /* rpr */ false);
+        write_plus_qcif_ep_header_with(w, /* rpr */ false, /* rtype */ false);
     }
 
     /// [`write_plus_qcif_ep_header`] with the MPPTYPE Reference Picture
     /// Resampling bit selectable; the caller appends the §P.2 RPRP
-    /// refinement field when `rpr` is set.
-    fn write_plus_qcif_ep_header_with(w: &mut BitWriter, rpr: bool) {
+    /// refinement field when `rpr` is set. `rtype` is the MPPTYPE
+    /// Rounding Type bit (§5.1.4.3 bit 6).
+    fn write_plus_qcif_ep_header_with(w: &mut BitWriter, rpr: bool, rtype: bool) {
         w.write_u32(PSC_VALUE, PSC_BITS);
         w.write_u32(0, 8); // TR
         w.write_bit(true); // PTYPE bits 1-2 = "10"
@@ -12919,7 +12968,7 @@ mod tests {
         w.write_u32(0b101, 3); // MPPTYPE picture type EP
         w.write_bit(rpr); // RPR
         w.write_bit(false); // RRU
-        w.write_bit(false); // RTYPE
+        w.write_bit(rtype); // RTYPE
         w.write_bit(false); // reserved
         w.write_bit(false); // reserved
         w.write_bit(true); // SCE-guard
@@ -13096,6 +13145,71 @@ mod tests {
         assert_eq!(frame.cr, forward.cr);
     }
 
+    /// §6.1.2 — RCONTROL equals the MPPTYPE RTYPE bit for an
+    /// EP-picture: a half-pel forward vector interpolates with
+    /// `(A + B + 1 - RTYPE) / 2`. The first macroblock carries a
+    /// Forward MVDFW of (+0.5, 0) pel with no texture; every other
+    /// macroblock is Forward-skipped.
+    #[test]
+    fn ep_forward_half_pel_honours_rtype() {
+        let build = |rtype: bool| {
+            let mut w = BitWriter::new();
+            write_plus_qcif_ep_header_with(&mut w, /* rpr */ false, rtype);
+            w.write_u32(8, SQUANT_BITS); // PQUANT
+            for gob in 0..9usize {
+                if gob != 0 {
+                    w.write_u32(GBSC_VALUE, GBSC_BITS);
+                    w.write_u32(gob as u32, GN_BITS);
+                    w.write_u32(0, GFID_BITS);
+                    w.write_u32(8, GQUANT_BITS);
+                }
+                for mb in 0..11 {
+                    if gob == 0 && mb == 0 {
+                        w.write_bit(false); // COD = 0
+                        w.write_bit(true); // MBTYPE Forward
+                        w.write_bit(false); // CBPC 00
+                        w.write_bit(true); // CBPY 1111 (INTER pattern 0000)
+                        w.write_bit(true);
+                        w.write_u32(0b010, 3); // MVDFW dx = +0.5 (Table 14)
+                        w.write_bit(true); // MVDFW dy = 0
+                    } else {
+                        w.write_bit(true); // COD = 1 (Forward skipped)
+                    }
+                }
+            }
+            while !w.is_byte_aligned() {
+                w.write_bit(false);
+            }
+            w.finish()
+        };
+        let forward = synthetic_qcif_forward();
+        let upward = synthetic_qcif_reference();
+        let y_ref = RefPlane::new(&forward.y, forward.luma_width, forward.luma_height);
+        let mv = MotionVector::new(1, 0);
+        for rtype in [false, true] {
+            let frame = decode_ep_picture_layer(
+                &build(rtype),
+                &forward,
+                &upward,
+                DecodeOptions::default(),
+                InheritedExtendedState::default(),
+            )
+            .expect("decode EP");
+            let expect = motion_compensate_block(&y_ref, 0, 0, mv, rtype as i32);
+            for j in 0..8 {
+                assert_eq!(
+                    &frame.y[j * 176..j * 176 + 8],
+                    &expect[j * 8..j * 8 + 8],
+                    "rtype={rtype} row {j}"
+                );
+            }
+        }
+        // The two roundings differ on this reference (odd A + B sums).
+        let r0 = motion_compensate_block(&y_ref, 0, 0, mv, 0);
+        let r1 = motion_compensate_block(&y_ref, 0, 0, mv, 1);
+        assert_ne!(r0, r1);
+    }
+
     /// Body of an all-Forward, zero-MV, no-texture EP-picture (every
     /// macroblock a verbatim forward-reference copy), GOB headers on
     /// every GOB after the first.
@@ -13153,7 +13267,7 @@ mod tests {
     #[test]
     fn ep_rpr_snr_refinement_reuses_lower_layer_parameters() {
         let mut w = BitWriter::new();
-        write_plus_qcif_ep_header_with(&mut w, /* rpr */ true);
+        write_plus_qcif_ep_header_with(&mut w, /* rpr */ true, /* rtype */ false);
         w.write_u32(0b11, 2); // §P.2.1 WDA = 1/16 pixel; nothing else (SNR)
         write_ep_forward_zero_mv_body(&mut w);
         let data = w.finish();
@@ -13195,7 +13309,7 @@ mod tests {
     fn ep_rpr_spatial_refinement_warps_the_forward_reference() {
         let bits = [true, false, true, true, false, false, true, false];
         let mut w = BitWriter::new();
-        write_plus_qcif_ep_header_with(&mut w, /* rpr */ true);
+        write_plus_qcif_ep_header_with(&mut w, /* rpr */ true, /* rtype */ false);
         w.write_u32(0b11, 2); // WDA
         for &b in &bits {
             w.write_bit(b);
@@ -13761,6 +13875,7 @@ mod tests {
             upward_ref: &backward,
             forward_mv: mvf,
             backward_mv: mvb,
+            rcontrol: RCONTROL_DEFAULT,
         };
         // Interior luma block at MB (col=2, row=2), block 0.
         let (bx, by) = luma_block_origin(2 * 16, 2 * 16, 0);

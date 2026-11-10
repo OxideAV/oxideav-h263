@@ -98,6 +98,24 @@ fn registry_decoder_matches_on_h263p_plusptype_stream() {
 }
 
 #[test]
+fn registry_decoder_matches_on_improved_pb_and_pb_frame_streams() {
+    // The two reference-coder tracer fixtures: B-parts must surface in
+    // display order (before their P-part) through the registry adapter
+    // exactly as through `decode_sequence`.
+    for name in ["umvplus-improved-pb-4mv", "umv-pb-frames-4mv"] {
+        let stream = fixture(name);
+        let direct = decode_sequence(&stream, DecodeOptions::default()).expect("direct decode");
+        let ctx = registered_context();
+        let mut dec = ctx
+            .codecs
+            .first_decoder(&video_params())
+            .expect("resolve decoder");
+        let frames = run_decoder(dec.as_mut(), &[&stream]);
+        assert_frames_match(&frames, &direct);
+    }
+}
+
+#[test]
 fn registry_decoder_handles_arbitrary_packetization() {
     // 7-byte packets shred every picture across many packets; the
     // adapter's PSC re-framing must reassemble them losslessly.

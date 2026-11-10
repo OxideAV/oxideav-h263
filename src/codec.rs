@@ -154,6 +154,7 @@ impl H263DecoderOptions {
             modified_quant: self.modified_quant,
             alt_inter_vlc: self.alt_inter_vlc,
             obmc_skip_zero_right: self.obmc_skip_zero_right,
+            ..Default::default()
         }
     }
 }

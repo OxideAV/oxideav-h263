@@ -158,6 +158,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - §M.2.1 — under Annex M an INTRA P-macroblock carries MVD only in
   the bidirectional mode; the macroblock parser read one for the
   forward / backward rows too.
+- §6.1.2 — RCONTROL now follows the MPPTYPE RTYPE bit for PLUSPTYPE
+  P-pictures, the P-part of Improved PB-frames and EP-pictures (it was
+  hard-wired to `0`, an off-by-one rounding drift on every half-pel
+  prediction of streams that alternate RTYPE as §5.1.4.3 recommends).
+  The BPB-part of an Improved PB-frame and B-pictures keep `0`.
+- §M.2.2 — the forward BPB-vector predictor resets to zero when the
+  left macroblock is skipped or bidirectional, not only when it is
+  backward; an older forward vector from further left in the row is
+  never carried along. Decoder and Improved-PB encoder both.
+- §G.4 — MVDB under Annex G + Annex D (PLUSPTYPE absent) is decoded
+  once per macroblock as the first Table 14 column and the same delta
+  is added to all four luminance B-blocks; the encoder only emits
+  deltas for which a per-block §D.2 pair resolution selects the same
+  value.
+- Two reference-coder tracer fixtures (`umv-pb-frames-4mv`: Annex
+  D + F + G on the version-1 header; `umvplus-improved-pb-4mv`:
+  PLUSPTYPE + UMV/UUI + Annex F + Annex M) now decode byte-exactly —
+  all 9 and 19 display pictures, I, P and B-parts.
 
 ## [0.0.10](https://github.com/OxideAV/oxideav-h263/compare/v0.0.9...v0.0.10) - 2026-08-30
 

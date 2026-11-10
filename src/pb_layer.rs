@@ -1171,44 +1171,55 @@ pub fn pb_b_predict_macroblock(
     pb_b_predict_macroblock_deltas(planes, mb_x, mb_y, p_mvs, &[mvd; 4], trb, trd, rcontrol)
 }
 
-/// §D.2 under the **Unrestricted Motion Vector mode with PLUSPTYPE
-/// absent** (Annex G + Annex D): "the interpretation of Table 14 for
-/// MVD, MVD2-4 and MVDB is as follows: if the predictor … is in the
-/// range [–15.5, 16], only the first column of vector differences
-/// applies; [otherwise] the vector difference from Table 14 shall be
-/// used that results in a vector component inside the range [−31.5,
-/// 31.5] with the same sign as the predictor (including zero). … For
-/// MVDB, the predictor Pc = (TRB × MV)/TRD, where MV represents a
-/// vector component for an 8 * 8 luminance block". The pair selection
-/// therefore resolves **per luminance block** (each block has its own
-/// Pc under §F.2 four vectors) — this returns the effective §G.4 delta
-/// of every block: the raw Table 14 value outside UMV, or the pair
-/// member the §D.2 rule selects for that block's Pc under it.
+/// The §G.4 delta every luminance B-block of a PB-macroblock uses.
+///
+/// MVDB is decoded **once per macroblock** and the single value is
+/// added to each block's scaled vector: "the same MVD given by MVDB is
+/// used for each of the four luminance B-blocks" (§G.4). Under the
+/// Unrestricted Motion Vector mode with PLUSPTYPE absent (Annex G +
+/// Annex D) the Table 14 MVDB codeword is taken from its **first
+/// column**, interpreted against a zero predictor — the reference
+/// coder's behaviour recorded in `h263-annex-clarifications.md` item
+/// 4a. The §D.2 sentence defining an MVDB predictor
+/// `Pc = (TRB × MV)/TRD` per 8 × 8 block would only select the second
+/// column when a block's `Pc` leaves `[-15.5, 16]` *and* the
+/// first-column value leaves the §D.2 range on the predictor's side;
+/// [`pb_mvdb_first_column_is_unambiguous`] identifies the deltas for
+/// which both readings coincide (the crate's encoder emits only those).
+///
+/// `p_mvs`, `trb`, `trd` and `umv_wrap` are accepted for call-site
+/// symmetry with [`pb_mvdb_first_column_is_unambiguous`]; the result
+/// is `[mvd; 4]`.
 pub fn pb_b_effective_deltas(
-    p_mvs: &[MotionVector; 4],
+    _p_mvs: &[MotionVector; 4],
     mvd: Option<Mvd>,
+    _trb: i32,
+    _trd: i32,
+    _umv_wrap: bool,
+) -> [Option<Mvd>; 4] {
+    [mvd; 4]
+}
+
+/// `true` when the first-column Table 14 MVDB value `delta` is also
+/// what a per-block §D.2 pair resolution (predictor
+/// `Pc = (TRB × MV)/TRD` of each 8 × 8 block, Annex D with PLUSPTYPE
+/// absent) would select for every block and component. A PB encoder
+/// restricted to such deltas produces streams on which the
+/// per-macroblock first-column reading of [`pb_b_effective_deltas`]
+/// and the per-block reading agree.
+pub fn pb_mvdb_first_column_is_unambiguous(
+    p_mvs: &[MotionVector; 4],
+    delta: Mvd,
     trb: i32,
     trd: i32,
-    umv_wrap: bool,
-) -> [Option<Mvd>; 4] {
-    let Some(raw) = mvd else {
-        return [None; 4];
-    };
-    if !umv_wrap {
-        return [Some(raw); 4];
-    }
-    let resolve = |mv_comp: i32, delta: i32| -> i16 {
+) -> bool {
+    let agrees = |mv_comp: i32, d: i32| -> bool {
         let pc = (trb * mv_comp) / trd;
-        (crate::motion::reconstruct_mv_component_umv(pc, delta) - pc) as i16
+        crate::motion::reconstruct_mv_component_umv(pc, d) == pc + d
     };
-    let mut out = [None; 4];
-    for (slot, mv) in out.iter_mut().zip(p_mvs.iter()) {
-        *slot = Some(Mvd {
-            dx_half: resolve(mv.dx_half, raw.dx_half as i32),
-            dy_half: resolve(mv.dy_half, raw.dy_half as i32),
-        });
-    }
-    out
+    p_mvs.iter().all(|mv| {
+        agrees(mv.dx_half, delta.dx_half as i32) && agrees(mv.dy_half, delta.dy_half as i32)
+    })
 }
 
 /// [`pb_b_predict_macroblock`] with a per-luminance-block §G.4 delta
