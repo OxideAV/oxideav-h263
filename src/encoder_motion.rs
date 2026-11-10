@@ -490,6 +490,89 @@ pub fn estimate_block_motion_umv_plus(
     best
 }
 
+/// Per-8×8-block counterpart of [`estimate_motion_umv`] for the Annex F
+/// four-vector encoder under **UMV with PLUSPTYPE absent** (Annex D on
+/// a version-1 header): candidates span the §D.2 `[-31.5, 31.5]` range
+/// but are admitted only when [`umv_mvd_for`] can code them as a
+/// Table-14 MVD from the block's own §F.2 predictor (the §D.2
+/// predictor-dependent pair rule), so every returned vector is exactly
+/// what the decoder reconstructs.
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_block_motion_umv(
+    source: &YuvFrame,
+    reference: &YuvFrame,
+    bx: usize,
+    by: usize,
+    predictor: MotionVector,
+    search_half: i32,
+    lambda: u32,
+) -> MotionVector {
+    let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
+    let clamp = |mv: MotionVector| -> MotionVector {
+        MotionVector {
+            dx_half: mv.dx_half.clamp(MV_UMV_HALF_MIN, MV_UMV_HALF_MAX),
+            dy_half: mv.dy_half.clamp(MV_UMV_HALF_MIN, MV_UMV_HALF_MAX),
+        }
+    };
+    let admit = |mv: MotionVector| -> bool { umv_mvd_for(mv, predictor).is_some() };
+    let cost = |mv: MotionVector| -> u32 {
+        let sad = block_sad(source, &y_ref, bx, by, mv);
+        let mvbits = (mv.dx_half - predictor.dx_half).unsigned_abs()
+            + (mv.dy_half - predictor.dy_half).unsigned_abs();
+        sad + lambda * mvbits
+    };
+
+    // The predictor itself (MVD = 0) is always reachable.
+    let mut best = clamp(predictor);
+    let mut best_cost = cost(best);
+    let zero = MotionVector::new(0, 0);
+    if admit(zero) {
+        let zc = cost(zero);
+        if zc < best_cost {
+            best = zero;
+            best_cost = zc;
+        }
+    }
+    let pdx_int = predictor.dx_half / 2;
+    let pdy_int = predictor.dy_half / 2;
+    for dy in -search_half..=search_half {
+        for dx in -search_half..=search_half {
+            let mv = clamp(MotionVector {
+                dx_half: (pdx_int + dx) * 2,
+                dy_half: (pdy_int + dy) * 2,
+            });
+            if !admit(mv) {
+                continue;
+            }
+            let c = cost(mv);
+            if c < best_cost {
+                best_cost = c;
+                best = mv;
+            }
+        }
+    }
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let mv = clamp(MotionVector {
+                dx_half: best.dx_half + dx,
+                dy_half: best.dy_half + dy,
+            });
+            if !admit(mv) {
+                continue;
+            }
+            let c = cost(mv);
+            if c < best_cost {
+                best_cost = c;
+                best = mv;
+            }
+        }
+    }
+    best
+}
+
 /// Annex D §D.2 — the Table-14 MVD component the encoder must emit so
 /// the decoder's [`reconstruct_mv_component_umv`] recovers `mv` from
 /// `predictor`, or `None` when `mv` is **not reachable** from that

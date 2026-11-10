@@ -4,7 +4,7 @@ use oxideav_h263::Error;
 use oxideav_h263::encoder::{
     EOS_BYTES, ImprovedPbConfig, PbConfig, encode_improved_pb_picture,
     encode_improved_pb_picture_stats, encode_intra_picture, encode_pb_picture,
-    encode_pb_picture_ap_stats, encode_pb_picture_umv_stats,
+    encode_pb_picture_ap_stats, encode_pb_picture_umv_ap_stats, encode_pb_picture_umv_stats,
 };
 use oxideav_h263::picture::{
     DecodeOptions, YuvFrame, decode_improved_pb_picture, decode_pb_picture_no_gob0_header,
@@ -441,6 +441,58 @@ fn annex_g_pb_umv_follows_a_wide_pan() {
     assert_eq!(decoded.len(), 3);
     assert_eq!(decoded[1], umv_pair.b_frame);
     assert_eq!(decoded[2], umv_pair.p_frame);
+}
+
+/// Annex G + Annex D + Annex F on the version-1 header (the tracer
+/// fixture's mode set): four §D.2 / Table 14 vectors per macroblock
+/// follow a 22 px pan beyond the default range (fewer bits and a better
+/// P-part than Annex G + AP alone), and the pair decodes
+/// identically through `decode_pb_picture_no_gob0_header` and
+/// `decode_sequence`.
+#[test]
+fn annex_g_pb_umv_with_advanced_prediction_follows_a_wide_pan() {
+    let base = textured(176, 144, 19);
+    let i_bytes = encode_intra_picture(&base, 6, 0).unwrap();
+    let r0 = decode_sequence(&i_bytes, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    let p = translated(&base, 22, 2);
+    let b = translated(&base, 11, 1);
+    let cfg = PbConfig::default()
+        .with_quant(6)
+        .with_trb(1)
+        .with_dbquant(0)
+        .with_search_half(24)
+        .with_b_search_half(2);
+    let (bytes, stats) = encode_pb_picture_umv_ap_stats(&p, &b, &r0, 2, 0, &cfg).unwrap();
+    eprintln!("Annex G + UMV + AP census: {stats:?}");
+    let pair = decode_pb_picture_no_gob0_header(&bytes, &r0, 0, DecodeOptions::default()).unwrap();
+    let (mp, mb) = (luma_mae(&pair.p_frame, &p), luma_mae(&pair.b_frame, &b));
+    // The same clip through Annex G + AP alone (default ±16 px range):
+    // the extended range must pay off in bits and P-part fidelity.
+    let (ap_bytes, _) = encode_pb_picture_ap_stats(&p, &b, &r0, 2, 0, &cfg).unwrap();
+    let ap_pair =
+        decode_pb_picture_no_gob0_header(&ap_bytes, &r0, 0, DecodeOptions::default()).unwrap();
+    let ap_mp = luma_mae(&ap_pair.p_frame, &p);
+    eprintln!(
+        "UMV + AP: {} bytes, P MAE {mp:.3}, B MAE {mb:.3}; AP only: {} bytes, P MAE {ap_mp:.3}",
+        bytes.len(),
+        ap_bytes.len()
+    );
+    assert!(
+        mp < 3.0 && mb < 4.5,
+        "UMV + AP PB pair reconstructs the pan"
+    );
+    assert!(
+        bytes.len() < ap_bytes.len() && mp < ap_mp,
+        "the extended range pays off"
+    );
+    let mut stream = i_bytes;
+    stream.extend_from_slice(&bytes);
+    let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.len(), 3);
+    assert_eq!(decoded[1], pair.b_frame);
+    assert_eq!(decoded[2], pair.p_frame);
 }
 
 /// Annex M + UMV (PLUSPTYPE, Table D.3): the P-part and the §M.2.2

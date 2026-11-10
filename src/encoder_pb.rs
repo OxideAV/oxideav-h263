@@ -41,7 +41,7 @@
 
 use crate::block::{COEFFS_PER_BLOCK, H263Block};
 use crate::encoder::{
-    PbConfig, PlusModes, PtypeFlags, extract_macroblock, motion_compensated_block, residual_of,
+    PbConfig, PlusModes, PtypeFlags, extract_macroblock, motion_compensated_block_rc, residual_of,
     source_format_for, write_picture_header, write_plus_picture_header,
 };
 use crate::encoder_block::{
@@ -116,6 +116,12 @@ pub struct ImprovedPbConfig {
     /// that, so a non-zero INTRA vector would desynchronise every
     /// vector predicted from it there.
     pub intra_refresh: usize,
+    /// MPPTYPE RTYPE bit (§5.1.4.3): the §6.1.2 `RCONTROL` of the
+    /// P-part's half-pel prediction (the BPB-part always uses `0`).
+    /// §5.1.4.3 recommends the value differ from the reference
+    /// picture's so rounding errors do not accumulate; a sequence
+    /// driver alternates it picture by picture.
+    pub rounding_type: bool,
 }
 
 impl ImprovedPbConfig {
@@ -195,6 +201,13 @@ impl ImprovedPbConfig {
         self.intra_refresh = v;
         self
     }
+
+    /// Set [`ImprovedPbConfig::rounding_type`].
+    #[must_use]
+    pub fn with_rounding_type(mut self, v: bool) -> Self {
+        self.rounding_type = v;
+        self
+    }
 }
 
 impl Default for ImprovedPbConfig {
@@ -211,6 +224,7 @@ impl Default for ImprovedPbConfig {
             slice_rows: 0,
             aic: false,
             intra_refresh: 0,
+            rounding_type: false,
         }
     }
 }
@@ -334,6 +348,9 @@ struct PbCore {
     /// Annex I on the INTRA-refresh macroblocks (Annex M only).
     aic: bool,
     intra_refresh: usize,
+    /// §6.1.2 `RCONTROL` of the P-part (the PLUSPTYPE RTYPE bit;
+    /// always `0` for Annex G, whose header has no RTYPE).
+    rcontrol: i32,
 }
 
 /// Encode an Annex M **Improved PB-frame**: one picture unit carrying a
@@ -375,28 +392,9 @@ pub fn encode_improved_pb_picture_stats(
     prev_tr: u8,
     cfg: &ImprovedPbConfig,
 ) -> Result<(Vec<u8>, ImprovedPbStats)> {
-    encode_pb_core(
-        p_source,
-        b_source,
-        reference,
-        tr_p,
-        prev_tr,
-        PbCore {
-            quant: cfg.quant,
-            trb: cfg.trb,
-            dbquant: cfg.dbquant,
-            search_half: cfg.search_half,
-            advanced_prediction: cfg.advanced_prediction,
-            umv: if cfg.umv { UmvMode::Plus } else { UmvMode::Off },
-            slice_rows: cfg.slice_rows,
-            aic: cfg.aic,
-            intra_refresh: cfg.intra_refresh,
-        },
-        PbFlavour::AnnexM {
-            forward_search_half: cfg.forward_search_half,
-            allow_backward: cfg.allow_backward,
-        },
-    )
+    let (core, flavour) = annex_m_core(cfg);
+    encode_pb_core(p_source, b_source, reference, tr_p, prev_tr, core, flavour)
+        .map(|o| (o.bytes, o.stats))
 }
 
 /// Encode an Annex G **PB-frame with Advanced Prediction** (baseline
@@ -437,31 +435,23 @@ pub fn encode_pb_picture_ap_stats(
         reference,
         tr_p,
         prev_tr,
-        PbCore {
-            quant: cfg.quant,
-            trb: cfg.trb,
-            dbquant: cfg.dbquant,
-            search_half: cfg.search_half,
-            advanced_prediction: true,
-            umv: UmvMode::Off,
-            slice_rows: 0,
-            aic: false,
-            intra_refresh: 0,
-        },
+        annex_g_core(cfg, true, UmvMode::Off),
         PbFlavour::AnnexG {
             b_search_half: cfg.b_search_half,
         },
     )
+    .map(|o| (o.bytes, o.stats))
 }
 
 /// Encode an Annex G **PB-frame in the Unrestricted Motion Vector
 /// mode** (baseline PTYPE bits 10 + 13): the P-part vectors are
 /// searched over the §D.2 extended `[-31.5, 31.5]` range with the
 /// predictor-dependent Table 14 pair rule, and the §5.3.9 MVDB delta
-/// ([`PbConfig::b_search_half`]) is interpreted per §D.2 with the
-/// predictor `Pc = (TRB × MV)/TRD` — resolved per luminance block
-/// exactly as the decoder does. Same contract as
-/// [`crate::encoder::encode_pb_picture`] otherwise.
+/// ([`PbConfig::b_search_half`]) is one first-column Table 14 value
+/// per macroblock (§G.4), restricted to deltas a per-block §D.2
+/// resolution with `Pc = (TRB × MV)/TRD` reads identically. Same
+/// contract as [`crate::encoder::encode_pb_picture`] otherwise; Annex
+/// F composes through [`encode_pb_picture_umv_ap`].
 pub fn encode_pb_picture_umv(
     p_source: &YuvFrame,
     b_source: &YuvFrame,
@@ -490,19 +480,94 @@ pub fn encode_pb_picture_umv_stats(
         reference,
         tr_p,
         prev_tr,
+        annex_g_core(cfg, false, UmvMode::Wrap),
+        PbFlavour::AnnexG {
+            b_search_half: cfg.b_search_half,
+        },
+    )
+    .map(|o| (o.bytes, o.stats))
+}
+
+/// Encode an Annex G **PB-frame in the Unrestricted Motion Vector mode
+/// with Advanced Prediction** (baseline PTYPE bits 10 + 12 + 13, no
+/// PLUSPTYPE): every P-macroblock carries four §F.2 vectors searched
+/// over the §D.2 `[-31.5, 31.5]` range, each coded as a Table 14 MVD
+/// through the §D.2 pair rule against its own block predictor, with
+/// the §F.3 OBMC P-luma as PREC. The §5.3.9 MVDB delta is one
+/// first-column Table 14 value per macroblock added to every 8 × 8
+/// block's scaled vector (§G.4), restricted to deltas a per-block §D.2
+/// resolution reads identically. Same contract as
+/// [`crate::encoder::encode_pb_picture`] otherwise.
+pub fn encode_pb_picture_umv_ap(
+    p_source: &YuvFrame,
+    b_source: &YuvFrame,
+    reference: &YuvFrame,
+    tr_p: u8,
+    prev_tr: u8,
+    cfg: &PbConfig,
+) -> Result<Vec<u8>> {
+    encode_pb_picture_umv_ap_stats(p_source, b_source, reference, tr_p, prev_tr, cfg)
+        .map(|(bytes, _)| bytes)
+}
+
+/// As [`encode_pb_picture_umv_ap`], additionally returning the
+/// per-picture [`ImprovedPbStats`] census.
+pub fn encode_pb_picture_umv_ap_stats(
+    p_source: &YuvFrame,
+    b_source: &YuvFrame,
+    reference: &YuvFrame,
+    tr_p: u8,
+    prev_tr: u8,
+    cfg: &PbConfig,
+) -> Result<(Vec<u8>, ImprovedPbStats)> {
+    encode_pb_core(
+        p_source,
+        b_source,
+        reference,
+        tr_p,
+        prev_tr,
+        annex_g_core(cfg, true, UmvMode::Wrap),
+        PbFlavour::AnnexG {
+            b_search_half: cfg.b_search_half,
+        },
+    )
+    .map(|o| (o.bytes, o.stats))
+}
+
+/// The shared-core knobs of an Annex G PB-frame encode.
+fn annex_g_core(cfg: &PbConfig, advanced_prediction: bool, umv: UmvMode) -> PbCore {
+    PbCore {
+        quant: cfg.quant,
+        trb: cfg.trb,
+        dbquant: cfg.dbquant,
+        search_half: cfg.search_half,
+        advanced_prediction,
+        umv,
+        slice_rows: 0,
+        aic: false,
+        intra_refresh: 0,
+        rcontrol: 0,
+    }
+}
+
+/// The shared-core knobs of an Annex M Improved PB-frame encode.
+fn annex_m_core(cfg: &ImprovedPbConfig) -> (PbCore, PbFlavour) {
+    (
         PbCore {
             quant: cfg.quant,
             trb: cfg.trb,
             dbquant: cfg.dbquant,
             search_half: cfg.search_half,
-            advanced_prediction: false,
-            umv: UmvMode::Wrap,
-            slice_rows: 0,
-            aic: false,
-            intra_refresh: 0,
+            advanced_prediction: cfg.advanced_prediction,
+            umv: if cfg.umv { UmvMode::Plus } else { UmvMode::Off },
+            slice_rows: cfg.slice_rows,
+            aic: cfg.aic,
+            intra_refresh: cfg.intra_refresh,
+            rcontrol: cfg.rounding_type as i32,
         },
-        PbFlavour::AnnexG {
-            b_search_half: cfg.b_search_half,
+        PbFlavour::AnnexM {
+            forward_search_half: cfg.forward_search_half,
+            allow_backward: cfg.allow_backward,
         },
     )
 }
@@ -537,6 +602,21 @@ struct BPart {
     forward_mv: Option<MotionVector>,
     blocks: [EncodedInterBlock; 6],
     any: bool,
+    /// The chosen B-prediction (the decoder-side reconstruction is this
+    /// plus the dequantised residual of `blocks`).
+    pred: PbBMacroblockPrediction,
+}
+
+/// What [`encode_pb_core`] produces: the picture unit plus the
+/// encoder-side reconstructions of both parts (what a conforming
+/// decoder must output).
+struct PbCoreOutput {
+    bytes: Vec<u8>,
+    stats: ImprovedPbStats,
+    #[cfg_attr(not(test), allow(dead_code))]
+    p_recon: YuvFrame,
+    #[cfg_attr(not(test), allow(dead_code))]
+    b_recon: YuvFrame,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -548,7 +628,7 @@ fn encode_pb_core(
     prev_tr: u8,
     core: PbCore,
     flavour: PbFlavour,
-) -> Result<(Vec<u8>, ImprovedPbStats)> {
+) -> Result<PbCoreOutput> {
     if core.quant == 0 || core.quant > 31 {
         return Err(Error::InvalidQuantiser);
     }
@@ -573,6 +653,8 @@ fn encode_pb_core(
 
     let quant = core.quant;
     let bquant = pb_bquant(core.dbquant, quant);
+    let mut p_recon = reference.clone();
+    let mut b_recon = reference.clone();
     let trb = i32::from(core.trb);
     let ap = core.advanced_prediction;
     let lambda = 2 * quant as u32;
@@ -596,11 +678,6 @@ fn encode_pb_core(
             false,
         )
     });
-    if ap && core.umv == UmvMode::Wrap {
-        // UMV + AP on a baseline header is not staged (the §D.2 pair
-        // rule per block vector); the PLUSPTYPE form is.
-        return Err(Error::NotImplemented);
-    }
     if core.aic && matches!(flavour, PbFlavour::AnnexG { .. }) {
         // Annex I is PLUSPTYPE-only (§G.1 bars it from Annex G).
         return Err(Error::NotImplemented);
@@ -688,6 +765,7 @@ fn encode_pb_core(
                 advanced_intra: core.aic,
                 improved_pb: Some((core.trb, core.dbquant)),
                 slice_structured: sss,
+                rounding_type: core.rcontrol != 0,
                 ..PlusModes::default()
             },
         )?,
@@ -731,7 +809,20 @@ fn encode_pb_core(
                         let bx = mb_col * 16 + (blk_i % 2) * 8;
                         let by = mb_row * 16 + (blk_i / 2) * 8;
                         let predictor = grid4.predict_block(mb_col, mb_row, blk, &cur);
-                        let mv = if core.umv == UmvMode::Plus {
+                        let mv = if core.umv == UmvMode::Wrap {
+                            // §D.2 pair rule per block: only vectors
+                            // Table-14-codable from this block's §F.2
+                            // predictor.
+                            crate::encoder_motion::estimate_block_motion_umv(
+                                p_source,
+                                reference,
+                                bx,
+                                by,
+                                predictor,
+                                core.search_half,
+                                lambda,
+                            )
+                        } else if core.umv == UmvMode::Plus {
                             crate::encoder_motion::estimate_block_motion_umv_plus(
                                 p_source,
                                 reference,
@@ -839,10 +930,28 @@ fn encode_pb_core(
                 let left = (mb_col > 0).then(|| field[idx - 1]);
                 let right = (mb_col + 1 < mb_cols).then(|| field[idx + 1]);
                 inter_p_part_ap(
-                    &src, &y_ref, reference, mb_col, mb_row, &mvs4, above, left, right, quant,
+                    &src,
+                    &y_ref,
+                    reference,
+                    mb_col,
+                    mb_row,
+                    &mvs4,
+                    above,
+                    left,
+                    right,
+                    quant,
+                    core.rcontrol,
                 )
             } else {
-                inter_p_part_single(&src, reference, mb_col, mb_row, single_mv, quant)
+                inter_p_part_single(
+                    &src,
+                    reference,
+                    mb_col,
+                    mb_row,
+                    single_mv,
+                    quant,
+                    core.rcontrol,
+                )
             };
 
             // ---- B-part. ----------------------------------------------
@@ -880,6 +989,42 @@ fn encode_pb_core(
                 /* bidirectional_only */ intra,
                 core.umv,
             );
+
+            // ---- Encoder-side reconstruction (PREC and the B-part). ---
+            blit_recon(
+                &mut p_recon,
+                mb_col,
+                mb_row,
+                &p_part.prec_y,
+                &p_part.prec_cb,
+                &p_part.prec_cr,
+            );
+            {
+                let mut by = [0u8; 256];
+                for blk in 0..4 {
+                    let (ox, oy) = ((blk % 2) * 8, (blk / 2) * 8);
+                    let mut pred = [0u8; COEFFS_PER_BLOCK];
+                    for j in 0..8 {
+                        pred[j * 8..j * 8 + 8]
+                            .copy_from_slice(&b_part.pred.luma[oy + j][ox..ox + 8]);
+                    }
+                    blit_prec_luma(
+                        &mut by,
+                        blk,
+                        &recon_inter_block(&b_part.blocks[blk], &pred, bquant),
+                    );
+                }
+                let flat8 = |p: &[[u8; 8]; 8]| -> [u8; COEFFS_PER_BLOCK] {
+                    let mut o = [0u8; COEFFS_PER_BLOCK];
+                    for j in 0..8 {
+                        o[j * 8..j * 8 + 8].copy_from_slice(&p[j]);
+                    }
+                    o
+                };
+                let bcb = recon_inter_block(&b_part.blocks[4], &flat8(&b_part.pred.cb), bquant);
+                let bcr = recon_inter_block(&b_part.blocks[5], &flat8(&b_part.pred.cr), bquant);
+                blit_recon(&mut b_recon, mb_col, mb_row, &by, &bcb, &bcr);
+            }
 
             // ---- Skip / emit. -----------------------------------------
             // A skipped macroblock (COD = 1) carries no MODB: its B-part
@@ -1037,7 +1182,12 @@ fn encode_pb_core(
     }
 
     w.align_to_byte_zero();
-    Ok((w.finish(), stats))
+    Ok(PbCoreOutput {
+        bytes: w.finish(),
+        stats,
+        p_recon,
+        b_recon,
+    })
 }
 
 /// One MVD pair: two Table 14 codewords, or the Table D.3 pair (with
@@ -1048,6 +1198,29 @@ fn write_mv_pair(w: &mut BitWriter, mvd: Mvd, table_d3: bool) -> Result<()> {
     } else {
         write_mvd_component(w, mvd.dx_half)?;
         write_mvd_component(w, mvd.dy_half)
+    }
+}
+
+/// Copy one reconstructed macroblock (16 × 16 luma in raster order,
+/// two 8 × 8 chroma blocks) into `frame`.
+fn blit_recon(
+    frame: &mut YuvFrame,
+    mb_col: usize,
+    mb_row: usize,
+    y: &[u8; 256],
+    cb: &[u8; COEFFS_PER_BLOCK],
+    cr: &[u8; COEFFS_PER_BLOCK],
+) {
+    let lw = frame.luma_width;
+    let cw = frame.chroma_width();
+    for j in 0..16 {
+        let at = (mb_row * 16 + j) * lw + mb_col * 16;
+        frame.y[at..at + 16].copy_from_slice(&y[j * 16..j * 16 + 16]);
+    }
+    for j in 0..8 {
+        let at = (mb_row * 8 + j) * cw + mb_col * 8;
+        frame.cb[at..at + 8].copy_from_slice(&cb[j * 8..j * 8 + 8]);
+        frame.cr[at..at + 8].copy_from_slice(&cr[j * 8..j * 8 + 8]);
     }
 }
 
@@ -1238,6 +1411,7 @@ fn inter_p_part_single(
     mb_row: usize,
     mv: MotionVector,
     quant: u8,
+    rcontrol: i32,
 ) -> PPart {
     let lw = reference.luma_width;
     let lh = reference.luma_height;
@@ -1247,13 +1421,27 @@ fn inter_p_part_single(
     for (blk, pred) in luma_pred.iter_mut().enumerate() {
         let bx = mb_col * 16 + (blk % 2) * 8;
         let by = mb_row * 16 + (blk / 2) * 8;
-        *pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
+        *pred = motion_compensated_block_rc(&reference.y, lw, lh, bx, by, mv, rcontrol);
     }
     let chroma_vec = chroma_mv(mv);
-    let cb_pred =
-        motion_compensated_block(&reference.cb, cw, ch, mb_col * 8, mb_row * 8, chroma_vec);
-    let cr_pred =
-        motion_compensated_block(&reference.cr, cw, ch, mb_col * 8, mb_row * 8, chroma_vec);
+    let cb_pred = motion_compensated_block_rc(
+        &reference.cb,
+        cw,
+        ch,
+        mb_col * 8,
+        mb_row * 8,
+        chroma_vec,
+        rcontrol,
+    );
+    let cr_pred = motion_compensated_block_rc(
+        &reference.cr,
+        cw,
+        ch,
+        mb_col * 8,
+        mb_row * 8,
+        chroma_vec,
+        rcontrol,
+    );
     finish_inter_p_part(src, luma_pred, cb_pred, cr_pred, quant)
 }
 
@@ -1276,6 +1464,7 @@ fn inter_p_part_ap(
     left: Option<Mb4Mv>,
     right: Option<Mb4Mv>,
     quant: u8,
+    rcontrol: i32,
 ) -> PPart {
     let remote = |nb: Option<Mb4Mv>, cell: LumaBlockIndex| -> RemoteMv {
         match nb {
@@ -1318,15 +1507,7 @@ fn inter_p_part_ap(
         let by = mb_row * 16 + (blk_i / 2) * 8;
         let (r_top, r_bot, s_left, s_right) = tags(blk);
         luma_pred[blk_i] = obmc_predict_block(
-            y_ref,
-            bx,
-            by,
-            cur[blk_i],
-            r_top,
-            r_bot,
-            s_left,
-            s_right,
-            RCONTROL_DEFAULT,
+            y_ref, bx, by, cur[blk_i], r_top, r_bot, s_left, s_right, rcontrol,
         );
     }
     // §F.2 chroma: sum-of-four / Table F.1 vector, plain half-pel
@@ -1334,10 +1515,24 @@ fn inter_p_part_ap(
     let chroma_vec = chroma_mv_4mv(cur);
     let cw = reference.chroma_width();
     let ch = reference.chroma_height();
-    let cb_pred =
-        motion_compensated_block(&reference.cb, cw, ch, mb_col * 8, mb_row * 8, chroma_vec);
-    let cr_pred =
-        motion_compensated_block(&reference.cr, cw, ch, mb_col * 8, mb_row * 8, chroma_vec);
+    let cb_pred = motion_compensated_block_rc(
+        &reference.cb,
+        cw,
+        ch,
+        mb_col * 8,
+        mb_row * 8,
+        chroma_vec,
+        rcontrol,
+    );
+    let cr_pred = motion_compensated_block_rc(
+        &reference.cr,
+        cw,
+        ch,
+        mb_col * 8,
+        mb_row * 8,
+        chroma_vec,
+        rcontrol,
+    );
     finish_inter_p_part(src, luma_pred, cb_pred, cr_pred, quant)
 }
 
@@ -1583,6 +1778,7 @@ fn decide_b_part(
         forward_mv,
         blocks,
         any,
+        pred: best_pred,
     }
 }
 
@@ -1648,4 +1844,196 @@ fn backward_prediction(planes: &PbBReferencePlanes<'_>) -> PbBMacroblockPredicti
         cr[j].copy_from_slice(&planes.prec_cr.samples[j * 8..j * 8 + 8]);
     }
     PbBMacroblockPrediction { luma, cb, cr }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::picture::{
+        DecodeOptions, decode_improved_pb_picture, decode_pb_picture_no_gob0_header,
+        decode_sequence,
+    };
+
+    /// Smooth sinusoidal QCIF texture sampled at a sub-pixel offset
+    /// `(ox, oy)` (in quarter pixels), plus three 16 × 16 random-texture
+    /// squares whose positions jitter per `seed` — so half-pel vectors,
+    /// and a mix of forward / bidirectional / backward BPB modes, are
+    /// all natural choices.
+    fn scene(ox: i32, oy: i32, seed: u32) -> YuvFrame {
+        let (lw, lh) = (176usize, 144usize);
+        let f = |x: f64, y: f64| -> f64 {
+            110.0 + 50.0 * (x / 5.3).sin() * (y / 3.7).cos() + 30.0 * ((x + 2.0 * y) / 9.1).sin()
+        };
+        let mut y = vec![0u8; lw * lh];
+        for r in 0..lh {
+            for c in 0..lw {
+                let v = f(c as f64 + ox as f64 / 4.0, r as f64 + oy as f64 / 4.0);
+                y[r * lw + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(12345);
+        let mut rnd = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for &col in &[8usize, 80, 136] {
+            let jx = (rnd() % 13) as usize;
+            let jy = (rnd() % 13) as usize;
+            let (x0, y0) = ((col + jx).min(lw - 17), (40 + jy * 3).min(lh - 17));
+            for r in 0..16 {
+                for c in 0..16 {
+                    y[(y0 + r) * lw + x0 + c] = (rnd() % 200 + 28) as u8;
+                }
+            }
+        }
+        let cb = (0..88 * 72)
+            .map(|i| (100 + (i % 88) / 3 + (i / 88) / 4) as u8)
+            .collect();
+        let cr = (0..88 * 72)
+            .map(|i| (150 - (i % 88) / 4 + (i / 88) / 5) as u8)
+            .collect();
+        YuvFrame {
+            y,
+            cb,
+            cr,
+            luma_width: lw,
+            luma_height: lh,
+        }
+    }
+
+    fn intra_anchor() -> (Vec<u8>, YuvFrame) {
+        let bytes = crate::encoder::encode_intra_picture(&scene(0, 0, 1), 8, 0).unwrap();
+        let recon = decode_sequence(&bytes, DecodeOptions::default())
+            .unwrap()
+            .remove(0);
+        (bytes, recon)
+    }
+
+    /// Annex M (PLUSPTYPE): for every UMV / AP / RTYPE combination the
+    /// decoder reproduces the encoder's own P-part (PREC) and BPB-part
+    /// reconstruction sample for sample — the §6.1.2 RTYPE rounding of
+    /// the P-part, the zero RCONTROL of the BPB-part, the Table D.3
+    /// MVDB with its per-pair emulation bit and the §M.2.2 predictor
+    /// reset all agree between the two sides.
+    #[test]
+    fn improved_pb_encoder_recon_equals_decoder_output() {
+        let (_, r0) = intra_anchor();
+        let p = scene(6, 2, 3);
+        let b = scene(3, 1, 2);
+        for umv in [false, true] {
+            for ap in [false, true] {
+                for rtype in [false, true] {
+                    let cfg = ImprovedPbConfig::default()
+                        .with_quant(6)
+                        .with_search_half(6)
+                        .with_forward_search_half(4)
+                        .with_allow_backward(true)
+                        .with_advanced_prediction(ap)
+                        .with_umv(umv)
+                        .with_rounding_type(rtype);
+                    let (core, flavour) = annex_m_core(&cfg);
+                    let out = encode_pb_core(&p, &b, &r0, 2, 0, core, flavour).unwrap();
+                    let tag = format!("umv {umv} ap {ap} rtype {rtype}: {:?}", out.stats);
+                    assert!(
+                        out.stats.forward > 0 && out.stats.bidirectional > 0,
+                        "{tag}"
+                    );
+                    let pair =
+                        decode_improved_pb_picture(&out.bytes, &r0, 0, DecodeOptions::default())
+                            .unwrap();
+                    assert_eq!(pair.p_frame, out.p_recon, "P-part, {tag}");
+                    assert_eq!(pair.b_frame, out.b_recon, "BPB-part, {tag}");
+                }
+            }
+        }
+    }
+
+    /// RTYPE is signalled on the wire and changes the P-part
+    /// reconstruction (half-pel vectors are present), while a decoder
+    /// that ignored it would drift from the encoder.
+    #[test]
+    fn improved_pb_rtype_is_signalled_and_load_bearing() {
+        let (_, r0) = intra_anchor();
+        let p = scene(6, 2, 3);
+        let b = scene(3, 1, 2);
+        let cfg = ImprovedPbConfig::default()
+            .with_quant(6)
+            .with_advanced_prediction(true);
+        let (c0, f0) = annex_m_core(&cfg);
+        let (c1, f1) = annex_m_core(&cfg.with_rounding_type(true));
+        let o0 = encode_pb_core(&p, &b, &r0, 2, 0, c0, f0).unwrap();
+        let o1 = encode_pb_core(&p, &b, &r0, 2, 0, c1, f1).unwrap();
+        assert_ne!(o0.p_recon, o1.p_recon, "RTYPE alters the P-part");
+        // MPPTYPE bit 6 sits 22 + 8 + 8 + 3 + 18 + 5 bits into the
+        // picture (PSC, TR, PTYPE, UFEP, OPPTYPE, MPPTYPE bits 1-5).
+        let bit = |bytes: &[u8], at: usize| (bytes[at / 8] >> (7 - at % 8)) & 1;
+        assert_eq!(bit(&o0.bytes, 64), 0);
+        assert_eq!(bit(&o1.bytes, 64), 1);
+    }
+
+    /// Annex G on the version-1 header, plain / AP / UMV / UMV + AP: the
+    /// decoder reproduces both encoder-side reconstructions exactly,
+    /// including the per-macroblock first-column MVDB of §G.4 applied to
+    /// four per-block scaled vectors under UMV + AP.
+    #[test]
+    fn annex_g_encoder_recon_equals_decoder_output() {
+        let (_, r0) = intra_anchor();
+        let p = scene(10, 4, 3);
+        let b = scene(5, 2, 2);
+        let cfg = PbConfig::default()
+            .with_quant(6)
+            .with_trb(1)
+            .with_search_half(8)
+            .with_b_search_half(2);
+        for (ap, umv) in [
+            (false, UmvMode::Off),
+            (true, UmvMode::Off),
+            (false, UmvMode::Wrap),
+            (true, UmvMode::Wrap),
+        ] {
+            let out = encode_pb_core(
+                &p,
+                &b,
+                &r0,
+                2,
+                0,
+                annex_g_core(&cfg, ap, umv),
+                PbFlavour::AnnexG { b_search_half: 2 },
+            )
+            .unwrap();
+            let tag = format!("ap {ap} umv {umv:?}: {:?}", out.stats);
+            let pair =
+                decode_pb_picture_no_gob0_header(&out.bytes, &r0, 0, DecodeOptions::default())
+                    .unwrap();
+            assert_eq!(pair.p_frame, out.p_recon, "P-part, {tag}");
+            assert_eq!(pair.b_frame, out.b_recon, "B-part, {tag}");
+        }
+    }
+
+    /// The first-column MVDB guard: a delta whose per-block §D.2 pair
+    /// resolution would pick the second column for a large scaled
+    /// predictor is refused, a small one passes.
+    #[test]
+    fn mvdb_first_column_guard() {
+        let mv = MotionVector::new(60, 0);
+        let mvs = [mv; 4];
+        // TRB 6 / TRD 7: Pc = 51 (outside [-31, 32]); a delta of +15
+        // would leave the range, so the pair resolves to 15 - 64.
+        let big = Mvd {
+            dx_half: 15,
+            dy_half: 0,
+        };
+        assert!(!crate::pb_layer::pb_mvdb_first_column_is_unambiguous(
+            &mvs, big, 6, 7
+        ));
+        let small = Mvd {
+            dx_half: -2,
+            dy_half: 1,
+        };
+        assert!(crate::pb_layer::pb_mvdb_first_column_is_unambiguous(
+            &mvs, small, 6, 7
+        ));
+    }
 }

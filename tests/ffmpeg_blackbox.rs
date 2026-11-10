@@ -20,7 +20,7 @@ use oxideav_h263::encoder::{
     encode_inter_picture_aic_plus, encode_inter_picture_ap, encode_inter_picture_deblock,
     encode_inter_picture_motion, encode_inter_picture_umv_plus, encode_intra_picture,
     encode_intra_picture_aic_plus, encode_intra_picture_deblock, encode_pb_picture,
-    encode_pb_picture_ap, encode_pb_picture_umv, encode_sequence,
+    encode_pb_picture_ap, encode_pb_picture_umv, encode_pb_picture_umv_ap, encode_sequence,
 };
 use oxideav_h263::picture::{DecodeOptions, YuvFrame, decode_sequence};
 use std::path::PathBuf;
@@ -639,9 +639,11 @@ fn pb_frames_with_umv_agree_with_oracle() {
     // oracle parses a forward-mode MVDB under UMV + PLUSPTYPE with some
     // table other than the Table D.3 this crate applies (§M.2.2 "coded
     // in the same way as … MVD", which §5.3.7 / §D.2 switch to Table
-    // D.3 when PLUSPTYPE is present) — its output desynchronises from
-    // the first forward macroblock, and a Table 14 MVDB is rejected by
-    // it outright. The P-part vectors (Table D.3, 20 px pan) agree.
+    // D.3 when PLUSPTYPE is present; the reference-coder trace of
+    // `h263-annex-clarifications.md` item 1 confirms Table D.3 plus the
+    // per-pair emulation bit) — its output desynchronises from the
+    // first forward macroblock, and a Table 14 MVDB is rejected by it
+    // outright. The P-part vectors (Table D.3, 20 px pan) agree.
     let mut stream = encode_intra_picture(&base, 8, 0).unwrap();
     let mut recon = decode_sequence(&stream, DecodeOptions::default())
         .unwrap()
@@ -765,4 +767,76 @@ fn aic_intra_macroblocks_in_p_and_improved_pb_agree_with_oracle() {
         prev_tr = tr_p;
     }
     cross_check_anchors(&stream, 176, 144, "improved-pb-aic", 0.08, &[0, 2, 4]);
+}
+
+/// Annex G + Annex D + Annex F on the version-1 header (the combination
+/// of the reference-coder tracer fixture `umv-pb-frames-4mv`): four
+/// Table 14 / §D.2 vectors per P-macroblock and one first-column MVDB
+/// per macroblock. The oracle parses every field (a misparse would
+/// desynchronise the rest of the picture); its P-part is held to the
+/// AP + PB PSNR floor (see `cross_check_anchors_psnr`).
+#[test]
+fn pb_frames_umv_with_advanced_prediction_agree_with_oracle() {
+    require_oracle!();
+    let base = gradient(176, 144, 41);
+    let mut stream = encode_intra_picture(&base, 8, 0).unwrap();
+    let mut recon = decode_sequence(&stream, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    let cfg = PbConfig::default()
+        .with_quant(8)
+        .with_trb(1)
+        .with_dbquant(1)
+        .with_search_half(20)
+        .with_b_search_half(2);
+    let mut prev_tr = 0u8;
+    for k in 1..=2usize {
+        let p = translated(&base, 18 * k, k);
+        let b = translated(&base, 18 * k - 9, k);
+        let tr_p = (2 * k) as u8;
+        let unit = encode_pb_picture_umv_ap(&p, &b, &recon, tr_p, prev_tr, &cfg).unwrap();
+        stream.extend_from_slice(&unit);
+        recon = decode_sequence(&stream, DecodeOptions::default())
+            .unwrap()
+            .pop()
+            .unwrap();
+        prev_tr = tr_p;
+    }
+    cross_check_anchors_psnr(&stream, 176, 144, "pb-umv-ap", 30.0, &[0, 2, 4]);
+}
+
+/// Annex M with the MPPTYPE RTYPE bit alternating picture by picture
+/// (§5.1.4.3): the oracle must apply the same §6.1.2 RCONTROL to every
+/// P-part and so agree on each anchor exactly (within the IDCT
+/// staircase).
+#[test]
+fn improved_pb_alternating_rtype_agrees_with_oracle() {
+    require_oracle!();
+    let base = gradient(176, 144, 47);
+    let mut stream = encode_intra_picture(&base, 6, 0).unwrap();
+    let mut recon = decode_sequence(&stream, DecodeOptions::default())
+        .unwrap()
+        .remove(0);
+    let mut prev_tr = 0u8;
+    for k in 1..=3usize {
+        let cfg = ImprovedPbConfig::default()
+            .with_quant(6)
+            .with_trb(1)
+            .with_search_half(6)
+            .with_forward_search_half(3)
+            .with_allow_backward(true)
+            .with_rounding_type(k % 2 == 1);
+        // Odd-pixel pans make half-pel vectors the natural choice.
+        let p = translated(&base, 3 * k, k);
+        let b = translated(&base, 3 * k - 1, k);
+        let tr_p = (2 * k) as u8;
+        let unit = encode_improved_pb_picture(&p, &b, &recon, tr_p, prev_tr, &cfg).unwrap();
+        stream.extend_from_slice(&unit);
+        recon = decode_sequence(&stream, DecodeOptions::default())
+            .unwrap()
+            .pop()
+            .unwrap();
+        prev_tr = tr_p;
+    }
+    cross_check_anchors(&stream, 176, 144, "improved-pb-rtype", 0.08, &[0, 2, 4, 6]);
 }

@@ -146,6 +146,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `with_*`; all-field `new(..)` constructors for `RateControlledStream`,
   `AdaptiveQuantPicture`, `DecodePictureOutcome`, `HrdPictureOutcome`,
   `PbFramePair`, `BPictureTemporal`, `MbBoundaryInfo` and `PictureLayout`.
+- `encode_pb_picture_umv_ap` / `encode_pb_picture_umv_ap_stats`: Annex G
+  PB-frames with Annex D + Annex F on the version-1 header (previously
+  refused) — four §D.2 Table 14 vectors per P-macroblock searched with
+  the per-block reachability rule, one first-column MVDB per macroblock.
+- `ImprovedPbConfig::rounding_type` / `PlusModes::rounding_type`: write
+  the MPPTYPE RTYPE bit (§5.1.4.3) and predict the P-part with the
+  matching §6.1.2 RCONTROL, so a caller can alternate it picture by
+  picture as §5.1.4.3 recommends. The header writer refuses it on an
+  INTRA picture.
+- `pb_layer::pb_mvdb_first_column_is_unambiguous` (hidden): the encoder
+  guard keeping MVDB deltas portable across both readings of §D.2.
+- Encoder-reconstruction tests: every Annex G (plain / AP / UMV / UMV +
+  AP) and Annex M (UMV x AP x RTYPE) combination decodes to the
+  encoder's own P- and B-part reconstruction sample for sample.
 
 ### Fixed
 

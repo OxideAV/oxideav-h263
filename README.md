@@ -38,11 +38,15 @@ rate-biased SAD — the full Table M.1 MODB row set; the oracle decoder
 agrees on every P-part; `advanced_prediction` / `intra_refresh`
 compose Annex F and INTRA macroblocks into the pair) and
 `encode_pb_picture_ap` (Annex G + Annex F: two-pass §F.2 field, OBMC
-PREC, per-block §G.4 scaling), `encode_pb_picture_umv` (Annex G +
-Annex D: extended-range P vectors and the §D.2 per-block MVDB pair
-rule with `Pc = (TRB × MV)/TRD`; `ImprovedPbConfig::umv` is the Annex
-M Table D.3 form with over-boundary forward vectors;
-`ImprovedPbConfig::slice_rows` frames the pair as Annex K slices),
+PREC, per-block §G.4 scaling), `encode_pb_picture_umv` /
+`encode_pb_picture_umv_ap` (Annex G + Annex D, optionally + Annex F:
+extended-range P vectors through the §D.2 Table 14 pair rule, one
+first-column MVDB per macroblock added to every block's scaled
+vector; `ImprovedPbConfig::umv` is the Annex M Table D.3 form with
+over-boundary forward vectors and per-pair emulation bits;
+`ImprovedPbConfig::rounding_type` sets the MPPTYPE RTYPE bit of the
+P-part; `ImprovedPbConfig::slice_rows` frames the pair as Annex K
+slices),
 `encode_intra_picture_dquant` (§5.3.6 per-macroblock DQUANT),
 `encode_intra_picture_gobs` / `encode_inter_picture_gobs` (§5.2 GOB
 headers with per-GOB GQUANT + segmented MV prediction),

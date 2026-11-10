@@ -40,7 +40,8 @@ pub use crate::encoder_deblock::{
 pub use crate::encoder_pb::{
     ImprovedPbConfig, ImprovedPbStats, encode_improved_pb_picture,
     encode_improved_pb_picture_stats, encode_pb_picture_ap, encode_pb_picture_ap_stats,
-    encode_pb_picture_umv, encode_pb_picture_umv_stats,
+    encode_pb_picture_umv, encode_pb_picture_umv_ap, encode_pb_picture_umv_ap_stats,
+    encode_pb_picture_umv_stats,
 };
 pub use crate::encoder_rc::{
     AdaptiveQuantConfig, AdaptiveQuantPicture, encode_inter_picture_adaptive,
@@ -245,6 +246,13 @@ pub struct PlusModes {
     /// `1..=7`) and §5.1.23 DBQUANT (`0..=3`) fields emitted after
     /// PQUANT. Requires `is_inter` (the P-part is a P-picture, §M.1).
     pub improved_pb: Option<(u8, u8)>,
+    /// MPPTYPE bit 6 — Rounding Type (RTYPE, §5.1.4.3): the §6.1.2
+    /// `RCONTROL` the decoder applies to this picture's half-pel
+    /// interpolation (the P-part only for an Improved PB-frame).
+    /// §5.1.4.3 permits `true` only on P-pictures / Improved PB-frames
+    /// (`is_inter`); the writer refuses it on an INTRA picture. The
+    /// caller's prediction must use the same rounding.
+    pub rounding_type: bool,
 }
 
 impl PlusModes {
@@ -332,6 +340,13 @@ impl PlusModes {
     #[must_use]
     pub fn with_improved_pb(mut self, v: Option<(u8, u8)>) -> Self {
         self.improved_pb = v;
+        self
+    }
+
+    /// Set [`PlusModes::rounding_type`].
+    #[must_use]
+    pub fn with_rounding_type(mut self, v: bool) -> Self {
+        self.rounding_type = v;
         self
     }
 }
@@ -428,7 +443,7 @@ pub fn write_plus_picture_header(
     }
     opptype |= 1 << 3; // bit 15 — "1", start-code-emulation guard
     w.write_bits(opptype, 18);
-    // §5.1.4.3 — MPPTYPE (9 bits): picture type, RPR / RRU / RTYPE = 0,
+    // §5.1.4.3 — MPPTYPE (9 bits): picture type, RPR = 0, RRU, RTYPE,
     // reserved "00", bit 9 = "1".
     let mut mpptype: u32 = 0;
     if let Some((trb, dbquant)) = modes.improved_pb {
@@ -446,6 +461,14 @@ pub fn write_plus_picture_header(
     }
     if modes.rru {
         mpptype |= 1 << 4; // bit 5 — Annex Q Reduced-Resolution Update
+    }
+    if modes.rounding_type {
+        // §5.1.4.3 — "Bit 6 can be set to '1' only when bits 1-3
+        // indicate a P-picture, Improved PB-frame, or EP-picture."
+        if !is_inter {
+            return Err(Error::NotImplemented);
+        }
+        mpptype |= 1 << 3; // bit 6 — RTYPE
     }
     mpptype |= 1; // bit 9 — start-code-emulation guard
     w.write_bits(mpptype, 9);
@@ -3634,8 +3657,29 @@ pub(crate) fn motion_compensated_block(
     y0: usize,
     mv: crate::motion::MotionVector,
 ) -> [u8; COEFFS_PER_BLOCK] {
+    motion_compensated_block_rc(
+        plane,
+        width,
+        height,
+        x0,
+        y0,
+        mv,
+        crate::motion::RCONTROL_DEFAULT,
+    )
+}
+
+/// [`motion_compensated_block`] with an explicit §6.1.2 `RCONTROL`.
+pub(crate) fn motion_compensated_block_rc(
+    plane: &[u8],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    mv: crate::motion::MotionVector,
+    rcontrol: i32,
+) -> [u8; COEFFS_PER_BLOCK] {
     let rp = crate::motion::RefPlane::new(plane, width, height);
-    crate::motion::motion_compensate_block(&rp, x0, y0, mv, crate::motion::RCONTROL_DEFAULT)
+    crate::motion::motion_compensate_block(&rp, x0, y0, mv, rcontrol)
 }
 
 /// Encode a planar 4:2:0 [`YuvFrame`] as a baseline H.263 **INTER**
