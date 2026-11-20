@@ -256,6 +256,51 @@ pub struct PlusModes {
     /// OPPTYPE bit 6 — Annex E Syntax-based Arithmetic Coding. The
     /// caller codes the macroblock layer with the arithmetic coder.
     pub sac: bool,
+    /// OPPTYPE bit 11 — Annex N Reference Picture Selection, with the
+    /// §5.1.13–§5.1.16 picture-header fields.
+    pub rps: Option<RpsFields>,
+}
+
+/// The Annex N forward-channel picture-header fields (§5.1.13 RPSMF,
+/// §5.1.14 TRPI, §5.1.15 TRP). The §5.1.16 BCI is written as `"01"`
+/// (no back-channel message in the video multiplex).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct RpsFields {
+    /// RPSMF: the encoder asks for ACK back-channel messages.
+    pub need_ack: bool,
+    /// RPSMF: the encoder asks for NACK back-channel messages.
+    pub need_nack: bool,
+    /// TRP — the 10-bit Temporal Reference (ETR ∥ TR) of the picture
+    /// to predict from; `None` sends TRPI = 0 (the most recent anchor).
+    /// Must be `None` in an I-picture (§5.1.14).
+    pub trp: Option<u16>,
+}
+
+impl RpsFields {
+    /// RPS in use, no back-channel messages requested, prediction from
+    /// the most recent anchor.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Set [`RpsFields::need_ack`].
+    #[must_use]
+    pub fn with_need_ack(mut self, v: bool) -> Self {
+        self.need_ack = v;
+        self
+    }
+    /// Set [`RpsFields::need_nack`].
+    #[must_use]
+    pub fn with_need_nack(mut self, v: bool) -> Self {
+        self.need_nack = v;
+        self
+    }
+    /// Set [`RpsFields::trp`].
+    #[must_use]
+    pub fn with_trp(mut self, v: Option<u16>) -> Self {
+        self.trp = v;
+        self
+    }
 }
 
 impl PlusModes {
@@ -419,7 +464,20 @@ pub fn write_plus_picture_header(
                 .with_data_partitioned_slices(modes.data_partitioned_slices)
                 .with_reduced_resolution_update(modes.rru)
                 .with_rounding_type(modes.rounding_type)
+                .with_reference_picture_selection(modes.rps.is_some())
                 .check()?;
+        }
+        if let Some(rps) = modes.rps {
+            // §5.1.14 — "TRPI shall be 0 whenever the picture header
+            // indicates an I- or EI-picture".
+            if rps.trp.is_some() && !is_inter {
+                return Err(Error::ModeCombination(
+                    crate::mode_rules::ModeRule::TrpInIntraPicture,
+                ));
+            }
+            if rps.trp.is_some_and(|t| t > 0x3FF) {
+                return Err(Error::BadPbTemporalReference);
+            }
         }
     }
     // §5.1.1 — Picture Start Code (22 bits).
@@ -457,6 +515,9 @@ pub fn write_plus_picture_header(
     }
     if modes.slice_structured.is_some() {
         opptype |= 1 << 8; // bit 10 — Annex K
+    }
+    if modes.rps.is_some() {
+        opptype |= 1 << 7; // bit 11 — Annex N
     }
     if modes.independent_segment_decoding {
         opptype |= 1 << 6; // bit 12 — Annex R
@@ -526,6 +587,19 @@ pub fn write_plus_picture_header(
     if let Some(sss) = modes.slice_structured {
         w.write_bit(sss.rectangular);
         w.write_bit(sss.arbitrary_order);
+    }
+    if let Some(rps) = modes.rps {
+        // §5.1.13 RPSMF ("1" + NACK + ACK), §5.1.14 TRPI, §5.1.15 TRP,
+        // §5.1.16 BCI = "01".
+        w.write_bits(0b100 | (rps.need_nack as u32) << 1 | rps.need_ack as u32, 3);
+        match rps.trp {
+            Some(trp) => {
+                w.write_bit(true);
+                w.write_bits(trp as u32, 10);
+            }
+            None => w.write_bit(false),
+        }
+        w.write_bits(0b01, 2);
     }
     // §5.1.19 — PQUANT (5 bits).
     w.write_bits(quant as u32, 5);
@@ -1716,6 +1790,23 @@ pub fn encode_intra_picture(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u
 /// entropy layer differs. Decodes through
 /// [`crate::picture::decode_picture_sac`] (and [`decode_sequence`]).
 pub fn encode_intra_picture_sac(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    encode_intra_picture_sac_impl(frame, quant, tr, false)
+}
+
+/// [`encode_intra_picture_sac`] on a **PLUSPTYPE** header (OPPTYPE
+/// bit 6): the same arithmetic-coded macroblock layer behind the
+/// §5.1.4 extended picture header, so the picture can open a sequence
+/// of PLUSPTYPE SAC pictures (Improved PB-frames among them).
+pub fn encode_intra_picture_sac_plus(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    encode_intra_picture_sac_impl(frame, quant, tr, true)
+}
+
+fn encode_intra_picture_sac_impl(
+    frame: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    plus: bool,
+) -> Result<Vec<u8>> {
     use crate::sac::{SacEncoder, encode_intra_macroblock_sac};
 
     if quant == 0 || quant > 31 {
@@ -1725,18 +1816,32 @@ pub fn encode_intra_picture_sac(frame: &YuvFrame, quant: u8, tr: u8) -> Result<V
         source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
 
     let mut w = BitWriter::new();
-    write_picture_header(
-        &mut w,
-        fmt,
-        quant,
-        tr,
-        /* is_inter */ false,
-        PtypeFlags {
-            sac: true,
-            ..PtypeFlags::default()
-        },
-        None,
-    );
+    if plus {
+        write_plus_picture_header(
+            &mut w,
+            fmt,
+            quant,
+            tr,
+            /* is_inter */ false,
+            PlusModes {
+                sac: true,
+                ..PlusModes::default()
+            },
+        )?;
+    } else {
+        write_picture_header(
+            &mut w,
+            fmt,
+            quant,
+            tr,
+            /* is_inter */ false,
+            PtypeFlags {
+                sac: true,
+                ..PtypeFlags::default()
+            },
+            None,
+        );
+    }
 
     let mb_cols = frame.luma_width / 16;
     let mb_rows = frame.luma_height / 16;
@@ -1744,7 +1849,9 @@ pub fn encode_intra_picture_sac(frame: &YuvFrame, quant: u8, tr: u8) -> Result<V
         // §E.5 — the zero-run counter spans the header/arithmetic
         // boundary: the header tail is PQUANT's trailing zeros + CPM=0
         // + PEI=0.
-        let mut enc = SacEncoder::with_zero_run(&mut w, 2 + quant.trailing_zeros());
+        // (PLUSPTYPE: CPM precedes PQUANT, so the tail is PQUANT + PEI.)
+        let mut enc =
+            SacEncoder::with_zero_run(&mut w, if plus { 1 } else { 2 } + quant.trailing_zeros());
         for mb_row in 0..mb_rows {
             for mb_col in 0..mb_cols {
                 let mb = extract_macroblock(frame, mb_col, mb_row);
@@ -1886,6 +1993,30 @@ pub fn encode_inter_picture_motion_sac(
     tr: u8,
     search_half: i32,
 ) -> Result<Vec<u8>> {
+    encode_inter_picture_motion_sac_impl(frame, reference, quant, tr, search_half, false)
+}
+
+/// [`encode_inter_picture_motion_sac`] on a **PLUSPTYPE** header
+/// (OPPTYPE bit 6). With neither Advanced Prediction nor Deblocking
+/// Filter in use the MCBPC model stays `cumf_MCBPC_no4MVQ` (§E.7).
+pub fn encode_inter_picture_motion_sac_plus(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+) -> Result<Vec<u8>> {
+    encode_inter_picture_motion_sac_impl(frame, reference, quant, tr, search_half, true)
+}
+
+fn encode_inter_picture_motion_sac_impl(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+    plus: bool,
+) -> Result<Vec<u8>> {
     use crate::sac::{
         SacEncoder, encode_inter_macroblock_sac, encode_intra_macroblock_sac,
         encode_skipped_macroblock_sac,
@@ -1901,18 +2032,32 @@ pub fn encode_inter_picture_motion_sac(
         source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
 
     let mut w = BitWriter::new();
-    write_picture_header(
-        &mut w,
-        fmt,
-        quant,
-        tr,
-        /* is_inter */ true,
-        PtypeFlags {
-            sac: true,
-            ..PtypeFlags::default()
-        },
-        None,
-    );
+    if plus {
+        write_plus_picture_header(
+            &mut w,
+            fmt,
+            quant,
+            tr,
+            /* is_inter */ true,
+            PlusModes {
+                sac: true,
+                ..PlusModes::default()
+            },
+        )?;
+    } else {
+        write_picture_header(
+            &mut w,
+            fmt,
+            quant,
+            tr,
+            /* is_inter */ true,
+            PtypeFlags {
+                sac: true,
+                ..PtypeFlags::default()
+            },
+            None,
+        );
+    }
 
     let lw = frame.luma_width;
     let lh = frame.luma_height;
@@ -1927,7 +2072,9 @@ pub fn encode_inter_picture_motion_sac(
         // §E.5 — the zero-run counter spans the header/arithmetic
         // boundary: the header tail is PQUANT's trailing zeros + CPM=0
         // + PEI=0.
-        let mut enc = SacEncoder::with_zero_run(&mut w, 2 + quant.trailing_zeros());
+        // (PLUSPTYPE: CPM precedes PQUANT, so the tail is PQUANT + PEI.)
+        let mut enc =
+            SacEncoder::with_zero_run(&mut w, if plus { 1 } else { 2 } + quant.trailing_zeros());
         for mb_row in 0..mb_rows {
             for mb_col in 0..mb_cols {
                 let predictor = grid.predict(mb_col, mb_row);
@@ -2574,6 +2721,37 @@ pub fn encode_pb_picture_sac(
 /// [`crate::picture::decode_sequence`] (extended-PTYPE dispatch) with
 /// `DecodeOptions::default()`.
 pub fn encode_intra_picture_plus(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
+    encode_intra_picture_plus_modes(frame, quant, tr, PlusModes::default())
+}
+
+/// [`encode_intra_picture_plus`] in **Annex N Reference Picture
+/// Selection** mode: OPPTYPE bit 11 and the §5.1.13–§5.1.16 header
+/// fields (TRPI = 0 — an I-picture predicts from nothing). Decodes
+/// through [`crate::picture::decode_picture_layer_rps`], which stores
+/// the picture under its Temporal Reference.
+pub fn encode_intra_picture_rps(
+    frame: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    rps: RpsFields,
+) -> Result<Vec<u8>> {
+    encode_intra_picture_plus_modes(
+        frame,
+        quant,
+        tr,
+        PlusModes {
+            rps: Some(rps),
+            ..PlusModes::default()
+        },
+    )
+}
+
+fn encode_intra_picture_plus_modes(
+    frame: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    modes: PlusModes,
+) -> Result<Vec<u8>> {
     if quant == 0 || quant > 31 {
         return Err(Error::InvalidQuantiser);
     }
@@ -2581,14 +2759,7 @@ pub fn encode_intra_picture_plus(frame: &YuvFrame, quant: u8, tr: u8) -> Result<
         source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
 
     let mut w = BitWriter::new();
-    write_plus_picture_header(
-        &mut w,
-        fmt,
-        quant,
-        tr,
-        /* is_inter */ false,
-        PlusModes::default(),
-    )?;
+    write_plus_picture_header(&mut w, fmt, quant, tr, /* is_inter */ false, modes)?;
 
     let mb_cols = frame.luma_width / 16;
     let mb_rows = frame.luma_height / 16;
@@ -3575,6 +3746,7 @@ pub fn encode_inter_picture_motion(
         InterFraming::Single,
         /* plus */ false,
         /* isd */ false,
+        /* rps */ None,
     )
 }
 
@@ -3603,6 +3775,41 @@ pub fn encode_inter_picture_plus(
         InterFraming::Single,
         /* plus */ true,
         /* isd */ false,
+        /* rps */ None,
+    )
+}
+
+/// [`encode_inter_picture_plus`] in **Annex N Reference Picture
+/// Selection** mode. `reference` must be the decoded picture the
+/// decoder will select: the one whose Temporal Reference equals
+/// `rps.trp` (§N.5 — "the decoder uses the stored picture for which
+/// the TR is TRP as the reference picture for inter-frame decoding
+/// instead of the last decoded picture"), or the most recent anchor
+/// when `rps.trp` is `None`. One video picture segment (no GOB
+/// headers, so no §N.4.1 per-GOB fields); `umv` selects the
+/// Unrestricted Motion Vector mode alongside.
+///
+/// Decodes through [`crate::picture::decode_picture_layer_rps`].
+pub fn encode_inter_picture_rps(
+    frame: &YuvFrame,
+    reference: &YuvFrame,
+    quant: u8,
+    tr: u8,
+    search_half: i32,
+    umv: bool,
+    rps: RpsFields,
+) -> Result<Vec<u8>> {
+    encode_inter_picture_motion_impl(
+        frame,
+        reference,
+        quant,
+        tr,
+        search_half,
+        umv,
+        InterFraming::Single,
+        /* plus */ true,
+        /* isd */ false,
+        Some(rps),
     )
 }
 
@@ -3640,6 +3847,7 @@ pub fn encode_inter_picture_slices(
         },
         /* plus */ true,
         /* isd */ false,
+        /* rps */ None,
     )
 }
 
@@ -3667,6 +3875,7 @@ pub fn encode_inter_picture_gobs(
         InterFraming::GobHeaders { cpm_psbi: None },
         /* plus */ false,
         /* isd */ false,
+        /* rps */ None,
     )
 }
 
@@ -3697,6 +3906,7 @@ pub fn encode_inter_picture_gobs_cpm(
         },
         /* plus */ false,
         /* isd */ false,
+        /* rps */ None,
     )
 }
 
@@ -3739,6 +3949,7 @@ pub fn encode_inter_picture_umv(
         InterFraming::Single,
         /* plus */ false,
         /* isd */ false,
+        /* rps */ None,
     )
 }
 
@@ -3774,6 +3985,7 @@ pub fn encode_inter_picture_umv_plus(
         InterFraming::Single,
         /* plus */ true,
         /* isd */ false,
+        /* rps */ None,
     )
 }
 
@@ -3807,6 +4019,7 @@ pub fn encode_inter_picture_umv_slices(
         },
         /* plus */ true,
         /* isd */ false,
+        /* rps */ None,
     )
 }
 
@@ -4440,6 +4653,7 @@ pub fn encode_inter_picture_isd(
         InterFraming::GobHeaders { cpm_psbi: None },
         /* plus */ true,
         /* isd */ true,
+        /* rps */ None,
     )
 }
 
@@ -4827,6 +5041,8 @@ fn encode_inter_picture_motion_impl(
     // the decoder's §R.2 rule-4 border extrapolation). Requires
     // `plus` and [`InterFraming::GobHeaders`].
     isd: bool,
+    // Annex N — the picture-header RPS fields (PLUSPTYPE only).
+    rps: Option<RpsFields>,
 ) -> Result<Vec<u8>> {
     use crate::plus_ptype::SliceStructuredSubmode;
     use crate::slice_header::{SliceHeaderContext, write_first_slice_header, write_slice_layer};
@@ -4878,6 +5094,7 @@ fn encode_inter_picture_motion_impl(
                 umv,
                 slice_structured: sss,
                 independent_segment_decoding: isd,
+                rps,
                 ..PlusModes::default()
             },
         )?;

@@ -122,6 +122,15 @@ pub struct ImprovedPbConfig {
     /// picture's so rounding errors do not accumulate; a sequence
     /// driver alternates it picture by picture.
     pub rounding_type: bool,
+    /// Annex E Syntax-based Arithmetic Coding (OPPTYPE bit 6): the
+    /// macroblock and block layers go through the §E.2 arithmetic
+    /// coder — MODB under `cumf_MODB_M`, CBPB per block, MVD / MVDB
+    /// under `cumf_MVD`, the BPB blocks under the INTER TCOEF models
+    /// (§E.7). The reconstruction is identical to the VLC coding of
+    /// the same decisions. §5.1.4.6 item 2 bars `umv` with it (typed
+    /// refusal); `advanced_prediction`, `aic` and `slice_rows` are not
+    /// staged together with SAC here.
+    pub sac: bool,
 }
 
 impl ImprovedPbConfig {
@@ -202,6 +211,13 @@ impl ImprovedPbConfig {
         self
     }
 
+    /// Set [`ImprovedPbConfig::sac`].
+    #[must_use]
+    pub fn with_sac(mut self, v: bool) -> Self {
+        self.sac = v;
+        self
+    }
+
     /// Set [`ImprovedPbConfig::rounding_type`].
     #[must_use]
     pub fn with_rounding_type(mut self, v: bool) -> Self {
@@ -225,6 +241,7 @@ impl Default for ImprovedPbConfig {
             aic: false,
             intra_refresh: 0,
             rounding_type: false,
+            sac: false,
         }
     }
 }
@@ -351,6 +368,15 @@ struct PbCore {
     /// §6.1.2 `RCONTROL` of the P-part (the PLUSPTYPE RTYPE bit;
     /// always `0` for Annex G, whose header has no RTYPE).
     rcontrol: i32,
+    /// Annex E — arithmetic-coded macroblock layer (Annex M only).
+    sac: bool,
+}
+
+/// Where the macroblock layer goes: the VLC bit writer, or the §E.2
+/// arithmetic coder wrapped around it.
+enum Sink<'w> {
+    Vlc(&'w mut BitWriter),
+    Sac(crate::sac::SacEncoder<'w>),
 }
 
 /// Encode an Annex M **Improved PB-frame**: one picture unit carrying a
@@ -547,6 +573,7 @@ fn annex_g_core(cfg: &PbConfig, advanced_prediction: bool, umv: UmvMode) -> PbCo
         aic: false,
         intra_refresh: 0,
         rcontrol: 0,
+        sac: false,
     }
 }
 
@@ -564,6 +591,7 @@ fn annex_m_core(cfg: &ImprovedPbConfig) -> (PbCore, PbFlavour) {
             aic: cfg.aic,
             intra_refresh: cfg.intra_refresh,
             rcontrol: cfg.rounding_type as i32,
+            sac: cfg.sac,
         },
         PbFlavour::AnnexM {
             forward_search_half: cfg.forward_search_half,
@@ -766,9 +794,22 @@ fn encode_pb_core(
                 improved_pb: Some((core.trb, core.dbquant)),
                 slice_structured: sss,
                 rounding_type: core.rcontrol != 0,
+                sac: core.sac,
                 ..PlusModes::default()
             },
         )?,
+    }
+    if core.sac
+        && (matches!(flavour, PbFlavour::AnnexG { .. })
+            || ap
+            || core.aic
+            || core.slice_rows > 0
+            || core.umv != UmvMode::Off)
+    {
+        // Legal pairings that the arithmetic macroblock layer of this
+        // encoder does not stage (the forbidden one — UMV — was
+        // refused by the header writer with its rule).
+        return Err(Error::NotImplemented);
     }
     // §K.2.2 — the reduced first-slice header (MBA 0) follows the
     // picture header.
@@ -776,6 +817,33 @@ fn encode_pb_core(
         crate::slice_header::write_first_slice_header(&mut w, ctx, 0, None)?;
     }
     let gfid = tr_p & 0b11;
+    // §E.5 — the stuffing filter counts zeros across the header /
+    // arithmetic boundary: the header tail is PQUANT + TRB + DBQUANT
+    // + PEI = 0 (PQUANT is never zero, so the run cannot reach
+    // further back).
+    let sac_seed = {
+        let tail = [
+            (quant as u32, 5u32),
+            (core.trb as u32, 3),
+            (core.dbquant as u32, 2),
+            (0, 1),
+        ];
+        let mut run = 0u32;
+        'tail: for &(value, bits) in tail.iter().rev() {
+            for i in 0..bits {
+                if (value >> i) & 1 != 0 {
+                    break 'tail;
+                }
+                run += 1;
+            }
+        }
+        run
+    };
+    let mut sink = if core.sac {
+        Sink::Sac(crate::sac::SacEncoder::with_zero_run(&mut w, sac_seed))
+    } else {
+        Sink::Vlc(&mut w)
+    };
 
     // ---- Pass 1 (Advanced Prediction): the whole §F.2 vector field,
     // so every §F.3 remote vector is known before any prediction. An
@@ -872,7 +940,10 @@ fn encode_pb_core(
             && mb_row % core.slice_rows == 0
         {
             let mba = (mb_row * mb_cols) as u32;
-            crate::slice_header::write_slice_layer(&mut w, ctx, mba, quant, gfid, None)?;
+            // Slices are refused together with SAC above.
+            if let Sink::Vlc(w) = &mut sink {
+                crate::slice_header::write_slice_layer(w, ctx, mba, quant, gfid, None)?;
+            }
         }
         // §M.2.2 — the forward-vector predictor restarts at the far-left
         // edge of every macroblock row (the decoder resets it per row,
@@ -1038,7 +1109,10 @@ fn encode_pb_core(
                 && b_part.mvdb.is_none()
                 && matches!(b_part.mode, BpbCodingMode::Bidirectional);
             if !intra && !p_part.any_coeffs && all_zero && b_needs_nothing {
-                crate::encoder_mb::encode_skipped_macroblock(&mut w);
+                match &mut sink {
+                    Sink::Vlc(w) => crate::encoder_mb::encode_skipped_macroblock(w),
+                    Sink::Sac(enc) => crate::sac::encode_skipped_macroblock_sac(enc),
+                }
                 grid.set_zero_candidate(mb_col, mb_row);
                 aic_grid.record_non_intra(mb_col, mb_row, segment);
                 stats.skipped += 1;
@@ -1047,7 +1121,6 @@ fn encode_pb_core(
             }
 
             // COD = 0; MCBPC (Table 8).
-            w.write_bit(false);
             let mb_type = if intra {
                 MbType::Intra
             } else if ap {
@@ -1055,48 +1128,19 @@ fn encode_pb_core(
             } else {
                 MbType::Inter
             };
-            write_mcbpc_p(&mut w, mb_type, p_part.cbpc)?;
-            // §I.2 — INTRA_MODE between MCBPC and MODB (Figure I.1).
-            if let Some(plan) = p_part.aic_plan.as_ref() {
-                crate::aic::write_intra_mode(&mut w, plan.mode);
-            }
-
-            // MODB (+ CBPB).
-            match flavour {
-                PbFlavour::AnnexG { .. } => {
-                    // §5.3.3 Table 11: "0" none, "10" MVDB, "11" CBPB + MVDB.
-                    if b_part.any {
-                        w.write_bits(0b11, 2);
-                    } else if b_part.mvdb.is_some() {
-                        w.write_bits(0b10, 2);
-                    } else {
-                        w.write_bit(false);
-                    }
-                }
-                PbFlavour::AnnexM { .. } => {
-                    write_modb_annex_m(&mut w, ModbAnnexM::from_parts(b_part.mode, b_part.any));
+            // §5.3.4 CBPB — block N lights bit (6 − N).
+            let mut cbpb = 0u8;
+            for (blk, e) in b_part.blocks.iter().enumerate() {
+                if e.has_coeffs {
+                    cbpb |= 1 << (6 - (blk + 1));
                 }
             }
-            if b_part.any {
-                // §5.3.4 CBPB — block N lights bit (6 − N).
-                let mut cbpb = 0u8;
-                for (blk, e) in b_part.blocks.iter().enumerate() {
-                    if e.has_coeffs {
-                        cbpb |= 1 << (6 - (blk + 1));
-                    }
-                }
-                w.write_bits(cbpb as u32, 6);
-                stats.b_residual += 1;
-            }
-
             // §5.3.5 CBPY (INTRA orientation for INTRA, complement for INTER).
             let cbpy_wire = if intra {
                 p_part.cbpy
             } else {
                 p_part.cbpy ^ 0b1111
             };
-            write_cbpy(&mut w, cbpy_wire)?;
-
             // §5.3.7 MVD — every INTER macroblock; an INTRA macroblock
             // in PB-frames mode too (§G.2), except Annex M's forward /
             // backward rows (§M.2.1).
@@ -1105,22 +1149,80 @@ fn encode_pb_core(
                 PbFlavour::AnnexM { .. } => matches!(b_part.mode, BpbCodingMode::Bidirectional),
             };
             let d3 = core.umv == UmvMode::Plus;
-            if !intra || intra_mvd {
-                write_mv_pair(&mut w, mvds[0], d3)?;
-            }
-            // §5.3.8 MVD2-4 — INTER4V only ("never used for INTRA", §G.2).
-            if ap && !intra {
-                for d in mvds.iter().skip(1) {
-                    write_mv_pair(&mut w, *d, d3)?;
+            match &mut sink {
+                Sink::Vlc(w) => {
+                    w.write_bit(false);
+                    write_mcbpc_p(w, mb_type, p_part.cbpc)?;
+                    // §I.2 — INTRA_MODE between MCBPC and MODB (Figure I.1).
+                    if let Some(plan) = p_part.aic_plan.as_ref() {
+                        crate::aic::write_intra_mode(w, plan.mode);
+                    }
+                    // MODB (+ CBPB).
+                    match flavour {
+                        PbFlavour::AnnexG { .. } => {
+                            // §5.3.3 Table 11: "0" none, "10" MVDB, "11" CBPB + MVDB.
+                            if b_part.any {
+                                w.write_bits(0b11, 2);
+                            } else if b_part.mvdb.is_some() {
+                                w.write_bits(0b10, 2);
+                            } else {
+                                w.write_bit(false);
+                            }
+                        }
+                        PbFlavour::AnnexM { .. } => {
+                            write_modb_annex_m(w, ModbAnnexM::from_parts(b_part.mode, b_part.any));
+                        }
+                    }
+                    if b_part.any {
+                        w.write_bits(cbpb as u32, 6);
+                    }
+                    write_cbpy(w, cbpy_wire)?;
+                    if !intra || intra_mvd {
+                        write_mv_pair(w, mvds[0], d3)?;
+                    }
+                    // §5.3.8 MVD2-4 — INTER4V only ("never used for INTRA", §G.2).
+                    if ap && !intra {
+                        for d in mvds.iter().skip(1) {
+                            write_mv_pair(w, *d, d3)?;
+                        }
+                    }
+                    // §5.3.9 MVDB — "coded in the same way as MVD" (§M.2.2), so
+                    // Table D.3 under UMV+ too.
+                    if let Some(d) = b_part.mvdb {
+                        write_mv_pair(w, d, d3)?;
+                    }
+                }
+                Sink::Sac(enc) => {
+                    // §E.7 — the same elements in the same order, each
+                    // under its model (Annex M, one vector, no AIC).
+                    use crate::sac::{
+                        encode_cbpb_sac, encode_cbpy_sac, encode_cod, encode_mcbpc_p_sac,
+                        encode_modb_m_sac, encode_mvd_component_sac,
+                    };
+                    encode_cod(enc, true);
+                    encode_mcbpc_p_sac(enc, mb_type, p_part.cbpc)?;
+                    encode_modb_m_sac(enc, ModbAnnexM::from_parts(b_part.mode, b_part.any));
+                    if b_part.any {
+                        encode_cbpb_sac(enc, cbpb);
+                    }
+                    encode_cbpy_sac(enc, cbpy_wire, intra)?;
+                    if !intra || intra_mvd {
+                        encode_mvd_component_sac(enc, mvds[0].dx_half)?;
+                        encode_mvd_component_sac(enc, mvds[0].dy_half)?;
+                    }
+                    if let Some(d) = b_part.mvdb {
+                        encode_mvd_component_sac(enc, d.dx_half)?;
+                        encode_mvd_component_sac(enc, d.dy_half)?;
+                    }
                 }
             }
-            // §5.3.9 MVDB — "coded in the same way as MVD" (§M.2.2), so
-            // Table D.3 under UMV+ too.
-            if let Some(d) = b_part.mvdb {
-                write_mv_pair(&mut w, d, d3)?;
-                if d.dx_half != 0 || d.dy_half != 0 {
-                    stats.mvdb += 1;
-                }
+            if b_part.any {
+                stats.b_residual += 1;
+            }
+            if let Some(d) = b_part.mvdb
+                && (d.dx_half != 0 || d.dy_half != 0)
+            {
+                stats.mvdb += 1;
             }
             match b_part.mode {
                 BpbCodingMode::Forward => {
@@ -1144,34 +1246,62 @@ fn encode_pb_core(
             }
 
             // §G.3 — six P-blocks, then six B-blocks.
-            if let Some(plan) = p_part.aic_plan.as_ref() {
-                plan.write_blocks(&mut w)?;
-                crate::encoder::commit_macroblock_aic(&mut aic_grid, plan, mb_col, mb_row, segment);
-            } else if intra {
-                aic_grid.record_non_intra(mb_col, mb_row, segment);
-                for e in p_part.luma_intra.iter().flatten() {
-                    write_intra_block(&mut w, e.dc_level, &e.scan, e.has_ac)?;
-                }
-                let cb = p_part.cb_intra.as_ref().expect("intra chroma");
-                let cr = p_part.cr_intra.as_ref().expect("intra chroma");
-                write_intra_block(&mut w, cb.dc_level, &cb.scan, cb.has_ac)?;
-                write_intra_block(&mut w, cr.dc_level, &cr.scan, cr.has_ac)?;
-            } else {
-                aic_grid.record_non_intra(mb_col, mb_row, segment);
-                for e in p_part.luma_inter.iter().flatten() {
-                    if e.has_coeffs {
-                        write_inter_block_coeffs(&mut w, &e.scan)?;
+            let intra_blocks = || {
+                p_part
+                    .luma_intra
+                    .iter()
+                    .flatten()
+                    .chain(p_part.cb_intra.as_ref())
+                    .chain(p_part.cr_intra.as_ref())
+            };
+            let inter_blocks = || {
+                p_part
+                    .luma_inter
+                    .iter()
+                    .flatten()
+                    .chain(p_part.cb_inter.as_ref())
+                    .chain(p_part.cr_inter.as_ref())
+            };
+            match &mut sink {
+                Sink::Vlc(w) => {
+                    if let Some(plan) = p_part.aic_plan.as_ref() {
+                        plan.write_blocks(w)?;
+                        crate::encoder::commit_macroblock_aic(
+                            &mut aic_grid,
+                            plan,
+                            mb_col,
+                            mb_row,
+                            segment,
+                        );
+                    } else if intra {
+                        aic_grid.record_non_intra(mb_col, mb_row, segment);
+                        for e in intra_blocks() {
+                            write_intra_block(w, e.dc_level, &e.scan, e.has_ac)?;
+                        }
+                    } else {
+                        aic_grid.record_non_intra(mb_col, mb_row, segment);
+                        for e in inter_blocks().filter(|e| e.has_coeffs) {
+                            write_inter_block_coeffs(w, &e.scan)?;
+                        }
+                    }
+                    for e in b_part.blocks.iter().filter(|e| e.has_coeffs) {
+                        write_inter_block_coeffs(w, &e.scan)?;
                     }
                 }
-                for e in [&p_part.cb_inter, &p_part.cr_inter].into_iter().flatten() {
-                    if e.has_coeffs {
-                        write_inter_block_coeffs(&mut w, &e.scan)?;
+                Sink::Sac(enc) => {
+                    use crate::sac::write_block_sac;
+                    if intra {
+                        for e in intra_blocks() {
+                            write_block_sac(enc, Some(e.dc_level), &e.scan, e.has_ac, true)?;
+                        }
+                    } else {
+                        for e in inter_blocks().filter(|e| e.has_coeffs) {
+                            write_block_sac(enc, None, &e.scan, true, false)?;
+                        }
                     }
-                }
-            }
-            for e in b_part.blocks.iter() {
-                if e.has_coeffs {
-                    write_inter_block_coeffs(&mut w, &e.scan)?;
+                    for e in b_part.blocks.iter().filter(|e| e.has_coeffs) {
+                        write_block_sac(enc, None, &e.scan, true, false)?;
+                    }
                 }
             }
 
@@ -1181,6 +1311,10 @@ fn encode_pb_core(
         }
     }
 
+    // §E.6 — flush the arithmetic coder before the closing PSTUF.
+    if let Sink::Sac(mut enc) = sink {
+        enc.flush();
+    }
     w.align_to_byte_zero();
     Ok(PbCoreOutput {
         bytes: w.finish(),

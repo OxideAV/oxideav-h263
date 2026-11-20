@@ -69,6 +69,10 @@ pub enum ModeRule {
     /// §F.2 — four motion vectors per macroblock exist only "when in
     /// Advanced Prediction mode or Deblocking Filter mode".
     FourVectorsWithoutApOrDf,
+    /// §5.1.14 — "TRPI shall be 0 whenever the picture header
+    /// indicates an I- or EI-picture": no Temporal Reference for
+    /// Prediction in a picture that predicts from nothing.
+    TrpInIntraPicture,
 }
 
 impl ModeRule {
@@ -88,6 +92,7 @@ impl ModeRule {
             ModeRule::IsdWithNonRectangularSlices => "5.1.4.6 item 4",
             ModeRule::DpsWithoutSliceStructured | ModeRule::DpsWithSac => "V.3",
             ModeRule::FourVectorsWithoutApOrDf => "F.2",
+            ModeRule::TrpInIntraPicture => "5.1.14",
         }
     }
 }
@@ -119,6 +124,7 @@ impl std::fmt::Display for ModeRule {
             ModeRule::FourVectorsWithoutApOrDf => {
                 "four motion vectors without Advanced Prediction or Deblocking Filter"
             }
+            ModeRule::TrpInIntraPicture => "TRP in an I- or EI-picture",
         };
         write!(f, "{what} (H.263 clause {})", self.clause())
     }

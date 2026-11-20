@@ -963,6 +963,7 @@ pub fn decode_picture_sac(
         pquant,
         header_zero_run,
         None,
+        false,
     )
 }
 
@@ -1075,8 +1076,104 @@ pub fn decode_pb_picture_sac(
             umv: UmvCoding::from_baseline(header.umv_mode),
             b_frame: &mut b_frame,
         }),
+        false,
     )?;
     Ok(PbFramePair { p_frame, b_frame })
+}
+
+/// Mode state of a PLUSPTYPE picture that the SAC body driver cannot
+/// combine with the arithmetic macroblock layer.
+struct SacPlusGate {
+    slices: bool,
+    isd: bool,
+    dps: bool,
+    cpm: bool,
+    umv: UmvCoding,
+}
+
+/// Decode the body of a **PLUSPTYPE picture in Syntax-based Arithmetic
+/// Coding mode** (OPPTYPE bit 6): an I- or P-picture, or — with
+/// `improved_pb = Some((TRD, B-frame sink))` — an Improved PB-frame
+/// (Annex M). `reader` is positioned at the §5.1.19 PQUANT.
+///
+/// §E.6: the header layer is sent as in VLC mode; the arithmetic
+/// decoder is reset after it. §E.7 selects `cumf_MCBPC_4MVQ` when
+/// Advanced Prediction or Deblocking Filter is in use and
+/// `cumf_MODB_M` under Annex M. Staged: one video picture segment (no
+/// GOB / slice headers), Advanced Prediction (not together with
+/// Improved PB), Deblocking Filter with the Table J.1 four vectors,
+/// RTYPE. §5.1.4.6 bars UMV, AIV and MQ with SAC under PLUSPTYPE;
+/// AIC / slices / ISD / CPM / RPR combinations are refused.
+#[allow(clippy::too_many_arguments)]
+fn decode_plus_sac_body(
+    data: &[u8],
+    reader: &mut BitReader<'_>,
+    extended: &H263ExtendedPicture,
+    header: &H263PictureHeader,
+    layout: &PictureLayout,
+    reference: Option<&YuvFrame>,
+    options: DecodeOptions,
+    gate: SacPlusGate,
+    improved_pb: Option<(i32, &mut YuvFrame)>,
+) -> Result<YuvFrame> {
+    if gate.slices
+        || gate.isd
+        || gate.dps
+        || gate.cpm
+        || !matches!(gate.umv, UmvCoding::Off)
+        || header.umv_mode
+        || extended.plus.rprp.is_some()
+        || options.aic
+        || options.modified_quant
+        || options.alt_inter_vlc
+    {
+        return Err(Error::NotImplemented);
+    }
+    // §5.1.19 — PQUANT.
+    let pquant = reader.read_u32(5).map_err(|_| Error::UnexpectedEof)? as u8;
+    if pquant == 0 || pquant > 31 {
+        return Err(Error::InvalidQuantiser);
+    }
+    // §5.1.22 / §5.1.23 — TRB + DBQUANT of an Improved PB-frame.
+    let pb_fields = match improved_pb.is_some() {
+        true => {
+            let trb = reader.read_u32(3).map_err(|_| Error::UnexpectedEof)? as i32;
+            if trb == 0 {
+                return Err(Error::BadPbTemporalReference);
+            }
+            let dbquant = reader.read_u32(2).map_err(|_| Error::UnexpectedEof)? as u8;
+            Some((trb, dbquant))
+        }
+        false => None,
+    };
+    // §5.1.24 / §5.1.25 — PEI + PSUPP.
+    skip_pei_psupp(reader)?;
+    // §E.5 — the stuffing filter counts zeros across the header /
+    // arithmetic boundary.
+    let header_zero_run = trailing_zero_run_before(data, reader.bit_position() as usize);
+    let pb = match (improved_pb, pb_fields) {
+        (Some((trd, b_frame)), Some((trb, dbquant))) => Some(PbPictureCtx {
+            trb,
+            trd,
+            dbquant,
+            annex_m: true,
+            left_bpb_forward_mv: None,
+            umv: UmvCoding::Off,
+            b_frame,
+        }),
+        _ => None,
+    };
+    decode_sac_macroblock_stream(
+        reader,
+        header,
+        layout,
+        reference,
+        options,
+        pquant,
+        header_zero_run,
+        pb,
+        true,
+    )
 }
 
 /// Length (capped at 14) of the run of `0` bits immediately preceding
@@ -1111,8 +1208,11 @@ fn decode_sac_macroblock_stream(
     pquant: u8,
     header_zero_run: u32,
     mut pb: Option<PbPictureCtx<'_>>,
+    // The picture header carries PLUSPTYPE (§E.7 MCBPC model choice,
+    // Table J.1 four vectors under Deblocking Filter mode).
+    plus: bool,
 ) -> Result<YuvFrame> {
-    use crate::sac::{SacDecoder, parse_block_sac, parse_macroblock_sac};
+    use crate::sac::{SacDecoder, parse_block_sac, parse_macroblock_sac_plus};
 
     let luma_w = layout.luma_width as usize;
     let luma_h = layout.luma_height as usize;
@@ -1123,6 +1223,9 @@ fn decode_sac_macroblock_stream(
 
     let advanced_prediction = header.advanced_prediction;
     let pb_mode = pb.is_some();
+    let annex_m = pb.as_ref().is_some_and(|p| p.annex_m);
+    let deblock_four_mv = plus && options.deblock && !advanced_prediction;
+    let mcbpc_4mvq = plus && (advanced_prediction || options.deblock);
     if advanced_prediction && pb_mode {
         // Mirror the VLC PB driver: the B-part reads the P-part's
         // pixels before a deferred OBMC reconstruction would land.
@@ -1156,19 +1259,20 @@ fn decode_sac_macroblock_stream(
         for col in 0..mb_cols {
             // §5.3.2 — MCBPC stuffing carries no macroblock data.
             let mb = loop {
-                let mb = parse_macroblock_sac(
+                let mb = parse_macroblock_sac_plus(
                     &mut dec,
                     MbContext {
                         picture_coding_type: header.coding_type,
                         advanced_prediction,
-                        deblocking_filter: false,
+                        deblocking_filter: deblock_four_mv,
                         aic_intra_mode: false,
                         pb_frames: pb_mode,
-                        pb_annex_m: false,
+                        pb_annex_m: annex_m,
                         quantiser_before: current_quant,
                         modified_quant: false,
                         umv_table_d3: false,
                     },
+                    mcbpc_4mvq,
                 )?;
                 if matches!(mb.mb_type, Some(MbType::Stuffing)) {
                     // §5.3.2 — stuffing consumes no macroblock slot. A
@@ -1198,6 +1302,8 @@ fn decode_sac_macroblock_stream(
                 pb_mode,
                 options.obmc_skip_zero_right,
                 &mut current_quant,
+                options.rcontrol,
+                deblock_four_mv,
             )?;
 
             // PB-frames mode: the six B-blocks follow the six P-blocks
@@ -1205,6 +1311,11 @@ fn decode_sac_macroblock_stream(
             // run the shared reconstruction core.
             if let Some(pb) = pb.as_mut() {
                 let prev = reference.ok_or(Error::NotImplemented)?;
+                // §M.2.2 — the forward-vector predictor is zero at the
+                // far left edge of the picture.
+                if col == 0 {
+                    pb.left_bpb_forward_mv = None;
+                }
                 let cbpb = mb.cbpb.unwrap_or(0);
                 let mut blocks: [Option<H263Block>; 6] = [None, None, None, None, None, None];
                 for (i, slot) in blocks.iter_mut().enumerate() {
@@ -1305,6 +1416,12 @@ fn decode_one_macroblock_sac(
     pb_mode: bool,
     obmc_skip_zero_right: bool,
     current_quant: &mut u8,
+    // §6.1.2 RCONTROL of the picture (the MPPTYPE RTYPE bit; `0`
+    // without PLUSPTYPE).
+    rcontrol: i32,
+    // Table J.1 — four vectors per macroblock without the overlap
+    // (Deblocking Filter mode under PLUSPTYPE, Advanced Prediction off).
+    deblock_four_mv: bool,
 ) -> Result<(MotionVector, Mb4Mv, Option<PendingApLuma>)> {
     use crate::sac::parse_block_sac;
 
@@ -1329,7 +1446,7 @@ fn decode_one_macroblock_sac(
             c_x,
             c_y,
             MotionVector::new(0, 0),
-            RCONTROL_DEFAULT,
+            rcontrol,
         );
         let zero = MotionVector::new(0, 0);
         let pending = advanced_prediction.then_some(PendingApLuma {
@@ -1339,7 +1456,7 @@ fn decode_one_macroblock_sac(
             mvs4: [zero; 4],
             blocks: [None, None, None, None],
             zero_right_remote: obmc_skip_zero_right,
-            rcontrol: RCONTROL_DEFAULT,
+            rcontrol,
             intra_remote_vector: pb_mode,
         });
         return Ok((zero, [zero; 4], pending));
@@ -1377,11 +1494,12 @@ fn decode_one_macroblock_sac(
                 grid, mb_cols, col, row, /* gob_top_row */ 0,
                 /* gob_header_present */ true, pb_mode, /* segment */ 0,
             );
-            let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
-            if umv_mode {
-                reconstruct_mv_umv(predictor, mvd)
-            } else {
-                reconstruct_mv(predictor, mvd)
+            // Annex M: no MVD on a forward- / backward-mode INTRA
+            // macroblock (§M.2.1) — its vector is zero.
+            match mb.mvd {
+                Some(mvd) if umv_mode => reconstruct_mv_umv(predictor, mvd),
+                Some(mvd) => reconstruct_mv(predictor, mvd),
+                None => MotionVector::new(0, 0),
             }
         } else {
             MotionVector::new(0, 0)
@@ -1411,6 +1529,26 @@ fn decode_one_macroblock_sac(
 
         // §F.3 OBMC luma is deferred (right remotes); parse the
         // coefficient blocks now in bitstream order.
+        if !advanced_prediction {
+            // Table J.1 — each 8 × 8 block predicted by its own
+            // vector, no overlap.
+            let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
+            for (blk, &mv) in mvs4.iter().enumerate() {
+                let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
+                let prediction = motion_compensate_block(&y_ref, bx, by, mv, rcontrol);
+                let samples = if (inter_cbpy >> (3 - blk)) & 1 == 1 {
+                    let block = parse_block_sac(dec, false, true, false)?;
+                    reconstruct_inter_block_with_prediction(&block, quant, &prediction)
+                } else {
+                    prediction
+                };
+                blit_block(&mut frame.y, luma_stride, bx, by, &samples);
+            }
+            decode_sac_inter_chroma(
+                dec, reference, frame, c_x, c_y, chroma_vec, cbpc, quant, rcontrol,
+            )?;
+            return Ok((mvs4[LumaBlockIndex::B1.index()], mvs4, None));
+        }
         let mut blocks: [Option<H263Block>; 4] = [None, None, None, None];
         for (blk_i, slot) in blocks.iter_mut().enumerate() {
             if (inter_cbpy >> (3 - blk_i)) & 1 == 1 {
@@ -1424,19 +1562,21 @@ fn decode_one_macroblock_sac(
             mvs4,
             blocks,
             zero_right_remote: false,
-            rcontrol: RCONTROL_DEFAULT,
+            rcontrol,
             intra_remote_vector: pb_mode,
         });
 
         // Chroma: no OBMC (§F.2) — immediate reconstruction.
-        decode_sac_inter_chroma(dec, reference, frame, c_x, c_y, chroma_vec, cbpc, quant)?;
+        decode_sac_inter_chroma(
+            dec, reference, frame, c_x, c_y, chroma_vec, cbpc, quant, rcontrol,
+        )?;
         return Ok((mvs4[LumaBlockIndex::B1.index()], mvs4, pending));
     }
 
     // INTER / INTER+Q (single MV). §F.2 — under Advanced Prediction
     // the candidates are "defined as for the 8 × 8 block numbered 1"
     // (Figure F.1).
-    let predictor = if advanced_prediction {
+    let predictor = if advanced_prediction || deblock_four_mv {
         predict_mv_ap_single(
             grid, mb_cols, col, row, /* gob_top_row */ 0, /* gob_header_present */ true,
             /* segment */ 0, pb_mode,
@@ -1478,7 +1618,7 @@ fn decode_one_macroblock_sac(
             mvs4: [luma_mv; 4],
             blocks,
             zero_right_remote: false,
-            rcontrol: RCONTROL_DEFAULT,
+            rcontrol,
             intra_remote_vector: pb_mode,
         });
     } else {
@@ -1486,7 +1626,7 @@ fn decode_one_macroblock_sac(
         for blk in 0..4 {
             let has_coef = (inter_cbpy >> (3 - blk)) & 1 == 1;
             let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
-            let prediction = motion_compensate_block(&y_ref, bx, by, luma_mv, RCONTROL_DEFAULT);
+            let prediction = motion_compensate_block(&y_ref, bx, by, luma_mv, rcontrol);
             let samples = if has_coef {
                 let block = parse_block_sac(dec, false, true, false)?;
                 reconstruct_inter_block_with_prediction(&block, quant, &prediction)
@@ -1497,7 +1637,9 @@ fn decode_one_macroblock_sac(
         }
     }
 
-    decode_sac_inter_chroma(dec, reference, frame, c_x, c_y, chroma_vec, cbpc, quant)?;
+    decode_sac_inter_chroma(
+        dec, reference, frame, c_x, c_y, chroma_vec, cbpc, quant, rcontrol,
+    )?;
 
     Ok((luma_mv, [luma_mv; 4], pending))
 }
@@ -1515,6 +1657,7 @@ fn decode_sac_inter_chroma(
     chroma_vec: MotionVector,
     cbpc: u8,
     quant: u8,
+    rcontrol: i32,
 ) -> Result<()> {
     use crate::sac::parse_block_sac;
 
@@ -1524,7 +1667,7 @@ fn decode_sac_inter_chroma(
         reference.chroma_width(),
         reference.chroma_height(),
     );
-    let cb_pred = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cb_pred = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, rcontrol);
     let cb_samples = if cbpc & 0b10 != 0 {
         let block = parse_block_sac(dec, false, true, false)?;
         reconstruct_inter_block_with_prediction(&block, quant, &cb_pred)
@@ -1538,7 +1681,7 @@ fn decode_sac_inter_chroma(
         reference.chroma_width(),
         reference.chroma_height(),
     );
-    let cr_pred = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cr_pred = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, rcontrol);
     let cr_samples = if cbpc & 0b01 != 0 {
         let block = parse_block_sac(dec, false, true, false)?;
         reconstruct_inter_block_with_prediction(&block, quant, &cr_pred)
@@ -3425,10 +3568,40 @@ pub fn decode_picture_layer_with_inherited(
                 cpm_psbi,
                 umv,
                 isd,
+                sac,
                 dps,
             } = plus_ptype_to_baseline_shim(
                 &extended, options, inherited, /* allow_rps */ false,
             )?;
+            // Annex E under PLUSPTYPE — the macroblock layer is
+            // arithmetic-coded (single video picture segment; §5.1.4.6
+            // bars UMV / AIV / MQ with it).
+            if sac {
+                if improved_pb {
+                    return Err(Error::NotImplemented);
+                }
+                let frame = decode_plus_sac_body(
+                    data,
+                    &mut reader,
+                    &extended,
+                    &header,
+                    &layout,
+                    reference,
+                    shim_options,
+                    SacPlusGate {
+                        slices: slice_structured.is_some(),
+                        isd,
+                        dps,
+                        cpm: cpm_psbi.is_some(),
+                        umv,
+                    },
+                    None,
+                )?;
+                return Ok(DecodePictureOutcome {
+                    frame,
+                    inherited: next_inherited,
+                });
+            }
             // An Improved PB-frame (Annex M) decodes into a (P, B) pair,
             // not a single frame: it must go through
             // [`decode_improved_pb_picture`], which supplies the B-frame
@@ -3616,6 +3789,7 @@ pub fn decode_picture_layer_rps(
         cpm_psbi,
         umv,
         isd,
+        sac,
         dps,
     } = plus_ptype_to_baseline_shim(
         &extended,
@@ -3623,7 +3797,7 @@ pub fn decode_picture_layer_rps(
         InheritedExtendedState::default(),
         /* allow_rps */ true,
     )?;
-    if improved_pb || isd || dps {
+    if improved_pb || isd || dps || sac {
         // Annex R + per-segment reference re-selection is unstaged
         // (defence-in-depth: the shim refuses ISD + RPS already).
         return Err(Error::NotImplemented);
@@ -4130,6 +4304,7 @@ pub fn decode_improved_pb_picture_with_inherited(
         cpm_psbi,
         umv,
         isd,
+        sac,
         dps,
     } = plus_ptype_to_baseline_shim(&extended, options, inherited, /* allow_rps */ false)?;
     if isd || dps {
@@ -4163,6 +4338,29 @@ pub fn decode_improved_pb_picture_with_inherited(
         luma_width: luma_w,
         luma_height: luma_h,
     };
+
+    if sac {
+        // Annex E + Annex M: MODB under `cumf_MODB_M`, the BPB blocks
+        // under the INTER TCOEF models (§E.7).
+        let p_frame = decode_plus_sac_body(
+            data,
+            &mut reader,
+            &extended,
+            &header,
+            &layout,
+            Some(reference),
+            shim_options,
+            SacPlusGate {
+                slices: slice_structured.is_some(),
+                isd,
+                dps,
+                cpm: cpm_psbi.is_some(),
+                umv,
+            },
+            Some((trd, &mut b_frame)),
+        )?;
+        return Ok((PbFramePair { p_frame, b_frame }, next_inherited));
+    }
 
     let p_frame = match slice_structured {
         // Annex K — the slice driver reads PQUANT, TRB / DBQUANT and the
@@ -4676,6 +4874,11 @@ struct PlusShimOutcome {
     /// treats video-picture-segment boundaries as picture boundaries
     /// when set; callers that cannot honour it must refuse.
     isd: bool,
+    /// OPPTYPE bit 6 — Annex E Syntax-based Arithmetic Coding in use
+    /// (after the §5.1.4.5 inference). The macroblock layer must be
+    /// read through the arithmetic decoder; callers that do not stage
+    /// it refuse.
+    sac: bool,
     /// Annex V — the OPPTYPE bit-17 Data-Partitioned Slice bit. The
     /// slice routing dispatches to the DPS driver when set; callers
     /// that cannot honour it must refuse.
@@ -4876,8 +5079,7 @@ fn plus_ptype_to_baseline_shim(
     // PSBI) is staged only on the Annex K Slice-Structured path, where
     // the §K.2.4 SSBI codeword identifies each slice's Sub-Bitstream
     let rps_in_use = extended.plus.trpi.is_some();
-    if opptype_sac || extended.plus.mpptype.reduced_resolution_update || (rps_in_use && !allow_rps)
-    {
+    if extended.plus.mpptype.reduced_resolution_update || (rps_in_use && !allow_rps) {
         return Err(Error::NotImplemented);
     }
 
@@ -5142,6 +5344,7 @@ fn plus_ptype_to_baseline_shim(
         cpm_psbi: extended.plus.cpm.then(|| extended.plus.psbi.unwrap_or(0)),
         umv: umv_coding,
         isd: opptype_independent_segment_decoding,
+        sac: opptype_sac,
         dps: opptype_dps,
     })
 }
@@ -15141,9 +15344,11 @@ mod tests {
         assert_eq!(frame.y[0], 130);
     }
 
-    /// SAC mode (OPPTYPE bit 6) is refused with `NotImplemented`.
+    /// SAC mode (OPPTYPE bit 6) on a PLUSPTYPE header routes to the
+    /// arithmetic-coded body driver: a header-only buffer runs out at
+    /// the §5.1.19 PQUANT rather than being refused as unstaged.
     #[test]
-    fn decode_picture_layer_plus_refuses_sac() {
+    fn decode_picture_layer_plus_routes_sac() {
         let mut w = BitWriter::new();
         w.write_u32(PSC_VALUE, PSC_BITS);
         w.write_u32(0, 8);
@@ -15179,7 +15384,7 @@ mod tests {
         w.write_bit(false); // CPM
         let data = w.finish();
         let r = decode_picture_layer(&data, None, DecodeOptions::default());
-        assert!(matches!(r, Err(Error::NotImplemented)));
+        assert!(matches!(r, Err(Error::UnexpectedEof)), "{r:?}");
     }
 
     /// Write a QCIF PLUSPTYPE INTER picture-layer header with the

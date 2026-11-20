@@ -67,6 +67,18 @@ pub(crate) static CUMF_MCBPC_NO4MVQ: [i64; 22] = [
 ];
 
 /// Model for MCBPC in I-pictures, Table 7 indexing (index 8 = stuffing).
+/// `cumf_MCBPC_4MVQ` — the P-picture MCBPC model "if PLUSPTYPE is
+/// present in the picture header and either the Advanced Prediction
+/// mode or the Deblocking Filter mode is in use" (§E.7): all 25 Table 8
+/// indexes, including the INTER4V+Q type at 21..=24.
+pub(crate) static CUMF_MCBPC_4MVQ: [i64; 26] = [
+    16383, 6880, 6092, 5178, 4916, 3965, 3880, 3795, 3768, 1491, 1190, 889, 655, 442, 416, 390,
+    360, 337, 334, 331, 327, 326, 88, 57, 26, 0,
+];
+
+/// `cumf_MODB_M` — MODB under Annex M (Table M.1 indexing, §E.7).
+pub(crate) static CUMF_MODB_M: [i64; 7] = [16383, 6717, 4568, 2784, 1370, 655, 0];
+
 pub(crate) static CUMF_MCBPC_INTRA: [i64; 10] = [16383, 7410, 6549, 5188, 442, 182, 181, 141, 1, 0];
 
 /// Model for CBPY in INTER macroblocks, Table 12 indexing.
@@ -640,6 +652,60 @@ fn mcbpc_p_to_index(mb_type: MbType, cbpc: u8) -> Result<usize> {
     Ok(base + cbpc as usize)
 }
 
+/// Decode a P-picture MCBPC symbol under `cumf_MCBPC_4MVQ` (all 25
+/// Table 8 indexes; 21..=24 are the INTER4V+Q type).
+pub fn decode_mcbpc_p_4mvq_sac(dec: &mut SacDecoder<'_, '_>) -> Result<(MbType, u8)> {
+    let index = dec.decode_symbol(&CUMF_MCBPC_4MVQ);
+    match index {
+        21..=24 => Ok((MbType::Inter4VQ, (index - 21) as u8)),
+        _ => mcbpc_p_from_index(index),
+    }
+}
+
+/// Encode a P-picture MCBPC symbol under `cumf_MCBPC_4MVQ`.
+pub fn encode_mcbpc_p_4mvq_sac(enc: &mut SacEncoder<'_>, mb_type: MbType, cbpc: u8) -> Result<()> {
+    if cbpc > 3 {
+        return Err(Error::BadMcbpcCode);
+    }
+    let index = match mb_type {
+        MbType::Inter4VQ => 21 + cbpc as usize,
+        _ => mcbpc_p_to_index(mb_type, cbpc)?,
+    };
+    enc.encode_symbol(index, &CUMF_MCBPC_4MVQ);
+    Ok(())
+}
+
+/// Table M.1 index of an Annex M MODB value.
+fn modb_m_index(modb: crate::pb_layer::ModbAnnexM) -> usize {
+    use crate::pb_layer::ModbAnnexM as M;
+    match modb {
+        M::BidirNoCbpbNoMvdb => 0,
+        M::BidirCbpbNoMvdb => 1,
+        M::ForwardNoCbpbMvdb => 2,
+        M::ForwardCbpbMvdb => 3,
+        M::BackwardNoCbpbNoMvdb => 4,
+        M::BackwardCbpbNoMvdb => 5,
+    }
+}
+
+/// Decode an Annex M MODB symbol (Table M.1 indexing, `cumf_MODB_M`).
+pub fn decode_modb_m_sac(dec: &mut SacDecoder<'_, '_>) -> crate::pb_layer::ModbAnnexM {
+    use crate::pb_layer::ModbAnnexM as M;
+    match dec.decode_symbol(&CUMF_MODB_M) {
+        0 => M::BidirNoCbpbNoMvdb,
+        1 => M::BidirCbpbNoMvdb,
+        2 => M::ForwardNoCbpbMvdb,
+        3 => M::ForwardCbpbMvdb,
+        4 => M::BackwardNoCbpbNoMvdb,
+        _ => M::BackwardCbpbNoMvdb,
+    }
+}
+
+/// Encode an Annex M MODB symbol (Table M.1 indexing).
+pub fn encode_modb_m_sac(enc: &mut SacEncoder<'_>, modb: crate::pb_layer::ModbAnnexM) {
+    enc.encode_symbol(modb_m_index(modb), &CUMF_MODB_M);
+}
+
 /// Decode an I-picture MCBPC symbol (Table 7 indexing,
 /// `cumf_MCBPC_intra`).
 pub fn decode_mcbpc_i_sac(dec: &mut SacDecoder<'_, '_>) -> Result<(MbType, u8)> {
@@ -1041,6 +1107,22 @@ pub fn parse_macroblock_sac(
     dec: &mut SacDecoder<'_, '_>,
     ctx: crate::macroblock::MbContext,
 ) -> Result<crate::macroblock::H263Macroblock> {
+    parse_macroblock_sac_plus(dec, ctx, false)
+}
+
+/// [`parse_macroblock_sac`] for a picture whose header may carry
+/// PLUSPTYPE: `mcbpc_4mvq` selects the `cumf_MCBPC_4MVQ` model (§E.7
+/// — PLUSPTYPE present and Advanced Prediction or Deblocking Filter in
+/// use), and [`MbContext::pb_annex_m`](crate::macroblock::MbContext)
+/// selects the Improved PB-frames macroblock layer: MODB under
+/// `cumf_MODB_M` with Table M.1 indexing, MVDB only in the forward
+/// rows, and the MVD of an INTRA macroblock only in the bidirectional
+/// rows (§M.2.1).
+pub fn parse_macroblock_sac_plus(
+    dec: &mut SacDecoder<'_, '_>,
+    ctx: crate::macroblock::MbContext,
+    mcbpc_4mvq: bool,
+) -> Result<crate::macroblock::H263Macroblock> {
     use crate::macroblock::{H263Macroblock, MbContext, Mvd};
     use crate::picture_header::H263PictureCodingType;
 
@@ -1049,7 +1131,7 @@ pub fn parse_macroblock_sac(
         quantiser_before,
         ..
     } = ctx;
-    if ctx.aic_intra_mode || ctx.modified_quant || ctx.pb_annex_m {
+    if ctx.aic_intra_mode || ctx.modified_quant || (ctx.pb_annex_m && !ctx.pb_frames) {
         return Err(Error::NotImplemented);
     }
     if quantiser_before == 0 || quantiser_before > 31 {
@@ -1079,7 +1161,9 @@ pub fn parse_macroblock_sac(
     }
 
     // §5.3.2 — MCBPC.
-    let (mb_type, cbpc) = if is_inter_picture {
+    let (mb_type, cbpc) = if is_inter_picture && mcbpc_4mvq {
+        decode_mcbpc_p_4mvq_sac(dec)?
+    } else if is_inter_picture {
         decode_mcbpc_p_sac(dec)?
     } else {
         decode_mcbpc_i_sac(dec)?
@@ -1102,14 +1186,14 @@ pub fn parse_macroblock_sac(
     // §5.3.3 — MODB (Table 11 under `cumf_MODB_G`), between MCBPC and
     // CBPY per Figure 10, for every coded non-stuffing macroblock in
     // PB-frames mode.
-    let modb = if ctx.pb_frames {
-        Some(decode_modb_sac(dec))
-    } else {
-        None
+    let (modb, annex_m_modb) = match (ctx.pb_frames, ctx.pb_annex_m) {
+        (true, true) => (None, Some(decode_modb_m_sac(dec))),
+        (true, false) => (Some(decode_modb_sac(dec)), None),
+        _ => (None, None),
     };
 
     // §5.3.4 — CBPB, between MODB and CBPY, when MODB indicates it.
-    let cbpb = if modb.is_some_and(|m| m.has_cbpb()) {
+    let cbpb = if modb.is_some_and(|m| m.has_cbpb()) || annex_m_modb.is_some_and(|m| m.has_cbpb()) {
         Some(decode_cbpb_sac(dec))
     } else {
         None
@@ -1131,7 +1215,17 @@ pub fn parse_macroblock_sac(
     // §5.3.7 — MVD (horizontal then vertical) for INTER types; in
     // PB-frames mode also for INTRA macroblocks (§G.2 — the vector
     // predicts the B-blocks only).
-    let mvd = if mb_type.has_mvd() || (ctx.pb_frames && mb_type.is_intra()) {
+    // Annex M: an INTRA macroblock carries MVD "in this mode (and only
+    // in this mode)" — bidirectional prediction (§M.2.1).
+    let intra_pb_mvd = ctx.pb_frames
+        && mb_type.is_intra()
+        && !annex_m_modb.is_some_and(|m| {
+            !matches!(
+                m.coding_mode(),
+                crate::pb_layer::BpbCodingMode::Bidirectional
+            )
+        });
+    let mvd = if mb_type.has_mvd() || intra_pb_mvd {
         let dx_half = decode_mvd_component_sac(dec);
         let dy_half = decode_mvd_component_sac(dec);
         Some(Mvd { dx_half, dy_half })
@@ -1152,7 +1246,7 @@ pub fn parse_macroblock_sac(
 
     // §5.3.9 — MVDB, last header field per Figure 10, when MODB
     // indicates it (model `cumf_MVD` per §E.7).
-    let mvdb = if modb.is_some_and(|m| m.has_mvdb()) {
+    let mvdb = if modb.is_some_and(|m| m.has_mvdb()) || annex_m_modb.is_some_and(|m| m.has_mvdb()) {
         let dx_half = decode_mvd_component_sac(dec);
         let dy_half = decode_mvd_component_sac(dec);
         Some(Mvd { dx_half, dy_half })
@@ -1170,6 +1264,7 @@ pub fn parse_macroblock_sac(
         mvd,
         mvd234,
         modb,
+        annex_m_modb,
         cbpb,
         mvdb,
         ..empty
@@ -1540,6 +1635,67 @@ mod tests {
 
     /// COD / MCBPC / CBPY / DQUANT / MVD / INTRADC symbol codecs are
     /// exact inverses.
+    /// §E.7 PLUSPTYPE models: every `cumf_MCBPC_4MVQ` symbol (Table 8
+    /// indexes 0..=24, the INTER4V+Q type included) and every
+    /// `cumf_MODB_M` symbol (Table M.1) round-trips.
+    #[test]
+    fn plus_ptype_models_round_trip() {
+        use crate::pb_layer::ModbAnnexM as M;
+        let types = [
+            MbType::Inter,
+            MbType::InterQ,
+            MbType::Inter4V,
+            MbType::Intra,
+            MbType::IntraQ,
+            MbType::Inter4VQ,
+        ];
+        let modbs = [
+            M::BidirNoCbpbNoMvdb,
+            M::BidirCbpbNoMvdb,
+            M::ForwardNoCbpbMvdb,
+            M::ForwardCbpbMvdb,
+            M::BackwardNoCbpbNoMvdb,
+            M::BackwardCbpbNoMvdb,
+        ];
+        let mut w = BitWriter::new();
+        {
+            let mut enc = SacEncoder::new(&mut w);
+            for ty in types {
+                for cbpc in 0..4u8 {
+                    encode_mcbpc_p_4mvq_sac(&mut enc, ty, cbpc).unwrap();
+                }
+            }
+            encode_mcbpc_p_4mvq_sac(&mut enc, MbType::Stuffing, 0).unwrap();
+            for m in modbs {
+                encode_modb_m_sac(&mut enc, m);
+            }
+            enc.flush();
+        }
+        w.align_to_byte_zero();
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let mut dec = SacDecoder::new(&mut r);
+        for ty in types {
+            for cbpc in 0..4u8 {
+                assert_eq!(decode_mcbpc_p_4mvq_sac(&mut dec).unwrap(), (ty, cbpc));
+            }
+        }
+        assert_eq!(
+            decode_mcbpc_p_4mvq_sac(&mut dec).unwrap().0,
+            MbType::Stuffing
+        );
+        for m in modbs {
+            assert_eq!(decode_modb_m_sac(&mut dec), m);
+        }
+        // The models are strictly decreasing cumulative frequencies
+        // ending at zero (§E.8).
+        for model in [&CUMF_MCBPC_4MVQ[..], &CUMF_MODB_M[..]] {
+            assert_eq!(model[0], 16383);
+            assert_eq!(*model.last().unwrap(), 0);
+            assert!(model.windows(2).all(|p| p[0] > p[1]));
+        }
+    }
+
     #[test]
     fn syntax_codecs_round_trip() {
         let mut w = BitWriter::new();

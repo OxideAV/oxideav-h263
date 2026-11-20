@@ -42,6 +42,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex N Reference Picture Selection on the encode side.**
+  `encode_intra_picture_rps` / `encode_inter_picture_rps` +
+  `RpsFields` (`PlusModes::rps`): OPPTYPE bit 11, §5.1.13 RPSMF,
+  §5.1.14 TRPI, §5.1.15 TRP, §5.1.16 BCI = "01"; the P-picture is
+  predicted from the picture the caller names by its Temporal
+  Reference (optionally with UMV). A TRP in an I-picture is
+  `ModeRule::TrpInIntraPicture`.
+- **Annex E under PLUSPTYPE, and Annex E + Annex M, both
+  directions.** A PLUSPTYPE picture with OPPTYPE bit 6 set decodes
+  through the arithmetic macroblock layer (I- and P-pictures and
+  Improved PB-frames, via `decode_picture_layer` /
+  `decode_improved_pb_picture` / `decode_sequence`): the §E.7
+  `cumf_MCBPC_4MVQ` model when Advanced Prediction or Deblocking
+  Filter is in use, `cumf_MODB_M` with Table M.1 indexing, the Table
+  J.1 four-vector macroblocks without overlap, RTYPE. Encoders:
+  `ImprovedPbConfig::sac`, `encode_intra_picture_sac_plus`,
+  `encode_inter_picture_motion_sac_plus`. SAC and VLC codings of the
+  same Improved PB-frame reconstruct identically; measured saving
+  3.3–4.1 % (QCIF / CIF, QP 3–12). New `sac` primitives
+  `parse_macroblock_sac_plus`, `{decode,encode}_mcbpc_p_4mvq_sac`,
+  `{decode,encode}_modb_m_sac`.
 - **Annex Q + Annex F / Annex K, both directions.** The
   Reduced-Resolution Update decode driver is now two-pass (parse, then
   reconstruct with the whole vector field known) and composes with

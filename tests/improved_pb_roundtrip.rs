@@ -705,3 +705,121 @@ fn aic_intra_macroblocks_inside_p_and_improved_pb_pictures_round_trip() {
         assert_eq!(decoded[2], pair.p_frame);
     }
 }
+
+/// Annex E + Annex M: an Improved PB-frame with the arithmetic-coded
+/// macroblock layer (MODB under `cumf_MODB_M`, per-block CBPB, MVD /
+/// MVDB under `cumf_MVD`, BPB blocks under the INTER TCOEF models)
+/// reconstructs **identically** to the VLC coding of the same
+/// decisions, is smaller or equal in the common case, and decodes in a
+/// PLUSPTYPE SAC stream (I + P + PB) through `decode_sequence`.
+#[test]
+fn sac_improved_pb_matches_vlc_reconstruction() {
+    use oxideav_h263::encoder::{
+        encode_inter_picture_motion_sac_plus, encode_intra_picture_sac_plus,
+    };
+    use oxideav_h263::picture::decode_picture_layer;
+
+    for (lw, lh) in [(176usize, 144usize), (352, 288)] {
+        let f0 = textured(lw, lh, 1);
+        let i_bytes = encode_intra_picture_sac_plus(&f0, 6, 0).unwrap();
+        let recon0 = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).unwrap();
+        // The PLUSPTYPE SAC I-picture reconstructs like the baseline one.
+        let i_vlc = encode_intra_picture(&f0, 6, 0).unwrap();
+        let recon0_vlc = decode_sequence(&i_vlc, DecodeOptions::default()).unwrap();
+        assert_eq!(recon0, recon0_vlc[0]);
+
+        let f1 = translated(&f0, 2, 1);
+        let p_bytes = encode_inter_picture_motion_sac_plus(&f1, &recon0, 6, 2, 4).unwrap();
+        let recon1 =
+            decode_picture_layer(&p_bytes, Some(&recon0), DecodeOptions::default()).unwrap();
+        assert!(luma_mae(&f1, &recon1) < 4.0);
+
+        let b_src = translated(&f0, 3, 1);
+        let p_src = translated(&f0, 5, 2);
+        let mut total = oxideav_h263::encoder::ImprovedPbStats::default();
+        for (quant, backward, refresh, rtype) in [
+            (6u8, true, 0usize, false),
+            (12, false, 7, true),
+            (3, true, 5, false),
+        ] {
+            let base = ImprovedPbConfig::default()
+                .with_quant(quant)
+                .with_trb(1)
+                .with_search_half(6)
+                .with_forward_search_half(6)
+                .with_allow_backward(backward)
+                .with_intra_refresh(refresh)
+                .with_rounding_type(rtype);
+            let (vlc, _) =
+                encode_improved_pb_picture_stats(&p_src, &b_src, &recon1, 4, 2, &base).unwrap();
+            let (sac, stats) = encode_improved_pb_picture_stats(
+                &p_src,
+                &b_src,
+                &recon1,
+                4,
+                2,
+                &base.with_sac(true),
+            )
+            .unwrap();
+            let pair_vlc =
+                decode_improved_pb_picture(&vlc, &recon1, 2, DecodeOptions::default()).unwrap();
+            let pair_sac =
+                decode_improved_pb_picture(&sac, &recon1, 2, DecodeOptions::default()).unwrap();
+            assert_eq!(
+                pair_sac.p_frame, pair_vlc.p_frame,
+                "{lw}x{lh} q{quant} P-part"
+            );
+            assert_eq!(
+                pair_sac.b_frame, pair_vlc.b_frame,
+                "{lw}x{lh} q{quant} B-part"
+            );
+            total.bidirectional += stats.bidirectional;
+            total.forward += stats.forward;
+            total.backward += stats.backward;
+            total.b_residual += stats.b_residual;
+            total.intra += stats.intra;
+            total.mvdb += stats.mvdb;
+            eprintln!(
+                "{lw}x{lh} q{quant}: VLC {} B, SAC {} B, {stats:?}",
+                vlc.len(),
+                sac.len()
+            );
+
+            // No start-code emulation inside the arithmetic payload.
+            let zeros = sac[3..]
+                .windows(3)
+                .filter(|w| w[0] == 0 && w[1] == 0 && w[2] & 0xFC == 0x80)
+                .count();
+            assert_eq!(zeros, 0, "PSC emulated in the SAC payload");
+
+            if quant == 6 {
+                let mut stream = i_bytes.clone();
+                stream.extend_from_slice(&p_bytes);
+                stream.extend_from_slice(&sac);
+                let frames = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+                assert_eq!(frames.len(), 4);
+                assert_eq!(frames[2], pair_sac.b_frame);
+                assert_eq!(frames[3], pair_sac.p_frame);
+            }
+        }
+        // Every Table M.1 mode family was exercised.
+        assert!(total.bidirectional > 0 && total.forward > 0, "{total:?}");
+        assert!(total.b_residual > 0 && total.intra > 0, "{total:?}");
+    }
+}
+
+/// §5.1.4.6 item 2 — SAC with UMV under PLUSPTYPE is forbidden: the
+/// encoder names the rule.
+#[test]
+fn sac_improved_pb_with_umv_is_refused_with_the_rule() {
+    let f = textured(176, 144, 2);
+    let cfg = ImprovedPbConfig::default()
+        .with_trb(1)
+        .with_sac(true)
+        .with_umv(true);
+    let err = encode_improved_pb_picture(&f, &f, &f, 4, 2, &cfg).unwrap_err();
+    assert_eq!(
+        err,
+        Error::ModeCombination(oxideav_h263::ModeRule::SacWithUmvUnderPlusPtype)
+    );
+}
