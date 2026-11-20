@@ -6,6 +6,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-h263/compare/v0.0.10...v0.0.11) - 2026-11-20
+
+### Other
+
+- resolve the rustdoc intra-doc link warnings (private / out-of-scope items become code spans)
+- round 491 — annex-combination table, typed mode rules, speed before/after, updated rate ladder and unstaged list
+- perf + conformance: bounded SAD search (encode 16.8x at CIF, same vectors), sparse bit-identical IDCT/FDCT (decode 1.26x), default-mode vectors confined to the picture (4.2.3)
+- Modified Quantization and Alternative INTER VLC on INTER pictures (encoder), oracle-checked
+- SAC under PLUSPTYPE with Improved PB-frames (both directions); Reference Picture Selection encoder
+- RRU composes with Advanced Prediction (Q.5 enlarged OBMC, four vectors) and Annex K slices, both directions; mode-combination rules as typed errors
+- clippy 1.100: needless_range_loop sweep (iterators over the luminance block arrays), output unchanged
+- README + robustness: tracer-fixture byte-exact record, truncation/bit-flip survival
+- Annex G + D + F PB-frames, RTYPE on Improved-PB P-parts, recon-exact tests
+- PB / Improved-PB: RTYPE rounding, M.2.2 predictor reset, MVDB per-MB rule; two tracer fixtures byte-exact
+- API hygiene: #[non_exhaustive] growable types, #[doc(hidden)] internals
+- edition 2024, MSRV 1.95
+- README examples use the current registry API
+- round 457 rollup — PB-frame encoder family closed, oracle deviation catalogue
+- explicit Reference Picture Resampling on EP-pictures (§P.2.2 lower-layer refinement)
+- the §Q.7.2 block boundary filter (RRU + Deblocking Filter), both directions
+- Advanced INTRA Coding macroblocks inside P-pictures and Improved PB-frames (encoder)
+- Rectangular Slice / ASO stripes with Advanced Prediction on the encode side
+- Slice Structured mode composes with Improved PB-frames, both directions
+- §5.2.4 GSBI on the GOB path, both directions
+- Unrestricted Motion Vectors compose with PB-frames, both directions
+- Advanced Prediction composes with PB-frames, both directions
+- Improved PB-frames encoder — §M.2 three-mode BPB decision, Table M.1 MODB writer; fix decoder header-tail framing + §M.2.1 INTRA MVD presence
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Changed
 
 - **Default-mode motion vectors stay inside the picture.**
