@@ -87,13 +87,31 @@ fn c(k: usize) -> f64 {
 pub fn fdct_8x8(samples: &[i16; COEFFS_PER_BLOCK]) -> [f64; COEFFS_PER_BLOCK] {
     let table = cos_table();
     let mut out = [0.0f64; COEFFS_PER_BLOCK];
-    for v in 0..BLOCK_DIM {
-        for u in 0..BLOCK_DIM {
+    if samples.iter().all(|&s| s == 0) {
+        return out;
+    }
+    // The double sum term by term in (y, x) order, each term
+    // associated as `(f · cos_u(x)) · cos_v(y)`. The first product does
+    // not depend on `v`, so it is formed once per `u` and reused for
+    // the eight `v` — the same floating-point operations in the same
+    // order as the plain four-deep loop, hence bit-identical output.
+    for u in 0..BLOCK_DIM {
+        let mut by_u = [0.0f64; COEFFS_PER_BLOCK];
+        for (row, srow) in by_u
+            .as_chunks_mut::<BLOCK_DIM>()
+            .0
+            .iter_mut()
+            .zip(samples.as_chunks::<BLOCK_DIM>().0)
+        {
+            for ((slot, &s), &cos_x) in row.iter_mut().zip(srow).zip(table[u].iter()) {
+                *slot = s as f64 * cos_x;
+            }
+        }
+        for v in 0..BLOCK_DIM {
             let mut acc = 0.0f64;
-            for y in 0..BLOCK_DIM {
-                for x in 0..BLOCK_DIM {
-                    let f = samples[y * BLOCK_DIM + x] as f64;
-                    acc += f * table[u][x] * table[v][y];
+            for (row, &cos_y) in by_u.as_chunks::<BLOCK_DIM>().0.iter().zip(table[v].iter()) {
+                for &p in row {
+                    acc += p * cos_y;
                 }
             }
             out[v * BLOCK_DIM + u] = 0.25 * c(u) * c(v) * acc;

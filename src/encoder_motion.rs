@@ -311,15 +311,122 @@ fn block_sad(
     bx: usize,
     by: usize,
     mv: MotionVector,
+    limit: u32,
+) -> u32 {
+    region_sad_bounded(source, reference_plane, bx, by, 8, mv, limit)
+}
+
+/// Sum of absolute differences between the `n × n` luminance region of
+/// `source` at `(x0, y0)` (`n` = 8 or 16) and its motion-compensated
+/// prediction from `plane` under `mv`, **bounded**: once the running
+/// sum reaches `limit` the exact value no longer matters to a
+/// minimum search, and some value `>= limit` is returned early.
+///
+/// An integer-pel vector whose block lies inside the plane (the bulk
+/// of a full search) is a plain row-by-row difference of two slices;
+/// every other vector goes through the §6.1.2 interpolating fetch.
+/// Below `limit` the result is the exact SAD on both paths.
+fn region_sad_bounded(
+    source: &YuvFrame,
+    plane: &RefPlane<'_>,
+    x0: usize,
+    y0: usize,
+    n: usize,
+    mv: MotionVector,
+    limit: u32,
 ) -> u32 {
     let lw = source.luma_width;
-    let pred = motion_compensate_block(reference_plane, bx, by, mv, RCONTROL_DEFAULT);
     let mut sad = 0u32;
-    for row in 0..8 {
-        for col in 0..8 {
-            let s = source.y[(by + row) * lw + (bx + col)] as i32;
-            let p = pred[row * 8 + col] as i32;
-            sad += (s - p).unsigned_abs();
+    if mv.dx_half & 1 == 0 && mv.dy_half & 1 == 0 {
+        let rx = x0 as i32 + mv.dx_half / 2;
+        let ry = y0 as i32 + mv.dy_half / 2;
+        let (top, bottom) = plane.band_rows.unwrap_or((0, plane.height));
+        if rx >= 0
+            && rx as usize + n <= plane.width
+            && ry >= top as i32
+            && ry as usize + n <= bottom
+        {
+            let (rx, ry) = (rx as usize, ry as usize);
+            for j in 0..n {
+                let s = &source.y[(y0 + j) * lw + x0..(y0 + j) * lw + x0 + n];
+                let r =
+                    &plane.samples[(ry + j) * plane.width + rx..(ry + j) * plane.width + rx + n];
+                sad += s
+                    .iter()
+                    .zip(r)
+                    .map(|(&a, &b)| a.abs_diff(b) as u32)
+                    .sum::<u32>();
+                if sad >= limit {
+                    return sad;
+                }
+            }
+            return sad;
+        }
+    }
+    // Half-pel vector with every interpolation tap inside the plane:
+    // the §6.1.2 bilinear means (RCONTROL = 0) straight off two rows.
+    if plane.band_rows.is_none() {
+        let rx = x0 as i32 + mv.dx_half.div_euclid(2);
+        let ry = y0 as i32 + mv.dy_half.div_euclid(2);
+        let (fx, fy) = ((mv.dx_half & 1) as usize, (mv.dy_half & 1) as usize);
+        if rx >= 0
+            && ry >= 0
+            && rx as usize + n + fx <= plane.width
+            && ry as usize + n + fy <= plane.height
+        {
+            let (rx, ry) = (rx as usize, ry as usize);
+            for j in 0..n {
+                let s = &source.y[(y0 + j) * lw + x0..(y0 + j) * lw + x0 + n];
+                let at = |row: usize, shift: usize| {
+                    let o = (ry + row) * plane.width + rx + shift;
+                    &plane.samples[o..o + n]
+                };
+                let (a, b) = (at(j, 0), at(j, fx));
+                let (c, d) = (at(j + fy, 0), at(j + fy, fx));
+                sad += match (fx, fy) {
+                    (1, 0) => s
+                        .iter()
+                        .zip(a.iter().zip(b))
+                        .map(|(&s, (&a, &b))| {
+                            (s as u32).abs_diff((a as u32 + b as u32).div_ceil(2))
+                        })
+                        .sum::<u32>(),
+                    (0, 1) => s
+                        .iter()
+                        .zip(a.iter().zip(c))
+                        .map(|(&s, (&a, &c))| {
+                            (s as u32).abs_diff((a as u32 + c as u32).div_ceil(2))
+                        })
+                        .sum::<u32>(),
+                    _ => s
+                        .iter()
+                        .zip(a.iter().zip(b).zip(c.iter().zip(d)))
+                        .map(|(&s, ((&a, &b), (&c, &d)))| {
+                            (s as u32).abs_diff((a as u32 + b as u32 + c as u32 + d as u32 + 2) / 4)
+                        })
+                        .sum::<u32>(),
+                };
+                if sad >= limit {
+                    return sad;
+                }
+            }
+            return sad;
+        }
+    }
+    for by in (y0..y0 + n).step_by(8) {
+        for bx in (x0..x0 + n).step_by(8) {
+            let pred = motion_compensate_block(plane, bx, by, mv, RCONTROL_DEFAULT);
+            for (row, prow) in pred.as_chunks::<8>().0.iter().enumerate() {
+                let s = &source.y[(by + row) * lw + bx..(by + row) * lw + bx + 8];
+                sad += s
+                    .iter()
+                    .zip(prow)
+                    .map(|(&a, &b)| a.abs_diff(b) as u32)
+                    .sum::<u32>();
+            }
+            if sad >= limit {
+                return sad;
+            }
         }
     }
     sad
@@ -345,17 +452,22 @@ pub fn estimate_block_motion(
             dy_half: mv.dy_half.clamp(MV_HALF_MIN, MV_HALF_MAX),
         }
     };
-    let cost = |mv: MotionVector| -> u32 {
-        let sad = block_sad(source, &y_ref, bx, by, mv);
+    // Cost of `mv`, exact when below `limit`; any value `>= limit`
+    // otherwise (the candidate cannot win, so its SAD is cut short).
+    let cost = |mv: MotionVector, limit: u32| -> u32 {
         let mvbits = (mv.dx_half - predictor.dx_half).unsigned_abs()
             + (mv.dy_half - predictor.dy_half).unsigned_abs();
-        sad + lambda * mvbits
+        let bias = lambda * mvbits;
+        if bias >= limit {
+            return u32::MAX;
+        }
+        block_sad(source, &y_ref, bx, by, mv, limit - bias).saturating_add(bias)
     };
 
     let mut best = clamp(predictor);
-    let mut best_cost = cost(best);
+    let mut best_cost = cost(best, u32::MAX);
     let zero = MotionVector::new(0, 0);
-    let zc = cost(zero);
+    let zc = cost(zero, best_cost);
     if zc < best_cost {
         best = zero;
         best_cost = zc;
@@ -368,7 +480,7 @@ pub fn estimate_block_motion(
                 dx_half: (pdx_int + dx) * 2,
                 dy_half: (pdy_int + dy) * 2,
             });
-            let c = cost(mv);
+            let c = cost(mv, best_cost);
             if c < best_cost {
                 best_cost = c;
                 best = mv;
@@ -384,7 +496,7 @@ pub fn estimate_block_motion(
                 dx_half: best.dx_half + dx,
                 dy_half: best.dy_half + dy,
             });
-            let c = cost(mv);
+            let c = cost(mv, best_cost);
             if c < best_cost {
                 best_cost = c;
                 best = mv;
@@ -432,20 +544,25 @@ pub fn estimate_block_motion_umv_plus(
             && by_i + floor_pel(mv.dy_half) >= -15
             && by_i + 7 + ceil_pel(mv.dy_half) <= h - 1 + 15
     };
-    let cost = |mv: MotionVector| -> u32 {
-        let sad = block_sad(source, &y_ref, bx, by, mv);
+    // Cost of `mv`, exact when below `limit`; any value `>= limit`
+    // otherwise (the candidate cannot win, so its SAD is cut short).
+    let cost = |mv: MotionVector, limit: u32| -> u32 {
         let mvbits = (mv.dx_half - predictor.dx_half).unsigned_abs()
             + (mv.dy_half - predictor.dy_half).unsigned_abs();
-        sad + lambda * mvbits
+        let bias = lambda * mvbits;
+        if bias >= limit {
+            return u32::MAX;
+        }
+        block_sad(source, &y_ref, bx, by, mv, limit - bias).saturating_add(bias)
     };
 
     let mut best = clamp(predictor);
     if !admit(best) {
         best = MotionVector::new(0, 0);
     }
-    let mut best_cost = cost(best);
+    let mut best_cost = cost(best, u32::MAX);
     let zero = MotionVector::new(0, 0);
-    let zc = cost(zero);
+    let zc = cost(zero, best_cost);
     if zc < best_cost {
         best = zero;
         best_cost = zc;
@@ -461,7 +578,7 @@ pub fn estimate_block_motion_umv_plus(
             if !admit(mv) {
                 continue;
             }
-            let c = cost(mv);
+            let c = cost(mv, best_cost);
             if c < best_cost {
                 best_cost = c;
                 best = mv;
@@ -480,7 +597,7 @@ pub fn estimate_block_motion_umv_plus(
             if !admit(mv) {
                 continue;
             }
-            let c = cost(mv);
+            let c = cost(mv, best_cost);
             if c < best_cost {
                 best_cost = c;
                 best = mv;
@@ -515,19 +632,24 @@ pub fn estimate_block_motion_umv(
         }
     };
     let admit = |mv: MotionVector| -> bool { umv_mvd_for(mv, predictor).is_some() };
-    let cost = |mv: MotionVector| -> u32 {
-        let sad = block_sad(source, &y_ref, bx, by, mv);
+    // Cost of `mv`, exact when below `limit`; any value `>= limit`
+    // otherwise (the candidate cannot win, so its SAD is cut short).
+    let cost = |mv: MotionVector, limit: u32| -> u32 {
         let mvbits = (mv.dx_half - predictor.dx_half).unsigned_abs()
             + (mv.dy_half - predictor.dy_half).unsigned_abs();
-        sad + lambda * mvbits
+        let bias = lambda * mvbits;
+        if bias >= limit {
+            return u32::MAX;
+        }
+        block_sad(source, &y_ref, bx, by, mv, limit - bias).saturating_add(bias)
     };
 
     // The predictor itself (MVD = 0) is always reachable.
     let mut best = clamp(predictor);
-    let mut best_cost = cost(best);
+    let mut best_cost = cost(best, u32::MAX);
     let zero = MotionVector::new(0, 0);
     if admit(zero) {
-        let zc = cost(zero);
+        let zc = cost(zero, best_cost);
         if zc < best_cost {
             best = zero;
             best_cost = zc;
@@ -544,7 +666,7 @@ pub fn estimate_block_motion_umv(
             if !admit(mv) {
                 continue;
             }
-            let c = cost(mv);
+            let c = cost(mv, best_cost);
             if c < best_cost {
                 best_cost = c;
                 best = mv;
@@ -563,7 +685,7 @@ pub fn estimate_block_motion_umv(
             if !admit(mv) {
                 continue;
             }
-            let c = cost(mv);
+            let c = cost(mv, best_cost);
             if c < best_cost {
                 best_cost = c;
                 best = mv;
@@ -641,23 +763,9 @@ fn macroblock_sad(
     mb_x: usize,
     mb_y: usize,
     mv: MotionVector,
+    limit: u32,
 ) -> u32 {
-    let lw = source.luma_width;
-    let mut sad = 0u32;
-    // Four 8×8 luma blocks of the 16×16 macroblock.
-    for blk in 0..4 {
-        let bx = mb_x + (blk % 2) * 8;
-        let by = mb_y + (blk / 2) * 8;
-        let pred = motion_compensate_block(reference_plane, bx, by, mv, RCONTROL_DEFAULT);
-        for row in 0..8 {
-            for col in 0..8 {
-                let s = source.y[(by + row) * lw + (bx + col)] as i32;
-                let p = pred[row * 8 + col] as i32;
-                sad += (s - p).unsigned_abs();
-            }
-        }
-    }
-    sad
+    region_sad_bounded(source, reference_plane, mb_x, mb_y, 16, mv, limit)
 }
 
 /// Estimate the best motion vector (half-pel) for the macroblock at grid
@@ -690,8 +798,23 @@ pub fn estimate_motion(
         }
     };
     // In the default prediction mode every MV in [-32, 31] half-pel is
-    // reachable from any predictor (the §6.1.1 wrap), so the candidate
-    // filter is a plain range clamp.
+    // reachable from any predictor (the §6.1.1 wrap), so reachability
+    // is a plain range clamp. §4.2.3 / §D.1: "in the default
+    // prediction mode ... motion vectors are restricted such that all
+    // pixels referenced by them are within the coded picture area" —
+    // leftmost sample `mb_x + floor(mv / 2)`, rightmost
+    // `mb_x + 15 + ceil(mv / 2)` (the second tap of a half-pel
+    // interpolation included).
+    let (w, h) = (reference.luma_width as i32, reference.luma_height as i32);
+    let (mb_x, mb_y) = (mb_col as i32 * 16, mb_row as i32 * 16);
+    let inside = move |mv: MotionVector| -> bool {
+        let lo = |p: i32, half: i32| p + half.div_euclid(2);
+        let hi = |p: i32, half: i32| p + 15 + (half + 1).div_euclid(2);
+        lo(mb_x, mv.dx_half) >= 0
+            && hi(mb_x, mv.dx_half) < w
+            && lo(mb_y, mv.dy_half) >= 0
+            && hi(mb_y, mv.dy_half) < h
+    };
     search_best(
         source,
         reference,
@@ -701,7 +824,7 @@ pub fn estimate_motion(
         search_half,
         lambda,
         &clamp,
-        &|_| true,
+        &inside,
     )
 }
 
@@ -828,20 +951,29 @@ fn search_best(
     let mb_x = mb_col * 16;
     let mb_y = mb_row * 16;
 
-    let cost = |mv: MotionVector| -> u32 {
-        let sad = macroblock_sad(source, &y_ref, mb_x, mb_y, mv);
+    // Cost of `mv`, exact when below `limit`; any value `>= limit`
+    // otherwise (the candidate cannot win, so its SAD is cut short).
+    let cost = |mv: MotionVector, limit: u32| -> u32 {
         let mvbits = (mv.dx_half - predictor.dx_half).unsigned_abs()
             + (mv.dy_half - predictor.dy_half).unsigned_abs();
-        sad + lambda * mvbits
+        let bias = lambda * mvbits;
+        if bias >= limit {
+            return u32::MAX;
+        }
+        macroblock_sad(source, &y_ref, mb_x, mb_y, mv, limit - bias).saturating_add(bias)
     };
 
     // Start from the predictor (always reachable: MVD = 0) and the zero
-    // vector; pick the cheaper.
-    let mut best = clamp(predictor);
-    let mut best_cost = cost(best);
+    // vector; pick the cheaper. The predictor is a neighbour's vector:
+    // legal where that macroblock sits, not necessarily here.
     let zero = MotionVector::new(0, 0);
+    let mut best = clamp(predictor);
+    if !admit(best) {
+        best = zero;
+    }
+    let mut best_cost = cost(best, u32::MAX);
     if admit(zero) {
-        let zc = cost(zero);
+        let zc = cost(zero, best_cost);
         if zc < best_cost {
             best = zero;
             best_cost = zc;
@@ -860,7 +992,7 @@ fn search_best(
             if !admit(mv) {
                 continue;
             }
-            let c = cost(mv);
+            let c = cost(mv, best_cost);
             if c < best_cost {
                 best_cost = c;
                 best = mv;
@@ -881,7 +1013,7 @@ fn search_best(
             if !admit(mv) {
                 continue;
             }
-            let c = cost(mv);
+            let c = cost(mv, best_cost);
             if c < best_cost {
                 best_cost = c;
                 best = mv;
@@ -968,6 +1100,86 @@ mod tests {
         assert_eq!(mv, MotionVector::new(0, 0));
     }
 
+    /// The bounded SAD equals the plain interpolating SAD wherever it
+    /// stays below the limit — on the integer-pel, half-pel and
+    /// out-of-plane paths, for 16 × 16 and 8 × 8 regions — and reports
+    /// a value at or above the limit otherwise.
+    #[test]
+    fn bounded_sad_matches_reference_sad() {
+        let reference = gradient_frame(176, 144, 0);
+        let mut source = gradient_frame(176, 144, 3);
+        for (i, v) in source.y.iter_mut().enumerate() {
+            *v = v.wrapping_add((i % 7) as u8 * 5);
+        }
+        let plane = RefPlane::new(&reference.y, 176, 144);
+        let exact = |x0: usize, y0: usize, n: usize, mv: MotionVector| -> u32 {
+            let mut sad = 0u32;
+            for by in (y0..y0 + n).step_by(8) {
+                for bx in (x0..x0 + n).step_by(8) {
+                    let p = motion_compensate_block(&plane, bx, by, mv, RCONTROL_DEFAULT);
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            sad += source.y[(by + r) * 176 + bx + c].abs_diff(p[r * 8 + c]) as u32;
+                        }
+                    }
+                }
+            }
+            sad
+        };
+        for (x0, y0) in [(0usize, 0usize), (80, 64), (160, 128), (168, 136)] {
+            for n in [8usize, 16] {
+                if x0 + n > 176 || y0 + n > 144 {
+                    continue;
+                }
+                for dy in -5..=5 {
+                    for dx in -5..=5 {
+                        let mv = MotionVector::new(dx, dy);
+                        let want = exact(x0, y0, n, mv);
+                        assert_eq!(
+                            region_sad_bounded(&source, &plane, x0, y0, n, mv, u32::MAX),
+                            want,
+                            "({x0},{y0}) n{n} {mv:?}"
+                        );
+                        let cut = region_sad_bounded(&source, &plane, x0, y0, n, mv, want / 2 + 1);
+                        assert!(cut > want / 2, "({x0},{y0}) n{n} {mv:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// §4.2.3 — in the default prediction mode no vector references a
+    /// pixel outside the picture, whatever the predictor says.
+    #[test]
+    fn default_mode_vectors_stay_inside_the_picture() {
+        let reference = gradient_frame(176, 144, 0);
+        let source = gradient_frame(176, 144, 9);
+        for (col, row) in [(0usize, 0usize), (10, 0), (0, 8), (10, 8), (5, 4)] {
+            for pred in [(0, 0), (-20, -20), (31, 31), (-32, 17)] {
+                let mv = estimate_motion(
+                    &source,
+                    &reference,
+                    col,
+                    row,
+                    MotionVector::new(pred.0, pred.1),
+                    15,
+                    1,
+                );
+                let (x, y) = (col as i32 * 16, row as i32 * 16);
+                assert!(x + mv.dx_half.div_euclid(2) >= 0, "{col},{row} {mv:?}");
+                assert!(y + mv.dy_half.div_euclid(2) >= 0, "{col},{row} {mv:?}");
+                assert!(
+                    x + 15 + (mv.dx_half + 1).div_euclid(2) < 176,
+                    "{col},{row} {mv:?}"
+                );
+                assert!(
+                    y + 15 + (mv.dy_half + 1).div_euclid(2) < 144,
+                    "{col},{row} {mv:?}"
+                );
+            }
+        }
+    }
+
     /// A horizontally-shifted frame estimates a non-zero horizontal MV
     /// that reduces SAD relative to the zero vector.
     #[test]
@@ -979,7 +1191,14 @@ mod tests {
         let mb_row = 4;
         let mb_x = mb_col * 16;
         let mb_y = mb_row * 16;
-        let zero_sad = macroblock_sad(&source, &y_ref, mb_x, mb_y, MotionVector::new(0, 0));
+        let zero_sad = macroblock_sad(
+            &source,
+            &y_ref,
+            mb_x,
+            mb_y,
+            MotionVector::new(0, 0),
+            u32::MAX,
+        );
         let mv = estimate_motion(
             &source,
             &reference,
@@ -989,7 +1208,7 @@ mod tests {
             4,
             1,
         );
-        let mv_sad = macroblock_sad(&source, &y_ref, mb_x, mb_y, mv);
+        let mv_sad = macroblock_sad(&source, &y_ref, mb_x, mb_y, mv, u32::MAX);
         assert!(mv_sad <= zero_sad, "estimated MV did not reduce SAD");
         // `source` samples the pattern at `col + 2`, so the matching
         // content sits at `col + 2` in the (unshifted) reference — the

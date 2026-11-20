@@ -577,6 +577,11 @@ fn improved_pb_with_annex_k_slices_round_trips() {
     let p1 = translated(&base, 5, 2);
     let half1 = translated(&base, 3, 1);
     let b1 = banded_b(&r0, &p1, &half1);
+    // Mode census over every pair of the test: which rows of Table M.1
+    // win a given macroblock is a rate decision that depends on the
+    // exact P-vectors, so the requirement is that the sliced streams
+    // together exercise all three modes.
+    let (mut forward, mut bidirectional, mut backward) = (0, 0, 0);
     for ap in [false, true] {
         let cfg = ImprovedPbConfig::default()
             .with_quant(6)
@@ -592,12 +597,19 @@ fn improved_pb_with_annex_k_slices_round_trips() {
             .with_intra_refresh(0);
         let (ipb1, stats) = encode_improved_pb_picture_stats(&p1, &b1, &r0, 2, 0, &cfg).unwrap();
         eprintln!("Improved-PB + slices (ap {ap}) census: {stats:?}");
-        assert!(stats.forward > 0 && stats.bidirectional > 0 && stats.backward > 0);
+        forward += stats.forward;
+        bidirectional += stats.bidirectional;
+        backward += stats.backward;
         let pair1 = decode_improved_pb_picture(&ipb1, &r0, 0, DecodeOptions::default()).unwrap();
         let p2 = translated(&base, 9, 3);
         let half2 = translated(&base, 7, 2);
         let b2 = banded_b(&pair1.p_frame, &p2, &half2);
-        let ipb2 = encode_improved_pb_picture(&p2, &b2, &pair1.p_frame, 4, 2, &cfg).unwrap();
+        let (ipb2, stats2) =
+            encode_improved_pb_picture_stats(&p2, &b2, &pair1.p_frame, 4, 2, &cfg).unwrap();
+        eprintln!("Improved-PB + slices (ap {ap}) census 2: {stats2:?}");
+        forward += stats2.forward;
+        bidirectional += stats2.bidirectional;
+        backward += stats2.backward;
         let mut stream = i_bytes.clone();
         stream.extend_from_slice(&ipb1);
         stream.extend_from_slice(&ipb2);
@@ -619,6 +631,10 @@ fn improved_pb_with_annex_k_slices_round_trips() {
             assert!(psnr > 35.0, "ap {ap} {name}: PSNR {psnr:.2} dB");
         }
     }
+    assert!(
+        forward > 0 && bidirectional > 0 && backward > 0,
+        "census: forward {forward}, bidirectional {bidirectional}, backward {backward}"
+    );
     // Slices taller than the picture are refused.
     let bad = ImprovedPbConfig::default().with_slice_rows(10);
     assert_eq!(

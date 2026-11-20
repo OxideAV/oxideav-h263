@@ -100,14 +100,39 @@ fn c(k: usize) -> f64 {
 pub fn idct_8x8(coefs: &[i16; COEFFS_PER_BLOCK]) -> [i16; COEFFS_PER_BLOCK] {
     let table = cos_table();
     let mut out = [0i16; COEFFS_PER_BLOCK];
+    // The §6.2.4 double sum, term by term in (v, u) order. A zero
+    // coefficient contributes a zero term, which leaves the running
+    // sum unchanged, so only the non-zero coefficients are visited;
+    // each term keeps the association
+    // `(((C(u)·C(v))·F)·cos_u(x))·cos_v(y)` with its x-dependent part
+    // formed once per coefficient. The sum is therefore the same
+    // sequence of floating-point operations as the plain 64-term loop
+    // and the output is bit-identical to it.
+    let mut terms = [([0.0f64; BLOCK_DIM], 0usize); COEFFS_PER_BLOCK];
+    let mut count = 0usize;
+    for v in 0..BLOCK_DIM {
+        for u in 0..BLOCK_DIM {
+            let level = coefs[v * BLOCK_DIM + u];
+            if level != 0 {
+                let g = c(u) * c(v) * level as f64;
+                let mut by_x = [0.0f64; BLOCK_DIM];
+                for (slot, &cos_x) in by_x.iter_mut().zip(table[u].iter()) {
+                    *slot = g * cos_x;
+                }
+                terms[count] = (by_x, v);
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        return out;
+    }
+    let terms = &terms[..count];
     for y in 0..BLOCK_DIM {
         for x in 0..BLOCK_DIM {
             let mut acc = 0.0f64;
-            for v in 0..BLOCK_DIM {
-                for u in 0..BLOCK_DIM {
-                    let f = coefs[v * BLOCK_DIM + u] as f64;
-                    acc += c(u) * c(v) * f * table[u][x] * table[v][y];
-                }
+            for (by_x, v) in terms {
+                acc += by_x[x] * table[*v][y];
             }
             // §6.2.4 prefactor 1/4: outer `1/4` ⋅ inner `C(0) = 1/√2`
             // factors land us at the orthonormal scaling. We apply the

@@ -407,12 +407,14 @@ fn rfc2190_mode_a_pb_fields_and_mode_c_fragmentation() {
     // A), every later one at a macroblock boundary (Mode C, F=1 P=1,
     // with the PB DBQ/TRB/TR fields mirrored). Bit-level reassembly is
     // byte-exact.
-    let payloads = packetize_stream_rfc2190(&pb, PacketizeConfig::default().with_max_payload(64))
+    // (The budget must hold the largest single macroblock of the
+    // picture plus the Mode C header.)
+    let payloads = packetize_stream_rfc2190(&pb, PacketizeConfig::default().with_max_payload(128))
         .expect("packetize PB fragments");
     assert!(payloads.len() > 1);
     let mut saw_mode_c = 0usize;
     for (i, p) in payloads.iter().enumerate() {
-        assert!(p.len() <= 64, "payload {i} is {} bytes", p.len());
+        assert!(p.len() <= 128, "payload {i} is {} bytes", p.len());
         if p[0] & 0x80 != 0 {
             let (c, _) = parse_rfc2190_mode_c(p).expect("mode C header");
             assert!(c.b.inter);

@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Default-mode motion vectors stay inside the picture.**
+  `estimate_motion` (every encoder without UMV / AP / DF) now admits
+  only vectors whose 16 × 16 block, interpolation taps included, lies
+  within the coded picture area — §4.2.3 / §D.1: "in the default
+  prediction mode ... motion vectors are restricted such that all
+  pixels referenced by them are within the coded picture area". A
+  neighbour's vector that is illegal at the current macroblock no
+  longer seeds the search either (all estimators). Streams with
+  motion across the picture edge get larger in the default mode
+  (measured ladder: QCIF +44 % at QP 2 … +52 % at QP 31 on the panning
+  test clip); `GopConfig::umv` restores the reach legally.
+- **Motion search 16.8× / 18× faster (CIF / 4CIF closed-loop GOP
+  encode: 6.2 → 104 fps, 1.5 → 27.7 fps), same vectors.** The SAD of a
+  candidate is cut short once it cannot beat the best cost, an
+  integer-pel candidate inside the picture is a direct row difference
+  and a half-pel one a direct bilinear mean; the search order and the
+  acceptance test are unchanged, so every estimator returns the
+  vector it returned before.
+- **IDCT / FDCT restructured, bit-identical.** The §6.2.4 inverse
+  transform visits only the non-zero coefficients and forms the
+  x-dependent part of each term once (decode 796 → 1005 fps at CIF,
+  212 → 280 fps at 4CIF on identical streams); the forward transform
+  shares the per-`u` products. Same floating-point operations in the
+  same order: decoded pictures and encoded streams are unchanged.
 - `encode_intra_picture_rru` / `encode_intra_picture_rru_deblock` now
   return `Error::ModeCombination(ModeRule::RruInIntraPicture)`:
   §5.1.4.5 item 4 — "the Reduced-Resolution Update mode bit shall not
@@ -42,6 +66,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `examples/throughput.rs`: encode / decode fps of the closed-loop
+  GOP at CIF and 4CIF, and decode-only timing of a stream file.
 - **Annex T and Annex S on INTER pictures (encoder).**
   `encoder_mq::encode_inter_picture_mq` / `_stats` + `InterVlcConfig`:
   §T.3 chrominance at `QUANT_C`, §T.4 EXTENDED-ESCAPE levels beyond
