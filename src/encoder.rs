@@ -253,6 +253,9 @@ pub struct PlusModes {
     /// (`is_inter`); the writer refuses it on an INTRA picture. The
     /// caller's prediction must use the same rounding.
     pub rounding_type: bool,
+    /// OPPTYPE bit 6 — Annex E Syntax-based Arithmetic Coding. The
+    /// caller codes the macroblock layer with the arithmetic coder.
+    pub sac: bool,
 }
 
 impl PlusModes {
@@ -392,6 +395,33 @@ pub fn write_plus_picture_header(
     if matches!(fmt, H263SourceFormat::Reserved110) {
         return Err(Error::NotImplemented);
     }
+    // The Recommendation's mode-combination rules (§5.1.4.5 /
+    // §5.1.4.6 / §V.3): a forbidden request is refused before any bit
+    // is written.
+    {
+        use crate::plus_ptype::PlusPictureType as T;
+        let picture_type = match (modes.improved_pb.is_some(), is_inter) {
+            (true, true) => T::ImprovedPb,
+            (_, true) => T::Inter,
+            (_, false) => T::Intra,
+        };
+        if modes.improved_pb.is_none() || is_inter {
+            crate::mode_rules::ModeSet::new(picture_type, true)
+                .with_umv(modes.umv)
+                .with_sac(modes.sac)
+                .with_advanced_prediction(modes.advanced_prediction)
+                .with_advanced_intra(modes.advanced_intra)
+                .with_deblocking(modes.deblocking)
+                .with_slice_structured(modes.slice_structured)
+                .with_independent_segment_decoding(modes.independent_segment_decoding)
+                .with_alt_inter_vlc(modes.alt_inter_vlc)
+                .with_modified_quant(modes.modified_quant)
+                .with_data_partitioned_slices(modes.data_partitioned_slices)
+                .with_reduced_resolution_update(modes.rru)
+                .with_rounding_type(modes.rounding_type)
+                .check()?;
+        }
+    }
     // §5.1.1 — Picture Start Code (22 bits).
     w.write_bits(PSC_VALUE, 22);
     // §5.1.2 — Temporal Reference (8 bits).
@@ -412,6 +442,9 @@ pub fn write_plus_picture_header(
     opptype |= source_format_bits(fmt) << 15; // bits 1-3 — source format
     if modes.umv {
         opptype |= 1 << 13; // bit 5 — Annex D
+    }
+    if modes.sac {
+        opptype |= 1 << 12; // bit 6 — Annex E
     }
     if modes.advanced_prediction {
         opptype |= 1 << 11; // bit 7 — Annex F
@@ -814,7 +847,12 @@ where
 /// `stride`-wide plane) to an 8 × 8 reduced-resolution block by 2 × 2
 /// averaging with round-to-nearest — the encoder-side inverse of the
 /// §Q.6 up-sampling (an encoder choice; §Q does not normify it).
-fn rru_downsample_16(plane: &[u8], stride: usize, x0: usize, y0: usize) -> [i16; COEFFS_PER_BLOCK] {
+pub(crate) fn rru_downsample_16(
+    plane: &[u8],
+    stride: usize,
+    x0: usize,
+    y0: usize,
+) -> [i16; COEFFS_PER_BLOCK] {
     let mut out = [0i16; COEFFS_PER_BLOCK];
     for j in 0..8 {
         for i in 0..8 {
@@ -829,7 +867,7 @@ fn rru_downsample_16(plane: &[u8], stride: usize, x0: usize, y0: usize) -> [i16;
 }
 
 /// As [`rru_downsample_16`] but over a signed 16 × 16 residual block.
-fn rru_downsample_residual(res: &[i32; 256]) -> [i16; COEFFS_PER_BLOCK] {
+pub(crate) fn rru_downsample_residual(res: &[i32; 256]) -> [i16; COEFFS_PER_BLOCK] {
     let mut out = [0i16; COEFFS_PER_BLOCK];
     for j in 0..8 {
         for i in 0..8 {
@@ -855,12 +893,16 @@ fn rru_downsample_residual(res: &[i32; 256]) -> [i16; COEFFS_PER_BLOCK] {
 /// and runs the §Q.7 boundary filter, so the round-trip is inherently
 /// low-passed (RRU trades detail for rate, §Q.1).
 ///
-/// Self-describing: decodes through
-/// [`crate::picture::decode_picture_layer`] / `decode_sequence` with
-/// `DecodeOptions::default()`. The source dimensions must be one of
-/// the five standard formats; for formats whose reference size is not
-/// divisible by 32 (sub-QCIF / QCIF / 4CIF) the source is §Q.3-style
-/// edge-extended to the coded size before down-sampling.
+/// **Always refused**: §5.1.4.5 (items 1 and 4) — the mode "does not
+/// apply within I (INTRA) pictures" and "the Reduced-Resolution Update
+/// mode bit shall not be set in an INTRA picture". The call returns
+/// [`Error::ModeCombination`] naming
+/// [`crate::mode_rules::ModeRule::RruInIntraPicture`]; start an RRU
+/// sequence with a full-resolution I-picture
+/// ([`encode_intra_picture_plus`]) and code INTRA macroblocks inside
+/// RRU P-pictures instead
+/// ([`crate::encoder_rru::RruInterConfig::intra_decision`]). The
+/// decoder still accepts such a picture from other sources.
 pub fn encode_intra_picture_rru(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
     encode_intra_picture_rru_impl(frame, quant, tr, /* deblock */ false)
 }
@@ -872,6 +914,7 @@ pub fn encode_intra_picture_rru(frame: &YuvFrame, quant: u8, tr: u8) -> Result<V
 /// coded data is identical — the filter is a decoder-side
 /// reconstruction step (§Q.7: "performed on the complete reconstructed
 /// image data before storing the data in the picture store").
+/// Refused like [`encode_intra_picture_rru`] (§5.1.4.5 item 4).
 pub fn encode_intra_picture_rru_deblock(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
     encode_intra_picture_rru_impl(frame, quant, tr, /* deblock */ true)
 }
@@ -1020,197 +1063,15 @@ fn encode_inter_picture_rru_impl(
     umv: bool,
     deblock: bool,
 ) -> Result<Vec<u8>> {
-    use crate::motion::{MotionVector, rru_actual_mv, rru_pseudo_mv};
-
-    if quant == 0 || quant > 31 {
-        return Err(Error::InvalidQuantiser);
-    }
-    if frame.luma_width != reference.luma_width || frame.luma_height != reference.luma_height {
-        return Err(Error::NotImplemented);
-    }
-    let fmt =
-        source_format_for(frame.luma_width, frame.luma_height).ok_or(Error::NotImplemented)?;
-    let (hc, vc) = crate::picture::rru_geometry_for_display(frame.luma_width, frame.luma_height);
-    let ext_src = crate::picture::extend_frame_rru(frame, hc, vc);
-    let ext_ref = crate::picture::extend_frame_rru(reference, hc, vc);
-    let mb_cols = hc / 32;
-    let mb_rows = vc / 32;
-
-    let mut w = BitWriter::new();
-    write_plus_picture_header(
-        &mut w,
-        fmt,
-        quant,
+    crate::encoder_rru::encode_inter_picture_rru_with(
+        frame,
+        reference,
         tr,
-        /* is_inter */ true,
-        PlusModes {
-            rru: true,
-            umv,
-            deblocking: deblock,
-            ..PlusModes::default()
-        },
-    )?;
-
-    let y_ref = crate::motion::RefPlane::new(&ext_ref.y, hc, vc);
-    let cb_ref = crate::motion::RefPlane::new(&ext_ref.cb, hc / 2, vc / 2);
-    let cr_ref = crate::motion::RefPlane::new(&ext_ref.cr, hc / 2, vc / 2);
-
-    // §6.1.1 predictor grid over the actual vectors (replayed like the
-    // decoder's).
-    let mut grid = crate::encoder_motion::MvGrid::new(mb_cols, mb_rows);
-
-    for mb_row in 0..mb_rows {
-        for mb_col in 0..mb_cols {
-            let mb_x = mb_col * 32;
-            let mb_y = mb_row * 32;
-            let c_x = mb_col * 16;
-            let c_y = mb_row * 16;
-
-            // §Q.4 — the predictor over actual vectors, converted to
-            // the pseudo domain; the search walks pseudo candidates.
-            let pc = grid.predict(mb_col, mb_row);
-            let pseudo_pc = rru_pseudo_mv(pc);
-
-            let sad_for = |actual: MotionVector| -> u32 {
-                let mut sad = 0u32;
-                for blk in 0..4 {
-                    let bx = mb_x + (blk % 2) * 16;
-                    let by = mb_y + (blk / 2) * 16;
-                    let pred =
-                        crate::picture::rru_motion_compensate_16_pub(&y_ref, bx, by, actual, 0);
-                    for j in 0..16 {
-                        for i in 0..16 {
-                            let sv = ext_src.y[(by + j) * hc + bx + i] as i32;
-                            sad += (sv - pred[j * 16 + i] as i32).unsigned_abs();
-                        }
-                    }
-                }
-                sad
-            };
-
-            let mut best_pseudo = MotionVector::new(0, 0);
-            let mut best_cost = sad_for(MotionVector::new(0, 0));
-            let lambda = 2 * quant as u32;
-            // Pseudo-domain candidate window: the baseline [-32, 31]
-            // half-pel window (§Q.4 item 2), widened to the
-            // Tables-D.1/D.2 range under UMV (§D.2 — the range applies
-            // to the pseudo vectors; UUI = "1" is emitted).
-            let (px_min, px_max) = if umv {
-                crate::motion::umv_plus_horizontal_range_half(frame.luma_width as u32)
-            } else {
-                (-32, 31)
-            };
-            let (py_min, py_max) = if umv {
-                crate::motion::umv_plus_vertical_range_half(frame.luma_height as u32)
-            } else {
-                (-32, 31)
-            };
-            for dy in -search_pseudo_half..=search_pseudo_half {
-                for dx in -search_pseudo_half..=search_pseudo_half {
-                    let cand = MotionVector {
-                        dx_half: pseudo_pc.dx_half + dx,
-                        dy_half: pseudo_pc.dy_half + dy,
-                    };
-                    if !(px_min..=px_max).contains(&cand.dx_half)
-                        || !(py_min..=py_max).contains(&cand.dy_half)
-                    {
-                        continue;
-                    }
-                    let actual = rru_actual_mv(cand);
-                    let mvbits = (cand.dx_half - pseudo_pc.dx_half).unsigned_abs()
-                        + (cand.dy_half - pseudo_pc.dy_half).unsigned_abs();
-                    let cost = sad_for(actual) + lambda * mvbits;
-                    if cost < best_cost {
-                        best_cost = cost;
-                        best_pseudo = cand;
-                    }
-                }
-            }
-            // The zero pseudo-vector must stay reachable through the
-            // Table-14 wrap; every candidate the loop admitted is.
-            let pseudo_mv = best_pseudo;
-            let mv = rru_actual_mv(pseudo_mv);
-            let chroma_vec = crate::motion::chroma_mv(mv);
-
-            // Residuals per 16 × 16 sub-block, down-sampled to 8 × 8.
-            let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(4);
-            for blk in 0..4 {
-                let bx = mb_x + (blk % 2) * 16;
-                let by = mb_y + (blk / 2) * 16;
-                let pred = crate::picture::rru_motion_compensate_16_pub(&y_ref, bx, by, mv, 0);
-                let mut res = [0i32; 256];
-                for j in 0..16 {
-                    for i in 0..16 {
-                        res[j * 16 + i] =
-                            ext_src.y[(by + j) * hc + bx + i] as i32 - pred[j * 16 + i] as i32;
-                    }
-                }
-                let reduced = rru_downsample_residual(&res);
-                luma_enc.push(crate::encoder_block::encode_inter_block(&reduced, quant));
-            }
-            let mut chroma_enc: Vec<crate::encoder_block::EncodedInterBlock> =
-                Vec::with_capacity(2);
-            for (plane, rp) in [(&ext_src.cb, &cb_ref), (&ext_src.cr, &cr_ref)] {
-                let pred =
-                    crate::picture::rru_motion_compensate_16_pub(rp, c_x, c_y, chroma_vec, 0);
-                let mut res = [0i32; 256];
-                for j in 0..16 {
-                    for i in 0..16 {
-                        res[j * 16 + i] =
-                            plane[(c_y + j) * (hc / 2) + c_x + i] as i32 - pred[j * 16 + i] as i32;
-                    }
-                }
-                let reduced = rru_downsample_residual(&res);
-                chroma_enc.push(crate::encoder_block::encode_inter_block(&reduced, quant));
-            }
-
-            let any_coeffs =
-                luma_enc.iter().any(|e| e.has_coeffs) || chroma_enc.iter().any(|e| e.has_coeffs);
-            let is_zero = mv.dx_half == 0 && mv.dy_half == 0;
-            if !any_coeffs && is_zero {
-                crate::encoder_mb::encode_skipped_macroblock(&mut w);
-                grid.set_zero_candidate(mb_col, mb_row);
-                continue;
-            }
-
-            // Emit: COD + MCBPC(INTER) + CBPY + MVD (pseudo-domain
-            // difference, Table 14 wrap) + blocks.
-            let luma_arr: [crate::encoder_block::EncodedInterBlock; 4] = [
-                luma_enc[0].clone(),
-                luma_enc[1].clone(),
-                luma_enc[2].clone(),
-                luma_enc[3].clone(),
-            ];
-            if umv {
-                // §Q.4 / §D.2 — the Table D.3 difference is the plain
-                // pseudo-domain `pseudo_mv − pseudo_pc`.
-                let mvd = crate::macroblock::Mvd {
-                    dx_half: (pseudo_mv.dx_half - pseudo_pc.dx_half) as i16,
-                    dy_half: (pseudo_mv.dy_half - pseudo_pc.dy_half) as i16,
-                };
-                crate::encoder_mb::encode_inter_macroblock_umv_plus(
-                    &mut w,
-                    &luma_arr,
-                    &chroma_enc[0],
-                    &chroma_enc[1],
-                    mvd,
-                )?;
-            } else {
-                let mvd = crate::encoder_motion::mvd_for(pseudo_mv, pseudo_pc);
-                crate::encoder_mb::encode_inter_macroblock(
-                    &mut w,
-                    &luma_arr,
-                    &chroma_enc[0],
-                    &chroma_enc[1],
-                    mvd,
-                )?;
-            }
-            grid.set_inter(mb_col, mb_row, mv);
-        }
-    }
-
-    w.align_to_byte_zero();
-    Ok(w.finish())
+        &crate::encoder_rru::RruInterConfig::new(quant)
+            .with_search_pseudo_half(search_pseudo_half)
+            .with_umv(umv)
+            .with_deblock(deblock),
+    )
 }
 
 /// Encode an Annex K **Rectangular Slice submode** H.263+ INTRA

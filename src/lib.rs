@@ -246,6 +246,7 @@ pub mod encoder_mb;
 pub mod encoder_motion;
 pub mod encoder_pb;
 pub mod encoder_rc;
+pub mod encoder_rru;
 #[doc(hidden)]
 pub mod encoder_vlc;
 #[doc(hidden)]
@@ -259,6 +260,7 @@ pub mod intra_tcoef;
 #[doc(hidden)]
 pub mod macroblock;
 #[doc(hidden)]
+pub mod mode_rules;
 pub mod motion;
 #[doc(hidden)]
 pub mod pb_layer;
@@ -360,6 +362,10 @@ pub use encoder_motion::{
     umv_mvd_component_for, umv_mvd_for,
 };
 #[doc(hidden)]
+pub use encoder_rru::{
+    RruInterConfig, RruInterStats, encode_inter_picture_rru_stats, encode_inter_picture_rru_with,
+};
+#[doc(hidden)]
 pub use encoder_vlc::{
     TcoefEvent, write_cbpy, write_dquant, write_intradc, write_mcbpc_i, write_mcbpc_p,
     write_mvd_component, write_tcoef,
@@ -379,7 +385,7 @@ pub use intra_tcoef::{
 };
 #[doc(hidden)]
 pub use macroblock::{H263Macroblock, MbContext, MbType, Mvd, parse_macroblock};
-#[doc(hidden)]
+pub use mode_rules::{ModeRule, ModeSet};
 pub use motion::{
     H0, H1, H2, LumaBlockIndex, MV_HALF_MAX, MV_HALF_MIN, MV_HALF_SPAN, MV_UMV_HALF_MAX,
     MV_UMV_HALF_MIN, Mb4Mv, Mb4MvNeighbourhood, MotionVector, OBMC_WEIGHT_SUM, RCONTROL_DEFAULT,
@@ -635,6 +641,10 @@ pub enum Error {
     /// reproduce the last motion vector of the §V.2.3.2 thread, or the
     /// partition inventories are inconsistent with each other.
     DpsPartitionMismatch,
+    /// An encoder was asked for a combination of optional modes the
+    /// Recommendation forbids; the payload names the rule (see
+    /// [`mode_rules::ModeRule`]).
+    ModeCombination(mode_rules::ModeRule),
 }
 
 impl core::fmt::Display for Error {
@@ -797,6 +807,9 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-h263: Annex V partition marker (HM/MVM) missing or malformed"
             ),
+            Error::ModeCombination(rule) => {
+                write!(f, "oxideav-h263: forbidden mode combination: {rule}")
+            }
             Error::DpsPartitionMismatch => write!(
                 f,
                 "oxideav-h263: Annex V partitions disagree (LMVV vs motion-vector thread)"

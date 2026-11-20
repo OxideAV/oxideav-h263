@@ -1733,46 +1733,78 @@ fn layout_dims_for_rru(fmt: PlusSourceFormat) -> Result<(u32, u32)> {
     fmt.luma_dimensions().ok_or(Error::NotImplemented)
 }
 
+/// One parsed macroblock of an Annex Q picture, held between the
+/// parse pass and the reconstruction pass of
+/// [`decode_rru_picture_body`].
+struct RruMbRecord {
+    /// COD = 0 (or INTRA) — the §Q.7 "coded macroblock" condition.
+    coded: bool,
+    /// INTRA macroblock type.
+    intra: bool,
+    /// Four §F.2 vectors on the wire (INTER4V / INTER4V+Q).
+    four_mv: bool,
+    /// QUANT in force for the coefficients.
+    quant: u8,
+    /// Actual (expanded, §Q.4 item 3) vectors of the four 16 × 16
+    /// luminance blocks; four copies for a one-vector macroblock.
+    mvs4: Mb4Mv,
+    /// Parsed blocks in Figure-5 order (four luminance, Cb, Cr);
+    /// `None` = no coefficients on the wire (prediction only).
+    blocks: [Option<H263Block>; 6],
+    /// Video picture segment (slice ordinal; `0` without Annex K).
+    segment: u32,
+    /// The macroblock has been decoded (coverage under Annex K).
+    seen: bool,
+}
+
 /// Decode the body of an **Annex Q Reduced-Resolution Update**
 /// picture — an extended-PTYPE I- or P-picture whose §5.1.4.3 MPPTYPE
 /// RRU bit is set. `reader` is positioned right after the parsed
 /// picture layer (the §5.1.19 PQUANT is next).
 ///
-/// The staged subset is the single-video-picture-segment stream shape
-/// the crate's own RRU encoders emit: §5.2.2 GOB-0 header elision with
-/// no later GOB headers, one of the five standard source formats, and
-/// — besides UMV, which composes per §Q.4 (Table D.3 pseudo-vector
-/// differences under the UUI-selected range) — none of the optional
-/// modes (AP / DF / AIC / SAC / AIV / MQ / Annex K — each is either
-/// unstaged in RRU semantics or alters the OBMC/filter layers; all
-/// are refused). Per §Q:
+/// The stream shape is §5.2.2 GOB-0 header elision with no later GOB
+/// headers, or the Annex K slice layer (free-running, Rectangular
+/// Slice and Arbitrary Slice Ordering forms — the §K.2.5 / §K.2.8
+/// field widths taken from the "RRU mode" columns of Tables K.2 / K.3
+/// and the macroblock addresses counted on the 32 × 32 grid), at one
+/// of the five standard source formats. UMV (§Q.4 Table D.3
+/// pseudo-vector differences under the UUI-selected range), Advanced
+/// Prediction (§Q.5 enlarged overlapped motion compensation, four
+/// §F.2 vectors per macroblock) and Deblocking Filter (§Q.7.2, four
+/// vectors without the overlap) compose; AIC / SAC / AIV / MQ / ISD
+/// are refused. Per §Q:
 ///
 /// 1. §Q.1 geometry: display `(H, V)`, reference `(HR, VR)`, coded
 ///    `(HC, VC)`; the picture is tiled by 32 × 32 macroblocks.
 /// 2. §Q.2.1.2 / §Q.3 — an INTER reference (at `(HR, VR)`) is
 ///    extended to `(HC, VC)` by edge replication.
 /// 3. §Q.2.2 — standard §5.3/§5.4 macroblock syntax; §Q.4
-///    pseudo-vector reconstruction (the §6.1.1 predictor over the
-///    **actual** vectors, converted to the pseudo domain, the MVD —
-///    Table 14 wrap by default, Table D.3 sum under UMV — applied
+///    pseudo-vector reconstruction (the §6.1.1 / §F.2 predictor over
+///    the **actual** vectors, converted to the pseudo domain, the MVD
+///    — Table 14 wrap by default, Table D.3 sum under UMV — applied
 ///    there, and the result expanded back to the
 ///    half-integer-or-zero actual lattice); four 16 × 16 luminance
 ///    prediction blocks + two 16 × 16 chrominance prediction blocks;
 ///    §Q.2.2.2 texture decode + §Q.6 up-sampling; §Q.2.2.3 summation
 ///    and clip.
-/// 4. §Q.7.1 — the default block boundary filter along the 16 × 16
-///    block edges (either adjoining macroblock coded), §J.3 edge
-///    ordering.
+/// 4. §Q.7 — the block boundary filter along the 16 × 16 block edges
+///    (either adjoining macroblock coded, §J.3 edge ordering, no
+///    filtering across slice edges).
 /// 5. §Q.2.3 / §Q.2.4 — the reconstruction is cropped to `(HR, VR)`
 ///    (the stored reference), which equals the display size for the
 ///    standard formats.
+///
+/// The walk is two-pass: every macroblock is parsed first (vectors
+/// reconstructed, coefficient blocks kept), then reconstructed with
+/// the complete vector field in hand — the §F.3 remote vectors of the
+/// right-hand neighbour are parsed after the current macroblock.
 fn decode_rru_picture_body(
     reader: &mut BitReader<'_>,
     extended: &H263ExtendedPicture,
     reference: Option<&YuvFrame>,
     options: DecodeOptions,
 ) -> Result<YuvFrame> {
-    use crate::motion::{rru_actual_mv, rru_pseudo_mv};
+    use crate::motion::{obmc_predict_block_16, rru_actual_mv, rru_pseudo_mv};
     use crate::rru_filter::{RruEdgeCondition, RruFilterMode, rru_filter_plane};
     use crate::rru_upsample::upsample_prediction_error;
 
@@ -1786,19 +1818,12 @@ fn decode_rru_picture_body(
         // Improved-PB / B / EI / EP under RRU are unstaged.
         _ => return Err(Error::NotImplemented),
     };
-    // Unstaged mode combinations (each changes the RRU OBMC or filter
-    // layers). UMV composes (round 447): §Q.4 — "if the Unrestricted
-    // Motion Vector mode is also used with the Reduced-Resolution
-    // Update mode, pseudo-MVC is obtained by adding the motion vector
-    // differences MVD ... from Table D.3", with the §D.2 range
-    // applying to the pseudo vectors.
     if opptype.sac
-        || opptype.advanced_prediction
         || opptype.advanced_intra
-        || opptype.slice_structured
         || opptype.independent_segment_decoding
         || opptype.alternative_inter_vlc
         || opptype.modified_quantization
+        || opptype.data_partitioned_slices
         || plus.cpm
         || plus.trpi.is_some()
         || plus.rprp.is_some()
@@ -1808,19 +1833,19 @@ fn decode_rru_picture_body(
     {
         return Err(Error::NotImplemented);
     }
-    // Annex J with RRU (round 457): the §Q.7.2 block boundary filter
-    // (the §J.3 four-tap filter with STRENGTH = +∞ on the 16 × 16
-    // block edges) replaces the §Q.7.1 default filter, and the Table
-    // J.1 four-vectors element makes MVD2-4 parseable — an INTER4V
-    // macroblock (four pseudo vectors per 32 × 32 macroblock) is still
-    // refused below.
+    // §5.1.4.5 item 1 — Advanced Prediction has an inferred state of
+    // "off" inside an INTRA picture whatever the OPPTYPE flag says.
+    let ap = opptype.advanced_prediction && is_inter;
+    // Annex J with RRU: the §Q.7.2 block boundary filter replaces the
+    // §Q.7.1 default one, and the Table J.1 four-vectors element makes
+    // INTER4V macroblocks legal without the overlap.
     let deblock = opptype.deblocking || options.deblock;
     // §Q.4 / §D.2 — with UMV on, MVDs are Table D.3 and the pseudo
     // vector is `pseudo-PC + difference` bounded by the UUI-selected
     // range ("the specified range applies to the pseudo motion
     // vectors"). UFEP=001 is mandated above, so UUI is on the wire
     // whenever UMV is.
-    let umv = if opptype.umv {
+    let umv = if opptype.umv && is_inter {
         let uui = plus.uui.ok_or(Error::NotImplemented)?;
         match uui {
             crate::plus_ptype::Uui::Limited => {
@@ -1864,6 +1889,7 @@ fn decode_rru_picture_body(
     let geo = RruGeometry::for_display(layout.luma_width as usize, layout.luma_height as usize);
     let mb_cols = geo.mb_cols();
     let mb_rows = geo.mb_rows();
+    let mb_count = mb_cols * mb_rows;
 
     // §5.1.19 — PQUANT; §5.1.24/§5.1.25 — PEI/PSUPP.
     let pquant = reader.read_u32(5).map_err(|_| Error::UnexpectedEof)? as u8;
@@ -1885,40 +1911,104 @@ fn decode_rru_picture_body(
     };
 
     let rcontrol = extended.plus.mpptype.rounding_type as i32;
-
-    let mut frame = YuvFrame {
-        y: vec![0u8; geo.hc * geo.vc],
-        cb: vec![0u8; (geo.hc / 2) * (geo.vc / 2)],
-        cr: vec![0u8; (geo.hc / 2) * (geo.vc / 2)],
-        luma_width: geo.hc,
-        luma_height: geo.vc,
-    };
-    let luma_stride = geo.hc;
-    let chroma_stride = geo.hc / 2;
-
-    // §6.1.1 predictor grid over the **actual** motion vectors (§Q.4:
-    // "PC is defined as the median value of MV1, MV2 and MV3 as
-    // defined in 6.1.1"), at 32 × 32 macroblock granularity.
-    let mut grid = vec![MbGridEntry::OUTSIDE; mb_cols * mb_rows];
-    let mut mb_quant = vec![0u8; mb_cols * mb_rows];
-    let mut coded_mb = vec![false; mb_cols * mb_rows];
-    let mut current_quant = pquant;
-
     let coding_type = if is_inter {
         H263PictureCodingType::Inter
     } else {
         H263PictureCodingType::Intra
     };
 
-    for row in 0..mb_rows {
-        for col in 0..mb_cols {
+    // ---- pass 1: parse ------------------------------------------------
+    //
+    // §6.1.1 / §F.2 predictor grid over the **actual** motion vectors
+    // (§Q.4: "PC is defined as the median value of MV1, MV2 and MV3 as
+    // defined in 6.1.1 and F.2"), at 32 × 32 macroblock granularity.
+    let mut grid = vec![MbGridEntry::OUTSIDE; mb_count];
+    let mut mb_quant = vec![0u8; mb_count];
+    let zero = MotionVector::new(0, 0);
+    let mut records: Vec<RruMbRecord> = (0..mb_count)
+        .map(|_| RruMbRecord {
+            coded: false,
+            intra: false,
+            four_mv: false,
+            quant: pquant,
+            mvs4: [zero; 4],
+            blocks: Default::default(),
+            segment: 0,
+            seen: false,
+        })
+        .collect();
+
+    // Annex K — the slice layer replaces the GOB layer. `None` is the
+    // single video picture segment form.
+    let slices = if opptype.slice_structured {
+        let sss = plus.sss.ok_or(Error::NotImplemented)?;
+        let ctx = SliceHeaderContext {
+            picture_width: layout.luma_width,
+            picture_height: layout.luma_height,
+            cpm: false,
+            rectangular_slices: sss.rectangular,
+            rru: true,
+        };
+        Some((sss, ctx))
+    } else {
+        None
+    };
+
+    let (mut slice_mba, mut slice_width) = match &slices {
+        Some((_, ctx)) => {
+            let first = parse_first_slice_header(reader, ctx)?;
+            (first.mba as usize, first.swi_actual_width)
+        }
+        None => (0usize, None),
+    };
+    let mut slice_quant = pquant;
+    let mut segment: u32 = 0;
+    let mut prev_mba: Option<usize> = None;
+    let mut decoded_count = 0usize;
+
+    loop {
+        if let Some((sss, _)) = &slices {
+            // §K.1 — MBA strictly increasing unless ASO is in use.
+            if !sss.arbitrary_order && prev_mba.is_some_and(|p| slice_mba <= p) {
+                return Err(Error::BadSliceCoverage);
+            }
+        }
+        prev_mba = Some(slice_mba);
+        if slice_mba >= mb_count {
+            return Err(Error::SliceMbaOutOfRange);
+        }
+        let col0 = slice_mba % mb_cols;
+        let row0 = slice_mba / mb_cols;
+        let rect_width = match slice_width {
+            Some(w) => {
+                let w = w as usize;
+                if w == 0 || col0 + w > mb_cols {
+                    return Err(Error::SliceSwiOutOfRange);
+                }
+                Some(w)
+            }
+            None => None,
+        };
+        let mut current_quant = slice_quant;
+        let mut k = 0usize;
+
+        loop {
+            let (col, row) = match rect_width {
+                Some(w) => (col0 + k % w, row0 + k / w),
+                None => ((slice_mba + k) % mb_cols, (slice_mba + k) / mb_cols),
+            };
+            let idx = row * mb_cols + col;
+            if records[idx].seen {
+                return Err(Error::BadSliceCoverage);
+            }
+
             // §5.3.2 — MCBPC stuffing carries no macroblock data.
             let mb = loop {
                 let mb = parse_macroblock(
                     reader,
                     MbContext {
                         picture_coding_type: coding_type,
-                        advanced_prediction: false,
+                        advanced_prediction: ap,
                         deblocking_filter: deblock,
                         aic_intra_mode: false,
                         pb_frames: false,
@@ -1931,35 +2021,17 @@ fn decode_rru_picture_body(
                 if matches!(mb.mb_type, Some(MbType::Stuffing)) {
                     continue;
                 }
-                if matches!(mb.mb_type, Some(MbType::Inter4V | MbType::Inter4VQ)) {
-                    // Four pseudo vectors per 32 × 32 macroblock (Table
-                    // J.1 element under RRU) are unstaged.
-                    return Err(Error::NotImplemented);
-                }
                 break mb;
             };
 
-            let mb_x = col * 32;
-            let mb_y = row * 32;
-            let c_x = col * 16;
-            let c_y = row * 16;
+            let rec = &mut records[idx];
+            rec.seen = true;
+            rec.segment = segment;
+            decoded_count += 1;
 
-            // Skipped: zero-MV 32 × 32 reference copy (§5.3.1; the
-            // §Q.7 filter condition sees it as not coded).
             if !mb.coded {
-                let r = extended_ref.as_ref().ok_or(Error::NotImplemented)?;
-                for j in 0..32 {
-                    let src = (mb_y + j) * geo.hc + mb_x;
-                    let dst = (mb_y + j) * luma_stride + mb_x;
-                    frame.y[dst..dst + 32].copy_from_slice(&r.y[src..src + 32]);
-                }
-                for j in 0..16 {
-                    let src = (c_y + j) * (geo.hc / 2) + c_x;
-                    let dst = (c_y + j) * chroma_stride + c_x;
-                    frame.cb[dst..dst + 16].copy_from_slice(&r.cb[src..src + 16]);
-                    frame.cr[dst..dst + 16].copy_from_slice(&r.cr[src..src + 16]);
-                }
-                let zero = MotionVector::new(0, 0);
+                // Skipped: zero vector, no texture (§5.3.1).
+                rec.quant = current_quant;
                 record_grid(
                     &mut grid,
                     &mut mb_quant,
@@ -1970,113 +2042,265 @@ fn decode_rru_picture_body(
                     current_quant,
                     zero,
                     [zero; 4],
-                    0,
+                    segment,
                 );
-                continue;
+            } else {
+                let mb_type = mb.mb_type.ok_or(Error::NotImplemented)?;
+                current_quant = mb.quantiser_after;
+                let quant = mb.quantiser_after;
+                let cbpy = mb.cbpy.unwrap_or(0);
+                let cbpc = mb.cbpc.unwrap_or(0);
+                rec.coded = true;
+                rec.quant = quant;
+
+                if mb_type.is_intra() {
+                    rec.intra = true;
+                    for (blk, slot) in rec.blocks.iter_mut().enumerate() {
+                        let has_ac = match blk {
+                            0..=3 => (cbpy >> (3 - blk)) & 1 == 1,
+                            4 => cbpc & 0b10 != 0,
+                            _ => cbpc & 0b01 != 0,
+                        };
+                        *slot = Some(parse_block(
+                            reader,
+                            BlockContext {
+                                has_intradc: true,
+                                has_coefficients: has_ac,
+                                ..Default::default()
+                            },
+                        )?);
+                    }
+                    record_grid(
+                        &mut grid,
+                        &mut mb_quant,
+                        mb_cols,
+                        col,
+                        row,
+                        &mb,
+                        quant,
+                        zero,
+                        [zero; 4],
+                        segment,
+                    );
+                } else {
+                    if extended_ref.is_none() {
+                        return Err(Error::NotImplemented);
+                    }
+                    // §Q.4 — pseudo-vector reconstruction.
+                    let four_mv = matches!(mb_type, MbType::Inter4V | MbType::Inter4VQ);
+                    let mvs4 = if four_mv {
+                        reconstruct_inter4v_mvs_scaled(
+                            &mb, &grid, mb_cols, col, row, /* gob_top_row */ 0,
+                            /* gob_header_present */ true, umv, segment, false, true,
+                        )?
+                    } else {
+                        let pc = if ap || deblock {
+                            predict_mv_ap_single(&grid, mb_cols, col, row, 0, true, segment, false)
+                        } else {
+                            predict_mv(&grid, mb_cols, col, row, 0, true, false, segment)
+                        };
+                        let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
+                        // §Q.4 item 2 — default mode: Table-14 wrap in
+                        // the [-16, 15.5]-pel pseudo window. With UMV
+                        // (Table D.3) the pseudo vector is the plain
+                        // sum, range-checked against the UUI selection.
+                        let pseudo = reconstruct_mv_coded(umv, rru_pseudo_mv(pc), mvd)?;
+                        [rru_actual_mv(pseudo); 4]
+                    };
+                    rec.four_mv = four_mv;
+                    rec.mvs4 = mvs4;
+                    let inter_cbpy = cbpy ^ 0b1111;
+                    for (blk, slot) in rec.blocks.iter_mut().enumerate() {
+                        let has = match blk {
+                            0..=3 => (inter_cbpy >> (3 - blk)) & 1 == 1,
+                            4 => cbpc & 0b10 != 0,
+                            _ => cbpc & 0b01 != 0,
+                        };
+                        if has {
+                            *slot = Some(parse_block(
+                                reader,
+                                BlockContext {
+                                    has_intradc: false,
+                                    has_coefficients: true,
+                                    ..Default::default()
+                                },
+                            )?);
+                        }
+                    }
+                    record_grid(
+                        &mut grid,
+                        &mut mb_quant,
+                        mb_cols,
+                        col,
+                        row,
+                        &mb,
+                        quant,
+                        mvs4[0],
+                        mvs4,
+                        segment,
+                    );
+                }
             }
 
-            let mb_type = mb.mb_type.ok_or(Error::NotImplemented)?;
-            current_quant = mb.quantiser_after;
-            let quant = mb.quantiser_after;
-            let cbpy = mb.cbpy.unwrap_or(0);
-            let cbpc = mb.cbpc.unwrap_or(0);
-            coded_mb[row * mb_cols + col] = true;
+            k += 1;
+            if slices.is_none() {
+                if k >= mb_count {
+                    break;
+                }
+                continue;
+            }
+            let next_exists = match rect_width {
+                Some(w) => row0 + k / w < mb_rows,
+                None => slice_mba + k < mb_count,
+            };
+            if !next_exists || at_slice_boundary(&*reader)? {
+                break;
+            }
+        }
 
-            if mb_type.is_intra() {
+        if decoded_count >= mb_count {
+            break;
+        }
+        let Some((_, ctx)) = &slices else {
+            return Err(Error::BadSliceCoverage);
+        };
+        skip_sstuf(reader)?;
+        let next = parse_slice_layer(reader, ctx)?;
+        segment += 1;
+        slice_mba = next.mba as usize;
+        slice_quant = next.squant;
+        slice_width = next.swi_actual_width;
+    }
+    let _ = &mb_quant;
+
+    // ---- pass 2: reconstruct ------------------------------------------
+    let mut frame = YuvFrame {
+        y: vec![0u8; geo.hc * geo.vc],
+        cb: vec![0u8; (geo.hc / 2) * (geo.vc / 2)],
+        cr: vec![0u8; (geo.hc / 2) * (geo.vc / 2)],
+        luma_width: geo.hc,
+        luma_height: geo.vc,
+    };
+    let luma_stride = geo.hc;
+    let chroma_stride = geo.hc / 2;
+    let slice_mode = slices.is_some();
+
+    for row in 0..mb_rows {
+        for col in 0..mb_cols {
+            let idx = row * mb_cols + col;
+            let rec = &records[idx];
+            let mb_x = col * 32;
+            let mb_y = row * 32;
+            let c_x = col * 16;
+            let c_y = row * 16;
+
+            if rec.intra {
                 // §Q.2.2.2 — the INTRA texture decodes at reduced
                 // resolution and up-samples; with no prediction the
                 // clip of the up-sampled block is the reconstruction.
-                for blk in 0..4 {
-                    let has_ac = (cbpy >> (3 - blk)) & 1 == 1;
-                    let block = parse_block(
-                        reader,
-                        BlockContext {
-                            has_intradc: true,
-                            has_coefficients: has_ac,
-                            ..Default::default()
-                        },
-                    )?;
-                    let error = rru_error_block(&block, quant, true);
+                for (blk, block) in rec.blocks.iter().enumerate() {
+                    let block = block.as_ref().ok_or(Error::NotImplemented)?;
+                    let error = rru_error_block(block, rec.quant, true);
                     let up = upsample_prediction_error(&error);
-                    let bx = mb_x + (blk % 2) * 16;
-                    let by = mb_y + (blk / 2) * 16;
-                    rru_blit_sum(&mut frame.y, luma_stride, bx, by, &[0u8; 256], &up);
+                    match blk {
+                        0..=3 => rru_blit_sum(
+                            &mut frame.y,
+                            luma_stride,
+                            mb_x + (blk % 2) * 16,
+                            mb_y + (blk / 2) * 16,
+                            &[0u8; 256],
+                            &up,
+                        ),
+                        4 => rru_blit_sum(&mut frame.cb, chroma_stride, c_x, c_y, &[0u8; 256], &up),
+                        _ => rru_blit_sum(&mut frame.cr, chroma_stride, c_x, c_y, &[0u8; 256], &up),
+                    }
                 }
-                for (chroma_bit, plane) in [(0b10u8, 0usize), (0b01u8, 1usize)] {
-                    let block = parse_block(
-                        reader,
-                        BlockContext {
-                            has_intradc: true,
-                            has_coefficients: cbpc & chroma_bit != 0,
-                            ..Default::default()
-                        },
-                    )?;
-                    let error = rru_error_block(&block, quant, true);
-                    let up = upsample_prediction_error(&error);
-                    let dst = if plane == 0 {
-                        &mut frame.cb
-                    } else {
-                        &mut frame.cr
-                    };
-                    rru_blit_sum(dst, chroma_stride, c_x, c_y, &[0u8; 256], &up);
-                }
-                let zero = MotionVector::new(0, 0);
-                record_grid(
-                    &mut grid,
-                    &mut mb_quant,
-                    mb_cols,
-                    col,
-                    row,
-                    &mb,
-                    quant,
-                    zero,
-                    [zero; 4],
-                    0,
-                );
                 continue;
             }
 
-            // INTER (single MV): §Q.4 pseudo-vector reconstruction.
+            // INTER (coded or skipped — a skipped macroblock is a
+            // zero-vector prediction with no texture).
             let r = extended_ref.as_ref().ok_or(Error::NotImplemented)?;
-            let pc = predict_mv(
-                &grid, mb_cols, col, row, /* gob_top_row */ 0,
-                /* gob_header_present */ true, /* pb */ false, /* segment */ 0,
-            );
-            let pseudo_pc = rru_pseudo_mv(pc);
-            let mvd = mb.mvd.ok_or(Error::NotImplemented)?;
-            // §Q.4 item 2 — default mode: Table-14 wrap in the
-            // [-16, 15.5]-pel pseudo window. With UMV (Table D.3) the
-            // pseudo vector is the plain sum, range-checked against
-            // the UUI selection.
-            let pseudo_mv = reconstruct_mv_coded(umv, pseudo_pc, mvd)?;
-            let mv = rru_actual_mv(pseudo_mv);
-            let chroma_vec = chroma_mv(mv);
-
-            let inter_cbpy = cbpy ^ 0b1111;
             let y_ref = RefPlane::new(&r.y, r.luma_width, r.luma_height);
-            for blk in 0..4 {
-                let bx = mb_x + (blk % 2) * 16;
-                let by = mb_y + (blk / 2) * 16;
-                let prediction = rru_motion_compensate_16(&y_ref, bx, by, mv, rcontrol);
-                if (inter_cbpy >> (3 - blk)) & 1 == 1 {
-                    let block = parse_block(
-                        reader,
-                        BlockContext {
-                            has_intradc: false,
-                            has_coefficients: true,
-                            ..Default::default()
-                        },
-                    )?;
-                    let error = rru_error_block(&block, quant, false);
-                    let up = upsample_prediction_error(&error);
-                    rru_blit_sum(&mut frame.y, luma_stride, bx, by, &prediction, &up);
-                } else {
-                    rru_blit_16(&mut frame.y, luma_stride, bx, by, &prediction);
+
+            // §F.3 / §Q.5 remote-vector neighbourhood (Advanced
+            // Prediction only).
+            let remotes = if ap {
+                let mb_below_outside = row + 1 >= mb_rows;
+                let mut above_outside = row == 0;
+                let mut left_outside = col == 0;
+                let mut right_outside = col + 1 >= mb_cols;
+                let nb_above = (!above_outside).then(|| grid[idx - mb_cols]);
+                let nb_left = (!left_outside).then(|| grid[idx - 1]);
+                let nb_right = (!right_outside).then(|| grid[idx + 1]);
+                if !rec.coded && options.obmc_skip_zero_right {
+                    right_outside = true;
+                }
+                if slice_mode {
+                    // §F.3 / §K.1 rule 3 — remote vectors of blocks
+                    // in other slices are the current vector.
+                    let other =
+                        |nb: Option<MbGridEntry>| nb.is_some_and(|e| e.segment != rec.segment);
+                    above_outside |= other(nb_above);
+                    left_outside |= other(nb_left);
+                    right_outside |= other(nb_right);
+                }
+                Some((
+                    nb_above,
+                    nb_left,
+                    nb_right,
+                    above_outside,
+                    left_outside,
+                    right_outside,
+                    mb_below_outside,
+                ))
+            } else {
+                None
+            };
+
+            for &blk in &LumaBlockIndex::ALL {
+                let b = blk.index();
+                let bx = mb_x + (b % 2) * 16;
+                let by = mb_y + (b / 2) * 16;
+                let prediction = match remotes {
+                    Some((nb_above, nb_left, nb_right, ao, lo, ro, bo)) => {
+                        let (r_top, r_bot, s_left, s_right) = classify_remote_mvs(
+                            blk, &rec.mvs4, nb_above, nb_left, nb_right, ao, lo, ro, bo, false,
+                        );
+                        obmc_predict_block_16(
+                            &y_ref,
+                            bx,
+                            by,
+                            rec.mvs4[b],
+                            r_top,
+                            r_bot,
+                            s_left,
+                            s_right,
+                            rcontrol,
+                        )
+                    }
+                    None => rru_motion_compensate_16(&y_ref, bx, by, rec.mvs4[b], rcontrol),
+                };
+                match &rec.blocks[b] {
+                    Some(block) => {
+                        let error = rru_error_block(block, rec.quant, false);
+                        let up = upsample_prediction_error(&error);
+                        rru_blit_sum(&mut frame.y, luma_stride, bx, by, &prediction, &up);
+                    }
+                    None => rru_blit_16(&mut frame.y, luma_stride, bx, by, &prediction),
                 }
             }
+
+            // §Q.2.2.1 — one chrominance vector per macroblock: §6.1.1
+            // from the macroblock vector, §F.2 from the four vectors.
+            let chroma_vec = if rec.four_mv {
+                chroma_mv_4mv(&rec.mvs4)
+            } else {
+                chroma_mv(rec.mvs4[0])
+            };
             let cb_ref = RefPlane::new(&r.cb, r.chroma_width(), r.chroma_height());
             let cr_ref = RefPlane::new(&r.cr, r.chroma_width(), r.chroma_height());
-            for (chroma_bit, plane) in [(0b10u8, 0usize), (0b01u8, 1usize)] {
+            for plane in 0..2usize {
                 let src_ref = if plane == 0 { &cb_ref } else { &cr_ref };
                 let prediction = rru_motion_compensate_16(src_ref, c_x, c_y, chroma_vec, rcontrol);
                 let dst = if plane == 0 {
@@ -2084,64 +2308,52 @@ fn decode_rru_picture_body(
                 } else {
                     &mut frame.cr
                 };
-                if cbpc & chroma_bit != 0 {
-                    let block = parse_block(
-                        reader,
-                        BlockContext {
-                            has_intradc: false,
-                            has_coefficients: true,
-                            ..Default::default()
-                        },
-                    )?;
-                    let error = rru_error_block(&block, quant, false);
-                    let up = upsample_prediction_error(&error);
-                    rru_blit_sum(dst, chroma_stride, c_x, c_y, &prediction, &up);
-                } else {
-                    rru_blit_16(dst, chroma_stride, c_x, c_y, &prediction);
+                match &rec.blocks[4 + plane] {
+                    Some(block) => {
+                        let error = rru_error_block(block, rec.quant, false);
+                        let up = upsample_prediction_error(&error);
+                        rru_blit_sum(dst, chroma_stride, c_x, c_y, &prediction, &up);
+                    }
+                    None => rru_blit_16(dst, chroma_stride, c_x, c_y, &prediction),
                 }
             }
-            record_grid(
-                &mut grid,
-                &mut mb_quant,
-                mb_cols,
-                col,
-                row,
-                &mb,
-                quant,
-                mv,
-                [mv; 4],
-                0,
-            );
         }
     }
-    let _ = &mb_quant;
 
-    // §Q.7.1 — default block boundary filter along the 16 × 16 block
-    // edges: filter iff either adjoining 32 × 32 macroblock is coded
+    // §Q.7 — block boundary filter along the 16 × 16 block edges:
+    // filter iff either adjoining 32 × 32 macroblock is coded
     // (COD == 0 or INTRA); picture edges are skipped by the plane
-    // driver itself. Luma blocks are 2 × 2 per macroblock; each chroma
-    // plane has one 16 × 16 block per macroblock.
-    let luma_cond = |b1: (usize, usize), b2: (usize, usize)| -> RruEdgeCondition {
-        let coded = |b: (usize, usize)| -> bool {
-            let (mc, mr) = (b.0 / 2, b.1 / 2);
-            mc < mb_cols && mr < mb_rows && coded_mb[mr * mb_cols + mc]
+    // driver itself and slice edges here ("no filtering is performed
+    // across ... slice edges in Slice Structured mode"). Luma blocks
+    // are 2 × 2 per macroblock; each chroma plane has one 16 × 16
+    // block per macroblock.
+    let edge = |m1: (usize, usize), m2: (usize, usize)| -> RruEdgeCondition {
+        let at = |m: (usize, usize)| {
+            (m.0 < mb_cols && m.1 < mb_rows).then(|| &records[m.1 * mb_cols + m.0])
         };
-        if coded(b1) || coded(b2) {
-            RruEdgeCondition::Filter
-        } else {
-            RruEdgeCondition::Skip
+        match (at(m1), at(m2)) {
+            (Some(a), Some(b)) => {
+                if slice_mode && a.segment != b.segment {
+                    RruEdgeCondition::Skip
+                } else if a.coded || b.coded {
+                    RruEdgeCondition::Filter
+                } else {
+                    RruEdgeCondition::Skip
+                }
+            }
+            (Some(a), None) | (None, Some(a)) => {
+                if a.coded {
+                    RruEdgeCondition::Filter
+                } else {
+                    RruEdgeCondition::Skip
+                }
+            }
+            (None, None) => RruEdgeCondition::Skip,
         }
     };
-    let chroma_cond = |b1: (usize, usize), b2: (usize, usize)| -> RruEdgeCondition {
-        let coded = |b: (usize, usize)| -> bool {
-            b.0 < mb_cols && b.1 < mb_rows && coded_mb[b.1 * mb_cols + b.0]
-        };
-        if coded(b1) || coded(b2) {
-            RruEdgeCondition::Filter
-        } else {
-            RruEdgeCondition::Skip
-        }
-    };
+    let luma_cond =
+        |b1: (usize, usize), b2: (usize, usize)| edge((b1.0 / 2, b1.1 / 2), (b2.0 / 2, b2.1 / 2));
+    let chroma_cond = |b1: (usize, usize), b2: (usize, usize)| edge(b1, b2);
     // §Q.7 — the §Q.7.1 default two-tap filter, or under Annex J the
     // §Q.7.2 variant (the §J.3 filter with STRENGTH = +∞).
     let filter_mode = if deblock {
@@ -9427,6 +9639,41 @@ fn reconstruct_inter4v_mvs(
     current_segment: u32,
     pb_frames: bool,
 ) -> Result<Mb4Mv> {
+    reconstruct_inter4v_mvs_scaled(
+        mb,
+        grid,
+        mb_cols,
+        col,
+        row,
+        gob_top_row,
+        gob_header_present,
+        umv,
+        current_segment,
+        pb_frames,
+        false,
+    )
+}
+
+/// [`reconstruct_inter4v_mvs`] with the §Q.4 pseudo-vector option:
+/// with `rru` set each block's median predictor is converted to the
+/// pseudo domain (item 1), the difference applied there (item 2) and
+/// the result expanded to the actual vector (item 3) — "if four motion
+/// vectors are present, the procedure is performed in a similar way as
+/// defined in F.2".
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_inter4v_mvs_scaled(
+    mb: &H263Macroblock,
+    grid: &[MbGridEntry],
+    mb_cols: usize,
+    col: usize,
+    row: usize,
+    gob_top_row: usize,
+    gob_header_present: bool,
+    umv: UmvCoding,
+    current_segment: u32,
+    pb_frames: bool,
+    rru: bool,
+) -> Result<Mb4Mv> {
     // §5.3.7 / §5.3.8 — the parser already pulled the four MVDs for an
     // INTER4V macroblock in AP mode. Block order is Figure 5
     // (`[B1, B2, B3, B4]`).
@@ -9505,7 +9752,15 @@ fn reconstruct_inter4v_mvs(
 
         let predictor = predict_mv_median(mv1, mv2, mv3);
         let mvd = mvds[blk.index()];
-        let mv = reconstruct_mv_coded(umv, predictor, mvd)?;
+        let mv = if rru {
+            crate::motion::rru_actual_mv(reconstruct_mv_coded(
+                umv,
+                crate::motion::rru_pseudo_mv(predictor),
+                mvd,
+            )?)
+        } else {
+            reconstruct_mv_coded(umv, predictor, mvd)?
+        };
         mvs4[blk.index()] = mv;
         // §F.2 — later blocks of this macroblock use the reconstructed
         // vector as an intra-macroblock candidate predictor.

@@ -5,10 +5,14 @@
 
 use oxideav_h263::encoder::{
     encode_inter_picture_rru, encode_inter_picture_rru_deblock, encode_inter_picture_rru_umv,
-    encode_intra_picture_rru, encode_intra_picture_rru_deblock,
+    encode_intra_picture_plus, encode_intra_picture_rru, encode_intra_picture_rru_deblock,
+};
+use oxideav_h263::encoder_rru::{
+    RruInterConfig, encode_inter_picture_rru_stats, encode_inter_picture_rru_with,
 };
 use oxideav_h263::motion::{rru_actual_component, rru_pseudo_component};
 use oxideav_h263::picture::{DecodeOptions, YuvFrame, decode_picture_layer, decode_sequence};
+use oxideav_h263::{Error, ModeRule};
 
 /// A deterministic gradient frame on every plane.
 fn gradient(lw: usize, lh: usize, seed: u8) -> YuvFrame {
@@ -88,19 +92,252 @@ fn rru_pseudo_actual_lattice_round_trips() {
     assert_eq!(rru_actual_component(4), 7); // 2.0 pseudo -> 3.5 pel
 }
 
-/// An RRU INTRA picture round-trips within the mode's low-pass budget
-/// on smooth content, at CIF (coded size == reference size) and QCIF
-/// (the §Q.3 extension + §Q.2.3 crop case).
+/// §5.1.4.5 items 1 / 4 — "the Reduced-Resolution Update mode bit
+/// shall not be set in an INTRA picture": the encoder refuses with the
+/// typed rule instead of emitting a non-conformant picture.
 #[test]
-fn rru_intra_round_trips_within_lowpass_budget() {
+fn rru_intra_picture_is_refused_with_the_rule() {
+    let src = gradient(176, 144, 3);
+    for r in [
+        encode_intra_picture_rru(&src, 6, 0),
+        encode_intra_picture_rru_deblock(&src, 6, 0),
+    ] {
+        assert_eq!(
+            r.unwrap_err(),
+            Error::ModeCombination(ModeRule::RruInIntraPicture)
+        );
+    }
+    assert_eq!(ModeRule::RruInIntraPicture.clause(), "5.1.4.5 item 4");
+}
+
+/// A textured frame: gradient plus a per-16-px checkerboard and a
+/// moving bright square, so INTER4V and INTRA decisions have something
+/// to bite on.
+fn textured(lw: usize, lh: usize, t: usize) -> YuvFrame {
+    let mut f = gradient(lw, lh, (t * 2) as u8);
+    for r in 0..lh {
+        for c in 0..lw {
+            let v = &mut f.y[r * lw + c];
+            if ((r / 8) + ((c + 3 * t) / 8)).is_multiple_of(2) {
+                *v = v.saturating_add(18);
+            }
+            let (sx, sy) = (40 + 7 * t, 30 + 5 * t);
+            if (sx..sx + 28).contains(&c) && (sy..sy + 28).contains(&r) {
+                *v = 230;
+            }
+        }
+    }
+    f
+}
+
+fn decode_p(bytes: &[u8], reference: &YuvFrame) -> YuvFrame {
+    decode_picture_layer(bytes, Some(reference), DecodeOptions::default()).expect("decode P")
+}
+
+/// INTRA macroblocks inside an RRU P-picture (the legal home of
+/// reduced-resolution INTRA texture): content unrelated to the
+/// reference is coded INTRA and round-trips within the low-pass
+/// budget, at CIF (coded == reference size) and QCIF (§Q.3 extension
+/// + §Q.2.3 crop).
+#[test]
+fn rru_p_picture_intra_macroblocks_round_trip() {
     for (lw, lh) in [(352usize, 288usize), (176, 144)] {
+        let flat = YuvFrame {
+            y: vec![16; lw * lh],
+            cb: vec![128; lw * lh / 4],
+            cr: vec![128; lw * lh / 4],
+            luma_width: lw,
+            luma_height: lh,
+        };
+        let i_bytes = encode_intra_picture_plus(&flat, 6, 0).unwrap();
+        let recon = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).unwrap();
         let src = gradient(lw, lh, 3);
-        let bytes = encode_intra_picture_rru(&src, 6, 0).expect("encode RRU I");
-        let dec = decode_picture_layer(&bytes, None, DecodeOptions::default()).expect("decode");
+        let cfg = RruInterConfig::new(6).with_intra_decision(true);
+        let (bytes, stats) = encode_inter_picture_rru_stats(&src, &recon, 1, &cfg).unwrap();
+        assert!(stats.intra > 0, "{lw}x{lh}: no INTRA macroblock chosen");
+        let dec = decode_p(&bytes, &recon);
         assert_eq!((dec.luma_width, dec.luma_height), (lw, lh));
         let mae = luma_mae(&src, &dec);
-        assert!(mae < 6.0, "{lw}x{lh} RRU I luma MAE {mae}");
+        assert!(mae < 6.0, "{lw}x{lh} RRU P/INTRA luma MAE {mae}");
     }
+}
+
+/// Every mode combination of the general RRU P encoder decodes, stays
+/// source-close, and — pinned by a second decode — reconstructs
+/// identically through `decode_sequence`. Covers RRU + Advanced
+/// Prediction (§Q.5 enlarged OBMC, one and four vectors), RRU + Annex
+/// K slices, the two together, and their UMV / Deblocking Filter
+/// compositions.
+#[test]
+fn rru_mode_matrix_round_trips() {
+    let base = RruInterConfig::new(6).with_search_pseudo_half(6);
+    let cases: Vec<(&str, RruInterConfig)> = vec![
+        ("plain", base),
+        ("ap", base.with_advanced_prediction(true)),
+        (
+            "ap+4mv",
+            base.with_advanced_prediction(true).with_four_mv(true),
+        ),
+        ("df+4mv", base.with_deblock(true).with_four_mv(true)),
+        ("slices", base.with_slice_rows(1)),
+        ("slices2", base.with_slice_rows(2)),
+        (
+            "ap+4mv+slices",
+            base.with_advanced_prediction(true)
+                .with_four_mv(true)
+                .with_slice_rows(1),
+        ),
+        (
+            "ap+4mv+umv",
+            base.with_advanced_prediction(true)
+                .with_four_mv(true)
+                .with_umv(true),
+        ),
+        (
+            "ap+4mv+umv+df+slices+intra",
+            base.with_advanced_prediction(true)
+                .with_four_mv(true)
+                .with_umv(true)
+                .with_deblock(true)
+                .with_slice_rows(2)
+                .with_intra_decision(true),
+        ),
+    ];
+    for (lw, lh) in [(176usize, 144usize), (352, 288)] {
+        let i_bytes = encode_intra_picture_plus(&textured(lw, lh, 0), 5, 0).unwrap();
+        let recon0 = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).unwrap();
+        for (name, cfg) in &cases {
+            // Two chained P-pictures: the second predicts from the
+            // first one's (filtered, cropped) reconstruction.
+            let mut stream = i_bytes.clone();
+            let mut reference = recon0.clone();
+            let mut any_four = 0;
+            let mut slices = 0;
+            for t in 1..=2 {
+                let src = textured(lw, lh, t);
+                let (p, stats) =
+                    encode_inter_picture_rru_stats(&src, &reference, t as u8, cfg).unwrap();
+                any_four += stats.four_vector;
+                slices = stats.slices;
+                let dec = decode_p(&p, &reference);
+                let mae = luma_mae(&src, &dec);
+                assert!(mae < 9.0, "{name} {lw}x{lh} t{t}: luma MAE {mae}");
+                stream.extend_from_slice(&p);
+                reference = dec;
+            }
+            let frames = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+            assert_eq!(frames.len(), 3, "{name}");
+            assert_eq!(frames[2], reference, "{name}: sequence decode drifted");
+            if cfg.four_mv {
+                assert!(
+                    any_four > 0,
+                    "{name} {lw}x{lh}: no INTER4V macroblock chosen"
+                );
+            }
+            if cfg.slice_rows > 0 {
+                assert_eq!(slices, (lh.div_ceil(32)).div_ceil(cfg.slice_rows), "{name}");
+            }
+        }
+    }
+}
+
+/// A static picture is lossless in every RRU mode set: all macroblocks
+/// skip (under Advanced Prediction a skipped macroblock is still
+/// overlap-predicted, from zero vectors — the reference itself), and
+/// no coded macroblock arms the §Q.7 filter.
+#[test]
+fn rru_static_p_is_lossless_in_every_mode() {
+    let i_bytes = encode_intra_picture_plus(&textured(176, 144, 0), 7, 0).unwrap();
+    let recon = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).unwrap();
+    for cfg in [
+        RruInterConfig::new(7).with_advanced_prediction(true),
+        RruInterConfig::new(7)
+            .with_advanced_prediction(true)
+            .with_four_mv(true)
+            .with_slice_rows(1),
+        RruInterConfig::new(7).with_slice_rows(2).with_deblock(true),
+    ] {
+        let (p, stats) = encode_inter_picture_rru_stats(&recon, &recon, 1, &cfg).unwrap();
+        assert_eq!(stats.skipped, 30, "{cfg:?}");
+        assert_eq!(decode_p(&p, &recon), recon, "{cfg:?}");
+    }
+}
+
+/// §Q.5 is observable: the same vector field decoded with and without
+/// the Advanced Prediction flag differs (overlapped vs plain
+/// prediction), and §K / §Q.7 is observable: slicing a picture changes
+/// the reconstruction only through the unfiltered slice edges and the
+/// confined predictors.
+#[test]
+fn rru_ap_and_slices_change_the_reconstruction() {
+    let i_bytes = encode_intra_picture_plus(&textured(176, 144, 0), 5, 0).unwrap();
+    let recon = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).unwrap();
+    let src = textured(176, 144, 2);
+    let base = RruInterConfig::new(5).with_search_pseudo_half(6);
+    let plain = decode_p(
+        &encode_inter_picture_rru_with(&src, &recon, 1, &base).unwrap(),
+        &recon,
+    );
+    let ap = decode_p(
+        &encode_inter_picture_rru_with(&src, &recon, 1, &base.with_advanced_prediction(true))
+            .unwrap(),
+        &recon,
+    );
+    let sliced = decode_p(
+        &encode_inter_picture_rru_with(&src, &recon, 1, &base.with_slice_rows(1)).unwrap(),
+        &recon,
+    );
+    assert_ne!(plain.y, ap.y);
+    assert_ne!(plain.y, sliced.y);
+}
+
+/// §F.2 — four vectors need Advanced Prediction or Deblocking Filter.
+#[test]
+fn rru_four_vectors_without_ap_or_df_is_refused() {
+    let f = gradient(176, 144, 1);
+    let cfg = RruInterConfig::new(6).with_four_mv(true);
+    assert_eq!(
+        encode_inter_picture_rru_with(&f, &f, 1, &cfg).unwrap_err(),
+        Error::ModeCombination(ModeRule::FourVectorsWithoutApOrDf)
+    );
+}
+
+/// Annex J with RRU (§Q.7.2): the deblocking-filter variant of the
+/// block boundary filter — the §J.3 four-tap filter with STRENGTH = +∞
+/// on the 16 × 16 block edges — replaces the §Q.7.1 two-tap default.
+/// Signalled in OPPTYPE by the `_deblock` encoder, or forced by
+/// `DecodeOptions::deblock`; the two filters must yield different,
+/// both source-close, reconstructions.
+#[test]
+fn rru_deblocking_filter_variant_round_trips() {
+    let i_bytes = encode_intra_picture_plus(&textured(176, 144, 0), 8, 0).unwrap();
+    let recon = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).unwrap();
+    let next = textured(176, 144, 2);
+    let plain = encode_inter_picture_rru(&next, &recon, 8, 1, 6).unwrap();
+    let r_plain = decode_p(&plain, &recon);
+    let r_forced = decode_picture_layer(
+        &plain,
+        Some(&recon),
+        DecodeOptions::default().with_deblock(true),
+    )
+    .unwrap();
+    assert!(
+        r_forced.y != r_plain.y,
+        "§Q.7.2 and §Q.7.1 filter differently"
+    );
+    assert!(luma_mae(&r_forced, &next) < 9.0);
+
+    // Signalled: P-picture through decode_sequence.
+    let p = encode_inter_picture_rru_deblock(&next, &recon, 8, 1, 6).unwrap();
+    let mut stream = i_bytes.clone();
+    stream.extend_from_slice(&p);
+    let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.len(), 2);
+    let m_p = luma_mae(&decoded[1], &next);
+    assert!(m_p < 9.0, "P MAE {m_p:.3}");
+    // A static P is lossless under §Q.7.2 as well.
+    let p_static = encode_inter_picture_rru_deblock(&recon, &recon, 8, 2, 6).unwrap();
+    assert_eq!(decode_p(&p_static, &recon), recon);
 }
 
 /// A static RRU P-picture (source == decoded reference) is lossless:
@@ -109,7 +346,7 @@ fn rru_intra_round_trips_within_lowpass_budget() {
 #[test]
 fn rru_static_p_is_lossless() {
     let src = gradient(176, 144, 9);
-    let i_bytes = encode_intra_picture_rru(&src, 7, 0).expect("encode I");
+    let i_bytes = encode_intra_picture_plus(&src, 7, 0).expect("encode I");
     let recon = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).expect("decode I");
     let p_bytes = encode_inter_picture_rru(&recon, &recon, 7, 1, 2).expect("encode P");
     let dec =
@@ -126,7 +363,7 @@ fn rru_static_p_is_lossless() {
 #[test]
 fn rru_translated_p_round_trips() {
     let src = gradient(176, 144, 0);
-    let i_bytes = encode_intra_picture_rru(&src, 5, 0).expect("encode I");
+    let i_bytes = encode_intra_picture_plus(&src, 5, 0).expect("encode I");
     let recon = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).expect("decode I");
     let moved = translated(&recon, 3);
     let p_bytes = encode_inter_picture_rru(&moved, &recon, 5, 1, 4).expect("encode P");
@@ -142,7 +379,7 @@ fn rru_translated_p_round_trips() {
 #[test]
 fn rru_stream_decodes_through_decode_sequence() {
     let src = gradient(176, 144, 4);
-    let i_bytes = encode_intra_picture_rru(&src, 6, 0).unwrap();
+    let i_bytes = encode_intra_picture_plus(&src, 6, 0).unwrap();
     let recon = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).unwrap();
     let moved = translated(&recon, 2);
     let p_bytes = encode_inter_picture_rru(&moved, &recon, 6, 1, 3).unwrap();
@@ -163,7 +400,7 @@ fn rru_stream_decodes_through_decode_sequence() {
 #[test]
 fn rru_umv_static_p_is_lossless() {
     let src = gradient(176, 144, 9);
-    let i_bytes = encode_intra_picture_rru(&src, 7, 0).expect("encode I");
+    let i_bytes = encode_intra_picture_plus(&src, 7, 0).expect("encode I");
     let recon = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).expect("decode I");
     let p_bytes = encode_inter_picture_rru_umv(&recon, &recon, 7, 1, 2).expect("encode P");
     let dec =
@@ -182,7 +419,7 @@ fn rru_umv_static_p_is_lossless() {
 #[test]
 fn rru_umv_large_translation_round_trips() {
     let src = gradient(128, 96, 0);
-    let i_bytes = encode_intra_picture_rru(&src, 5, 0).expect("encode I");
+    let i_bytes = encode_intra_picture_plus(&src, 5, 0).expect("encode I");
     let recon = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).expect("decode I");
     let moved = translated(&recon, 40);
     let p_bytes = encode_inter_picture_rru_umv(&moved, &recon, 5, 1, 44).expect("encode P");
@@ -217,7 +454,7 @@ fn rru_umv_large_translation_round_trips() {
 #[test]
 fn rru_umv_stream_decodes_through_decode_sequence() {
     let src = gradient(176, 144, 4);
-    let i_bytes = encode_intra_picture_rru(&src, 6, 0).unwrap();
+    let i_bytes = encode_intra_picture_plus(&src, 6, 0).unwrap();
     let recon = decode_picture_layer(&i_bytes, None, DecodeOptions::default()).unwrap();
     let moved = translated(&recon, 2);
     let p_bytes = encode_inter_picture_rru_umv(&moved, &recon, 6, 1, 3).unwrap();
@@ -229,64 +466,4 @@ fn rru_umv_stream_decodes_through_decode_sequence() {
     assert_eq!(frames[0].y, recon.y);
     let mae = luma_mae(&moved, &frames[1]);
     assert!(mae < 6.0, "sequence RRU+UMV P luma MAE {mae}");
-}
-
-/// RRU pictures refuse the unstaged mode combinations (the OPPTYPE
-/// AP / DF / AIC bits alter the OBMC / filter layers): a caller-forced
-/// deblock option on an RRU stream is refused rather than
-/// mis-filtered.
-/// Annex J with RRU (§Q.7.2): the deblocking-filter variant of the
-/// block boundary filter — the §J.3 four-tap filter with STRENGTH = +∞
-/// on the 16 × 16 block edges — replaces the §Q.7.1 two-tap default.
-/// Signalled in OPPTYPE by the `_deblock` encoders (identical coded
-/// data), or forced by `DecodeOptions::deblock`; the two filters must
-/// yield different, both source-close, reconstructions.
-#[test]
-fn rru_deblocking_filter_variant_round_trips() {
-    // A 16-px checkerboard puts a real discontinuity on every RRU block
-    // edge (a slow ramp leaves both filters as no-ops after rounding).
-    let mut src = gradient(176, 144, 5);
-    for r in 0..144 {
-        for c in 0..176 {
-            if ((r / 16) + (c / 16)) % 2 == 0 {
-                src.y[r * 176 + c] = src.y[r * 176 + c].saturating_add(40);
-            }
-        }
-    }
-    let plain = encode_intra_picture_rru(&src, 8, 0).unwrap();
-    let df = encode_intra_picture_rru_deblock(&src, 8, 0).unwrap();
-    assert_eq!(plain.len(), df.len(), "only the OPPTYPE bit differs");
-    let r_plain = decode_picture_layer(&plain, None, DecodeOptions::default()).unwrap();
-    let r_df = decode_picture_layer(&df, None, DecodeOptions::default()).unwrap();
-    // The same wire under `deblock` forced on the plain stream selects
-    // the §Q.7.2 variant too.
-    let r_forced =
-        decode_picture_layer(&plain, None, DecodeOptions::default().with_deblock(true)).unwrap();
-    assert_eq!(r_df, r_forced);
-    assert!(r_df.y != r_plain.y, "§Q.7.2 and §Q.7.1 filter differently");
-    let (m_plain, m_df) = (luma_mae(&r_plain, &src), luma_mae(&r_df, &src));
-    eprintln!("RRU I: §Q.7.1 MAE {m_plain:.3}, §Q.7.2 MAE {m_df:.3}");
-    assert!(
-        m_df < 6.0,
-        "§Q.7.2 reconstruction stays close to the source"
-    );
-
-    // P-picture on the §Q.7.2-filtered reference, through decode_sequence.
-    let next = translated(&src, 4);
-    let p = encode_inter_picture_rru_deblock(&next, &r_df, 8, 1, 6).unwrap();
-    let mut stream = df.clone();
-    stream.extend_from_slice(&p);
-    let decoded = decode_sequence(&stream, DecodeOptions::default()).unwrap();
-    assert_eq!(decoded.len(), 2);
-    assert_eq!(decoded[0], r_df);
-    let m_p = luma_mae(&decoded[1], &next);
-    eprintln!("RRU P (§Q.7.2): MAE {m_p:.3}");
-    assert!(m_p < 6.0, "P MAE {m_p:.3}");
-    // A static P is lossless under §Q.7.2 as well: an all-skipped
-    // picture is not filtered (no coded macroblock touches any edge).
-    let p_static = encode_inter_picture_rru_deblock(&r_df, &r_df, 8, 2, 6).unwrap();
-    let mut s2 = df.clone();
-    s2.extend_from_slice(&p_static);
-    let decoded = decode_sequence(&s2, DecodeOptions::default()).unwrap();
-    assert_eq!(decoded[1], r_df);
 }

@@ -1090,6 +1090,67 @@ pub fn obmc_predict_block(
     out
 }
 
+/// Annex Q §Q.5 — enlarged overlapped motion compensation: one
+/// 16 × 16 luminance prediction block of a Reduced-Resolution Update
+/// picture in Advanced Prediction mode.
+///
+/// "Except that the size of each block and weighting matrices is
+/// 16 × 16, the procedure of the creation of each prediction block is
+/// identical to the description in F.3." The Figure Q.4 / Q.5 / Q.6
+/// matrices are the Figure F.2 / F.3 / F.4 ones with every weight
+/// repeated over a 2 × 2 cell, so the weight at `(i, j)` is the 8 × 8
+/// matrix entry at `(i / 2, j / 2)`; the upper / lower and left /
+/// right halves that select the remote vector are eight pixels each.
+/// Arguments are as for [`obmc_predict_block`].
+#[allow(clippy::too_many_arguments)]
+pub fn obmc_predict_block_16(
+    plane: &RefPlane<'_>,
+    block_x: usize,
+    block_y: usize,
+    q_mv: MotionVector,
+    r_top: RemoteMv,
+    r_bot: RemoteMv,
+    s_left: RemoteMv,
+    s_right: RemoteMv,
+    rcontrol: i32,
+) -> [u8; 256] {
+    const DIM: usize = 2 * BLOCK_DIM;
+    let r_mvs = [r_top.resolve(q_mv), r_bot.resolve(q_mv)];
+    let s_mvs = [s_left.resolve(q_mv), s_right.resolve(q_mv)];
+    let mut out = [0u8; DIM * DIM];
+    for (j, out_row) in out.as_chunks_mut::<DIM>().0.iter_mut().enumerate() {
+        let r_mv = r_mvs[j / BLOCK_DIM];
+        let base_hy = ((block_y + j) as i32) * 2;
+        for (i, px) in out_row.iter_mut().enumerate() {
+            let s_mv = s_mvs[i / BLOCK_DIM];
+            let base_hx = ((block_x + i) as i32) * 2;
+            let q = sample_half_pel(
+                plane,
+                base_hx + q_mv.dx_half,
+                base_hy + q_mv.dy_half,
+                rcontrol,
+            );
+            let r = sample_half_pel(
+                plane,
+                base_hx + r_mv.dx_half,
+                base_hy + r_mv.dy_half,
+                rcontrol,
+            );
+            let s = sample_half_pel(
+                plane,
+                base_hx + s_mv.dx_half,
+                base_hy + s_mv.dy_half,
+                rcontrol,
+            );
+            let h0 = H0[j / 2][i / 2] as i32;
+            let h1 = H1[j / 2][i / 2] as i32;
+            let h2 = H2[j / 2][i / 2] as i32;
+            *px = ((q * h0 + r * h1 + s * h2 + 4) / 8).clamp(0, 255) as u8;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

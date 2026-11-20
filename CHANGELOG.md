@@ -8,6 +8,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `encode_intra_picture_rru` / `encode_intra_picture_rru_deblock` now
+  return `Error::ModeCombination(ModeRule::RruInIntraPicture)`:
+  §5.1.4.5 item 4 — "the Reduced-Resolution Update mode bit shall not
+  be set in an INTRA picture". Start an RRU sequence with a
+  full-resolution I-picture; `RruInterConfig::intra_decision` codes
+  INTRA macroblocks inside RRU P-pictures. The decoder still accepts
+  an RRU I-picture.
+- The default-mode RRU P encoder (no UMV / AP / DF) keeps every
+  stored pixel's prediction inside the reference picture (§Q.3 leaves
+  the extension area undefined in that mode), so its streams no longer
+  depend on the decoder's choice of extension values.
+- `SliceHeaderContext::mba_max_value` counts 32 × 32 macroblocks when
+  `rru` is set (§K.2.5).
+- clippy 1.100 `needless_range_loop` sweep.
 - edition 2024, MSRV 1.95
 - API hygiene: `#[non_exhaustive]` on the `Error` enum and on the
   option / config / stats / outcome records listed under Added. Build
@@ -27,6 +41,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   fixed-layout RTP payload headers stay exhaustive.
 
 ### Added
+
+- **Annex Q + Annex F / Annex K, both directions.** The
+  Reduced-Resolution Update decode driver is now two-pass (parse, then
+  reconstruct with the whole vector field known) and composes with
+  Advanced Prediction (§Q.5 enlarged overlapped motion compensation —
+  `motion::obmc_predict_block_16`, the Figure Q.4–Q.6 weights; four
+  §F.2 vectors per 32 × 32 macroblock through the §Q.4 pseudo-vector
+  rule; skipped macroblocks overlap-predicted), with the Table J.1
+  four-vector macroblocks under Deblocking Filter mode, and with the
+  Annex K slice layer (free-running, Rectangular Slice and Arbitrary
+  Slice Ordering forms; Tables K.2 / K.3 "RRU mode" field widths,
+  macroblock addresses on the 32 × 32 grid, §K.1 predictor / remote
+  confinement, no §Q.7 filtering across slice edges). New encoder
+  `encoder_rru::encode_inter_picture_rru_with` / `_stats` +
+  `RruInterConfig` (UMV, Deblocking Filter, Advanced Prediction, a
+  cost-driven one / four vector decision, row-aligned slices, an INTRA
+  macroblock decision) and `RruInterStats`.
+- `mode_rules`: `ModeSet::check` applies the Recommendation's
+  mode-combination rules (§5.1.3, §5.1.4.3–§5.1.4.6, §F.2, §V.3) to a
+  requested mode set and returns the effective set after the §5.1.4.5
+  inference; a forbidden request is `Error::ModeCombination(ModeRule)`
+  naming the rule and its clause. `write_plus_picture_header` runs it,
+  so no PLUSPTYPE picture this crate emits signals a forbidden
+  combination. `PlusModes::sac` (OPPTYPE bit 6).
 
 - Annex M **Improved PB-frames encoder** (`encoder_pb` module,
   re-exported from `encoder`): `encode_improved_pb_picture` /

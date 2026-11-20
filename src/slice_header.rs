@@ -272,7 +272,11 @@ impl SliceHeaderContext {
     /// "the maximum value is the number of macroblocks in the current
     /// picture minus one".
     pub fn mba_max_value(&self) -> Option<u32> {
-        let mbs_per_pic = self.picture_width.div_ceil(16) * self.picture_height.div_ceil(16);
+        // §K.2.5 — "when in the Reduced-Resolution Update mode, the
+        // relevant picture size is the lower resolution update picture
+        // size": the 32 × 32 macroblock grid of §Q.1.
+        let unit = if self.rru { 32 } else { 16 };
+        let mbs_per_pic = self.picture_width.div_ceil(unit) * self.picture_height.div_ceil(unit);
         if mbs_per_pic == 0 {
             return None;
         }
