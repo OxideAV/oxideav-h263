@@ -244,6 +244,7 @@ pub mod encoder_deblock;
 pub mod encoder_mb;
 #[doc(hidden)]
 pub mod encoder_motion;
+pub mod encoder_mq;
 pub mod encoder_pb;
 pub mod encoder_rc;
 pub mod encoder_rru;
@@ -364,6 +365,9 @@ pub use encoder_motion::{
     umv_mvd_component_for, umv_mvd_for,
 };
 #[doc(hidden)]
+pub use encoder_mq::{
+    InterVlcConfig, InterVlcStats, encode_inter_picture_mq, encode_inter_picture_mq_stats,
+};
 pub use encoder_rru::{
     RruInterConfig, RruInterStats, encode_inter_picture_rru_stats, encode_inter_picture_rru_with,
 };

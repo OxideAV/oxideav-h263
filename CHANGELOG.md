@@ -42,6 +42,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex T and Annex S on INTER pictures (encoder).**
+  `encoder_mq::encode_inter_picture_mq` / `_stats` + `InterVlcConfig`:
+  §T.3 chrominance at `QUANT_C`, §T.4 EXTENDED-ESCAPE levels beyond
+  ±127 (only below step 8, §T.5), §S.2 Table I.2 codewords on an INTER
+  block whenever the decoder's own §S.2.2 detection recovers the block
+  and the coding is shorter, §S.3 INTRA-column CBPY when both
+  chrominance blocks are coded; optional UMV. Alternative INTER VLC is
+  a lossless recoding (identical reconstruction), 1.5–9.3 % smaller on
+  busy QCIF / CIF content at QP 2–4; a black-box decoder agrees on
+  every mode pairing.
 - **Annex N Reference Picture Selection on the encode side.**
   `encode_intra_picture_rps` / `encode_inter_picture_rps` +
   `RpsFields` (`PlusModes::rps`): OPPTYPE bit 11, §5.1.13 RPSMF,

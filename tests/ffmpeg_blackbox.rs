@@ -840,3 +840,58 @@ fn improved_pb_alternating_rtype_agrees_with_oracle() {
     }
     cross_check_anchors(&stream, 176, 144, "improved-pb-rtype", 0.08, &[0, 2, 4, 6]);
 }
+
+/// Annex T (chrominance `QUANT_C`, EXTENDED-ESCAPE levels) and Annex S
+/// (Table I.2 codewords on INTER blocks, INTRA-column CBPY) on
+/// P-pictures: the oracle follows the same §S.2.2 table detection and
+/// §T.3 / §T.4 rules.
+#[test]
+fn modified_quant_and_alt_inter_vlc_pictures_agree_with_oracle() {
+    use oxideav_h263::encoder::encode_intra_picture_plus;
+    use oxideav_h263::encoder_mq::{InterVlcConfig, encode_inter_picture_mq_stats};
+    require_oracle!();
+    // A fine texture so that blocks carry many large coefficients.
+    let textured = |shift: usize| -> YuvFrame {
+        let mut f = gradient(176, 144, 7);
+        for (n, v) in f.y.iter_mut().enumerate() {
+            let (r, c) = (n / 176, n % 176);
+            if ((r / 2) + ((c + shift) / 3)).is_multiple_of(2) {
+                *v = v.saturating_add(60);
+            }
+        }
+        for (n, v) in f.cb.iter_mut().enumerate() {
+            *v = if ((n % 88 + shift) / 4).is_multiple_of(2) {
+                60
+            } else {
+                200
+            };
+        }
+        f
+    };
+    for (name, quant, mq, aiv, umv) in [
+        ("aiv", 3u8, false, true, false),
+        ("mq", 14, true, false, false),
+        ("mq-aiv", 2, true, true, false),
+        ("mq-aiv-umv", 5, true, true, true),
+    ] {
+        let i_bytes = encode_intra_picture_plus(&textured(0), quant, 0).unwrap();
+        let recon = decode_sequence(&i_bytes, DecodeOptions::default())
+            .unwrap()
+            .remove(0);
+        let cfg = InterVlcConfig::new(quant)
+            .with_search_half(6)
+            .with_modified_quant(mq)
+            .with_alt_inter_vlc(aiv)
+            .with_umv(umv);
+        let (p, stats) = encode_inter_picture_mq_stats(&textured(4), &recon, 1, &cfg).unwrap();
+        if aiv {
+            assert!(
+                stats.intra_vlc_blocks > 0 && stats.intra_cbpy > 0,
+                "{name}: {stats:?}"
+            );
+        }
+        let mut stream = i_bytes;
+        stream.extend_from_slice(&p);
+        cross_check(&stream, 176, 144, name, 0.25);
+    }
+}
