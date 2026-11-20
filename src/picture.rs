@@ -4092,7 +4092,7 @@ pub fn decode_pb_picture(
 /// 4. §5.1.24 / §5.1.25 PEI / PSUPP extension loop — consumed and
 ///    discarded.
 ///
-/// The reconstruction then runs through [`decode_after_picture_header`]
+/// The reconstruction then runs through `decode_after_picture_header`
 /// with `gob0_pquant = Some(pquant)`, so the topmost group-number-0 GOB
 /// header is elided (§5.2.2) and every later GOB header is **optional**
 /// (§5.2) — exactly the framing the baseline non-PB streaming path uses.
@@ -4198,13 +4198,13 @@ pub fn decode_pb_picture_no_gob0_header(
 /// there is no baseline-PTYPE arm here.
 ///
 /// Wire layout consumed: the §5.1.1–§5.1.4 PLUSPTYPE header (via
-/// [`parse_picture_layer`] / [`plus_ptype_to_baseline_shim`]), then —
+/// [`parse_picture_layer`] / `plus_ptype_to_baseline_shim`), then —
 /// because the picture is an Improved PB-frame — §5.1.19 PQUANT (5 bits;
 /// always present with PLUSPTYPE, Figure 6 part 1), §5.1.22 TRB (3 bits
 /// at the standard CIF picture clock frequency) and §5.1.23 DBQUANT
 /// (2 bits), then the GOB layers. PQUANT primes the QUANT for the first
 /// GOB; each GOB header's GQUANT then takes over (the GOB-header-per-GOB
-/// convention of [`decode_after_picture_header`]).
+/// convention of `decode_after_picture_header`).
 ///
 /// `prev_tr` is the §5.1.2 Temporal Reference of the `reference` picture
 /// (the last decoded P- or I-picture / P-part). §G.4 (referenced by §M
@@ -4226,7 +4226,7 @@ pub fn decode_pb_picture_no_gob0_header(
 ///
 /// * [`Error::NotImplemented`] — not a PLUSPTYPE picture; an MPPTYPE
 ///   picture-type other than Improved PB-frame; any mode
-///   [`plus_ptype_to_baseline_shim`] refuses (SAC, ISD, Alternative
+///   `plus_ptype_to_baseline_shim` refuses (ISD, Alternative
 ///   INTER VLC, Modified Quantisation, custom PCF, CPM, RRU); the
 ///   or a `reference` of mismatched geometry. Advanced Prediction
 ///   composes as for [`decode_pb_picture`], Annex K slices compose

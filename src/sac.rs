@@ -1088,7 +1088,7 @@ pub fn write_block_sac(
 /// Parse one macroblock header of an SAC picture (§5.3 syntax with
 /// every VLC replaced by its §E.7 model): COD (P-pictures), MCBPC,
 /// CBPY, optional DQUANT and the MVD pair. The returned
-/// [`H263Macroblock`] uses the exact conventions of
+/// [`crate::macroblock::H263Macroblock`] uses the exact conventions of
 /// [`crate::macroblock::parse_macroblock`] (CBPY in INTRA orientation,
 /// `quantiser_after` post-DQUANT, `Stuffing` surfaced for the caller's
 /// re-read loop).

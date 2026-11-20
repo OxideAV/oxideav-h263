@@ -950,7 +950,7 @@ pub const OBMC_WEIGHT_SUM: u32 = 8;
 ///   outside the picture / current segment), the remote MV is **replaced
 ///   by the current block's MV** ([`Self::Current`]). The same
 ///   substitution applies when "the current block is at the bottom of
-///   the macroblock (for block number 3 or 4) [and] the remote motion
+///   the macroblock (for block number 3 or 4) \[and\] the remote motion
 ///   vector corresponding with an 8 * 8 luminance block in the
 ///   macroblock below the current macroblock is replaced by the motion
 ///   vector for the current block".
@@ -1019,7 +1019,7 @@ impl RemoteMv {
 /// vector here. `block_x` / `block_y` are the block's top-left integer
 /// pixel position in the current picture; `plane` is the luma reference
 /// plane (with the always-on §D.1 edge replication via
-/// [`RefPlane::at`]).
+/// `RefPlane::at`).
 ///
 /// `rcontrol` is the §6.1.2 `RCONTROL` bit (implied `0` in baseline H.263).
 #[allow(clippy::too_many_arguments)]

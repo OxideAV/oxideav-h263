@@ -58,12 +58,12 @@
 //! * §5.1.16 — the variable-length BCI codeword (`"1"` / `"01"`) is
 //!   parsed. A BCI of `"1"` signals a following §5.1.17 BCM whose
 //!   §N.4.2 videomux-dependent layout is not staged, so the parser stops
-//!   with [`PlusPtypeUnsupported`] in that case (BCI is `"01"` whenever
+//!   with [`crate::Error::PlusPtypeUnsupported`] in that case (BCI is `"01"` whenever
 //!   the videomux submode is not in use, which is the forward-channel
 //!   default).
 //! * §5.1.18 — RPRP (Annex P reference-picture-resampling parameters)
 //!   carries a variable-length payload that is not staged; the parser
-//!   stops with [`PlusPtypeUnsupported`] when the RPR mode bit is set.
+//!   stops with [`crate::Error::PlusPtypeUnsupported`] when the RPR mode bit is set.
 //!
 //! All bit numbering follows the spec's 1-based "Bit N" convention; the
 //! implementation reads MSB-first via [`oxideav_core::bits::BitReader`].

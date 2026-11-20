@@ -431,7 +431,7 @@ fn intra_tcoef_vlc_codeword(last: bool, run: u8, abs_level: u8) -> Option<(u32, 
 /// so an ESCAPE magnitude is restricted to `1..=127` unless
 /// `modified_quant` is set: with Modified Quantization mode in use the
 /// §T.4 / §T.5-rule-2 EXTENDED-ESCAPE marker `1000 0000` introduces an
-/// 11-bit EXTENDED-LEVEL field ([`crate::block::extended_level_to_wire`])
+/// 11-bit EXTENDED-LEVEL field (`crate::block::extended_level_to_wire`)
 /// carrying a magnitude up to the §T.4 range. `run` must be `0..=63`.
 ///
 /// Errors ([`Error::BadTcoefCode`]) when `level` is zero, `run` exceeds

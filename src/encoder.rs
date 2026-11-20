@@ -1788,7 +1788,8 @@ pub fn encode_intra_picture(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u
 /// encoder, so the SAC picture reconstructs **byte-identically** to
 /// the [`encode_intra_picture`] output of the same source — only the
 /// entropy layer differs. Decodes through
-/// [`crate::picture::decode_picture_sac`] (and [`decode_sequence`]).
+/// [`crate::picture::decode_picture_sac`] (and
+/// [`crate::picture::decode_sequence`]).
 pub fn encode_intra_picture_sac(frame: &YuvFrame, quant: u8, tr: u8) -> Result<Vec<u8>> {
     encode_intra_picture_sac_impl(frame, quant, tr, false)
 }
@@ -4625,7 +4626,7 @@ pub fn encode_intra_picture_isd(frame: &YuvFrame, quant: u8, tr: u8) -> Result<V
 /// segment in the prior picture are extrapolated as described in
 /// Annex D". With UMV on, this encoder searches each segment against
 /// an edge-replicated band view of the reference
-/// ([`band_replicated_reference`]) — byte-identical to the decoder's
+/// (`band_replicated_reference`) — byte-identical to the decoder's
 /// banded fetch — so over-boundary vectors are both legal and
 /// closed-loop exact.
 ///

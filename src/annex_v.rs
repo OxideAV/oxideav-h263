@@ -385,7 +385,7 @@ const MAX_RVLC_BITS: u32 = 11;
 /// # Errors
 ///
 /// [`Error::BadDpsHeaderCode`] when no inventory row matches within
-/// [`MAX_RVLC_BITS`]; [`Error::UnexpectedEof`] on starvation.
+/// `MAX_RVLC_BITS`; [`Error::UnexpectedEof`] on starvation.
 pub fn read_dps_mb_header(reader: &mut BitReader<'_>, table: &[RvlcRow]) -> Result<DpsMbHeader> {
     let mut code: u32 = 0;
     for len in 1..=MAX_RVLC_BITS {

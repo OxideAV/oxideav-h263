@@ -186,7 +186,7 @@ pub fn write_mvd_component(w: &mut BitWriter, half: i16) -> Result<()> {
 /// one bit set to '1'" — the `(+1, +1)` half-pel pair (two `"000"`
 /// codewords) is followed by the emulation-prevention `"1"` (the
 /// zero-difference codeword). Exact inverse of
-/// [`crate::macroblock::read_mvd_pair`] in its Table D.3 form.
+/// `crate::macroblock::read_mvd_pair` in its Table D.3 form.
 pub fn write_mvd_pair_d3(w: &mut BitWriter, mvd: crate::macroblock::Mvd) -> Result<()> {
     crate::annex_p::write_table_d3(w, mvd.dx_half as i32)?;
     crate::annex_p::write_table_d3(w, mvd.dy_half as i32)?;
