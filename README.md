@@ -126,18 +126,24 @@ same source reconstruct **byte-identically** (pinned for the I / P /
 AP / PB shapes); measured entropy-layer saving on the gradient QCIF
 corpus is 6.4–25.5 % on I-pictures (QP 31 → QP 2).
 
-The encoder gained **Annex Q Reduced-Resolution Update** entry points
-(round 443): `encode_intra_picture_rru` (each 16×16 region
-down-sampled to the reduced 8×8 block, standard INTRA stage over the
-32×32 macroblock grid) and `encode_inter_picture_rru` (pseudo-domain
-motion search so every candidate expands to a legal §Q.4
-half-integer-or-zero vector, per-16×16-sub-block residuals
-down-sampled to 8×8; `encode_inter_picture_rru_umv` widens the
-pseudo window to the Tables-D.1/D.2 UMV range with Table D.3
-difference coding — round 447) — both self-describing (MPPTYPE RRU bit) and
-round-tripped through the RRU decode driver (static P lossless,
-translated content within tolerance, I + P streams through
-`decode_sequence`).
+The encoder has **Annex Q Reduced-Resolution Update** P-picture
+entry points: `encode_inter_picture_rru` (pseudo-domain motion search
+so every candidate expands to a legal §Q.4 half-integer-or-zero
+vector, per-16×16-sub-block residuals down-sampled to 8×8),
+`encode_inter_picture_rru_umv` (Tables-D.1/D.2 pseudo range, Table D.3
+difference coding), `encode_inter_picture_rru_deblock` (§Q.7.2), and
+the general `encoder_rru::encode_inter_picture_rru_with` +
+`RruInterConfig` (round 491), which composes RRU with **Advanced
+Prediction** (§Q.5 enlarged overlapped motion compensation; a
+cost-driven one / four vector decision per 32 × 32 macroblock), the
+Table J.1 four vectors under Deblocking Filter, **Annex K slices**
+(Tables K.2 / K.3 "RRU mode" field widths), UMV and an INTRA
+macroblock decision — all self-describing (MPPTYPE RRU bit) and
+round-tripped through the RRU decode driver (static P lossless in
+every mode set, I + P + P streams through `decode_sequence`). An RRU
+**I-picture** is refused with a typed error: §5.1.4.5 item 4, "the
+Reduced-Resolution Update mode bit shall not be set in an INTRA
+picture".
 
 The encoder also has **rate control** (round 438): the
 `rate_control` module pairs the Annex B Hypothetical Reference
@@ -163,9 +169,59 @@ textured clips; pinned monotone by `tests/rate_psnr_ladder.rs`):
 
 | QP | QCIF bits/picture | QCIF Y-PSNR | CIF bits/picture | CIF Y-PSNR |
 |---:|---:|---:|---:|---:|
-| 2  | 50 808 | 44.1 dB | 206 188 | 41.5 dB |
-| 8  | 17 508 | 38.8 dB |  69 348 | 40.0 dB |
-| 31 |  4 252 | 26.2 dB |  19 244 | 26.5 dB |
+| 2  | 72 916 | 43.8 dB | 243 268 | 41.4 dB |
+| 8  | 25 593 | 37.6 dB |  82 400 | 39.3 dB |
+| 31 |  6 461 | 25.9 dB |  22 650 | 26.3 dB |
+
+(Round 491: the default-mode search no longer lets a vector reference
+pixels outside the picture — §4.2.3 — so this panning clip costs more
+than the earlier 50 808 / 17 508 / 4 252 QCIF figures, which relied on
+such vectors; `GopConfig::umv` is the legal way to reach across the
+edge.)
+
+### Round 491: annex combinations, typed mode rules, speed
+
+**Mode combinations.** `mode_rules::ModeSet::check` applies the
+Recommendation's rules to a requested mode set — §5.1.3 (PB-frames
+need an INTER picture), §5.1.4.3 (RTYPE), §5.1.4.4 (Annex G vs
+PLUSPTYPE), §5.1.4.5 (RRU / RPR not in I- / EI-pictures, with the
+items 1–3 inference turning inapplicable modes off instead of
+refusing), §5.1.4.6 (SAC × AIV, SAC × MQ, SAC × UMV under PLUSPTYPE,
+ISD × RPR, ISD × non-rectangular slices), §5.1.14 (no TRP in an
+I-picture), §F.2 (four vectors need AP or DF) and §V.3 (DPS needs SS,
+not SAC). A forbidden request is
+`Error::ModeCombination(ModeRule)`, the rule naming its clause;
+`write_plus_picture_header` runs the check, so no PLUSPTYPE picture
+the crate emits signals a forbidden combination. A legal combination
+that an encoder entry point does not stage is `Error::NotImplemented`.
+
+| New this round | Encoder entry point | Decoder | Measured |
+|---|---|---|---|
+| RRU + Advanced Prediction (§Q.5), 1 / 4 vectors | `encode_inter_picture_rru_with` | new | static P lossless; I+P+P chain drift-free |
+| RRU + Annex K slices (free-running; decoder also RS / ASO) | same, `slice_rows` | new | no §Q.7 filtering across slice edges |
+| RRU + DF four vectors, RRU INTRA macroblocks in P | same | new | — |
+| SAC on PLUSPTYPE (I, P) | `encode_intra_picture_sac_plus`, `encode_inter_picture_motion_sac_plus` | new | reconstruction = VLC coding |
+| SAC + Improved PB-frames | `ImprovedPbConfig::sac` | new | 3.3–4.1 % smaller than VLC, identical pictures |
+| Annex N RPS (TRP per picture) | `encode_intra_picture_rps`, `encode_inter_picture_rps` | existing | reference selected by TR |
+| Annex T on INTER pictures | `encoder_mq::encode_inter_picture_mq` | existing | chroma MAE 6.73 → 4.56 at QP 20; QP 1 edges exact via EXTENDED-ESCAPE |
+| Annex S on INTER pictures | same, `alt_inter_vlc` | existing | 1.5–9.3 % smaller at QP 2–4, identical pictures; black-box decoder agrees |
+
+**Speed** (`cargo run --release --example throughput`, closed-loop
+I + P GOP, QP 8, ±14-pel search, medians of three runs on a shared
+machine; decode timed on identical streams):
+
+| | before | after |
+|---|---:|---:|
+| encode, CIF | 6.2 fps | 104 fps |
+| encode, 4CIF | 1.5 fps | 27.7 fps |
+| decode, CIF | 796 fps | 1005 fps |
+| decode, 4CIF | 212 fps | 280 fps |
+
+The search returns the same vectors as before (a candidate's SAD is
+cut short once it cannot win; in-picture candidates are direct row
+differences), and the inverse / forward transforms run the same
+floating-point operations in the same order over the non-zero
+coefficients only — decoded pictures are bit-identical.
 
 Everything is built bottom-up from reusable layers —
 `encoder_vlc`, `fdct`, `encoder_block` (§5.4), `encoder_aic` (§I.3
@@ -313,6 +369,11 @@ planar 4:2:0 `YuvFrame`:
   §5.1.4.6 bars Annex S / T combinations; AP + PB together and
   mid-picture GOB headers stay refused. Reconstruction is
   byte-identical to the VLC path at equal quantised coefficients.
+  **PLUSPTYPE SAC** (round 491): OPPTYPE bit 6 routes I- / P-pictures
+  and Improved PB-frames to the arithmetic macroblock layer —
+  `cumf_MCBPC_4MVQ` when Advanced Prediction or Deblocking Filter is
+  in use, `cumf_MODB_M` with Table M.1 indexing, the Table J.1 four
+  vectors without overlap, RTYPE (§5.1.4.6 item 2 bars UMV there).
 * **Annex F §F.2 / §F.3** — Advanced Prediction: four-motion-vector
   candidate-predictor redefinition (Figure F.1 — B1's MV3 reads the
   above-right macroblock's B3, B4's candidates are entirely
@@ -394,6 +455,11 @@ planar 4:2:0 `YuvFrame`:
   PLUSPTYPE OPPTYPE bit 13; refused only when combined with Advanced
   Prediction / INTER4V or PB-frames. The `alt-inter-vlc` (AIV + AIC + MQ
   + slice-structured) QCIF I+P+P conformance fixture decodes byte-exact.
+  **Encoder** (round 491): `encoder_mq::encode_inter_picture_mq` with
+  `alt_inter_vlc` sends an INTER block with Table I.2 codewords when
+  that is shorter and the §S.2.2 detection (run on the candidate
+  codewords) recovers the block, and the INTRA CBPY column when both
+  chrominance blocks are coded.
 * **Annex T** — Modified Quantization mode: the §T.2 variable-length
   DQUANT parser, the §T.3 chrominance `QUANT_C` step, and the §T.4
   EXTENDED-ESCAPE / EXTENDED-LEVEL extended coefficient range, driving
@@ -403,7 +469,10 @@ planar 4:2:0 `YuvFrame`:
   the §T.5-rule-2 EXTENDED-ESCAPE extension to the Table I.2 VLC thread
   through the shared per-macroblock reconstruction on all three). The
   `advanced-intra-coding` (AIC + MQ + slice-structured) conformance
-  fixture decodes byte-exact.
+  fixture decodes byte-exact. **Encoder on INTER pictures** (round
+  491): `encoder_mq::encode_inter_picture_mq` with `modified_quant` —
+  chrominance quantised at `QUANT_C`, levels beyond ±127 through
+  EXTENDED-ESCAPE below step 8 (§T.5).
 * **Annex Q** — Reduced-Resolution Update mode **end-to-end** (round
   443): an extended-PTYPE picture whose §5.1.4.3 MPPTYPE RRU bit is
   set routes to the dedicated driver — §Q.1 geometry (display /
@@ -418,19 +487,25 @@ planar 4:2:0 `YuvFrame`:
   Figure-Q.8/Q.9 filters with the Implementors' Guide arithmetic-shift
   rounding correction), §Q.2.2.3 summation + clip, the §Q.7.1 default
   block boundary filter (coded-MB condition, §J.3 edge ordering) and
-  the §Q.2.3/§Q.2.4 crop back to the reference size. The staged
-  subset is the single-segment I/P stream shape at the five standard
-  formats. **UMV composes** (round 447): §Q.4 — the pseudo vector is
+  the §Q.2.3/§Q.2.4 crop back to the reference size, at the five
+  standard formats. **UMV composes** (round 447): §Q.4 — the pseudo vector is
   `pseudo-PC + difference` with the difference read from Table D.3,
   the UUI-selected Tables-D.1/D.2 range applying to the *pseudo*
   vectors (actual motion reach roughly doubled). **Deblocking Filter
   composes** (round 457): the §Q.7.2 variant — the §J.3 four-tap
   filter with `STRENGTH = +∞` on the 16 × 16 block edges — replaces
   the §Q.7.1 default, both directions
-  (`encode_intra_picture_rru_deblock` / `encode_inter_picture_rru_deblock`;
-  INTER4V under RRU stays refused). AP / AIC / SAC / AIV / MQ / Annex
-  K / B-EI-EP combinations inside RRU are refused; §Q.5 enlarged OBMC
-  stays a primitive.
+  (`encode_inter_picture_rru_deblock`; the Table J.1 four-vector
+  macroblocks compose since round 491).
+  **Advanced Prediction composes** (round 491): four §F.2 vectors per
+  32 × 32 macroblock through the §Q.4 pseudo-vector rule and the §Q.5
+  enlarged overlapped motion compensation (Figure Q.4–Q.6 weights) for
+  every INTER macroblock, skipped ones included. **Annex K composes**
+  (round 491): the slice layer with the Tables K.2 / K.3 "RRU mode"
+  field widths, free-running / Rectangular Slice / Arbitrary Slice
+  Ordering, §K.1 predictor and remote-vector confinement, and no §Q.7
+  filtering across slice edges. AIC / SAC / AIV / MQ / ISD and
+  Improved-PB / B / EI / EP pictures inside RRU are refused.
 * **Annex N §N.4.1 / §N.5** — Reference Picture Selection mode (forward
   channel) end-to-end, including **per-GOB** re-selection: the
   `RpsReferenceStore` picture memory keys decoded anchors by their 10-bit
@@ -456,7 +531,11 @@ planar 4:2:0 `YuvFrame`:
   caller-supplied `BcmContext` (videomux + GN/MBA width — per the
   §N.4.2.9 NOTE these are properties of the bitstream the message
   applies to, so an in-picture-header BCM stays refused at the
-  `plus_ptype` layer where that knowledge is absent).
+  `plus_ptype` layer where that knowledge is absent). **Encoder**
+  (round 491): `encode_intra_picture_rps` / `encode_inter_picture_rps`
+  write OPPTYPE bit 11 and the §5.1.13–§5.1.16 fields (RPSMF, TRPI,
+  TRP, BCI = "01") and predict from the picture the caller names by
+  its Temporal Reference.
 * **Annex P §P.2 / §P.3** — Reference Picture Resampling: the §P.3 /
   §P.4.2 integer bilinear warp engine (`resample_yuv`) resamples the
   reference picture before motion compensation, driven from the §P.3
@@ -736,8 +815,9 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
 * Annex G PB-frames and Annex M Improved PB-frames both decode and
   encode end-to-end through `decode_sequence` (see the supported list),
   including Advanced Prediction / INTER4V B-blocks, AIC, UMV and the
-  Annex K Slice-Structured + Improved-PB combination (round 457). Still
-  unstaged within those modes: SAC + Improved-PB.
+  Annex K Slice-Structured + Improved-PB combination (round 457), and
+  SAC + Improved-PB (round 491; not together with Advanced Prediction,
+  AIC or slices).
 * Annex K Rectangular Slices narrower than the picture height on the
   encode side (the rect encoders — including the round-457 Advanced
   Prediction form `encode_inter_picture_ap_slices_rect` — emit
@@ -752,13 +832,15 @@ let samples_8x8 = reconstruct_intra_block(&block, gob.quantiser);
   Annex P warp on the EP path applies to the enhancement layer's
   forward reference (round 457), the upward reference keeping the §O.6
   factor-of-two upsample.
-* Annex Q Reduced-Resolution Update combined with Advanced
-  Prediction (§Q.5 enlarged OBMC), the Table J.1 four-vector
-  macroblocks under Deblocking Filter mode, Annex K slices, custom
-  source formats or mid-picture GOB headers — the single-segment
-  standard-format I/P subset (including the §Q.4 UMV Table-D.3
-  pseudo-vector coding and the §Q.7.2 Deblocking-Filter variant, both
-  directions) decodes and encodes end-to-end (see the supported list).
+* Annex Q Reduced-Resolution Update combined with AIC, SAC, AIV, MQ,
+  ISD, Improved PB-frames or the Annex O picture types, with custom
+  source formats or mid-picture GOB headers (UMV, Advanced Prediction,
+  Deblocking Filter and Annex K slices compose — see the supported
+  list).
+* Encoders for the Annex O picture types (B / EI / EP) and for Annex P
+  Reference Picture Resampling (both decode); Annex N per-GOB /
+  per-slice TRP on the encode side (`encode_inter_picture_rps` selects
+  one reference per picture); Annex U (neither direction).
 * A true Annex C multiplex (interleaved sub-bitstreams — the GOB and
   slice paths decode one PSBI / GSBI / SSBI member each); the EOSBS
   end marker (the §5.1.27 EOS is emitted by the encoder and
