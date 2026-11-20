@@ -264,7 +264,7 @@ pub fn encode_inter_picture_adaptive(
             let src = extract_macroblock(frame, mb_col, mb_row);
             let mut luma_enc: Vec<EncodedInterBlock> = Vec::with_capacity(4);
             let mut inter_sad = 0u32;
-            for blk in 0..4 {
+            for (blk, luma_blk) in src.luma.iter().enumerate() {
                 let bx = mb_x + (blk % 2) * 8;
                 let by = mb_y + (blk / 2) * 8;
                 let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
@@ -278,7 +278,7 @@ pub fn encode_inter_picture_adaptive(
                         inter_sad += (sv - pred[row * 8 + col] as i32).unsigned_abs();
                     }
                 }
-                let residual = residual_of(&src.luma[blk], &pred_i16);
+                let residual = residual_of(luma_blk, &pred_i16);
                 luma_enc.push(encode_inter_block(&residual, next));
             }
             let chroma_vec = chroma_mv(mv);

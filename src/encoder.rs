@@ -922,10 +922,10 @@ fn encode_intra_picture_rru_impl(
                 cb: [0i16; COEFFS_PER_BLOCK],
                 cr: [0i16; COEFFS_PER_BLOCK],
             };
-            for blk in 0..4 {
+            for (blk, luma_blk) in samples.luma.iter_mut().enumerate() {
                 let bx = mb_x + (blk % 2) * 16;
                 let by = mb_y + (blk / 2) * 16;
-                samples.luma[blk] = rru_downsample_16(&ext.y, hc, bx, by);
+                *luma_blk = rru_downsample_16(&ext.y, hc, bx, by);
             }
             samples.cb = rru_downsample_16(&ext.cb, hc / 2, c_x, c_y);
             samples.cr = rru_downsample_16(&ext.cr, hc / 2, c_x, c_y);
@@ -2090,7 +2090,7 @@ pub fn encode_inter_picture_motion_sac(
                 let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> =
                     Vec::with_capacity(4);
                 let mut inter_sad = 0u32;
-                for blk in 0..4 {
+                for (blk, luma_blk) in src.luma.iter().enumerate() {
                     let bx = mb_x + (blk % 2) * 8;
                     let by = mb_y + (blk / 2) * 8;
                     let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
@@ -2098,10 +2098,10 @@ pub fn encode_inter_picture_motion_sac(
                     for (d, &p) in pred_i16.iter_mut().zip(pred.iter()) {
                         *d = p as i16;
                     }
-                    for (&s, &p) in src.luma[blk].iter().zip(pred_i16.iter()) {
+                    for (&s, &p) in luma_blk.iter().zip(pred_i16.iter()) {
                         inter_sad += (s as i32 - p as i32).unsigned_abs();
                     }
-                    let residual = residual_of(&src.luma[blk], &pred_i16);
+                    let residual = residual_of(luma_blk, &pred_i16);
                     luma_enc.push(crate::encoder_block::encode_inter_block(&residual, quant));
                 }
                 let cb_pred = motion_compensated_block(&reference.cb, cw, ch, c_x, c_y, chroma_mv);
@@ -2505,7 +2505,7 @@ pub fn encode_pb_picture_sac(
                 let mut luma_pred: Vec<[u8; COEFFS_PER_BLOCK]> = Vec::with_capacity(4);
                 let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> =
                     Vec::with_capacity(4);
-                for blk in 0..4 {
+                for (blk, luma_blk) in src.luma.iter().enumerate() {
                     let bx = mb_x + (blk % 2) * 8;
                     let by = mb_y + (blk / 2) * 8;
                     let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
@@ -2514,7 +2514,7 @@ pub fn encode_pb_picture_sac(
                         *d = pv as i16;
                     }
                     luma_enc.push(crate::encoder_block::encode_inter_block(
-                        &residual_of(&src.luma[blk], &pred_i16),
+                        &residual_of(luma_blk, &pred_i16),
                         quant,
                     ));
                     luma_pred.push(pred);
@@ -2591,7 +2591,7 @@ pub fn encode_pb_picture_sac(
 
                 let b_src = extract_macroblock(b_source, mb_col, mb_row);
                 let mut b_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(6);
-                for blk in 0..4 {
+                for (blk, luma_blk) in b_src.luma.iter().enumerate() {
                     let ox = (blk % 2) * 8;
                     let oy = (blk / 2) * 8;
                     let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
@@ -2601,7 +2601,7 @@ pub fn encode_pb_picture_sac(
                         }
                     }
                     b_enc.push(crate::encoder_block::encode_inter_block(
-                        &residual_of(&b_src.luma[blk], &pred_i16),
+                        &residual_of(luma_blk, &pred_i16),
                         bquant,
                     ));
                 }
@@ -3337,7 +3337,7 @@ pub fn encode_inter_picture_aic_plus(
             );
             let chroma_vec = crate::motion::chroma_mv(mv);
             let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(4);
-            for blk in 0..4 {
+            for (blk, luma_blk) in src.luma.iter().enumerate() {
                 let bx = mb_col * 16 + (blk % 2) * 8;
                 let by = mb_row * 16 + (blk / 2) * 8;
                 let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
@@ -3345,10 +3345,7 @@ pub fn encode_inter_picture_aic_plus(
                 for (d, &pv) in pred_i16.iter_mut().zip(pred.iter()) {
                     *d = pv as i16;
                 }
-                luma_enc.push(encode_inter_block(
-                    &residual_of(&src.luma[blk], &pred_i16),
-                    quant,
-                ));
+                luma_enc.push(encode_inter_block(&residual_of(luma_blk, &pred_i16), quant));
             }
             let cb_pred =
                 motion_compensated_block(&reference.cb, cw, ch, mb_col * 8, mb_row * 8, chroma_vec);
@@ -4814,7 +4811,7 @@ pub fn encode_inter_picture_dps(
                 let c_y = mb_row * 8;
                 let src = extract_macroblock(frame, mb_col, mb_row);
                 let mut luma: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(4);
-                for blk in 0..4 {
+                for (blk, luma_blk) in src.luma.iter().enumerate() {
                     let bx = mb_x + (blk % 2) * 8;
                     let by = mb_y + (blk / 2) * 8;
                     let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
@@ -4822,7 +4819,7 @@ pub fn encode_inter_picture_dps(
                     for (d, &p) in pred_i16.iter_mut().zip(pred.iter()) {
                         *d = p as i16;
                     }
-                    let residual = residual_of(&src.luma[blk], &pred_i16);
+                    let residual = residual_of(luma_blk, &pred_i16);
                     luma.push(crate::encoder_block::encode_inter_block(&residual, quant));
                 }
                 let chroma_mv = crate::motion::chroma_mv(mv);
@@ -5166,7 +5163,7 @@ fn encode_inter_picture_motion_impl(
             // Build the motion-compensated prediction + residual per block.
             let src = extract_macroblock(frame, mb_col, mb_row);
             let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(4);
-            for blk in 0..4 {
+            for (blk, luma_blk) in src.luma.iter().enumerate() {
                 let bx = mb_x + (blk % 2) * 8;
                 let by = mb_y + (blk / 2) * 8;
                 let pred = motion_compensated_block(&seg_ref.y, lw, lh, bx, by, mv);
@@ -5174,7 +5171,7 @@ fn encode_inter_picture_motion_impl(
                 for (d, &p) in pred_i16.iter_mut().zip(pred.iter()) {
                     *d = p as i16;
                 }
-                let residual = residual_of(&src.luma[blk], &pred_i16);
+                let residual = residual_of(luma_blk, &pred_i16);
                 luma_enc.push(crate::encoder_block::encode_inter_block(&residual, quant));
             }
             let cb_pred = motion_compensated_block(&seg_ref.cb, cw, ch, c_x, c_y, chroma_mv);
@@ -5464,7 +5461,7 @@ pub fn encode_pb_picture(
 
             let mut luma_pred: Vec<[u8; COEFFS_PER_BLOCK]> = Vec::with_capacity(4);
             let mut luma_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(4);
-            for blk in 0..4 {
+            for (blk, luma_blk) in src.luma.iter().enumerate() {
                 let bx = mb_x + (blk % 2) * 8;
                 let by = mb_y + (blk / 2) * 8;
                 let pred = motion_compensated_block(&reference.y, lw, lh, bx, by, mv);
@@ -5473,7 +5470,7 @@ pub fn encode_pb_picture(
                     *d = pv as i16;
                 }
                 luma_enc.push(crate::encoder_block::encode_inter_block(
-                    &residual_of(&src.luma[blk], &pred_i16),
+                    &residual_of(luma_blk, &pred_i16),
                     quant,
                 ));
                 luma_pred.push(pred);
@@ -5548,12 +5545,12 @@ pub fn encode_pb_picture(
             // the MODB/MVDB bits.
             let b_sad_of = |pred: &crate::pb_layer::PbBMacroblockPrediction| -> u32 {
                 let mut sad = 0u32;
-                for blk in 0..4 {
+                for (blk, luma_blk) in b_src.luma.iter().enumerate() {
                     let ox = (blk % 2) * 8;
                     let oy = (blk / 2) * 8;
                     for j in 0..8 {
                         for i in 0..8 {
-                            let sv = b_src.luma[blk][j * 8 + i] as i32;
+                            let sv = luma_blk[j * 8 + i] as i32;
                             let pv = pred.luma[oy + j][ox + i] as i32;
                             sad += (sv - pv).unsigned_abs();
                         }
@@ -5610,7 +5607,7 @@ pub fn encode_pb_picture(
             }
 
             let mut b_enc: Vec<crate::encoder_block::EncodedInterBlock> = Vec::with_capacity(6);
-            for blk in 0..4 {
+            for (blk, luma_blk) in b_src.luma.iter().enumerate() {
                 let ox = (blk % 2) * 8;
                 let oy = (blk / 2) * 8;
                 let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
@@ -5620,7 +5617,7 @@ pub fn encode_pb_picture(
                     }
                 }
                 b_enc.push(crate::encoder_block::encode_inter_block(
-                    &residual_of(&b_src.luma[blk], &pred_i16),
+                    &residual_of(luma_blk, &pred_i16),
                     bquant,
                 ));
             }

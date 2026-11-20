@@ -1540,12 +1540,12 @@ fn inter_p_part_ap(
 /// prediction.
 fn b_sad(b_src: &crate::encoder_mb::MacroblockSamples, pred: &PbBMacroblockPrediction) -> u32 {
     let mut sad = 0u32;
-    for blk in 0..4 {
+    for (blk, luma_blk) in b_src.luma.iter().enumerate() {
         let ox = (blk % 2) * 8;
         let oy = (blk / 2) * 8;
         for j in 0..8 {
             for i in 0..8 {
-                let sv = b_src.luma[blk][j * 8 + i] as i32;
+                let sv = luma_blk[j * 8 + i] as i32;
                 let pv = pred.luma[oy + j][ox + i] as i32;
                 sad += (sv - pv).unsigned_abs();
             }
@@ -1561,7 +1561,7 @@ fn b_residual(
     bquant: u8,
 ) -> ([EncodedInterBlock; 6], bool) {
     let mut out: Vec<EncodedInterBlock> = Vec::with_capacity(6);
-    for blk in 0..4 {
+    for (blk, luma_blk) in b_src.luma.iter().enumerate() {
         let ox = (blk % 2) * 8;
         let oy = (blk / 2) * 8;
         let mut pred_i16 = [0i16; COEFFS_PER_BLOCK];
@@ -1571,7 +1571,7 @@ fn b_residual(
             }
         }
         out.push(encode_inter_block(
-            &residual_of(&b_src.luma[blk], &pred_i16),
+            &residual_of(luma_blk, &pred_i16),
             bquant,
         ));
     }

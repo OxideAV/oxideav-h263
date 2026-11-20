@@ -57,8 +57,8 @@ pub fn dequantise_ac(block: &mut H263Block, quant: u8, is_intra: bool) {
     let q = quant.clamp(1, 31) as i32;
     let q_even = (q & 1) == 0;
     let start = if is_intra { 1 } else { 0 };
-    for slot in start..COEFFS_PER_BLOCK {
-        let level = block.coefficients[slot] as i32;
+    for coeff in block.coefficients[start..COEFFS_PER_BLOCK].iter_mut() {
+        let level = *coeff as i32;
         if level == 0 {
             continue;
         }
@@ -70,7 +70,7 @@ pub fn dequantise_ac(block: &mut H263Block, quant: u8, is_intra: bool) {
         let rec = if level < 0 { -abs_rec } else { abs_rec };
         // §6.2.2 clip to [-2048, +2047].
         let clipped = rec.clamp(AC_REC_MIN as i32, AC_REC_MAX as i32);
-        block.coefficients[slot] = clipped as i16;
+        *coeff = clipped as i16;
     }
 }
 
