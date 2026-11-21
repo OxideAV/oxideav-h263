@@ -258,6 +258,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- decoder: option keys this decoder does not define (a container's track records such as the MP4 edit-list entries, or the producing encoder's options) no longer fail the decoder factory; only its own keys are parsed, and a malformed value of one of them is still an error. Such streams could not be opened through the registry at all.
+
 - The Improved PB-frame decode driver consumed neither the §5.1.24
   PEI / PSUPP loop nor the §5.2.2 group-number-0 GOB-header elision:
   a spec-conformant Improved PB-frame (as any real encoder emits it,

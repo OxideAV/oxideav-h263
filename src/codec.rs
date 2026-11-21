@@ -506,12 +506,14 @@ pub struct H263StreamDecoder {
 
 impl H263StreamDecoder {
     /// Construct from codec parameters (the [`make_decoder`] factory
-    /// body): parses [`H263DecoderOptions`] strictly and captures the
+    /// body): parses this decoder's own [`H263DecoderOptions`] keys (others are
+    /// left alone; a malformed value is an error) and captures the
     /// decode limits. Stream geometry is read from the self-describing
     /// bitstream; `params.width` / `params.height` are advisory and
     /// not enforced.
     pub fn from_params(params: &CodecParameters) -> CoreResult<Self> {
-        let opts: H263DecoderOptions = oxideav_core::parse_options(&params.options)?;
+        let opts: H263DecoderOptions =
+            oxideav_core::parse_options(&own_options::<H263DecoderOptions>(&params.options))?;
         Ok(H263StreamDecoder {
             id: CodecId::new(CODEC_ID),
             options: opts.to_decode_options(),
@@ -989,4 +991,23 @@ fn codec_info() -> CodecInfo {
 /// payload-magic claims — into the runtime context's codec registry.
 pub fn register(ctx: &mut RuntimeContext) {
     ctx.codecs.register(codec_info());
+}
+
+/// The options of `params` that belong to schema `T`.
+///
+/// A stream's parameter set also carries what its container recorded
+/// about the track (edit lists, bit-rate boxes, handler names, …) and
+/// may carry the options of the encoder that produced it; none of that
+/// configures this decoder, so only its own keys are parsed (a
+/// malformed value of one of them is still an error).
+fn own_options<T: oxideav_core::CodecOptionsStruct>(
+    options: &oxideav_core::CodecOptions,
+) -> oxideav_core::CodecOptions {
+    let mut own = oxideav_core::CodecOptions::default();
+    for (key, value) in options.iter() {
+        if T::SCHEMA.iter().any(|f| f.name == key) {
+            own.insert(key, value);
+        }
+    }
+    own
 }

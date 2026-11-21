@@ -199,14 +199,22 @@ fn registry_decoder_reset_decodes_again_from_scratch() {
 
 #[test]
 fn registry_decoder_honours_decoder_options() {
-    // An unknown option key must fail the factory; a known one must
-    // change the decode (deblock alters reconstructed pixels).
+    // A key the decoder does not define (a container's track record)
+    // is left alone; a malformed value of its own key fails the
+    // factory; a known one must change the decode (deblock alters
+    // reconstructed pixels).
     let ctx = registered_context();
     let mut params = video_params();
-    params.options = CodecOptions::new().set("no_such_option", "1");
+    params.options = CodecOptions::new().set("elst_entry_count", "1");
+    assert!(
+        ctx.codecs.first_decoder(&params).is_ok(),
+        "a foreign key must not stop the decoder"
+    );
+    let mut params = video_params();
+    params.options = CodecOptions::new().set("deblock", "maybe");
     assert!(
         ctx.codecs.first_decoder(&params).is_err(),
-        "unknown option must be rejected"
+        "a malformed value must be rejected"
     );
 
     let stream = fixture("i-frame-then-p-frame-qcif");
